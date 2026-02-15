@@ -1,0 +1,2221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ZipherX // Security Audit Remediation</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Orbitron:wght@400;700;900&family=Share+Tech+Mono&display=swap');
+
+  :root {
+    --neon-cyan: #00f0ff;
+    --neon-magenta: #ff00d4;
+    --neon-green: #39ff14;
+    --neon-red: #ff073a;
+    --neon-orange: #ff6a00;
+    --neon-yellow: #f0e130;
+    --neon-purple: #b026ff;
+    --dark-bg: #0a0a0f;
+    --panel-bg: #0d0d15;
+    --panel-border: #1a1a2e;
+    --text-primary: #e0e0e8;
+    --text-dim: #6a6a80;
+    --text-muted: #3a3a50;
+    --glow-cyan: 0 0 10px #00f0ff44, 0 0 30px #00f0ff22;
+    --glow-magenta: 0 0 10px #ff00d444, 0 0 30px #ff00d422;
+    --glow-green: 0 0 10px #39ff1444, 0 0 30px #39ff1422;
+    --glow-red: 0 0 10px #ff073a44, 0 0 30px #ff073a22;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--dark-bg);
+    color: var(--text-primary);
+    font-family: 'JetBrains Mono', 'Courier New', monospace;
+    font-size: 13px;
+    line-height: 1.7;
+    overflow-x: hidden;
+  }
+
+  /* Scanline overlay */
+  body::before {
+    content: '';
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(0, 240, 255, 0.008) 2px,
+      rgba(0, 240, 255, 0.008) 4px
+    );
+    pointer-events: none;
+    z-index: 9999;
+  }
+
+  /* Grid background */
+  body::after {
+    content: '';
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background-image:
+      linear-gradient(rgba(0, 240, 255, 0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0, 240, 255, 0.03) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+    z-index: -1;
+  }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: var(--dark-bg); }
+  ::-webkit-scrollbar-thumb { background: var(--neon-cyan); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--neon-magenta); }
+
+  .container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 30px 40px 80px;
+  }
+
+  /* Header */
+  .header {
+    text-align: center;
+    padding: 60px 0 50px;
+    position: relative;
+  }
+
+  .header::before {
+    content: '> CLASSIFIED // EYES ONLY';
+    display: block;
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 11px;
+    color: var(--neon-red);
+    letter-spacing: 6px;
+    text-transform: uppercase;
+    margin-bottom: 20px;
+    animation: blink 2s ease-in-out infinite;
+  }
+
+  @keyframes blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+  }
+
+  .logo {
+    font-family: 'Orbitron', sans-serif;
+    font-weight: 900;
+    font-size: 52px;
+    letter-spacing: 8px;
+    background: linear-gradient(135deg, var(--neon-cyan), var(--neon-magenta), var(--neon-cyan));
+    background-size: 200% 200%;
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    animation: gradient-shift 4s ease infinite;
+    text-shadow: none;
+    filter: drop-shadow(0 0 20px rgba(0, 240, 255, 0.3));
+    position: relative;
+  }
+
+  @keyframes gradient-shift {
+    0% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+    100% { background-position: 0% 50%; }
+  }
+
+  .subtitle {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 14px;
+    letter-spacing: 10px;
+    color: var(--neon-cyan);
+    text-transform: uppercase;
+    margin-top: 12px;
+    opacity: 0.7;
+  }
+
+  .header-line {
+    width: 100%;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--neon-cyan), var(--neon-magenta), var(--neon-cyan), transparent);
+    margin-top: 30px;
+  }
+
+  .date-stamp {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-top: 15px;
+    letter-spacing: 2px;
+  }
+
+  .date-stamp span {
+    color: var(--neon-green);
+  }
+
+  /* Score badge */
+  .score-badge {
+    display: inline-block;
+    margin-top: 25px;
+    padding: 12px 35px;
+    border: 2px solid var(--neon-orange);
+    color: var(--neon-orange);
+    font-family: 'Orbitron', sans-serif;
+    font-weight: 700;
+    font-size: 16px;
+    letter-spacing: 4px;
+    position: relative;
+    box-shadow: var(--glow-red), inset 0 0 20px rgba(255, 106, 0, 0.05);
+  }
+
+  .score-badge::before {
+    content: '';
+    position: absolute;
+    top: -1px; left: -1px; right: -1px; bottom: -1px;
+    border: 1px solid rgba(255, 106, 0, 0.3);
+  }
+
+  /* Status metrics */
+  .metrics-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 15px;
+    margin: 40px 0;
+  }
+
+  .metric-card {
+    background: var(--panel-bg);
+    border: 1px solid var(--panel-border);
+    padding: 20px;
+    text-align: center;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .metric-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+  }
+
+  .metric-card.findings::before { background: var(--neon-cyan); box-shadow: var(--glow-cyan); }
+  .metric-card.fixed::before { background: var(--neon-green); box-shadow: var(--glow-green); }
+  .metric-card.partial::before { background: var(--neon-orange); }
+  .metric-card.open::before { background: var(--neon-red); box-shadow: var(--glow-red); }
+  .metric-card.new::before { background: var(--neon-magenta); box-shadow: var(--glow-magenta); }
+
+  .metric-value {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 32px;
+    font-weight: 700;
+  }
+
+  .metric-card.findings .metric-value { color: var(--neon-cyan); }
+  .metric-card.fixed .metric-value { color: var(--neon-green); }
+  .metric-card.partial .metric-value { color: var(--neon-orange); }
+  .metric-card.open .metric-value { color: var(--neon-red); }
+  .metric-card.new .metric-value { color: var(--neon-magenta); }
+
+  .metric-label {
+    font-size: 10px;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin-top: 8px;
+  }
+
+  /* Severity table */
+  .severity-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 25px 0;
+    font-size: 12px;
+  }
+
+  .severity-table th {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 10px;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    color: var(--neon-cyan);
+    padding: 12px 16px;
+    text-align: left;
+    border-bottom: 1px solid var(--panel-border);
+    background: rgba(0, 240, 255, 0.03);
+  }
+
+  .severity-table td {
+    padding: 10px 16px;
+    border-bottom: 1px solid rgba(26, 26, 46, 0.5);
+  }
+
+  .severity-table tr:hover td {
+    background: rgba(0, 240, 255, 0.02);
+  }
+
+  .sev-critical { color: var(--neon-red); font-weight: 700; }
+  .sev-high { color: var(--neon-orange); font-weight: 700; }
+  .sev-medium { color: var(--neon-yellow); font-weight: 700; }
+  .sev-low { color: var(--neon-cyan); font-weight: 500; }
+
+  /* Sections */
+  .section {
+    margin: 50px 0;
+  }
+
+  .section-header {
+    display: flex;
+    align-items: center;
+    gap: 15px;
+    margin-bottom: 30px;
+  }
+
+  .section-header h2 {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+  }
+
+  .section-header .line {
+    flex: 1;
+    height: 1px;
+    background: linear-gradient(90deg, var(--panel-border), transparent);
+  }
+
+  .phase-tag {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    padding: 4px 14px;
+    border: 1px solid;
+    white-space: nowrap;
+  }
+
+  .phase-p0 { color: var(--neon-red); border-color: var(--neon-red); }
+  .phase-p1 { color: var(--neon-orange); border-color: var(--neon-orange); }
+  .phase-p2 { color: var(--neon-yellow); border-color: var(--neon-yellow); }
+  .phase-new { color: var(--neon-magenta); border-color: var(--neon-magenta); }
+
+  /* Task cards */
+  .task-card {
+    background: var(--panel-bg);
+    border: 1px solid var(--panel-border);
+    margin-bottom: 20px;
+    position: relative;
+    overflow: hidden;
+    transition: border-color 0.3s ease;
+  }
+
+  .task-card:hover {
+    border-color: rgba(0, 240, 255, 0.2);
+  }
+
+  .task-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; bottom: 0;
+    width: 3px;
+  }
+
+  .task-card.status-fixed::before { background: var(--neon-green); box-shadow: var(--glow-green); }
+  .task-card.status-partial::before { background: var(--neon-orange); }
+  .task-card.status-open::before { background: var(--neon-red); box-shadow: var(--glow-red); }
+
+  .task-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 18px 24px;
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .task-header:hover {
+    background: rgba(0, 240, 255, 0.02);
+  }
+
+  .task-title-group {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex: 1;
+    min-width: 0;
+  }
+
+  .task-number {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--neon-cyan);
+    white-space: nowrap;
+    min-width: 65px;
+  }
+
+  .task-title {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .task-badges {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-shrink: 0;
+    margin-left: 15px;
+  }
+
+  .badge {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 1px;
+    padding: 3px 10px;
+    border: 1px solid;
+    white-space: nowrap;
+  }
+
+  .badge-critical { color: var(--neon-red); border-color: var(--neon-red); background: rgba(255, 7, 58, 0.08); }
+  .badge-high { color: var(--neon-orange); border-color: var(--neon-orange); background: rgba(255, 106, 0, 0.08); }
+  .badge-medium { color: var(--neon-yellow); border-color: var(--neon-yellow); background: rgba(240, 225, 48, 0.08); }
+  .badge-low { color: var(--neon-cyan); border-color: var(--neon-cyan); background: rgba(0, 240, 255, 0.08); }
+
+  .badge-fixed { color: var(--neon-green); border-color: var(--neon-green); background: rgba(57, 255, 20, 0.08); }
+  .badge-partial { color: var(--neon-orange); border-color: var(--neon-orange); background: rgba(255, 106, 0, 0.08); }
+  .badge-open { color: var(--neon-red); border-color: var(--neon-red); background: rgba(255, 7, 58, 0.08); }
+
+  .toggle-icon {
+    font-size: 14px;
+    color: var(--text-dim);
+    transition: transform 0.3s ease;
+    flex-shrink: 0;
+    margin-left: 10px;
+  }
+
+  .task-card.expanded .toggle-icon {
+    transform: rotate(90deg);
+  }
+
+  .task-body {
+    display: none;
+    padding: 0 24px 24px;
+    border-top: 1px solid var(--panel-border);
+  }
+
+  .task-card.expanded .task-body {
+    display: block;
+  }
+
+  .task-body h4 {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 10px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: var(--neon-cyan);
+    margin: 18px 0 10px;
+  }
+
+  .task-body h4:first-child {
+    margin-top: 20px;
+  }
+
+  .task-body p, .task-body li {
+    color: var(--text-primary);
+    font-size: 12px;
+    line-height: 1.8;
+    opacity: 0.85;
+  }
+
+  .task-body ul {
+    list-style: none;
+    padding-left: 0;
+  }
+
+  .task-body ul li::before {
+    content: '>';
+    color: var(--neon-cyan);
+    margin-right: 10px;
+    font-weight: 700;
+  }
+
+  .task-body ul li {
+    margin: 4px 0;
+    padding-left: 4px;
+  }
+
+  .task-body ol {
+    padding-left: 20px;
+    counter-reset: task-step;
+    list-style: none;
+  }
+
+  .task-body ol li {
+    counter-increment: task-step;
+    margin: 6px 0;
+    padding-left: 6px;
+  }
+
+  .task-body ol li::before {
+    content: counter(task-step, decimal-leading-zero);
+    color: var(--neon-magenta);
+    font-family: 'Orbitron', sans-serif;
+    font-size: 10px;
+    margin-right: 10px;
+    font-weight: 700;
+  }
+
+  .file-ref {
+    font-size: 11px;
+    color: var(--neon-purple);
+    font-style: italic;
+    opacity: 0.9;
+  }
+
+  .file-ref::before {
+    content: '//';
+    margin-right: 6px;
+    color: var(--text-muted);
+  }
+
+  pre {
+    background: #06060c;
+    border: 1px solid var(--panel-border);
+    border-left: 3px solid var(--neon-cyan);
+    padding: 16px 20px;
+    margin: 12px 0;
+    overflow-x: auto;
+    font-size: 11px;
+    line-height: 1.6;
+    color: #b8b8cc;
+  }
+
+  pre .keyword { color: var(--neon-magenta); }
+  pre .string { color: var(--neon-green); }
+  pre .comment { color: var(--text-dim); font-style: italic; }
+  pre .type { color: var(--neon-cyan); }
+  pre .number { color: var(--neon-orange); }
+
+  code {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    background: rgba(0, 240, 255, 0.06);
+    color: var(--neon-cyan);
+    padding: 2px 6px;
+    border: 1px solid rgba(0, 240, 255, 0.1);
+  }
+
+  .warning-box {
+    background: rgba(255, 7, 58, 0.05);
+    border: 1px solid rgba(255, 7, 58, 0.2);
+    border-left: 3px solid var(--neon-red);
+    padding: 12px 18px;
+    margin: 12px 0;
+    font-size: 12px;
+  }
+
+  .warning-box::before {
+    content: '! WARNING';
+    font-family: 'Orbitron', sans-serif;
+    font-size: 10px;
+    font-weight: 700;
+    color: var(--neon-red);
+    letter-spacing: 2px;
+    display: block;
+    margin-bottom: 6px;
+  }
+
+  .note-box {
+    background: rgba(0, 240, 255, 0.03);
+    border: 1px solid rgba(0, 240, 255, 0.1);
+    border-left: 3px solid var(--neon-cyan);
+    padding: 12px 18px;
+    margin: 12px 0;
+    font-size: 12px;
+  }
+
+  .note-box::before {
+    content: '> NOTE';
+    font-family: 'Orbitron', sans-serif;
+    font-size: 10px;
+    font-weight: 700;
+    color: var(--neon-cyan);
+    letter-spacing: 2px;
+    display: block;
+    margin-bottom: 6px;
+  }
+
+  /* Improvements list */
+  .improvements-list {
+    list-style: none;
+    padding: 0;
+    margin: 20px 0;
+  }
+
+  .improvements-list li {
+    padding: 8px 0;
+    font-size: 12px;
+    border-bottom: 1px solid rgba(26, 26, 46, 0.3);
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+  }
+
+  .improvements-list li .check {
+    color: var(--neon-green);
+    font-weight: 700;
+    flex-shrink: 0;
+    min-width: 16px;
+  }
+
+  .improvements-list li .partial-check {
+    color: var(--neon-orange);
+    font-weight: 700;
+    flex-shrink: 0;
+    min-width: 16px;
+  }
+
+  /* Critical risks */
+  .risk-item {
+    background: rgba(255, 7, 58, 0.04);
+    border: 1px solid rgba(255, 7, 58, 0.12);
+    padding: 12px 18px;
+    margin: 8px 0;
+    font-size: 12px;
+    position: relative;
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+  }
+
+  .risk-item .risk-id {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 10px;
+    font-weight: 700;
+    color: var(--neon-red);
+    white-space: nowrap;
+    min-width: 80px;
+  }
+
+  /* Layer summary table */
+  .layer-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 15px 0 30px;
+    font-size: 11px;
+  }
+
+  .layer-table caption {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    color: var(--neon-magenta);
+    text-align: left;
+    padding: 10px 0;
+    caption-side: top;
+  }
+
+  .layer-table th {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    padding: 10px 14px;
+    text-align: left;
+    border-bottom: 1px solid var(--panel-border);
+  }
+
+  .layer-table td {
+    padding: 8px 14px;
+    border-bottom: 1px solid rgba(26, 26, 46, 0.3);
+  }
+
+  .layer-table tr:hover td {
+    background: rgba(0, 240, 255, 0.02);
+  }
+
+  .status-pass { color: var(--neon-green); }
+  .status-partial { color: var(--neon-orange); }
+  .status-fail { color: var(--neon-red); font-weight: 700; }
+  .status-icon { font-size: 12px; margin-right: 4px; }
+
+  /* Execution roadmap */
+  .sprint-block {
+    background: var(--panel-bg);
+    border: 1px solid var(--panel-border);
+    margin: 20px 0;
+    padding: 24px;
+  }
+
+  .sprint-title {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    margin-bottom: 16px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .sprint-title .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+  }
+
+  .sprint-1 .sprint-title { color: var(--neon-red); }
+  .sprint-1 .dot { background: var(--neon-red); box-shadow: 0 0 8px var(--neon-red); }
+  .sprint-2 .sprint-title { color: var(--neon-orange); }
+  .sprint-2 .dot { background: var(--neon-orange); box-shadow: 0 0 8px var(--neon-orange); }
+  .sprint-3 .sprint-title { color: var(--neon-yellow); }
+  .sprint-3 .dot { background: var(--neon-yellow); box-shadow: 0 0 8px var(--neon-yellow); }
+
+  .sprint-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 6px 0;
+    font-size: 12px;
+  }
+
+  .sprint-item .checkbox {
+    width: 16px;
+    height: 16px;
+    border: 1px solid var(--panel-border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    flex-shrink: 0;
+  }
+
+  .sprint-item .checkbox.checked {
+    border-color: var(--neon-green);
+    color: var(--neon-green);
+  }
+
+  .sprint-item.done {
+    opacity: 0.4;
+    text-decoration: line-through;
+    text-decoration-color: var(--text-dim);
+  }
+
+  /* Files reference */
+  .files-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 11px;
+    margin: 15px 0;
+  }
+
+  .files-table th {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    padding: 10px 14px;
+    text-align: left;
+    border-bottom: 1px solid var(--panel-border);
+  }
+
+  .files-table td {
+    padding: 7px 14px;
+    border-bottom: 1px solid rgba(26, 26, 46, 0.3);
+    color: var(--text-primary);
+  }
+
+  .files-table td:first-child {
+    color: var(--neon-purple);
+    font-size: 11px;
+  }
+
+  .files-table td:nth-child(3) {
+    color: var(--text-dim);
+  }
+
+  /* Safety constraints */
+  .safety-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin: 20px 0;
+  }
+
+  .safety-item {
+    padding: 12px 16px;
+    font-size: 11px;
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+  }
+
+  .safety-item.never {
+    background: rgba(255, 7, 58, 0.04);
+    border: 1px solid rgba(255, 7, 58, 0.1);
+  }
+
+  .safety-item.always {
+    background: rgba(57, 255, 20, 0.04);
+    border: 1px solid rgba(57, 255, 20, 0.1);
+  }
+
+  .safety-item .safety-prefix {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    flex-shrink: 0;
+    min-width: 50px;
+  }
+
+  .safety-item.never .safety-prefix { color: var(--neon-red); }
+  .safety-item.always .safety-prefix { color: var(--neon-green); }
+
+  /* Context section */
+  .context-box {
+    background: var(--panel-bg);
+    border: 1px solid var(--panel-border);
+    padding: 24px;
+    margin: 20px 0;
+  }
+
+  .context-box p {
+    font-size: 12px;
+    line-height: 1.8;
+    color: var(--text-primary);
+    opacity: 0.85;
+    margin-bottom: 12px;
+  }
+
+  .context-box p:last-child { margin-bottom: 0; }
+
+  .layer-list {
+    list-style: none;
+    padding: 0;
+    margin: 10px 0;
+    font-size: 12px;
+  }
+
+  .layer-list li {
+    padding: 4px 0;
+    color: var(--text-primary);
+    opacity: 0.85;
+  }
+
+  .layer-list li::before {
+    content: '//';
+    color: var(--neon-cyan);
+    margin-right: 10px;
+    font-weight: 700;
+  }
+
+  .layer-list li strong {
+    color: var(--neon-magenta);
+    font-weight: 500;
+  }
+
+  /* Progress bars */
+  .progress-bar-container {
+    margin: 30px 0;
+  }
+
+  .progress-label {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin-bottom: 8px;
+    display: flex;
+    justify-content: space-between;
+  }
+
+  .progress-bar {
+    height: 4px;
+    background: var(--panel-border);
+    position: relative;
+    overflow: hidden;
+  }
+
+  .progress-fill {
+    height: 100%;
+    position: absolute;
+    top: 0; left: 0;
+    transition: width 1s ease;
+  }
+
+  .progress-fill.green { background: var(--neon-green); box-shadow: 0 0 8px rgba(57, 255, 20, 0.4); }
+  .progress-fill.orange { background: var(--neon-orange); }
+  .progress-fill.red { background: var(--neon-red); }
+
+  /* Footer */
+  .footer {
+    text-align: center;
+    padding: 40px 0 20px;
+    border-top: 1px solid var(--panel-border);
+    margin-top: 60px;
+  }
+
+  .footer p {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+
+  .footer .cipher {
+    color: var(--neon-cyan);
+    opacity: 0.4;
+    font-size: 9px;
+    margin-top: 10px;
+    letter-spacing: 1px;
+  }
+
+  /* Responsive */
+  @media (max-width: 768px) {
+    .container { padding: 20px; }
+    .logo { font-size: 32px; letter-spacing: 4px; }
+    .metrics-grid { grid-template-columns: repeat(2, 1fr); }
+    .safety-grid { grid-template-columns: 1fr; }
+    .task-header { flex-wrap: wrap; }
+    .task-badges { margin-left: 0; margin-top: 8px; }
+  }
+
+  /* Animations */
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .task-card, .metric-card, .sprint-block {
+    animation: fadeIn 0.4s ease forwards;
+  }
+
+  /* Expand all control */
+  .controls {
+    display: flex;
+    justify-content: flex-end;
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+
+  .controls button {
+    background: transparent;
+    border: 1px solid var(--panel-border);
+    color: var(--text-dim);
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    padding: 6px 16px;
+    cursor: pointer;
+    transition: all 0.3s ease;
+  }
+
+  .controls button:hover {
+    border-color: var(--neon-cyan);
+    color: var(--neon-cyan);
+  }
+</style>
+</head>
+<body>
+
+<div class="container">
+
+  <!-- HEADER -->
+  <div class="header">
+    <div class="logo">ZIPHERX</div>
+    <div class="subtitle">Security Audit Remediation</div>
+    <div class="header-line"></div>
+    <div class="date-stamp">CONSOLIDATED REPORT // <span>2026-02-15</span> // REVISION 3.1</div>
+    <div class="score-badge">GRADE: C- &mdash; HIGH RISK</div>
+  </div>
+
+  <!-- METRICS -->
+  <div class="metrics-grid">
+    <div class="metric-card findings">
+      <div class="metric-value">42</div>
+      <div class="metric-label">Original Findings</div>
+    </div>
+    <div class="metric-card fixed">
+      <div class="metric-value">3</div>
+      <div class="metric-label">Tasks Fixed</div>
+    </div>
+    <div class="metric-card partial">
+      <div class="metric-value">12</div>
+      <div class="metric-label">Partially Fixed</div>
+    </div>
+    <div class="metric-card open">
+      <div class="metric-value">10</div>
+      <div class="metric-label">Tasks Open</div>
+    </div>
+    <div class="metric-card new">
+      <div class="metric-value">5</div>
+      <div class="metric-label">New Findings</div>
+    </div>
+  </div>
+
+  <!-- SEVERITY BREAKDOWN -->
+  <table class="severity-table">
+    <thead>
+      <tr>
+        <th>Severity</th>
+        <th>Fixed</th>
+        <th>Partial</th>
+        <th>Open</th>
+        <th>Total</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td class="sev-critical">CRITICAL</td>
+        <td>0</td>
+        <td>2</td>
+        <td>5</td>
+        <td>7</td>
+      </tr>
+      <tr>
+        <td class="sev-high">HIGH</td>
+        <td>2</td>
+        <td>6</td>
+        <td>1</td>
+        <td>9</td>
+      </tr>
+      <tr>
+        <td class="sev-medium">MEDIUM</td>
+        <td>1</td>
+        <td>4</td>
+        <td>4</td>
+        <td>9</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- PROGRESS -->
+  <div class="progress-bar-container">
+    <div class="progress-label">
+      <span>Overall Remediation</span>
+      <span>12% Fixed &middot; 48% Partial &middot; 40% Open</span>
+    </div>
+    <div class="progress-bar">
+      <div class="progress-fill green" style="width: 12%;"></div>
+      <div class="progress-fill orange" style="width: 60%; opacity: 0.5;"></div>
+    </div>
+  </div>
+
+  <!-- KEY IMPROVEMENTS -->
+  <div class="section">
+    <div class="section-header">
+      <h2 style="color: var(--neon-green);">Key Improvements</h2>
+      <div class="line"></div>
+    </div>
+
+    <ul class="improvements-list">
+      <li><span class="check">&check;</span> SOCKS5 authentication response verification implemented (TASK 10)</li>
+      <li><span class="check">&check;</span> Prepared transaction race condition fixed (TASK 21)</li>
+      <li><span class="check">&check;</span> Null pointer checks added to FFI multi-input TX builder (TASK 7)</li>
+      <li><span class="check">&check;</span> <code>DEBUG_DISABLE_ENCRYPTION = false</code> (TASK 1) &mdash; encryption IS active</li>
+      <li><span class="partial-check">~</span> Log rotation system implemented (TASK 18, partial)</li>
+      <li><span class="partial-check">~</span> IP address validation function implemented (TASK 24, partial)</li>
+      <li><span class="partial-check">~</span> Rate limiter actor created (TASK 22, dead code &mdash; never called)</li>
+      <li><span class="partial-check">~</span> <code>safe_lock!</code> macro applied to ~60% of mutex sites (TASK 4, partial)</li>
+      <li><span class="partial-check">~</span> <code>safe_slice()</code> with alignment + overflow checks (TASK 5, partial)</li>
+      <li><span class="check">&check;</span> Comprehensive Sybil detection + protocol version validation</li>
+      <li><span class="check">&check;</span> SQLCipher full-database encryption active with FULLMUTEX</li>
+      <li><span class="check">&check;</span> Secure Enclave key storage on iOS (with macOS fallback)</li>
+    </ul>
+  </div>
+
+  <!-- CRITICAL REMAINING RISKS -->
+  <div class="section">
+    <div class="section-header">
+      <h2 style="color: var(--neon-red);">Critical Remaining Risks</h2>
+      <div class="line"></div>
+    </div>
+
+    <div class="risk-item">
+      <span class="risk-id">VUL-U-001</span>
+      <span>Private key clipboard export &mdash; no auth, no auto-clear, key persists in memory</span>
+    </div>
+    <div class="risk-item">
+      <span class="risk-id">VUL-S-002</span>
+      <span>Spending keys stored as plaintext BLOB in SQLite <code>accounts</code> table</span>
+    </div>
+    <div class="risk-item">
+      <span class="risk-id">VUL-F-004</span>
+      <span><code>DEBUG_LOGGING = true</code> in Rust FFI &mdash; IVK, shared secrets, full TX hex actively leaked to unencrypted log file <strong>(upgraded to CRITICAL)</strong></span>
+    </div>
+    <div class="risk-item">
+      <span class="risk-id">VUL-U-007</span>
+      <span>macOS key storage uses Hardware UUID (publicly readable) as encryption key &mdash; deterministic spending key extraction by any local process <strong>(upgraded to CRITICAL)</strong></span>
+    </div>
+    <div class="risk-item">
+      <span class="risk-id">VUL-F-002</span>
+      <span>Parallel decryption missing <code>checked_mul</code> &mdash; integer overflow possible</span>
+    </div>
+    <div class="risk-item">
+      <span class="risk-id">VUL-F-001</span>
+      <span>21 remaining <code>.lock().unwrap()</code> calls &mdash; panic on poisoned mutex</span>
+    </div>
+  </div>
+
+  <!-- CONTEXT -->
+  <div class="section">
+    <div class="section-header">
+      <h2 style="color: var(--neon-cyan);">Audit Context</h2>
+      <div class="line"></div>
+    </div>
+
+    <div class="context-box">
+      <p>On <strong style="color: var(--neon-cyan);">2026-02-07</strong>, a comprehensive security audit was performed across all 4 layers of ZipherX:</p>
+      <ul class="layer-list">
+        <li><strong>Crypto/FFI</strong> &mdash; lib.rs, download.rs, tor.rs, TransactionBuilder.swift, ZipherXFFI.swift, Bridging-Header.h</li>
+        <li><strong>Network/P2P</strong> &mdash; NetworkManager.swift, Peer.swift, PeerManager.swift, HeaderSyncManager.swift, FilterScanner.swift, HiddenServiceManager.swift, TorManager.swift</li>
+        <li><strong>Storage/Wallet</strong> &mdash; WalletDatabase.swift, DatabaseEncryption.swift, SQLCipherManager.swift, HeaderStore.swift, DeltaCMUManager.swift, WalletManager.swift, SecureKeyStorage.swift</li>
+        <li><strong>UI/App</strong> &mdash; ContentView.swift, AppDelegate.swift, SendView.swift, SettingsView.swift, FullNodeWalletView.swift, WalletSetupView.swift, BiometricAuthManager.swift</li>
+      </ul>
+      <p style="margin-top:14px;"><strong style="color: var(--neon-red);">Result: 42 findings</strong> (10 CRITICAL, 12 HIGH, 13 MEDIUM) + 7 positive practices<br>
+      <strong>Original Score:</strong> C+ (MEDIUM-HIGH RISK &mdash; Not Production Ready)</p>
+    </div>
+  </div>
+
+  <!-- ================ PHASE 1: P0 ================ -->
+  <div class="section">
+    <div class="section-header">
+      <span class="phase-tag phase-p0">P0</span>
+      <h2 style="color: var(--neon-red);">Phase 1 &mdash; Critical</h2>
+      <div class="line"></div>
+    </div>
+
+    <div class="controls">
+      <button onclick="toggleAll(this.parentElement.parentElement, true)">Expand All</button>
+      <button onclick="toggleAll(this.parentElement.parentElement, false)">Collapse All</button>
+    </div>
+
+    <!-- TASK 1 -->
+    <div class="task-card status-partial" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">TASK 01</span>
+          <span class="task-title">Disable DEBUG_DISABLE_ENCRYPTION</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-critical">CRITICAL</span>
+          <span class="badge badge-partial">PARTIAL</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <h4>Vulnerability</h4>
+        <p>VUL-S-001</p>
+
+        <h4>What's Fixed</h4>
+        <p><code>DEBUG_DISABLE_ENCRYPTION = false</code> on line 30 of WalletDatabase.swift. <code>encryptBlob()</code> unconditionally calls <code>DatabaseEncryption.shared.encrypt()</code>. Field-level AES-GCM-256 encryption IS active for <code>diversifier</code>, <code>rcm</code>, <code>memo</code>, <code>witness</code>, and <code>tree_state</code> columns.</p>
+
+        <h4>What Remains</h4>
+        <ol>
+          <li>Remove the vestigial <code>DEBUG_DISABLE_ENCRYPTION</code> flag and <code>isEncryptionEnabled</code> property entirely, OR add a compile-time guard:</li>
+        </ol>
+<pre><span class="keyword">#if</span> !DEBUG
+<span class="comment">// Compile-time assertion: encryption MUST be enabled in release</span>
+<span class="keyword">private static let</span> DEBUG_DISABLE_ENCRYPTION = <span class="keyword">false</span>
+<span class="keyword">#endif</span></pre>
+
+        <p class="file-ref">Sources/Core/Storage/WalletDatabase.swift : lines 30, 62</p>
+
+        <h4>Testing</h4>
+        <p>Verify <code>getBalance()</code> returns correct values, <code>getAllUnspentNotes()</code> returns decryptable notes.</p>
+      </div>
+    </div>
+
+    <!-- TASK 2 -->
+    <div class="task-card status-open" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">TASK 02</span>
+          <span class="task-title">Remove Spending Keys from Database</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-critical">CRITICAL</span>
+          <span class="badge badge-open">OPEN</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <h4>Vulnerability</h4>
+        <p>VUL-S-002</p>
+
+        <h4>Evidence</h4>
+        <p>The <code>accounts</code> table schema STILL has <code>spending_key BLOB NOT NULL</code> (line 399). <code>insertAccount()</code> (line 975) binds raw spending key bytes with NO encryption. <code>getAccount()</code> (line 1019) reads back the raw spending key. No migration exists. Protection relies solely on SQLCipher full-database encryption.</p>
+
+        <p class="file-ref">Sources/Core/Storage/WalletDatabase.swift : lines 399, 975, 1019</p>
+
+        <h4>Required Changes</h4>
+        <ol>
+          <li>Remove <code>spending_key</code> column from accounts table (or zero it out)</li>
+          <li>Update <code>insertAccount()</code> to NOT store spending key bytes</li>
+          <li>Create migration to securely delete existing spending keys:</li>
+        </ol>
+<pre>sqlite3_exec(db, <span class="string">"UPDATE accounts SET spending_key = zeroblob(length(spending_key))"</span>, nil, nil, nil)</pre>
+        <ol start="4">
+          <li>Update ALL code paths that READ <code>spending_key</code> to use <code>SecureKeyStorage.retrieveSpendingKey()</code></li>
+          <li>Search for ALL references to <code>spending_key</code> column and update</li>
+        </ol>
+
+        <div class="warning-box">macOS unsigned builds use Hardware UUID-based encryption (TASK 25). Verify that path works before removing the DB fallback.</div>
+
+        <h4>Testing</h4>
+        <p>Verify spending key retrieval from Secure Enclave works BEFORE removing DB keys. Test on both iOS and macOS. Test full TX signing flow.</p>
+      </div>
+    </div>
+
+    <!-- TASK 3 -->
+    <div class="task-card status-open" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">TASK 03</span>
+          <span class="task-title">Disable DEBUG_LOGGING in Rust FFI</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-critical">CRITICAL</span>
+          <span class="badge badge-open">OPEN</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <h4>Vulnerability</h4>
+        <p>VUL-F-004</p>
+
+        <h4>Severity Upgrade</h4>
+        <p style="color: var(--neon-red);">Upgraded from HIGH to <strong>CRITICAL</strong> &mdash; IVK, shared secrets, and KDF material are actively written to an unencrypted log file readable by any local process. This is equivalent to a live key exfiltration channel.</p>
+
+        <h4>Evidence</h4>
+        <p>Line 13 of lib.rs: <code>const DEBUG_LOGGING: bool = true;</code> &mdash; still enabled. The <code>debug_log!</code> macro guards ~220+ log calls but they ALL fire. Additionally, ~324 unguarded <code>eprintln!()</code> calls print regardless.</p>
+
+        <h4>Sensitive Data Actively Logged</h4>
+        <ul>
+          <li>Full IVK scalar (lines 863, 921)</li>
+          <li>Full EPK (line 920)</li>
+          <li>pk_d bytes (line 871)</li>
+          <li>Shared secret material (line 917)</li>
+          <li>KDF key material (line 935)</li>
+          <li>Diversifier plaintext (line 947)</li>
+          <li>RCM values (line 6335)</li>
+          <li>Full TX hex (line 6523)</li>
+          <li>Nullifier values (line 2358)</li>
+        </ul>
+
+        <p class="file-ref">Libraries/zipherx-ffi/src/lib.rs : line 13</p>
+
+        <h4>Required Changes</h4>
+        <ol>
+          <li>Set <code>const DEBUG_LOGGING: bool = false;</code></li>
+          <li>Wrap ALL <code>eprintln!()</code> calls containing sensitive data in <code>if DEBUG_LOGGING {}</code></li>
+          <li>Use compile-time gating for production:</li>
+        </ol>
+<pre><span class="keyword">#[cfg(debug_assertions)]</span>
+<span class="keyword">const</span> DEBUG_LOGGING: <span class="type">bool</span> = <span class="keyword">true</span>;
+<span class="keyword">#[cfg(not(debug_assertions))]</span>
+<span class="keyword">const</span> DEBUG_LOGGING: <span class="type">bool</span> = <span class="keyword">false</span>;</pre>
+
+        <div class="note-box">Requires recompiling the Rust FFI library.</div>
+      </div>
+    </div>
+
+    <!-- TASK 4 -->
+    <div class="task-card status-partial" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">TASK 04</span>
+          <span class="task-title">Fix .unwrap() Panics in Rust FFI</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-critical">CRITICAL</span>
+          <span class="badge badge-partial">PARTIAL</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <h4>Vulnerability</h4>
+        <p>VUL-F-001, VUL-F-003</p>
+
+        <h4>What's Fixed</h4>
+        <p><code>safe_lock!</code> macro defined (lines 177-189) and used at ~30 call sites. Recovers from poisoned mutex.</p>
+
+        <h4>What Remains</h4>
+        <p>21 call sites still use raw <code>.lock().unwrap()</code>:</p>
+        <ul>
+          <li>PROVER: lines 1433, 1545</li>
+          <li>VERIFYING_KEYS: lines 1439, 1551, 7470</li>
+          <li>COMMITMENT_TREE: lines 2543, 2700, 2873, 3901</li>
+          <li>WITNESSES: lines 2546, 2632, 2700, 2881, 3270, 4124</li>
+          <li>TREE_POSITION: lines 2549, 2637, 3311, 3904</li>
+          <li>DELTA_CMUS: lines 2555, 2623, 4112</li>
+        </ul>
+
+        <p class="file-ref">Libraries/zipherx-ffi/src/lib.rs</p>
+
+        <h4>Required Changes</h4>
+        <ol>
+          <li>Replace ALL 21 <code>.lock().unwrap()</code> calls with <code>safe_lock!</code> macro</li>
+          <li><code>safe_lock!</code> returns <code>Option&lt;MutexGuard&gt;</code> &mdash; each call site needs <code>match</code> or <code>?</code> handling</li>
+        </ol>
+      </div>
+    </div>
+
+    <!-- TASK 5 -->
+    <div class="task-card status-partial" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">TASK 05</span>
+          <span class="task-title">Fix Buffer Overflow in Parallel Decryption</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-critical">CRITICAL</span>
+          <span class="badge badge-partial">PARTIAL</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <h4>Vulnerability</h4>
+        <p>VUL-F-002</p>
+
+        <h4>What's Fixed</h4>
+        <p>Input validation via <code>safe_slice()</code> at lines 1070-1108. Pre-parsing uses safe slice indexing. Integer overflow protection using <code>saturating_sub</code> pattern confirmed in 6 tree-loading functions.</p>
+
+        <h4>What Remains</h4>
+        <ol>
+          <li>Lines 1095 and 1102 use <code>output_count * 644</code> and <code>output_count * 564</code> with NO <code>checked_mul()</code> &mdash; zero <code>checked_mul</code> calls exist in the entire file</li>
+          <li>Lines 1150-1174 use raw pointer arithmetic (<code>out_ptr.add(result_offset)</code>, <code>ptr::copy_nonoverlapping</code>) bypassing Rust's borrow checker</li>
+        </ol>
+
+        <p class="file-ref">Libraries/zipherx-ffi/src/lib.rs : lines 1058-1180</p>
+
+        <h4>Required Changes</h4>
+<pre><span class="keyword">let</span> total_output_size = output_count.<span class="type">checked_mul</span>(<span class="number">644</span>).unwrap_or(<span class="number">0</span>);
+<span class="keyword">if</span> total_output_size == <span class="number">0</span> && output_count > <span class="number">0</span> { <span class="keyword">return</span> <span class="number">0</span>; }
+<span class="keyword">let</span> total_result_size = output_count.<span class="type">checked_mul</span>(<span class="number">564</span>).unwrap_or(<span class="number">0</span>);
+<span class="keyword">if</span> total_result_size == <span class="number">0</span> && output_count > <span class="number">0</span> { <span class="keyword">return</span> <span class="number">0</span>; }</pre>
+      </div>
+    </div>
+
+    <!-- TASK 6 -->
+    <div class="task-card status-open" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">TASK 06</span>
+          <span class="task-title">Fix Private Key Clipboard Export</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-critical">CRITICAL</span>
+          <span class="badge badge-open">OPEN</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <h4>Vulnerability</h4>
+        <p>VUL-U-001</p>
+
+        <h4>Evidence &mdash; SettingsView.swift</h4>
+        <ul>
+          <li>Line 119: <code>@State private var exportedKey = ""</code> &mdash; never cleared on dismissal</li>
+          <li>Line 1897: <code>exportPrivateKey()</code> called with ZERO authentication</li>
+          <li>Lines 3194-3196: Directly calls <code>walletManager.exportSpendingKey()</code> without auth gate</li>
+          <li>Line 231: <code>copyToClipboard(exportedKey)</code> &mdash; raw clipboard write, no auto-clear</li>
+          <li>Line 234: Full private key displayed in alert text</li>
+        </ul>
+
+        <h4>Evidence &mdash; FullNodeWalletView.swift</h4>
+        <ul>
+          <li>Line 934: <code>@State private var exportedPrivateKey: String = ""</code> &mdash; never cleared</li>
+          <li>Line 1079: Export button with no authentication</li>
+          <li>Line 1104: Private key displayed in plaintext in sheet</li>
+          <li>Line 1112: <code>copyToClipboard(exportedPrivateKey)</code> &mdash; no auto-clear</li>
+        </ul>
+
+        <p class="file-ref">Sources/Features/Settings/SettingsView.swift : lines 119, 231, 234, 1897, 3194</p>
+        <p class="file-ref">Sources/Features/FullNodeWallet/FullNodeWalletView.swift : lines 934, 1079, 1104, 1112</p>
+
+        <h4>Required Changes</h4>
+        <ol>
+          <li>Add biometric authentication before key export</li>
+          <li>Implement clipboard auto-clear (10 seconds for private keys)</li>
+          <li>Clear <code>exportedKey</code> on alert dismissal: <code>.onDisappear { exportedKey = "" }</code></li>
+          <li>Show truncated key in alert text instead of full key</li>
+          <li>Apply same fixes to FullNodeWalletView.swift</li>
+        </ol>
+<pre><span class="keyword">private func</span> <span class="type">exportPrivateKey</span>() {
+    <span class="type">BiometricAuthManager</span>.shared.<span class="type">authenticateForKeyExport</span> { success, _ <span class="keyword">in</span>
+        <span class="keyword">guard</span> success <span class="keyword">else</span> { <span class="keyword">return</span> }
+        <span class="comment">// ... existing export logic</span>
+    }
+}</pre>
+      </div>
+    </div>
+
+    <!-- TASK 7 -->
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">TASK 07</span>
+          <span class="task-title">Null Pointer Checks in Multi-Input TX Builder</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-high">HIGH</span>
+          <span class="badge badge-fixed">FIXED</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <h4>Vulnerability</h4>
+        <p>VUL-F-006</p>
+        <p><code>zipherx_build_transaction_multi()</code> (lines 2016-2130) has comprehensive null/validity checks via <code>safe_slice()</code> for all inputs. Per-spend validation checks witness, rcm, and diversifier pointers individually. <code>safe_slice()</code> includes alignment validation and integer overflow protection.</p>
+        <div class="note-box">No further changes needed.</div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ================ PHASE 2: P1 ================ -->
+  <div class="section">
+    <div class="section-header">
+      <span class="phase-tag phase-p1">P1</span>
+      <h2 style="color: var(--neon-orange);">Phase 2 &mdash; High Priority</h2>
+      <div class="line"></div>
+    </div>
+
+    <div class="controls">
+      <button onclick="toggleAll(this.parentElement.parentElement, true)">Expand All</button>
+      <button onclick="toggleAll(this.parentElement.parentElement, false)">Collapse All</button>
+    </div>
+
+    <!-- TASK 8 -->
+    <div class="task-card status-partial" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">TASK 08</span>
+          <span class="task-title">Implement Side-Channel Protections</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-high">HIGH</span>
+          <span class="badge badge-partial">PARTIAL</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <h4>Vulnerability</h4>
+        <p>VUL-F-005</p>
+
+        <h4>What's Fixed</h4>
+        <p><code>subtle = "2.5"</code> in Cargo.toml. <code>CtOption</code> used in Groth16 verification. Custom <code>secure_zero()</code> function using <code>write_volatile</code> + <code>compiler_fence</code>.</p>
+
+        <h4>What Remains</h4>
+        <ol>
+          <li>Line 965: Diversifier comparison uses variable-time <code>==</code> instead of <code>ConstantTimeEq</code></li>
+          <li><code>zeroize</code> crate NOT in Cargo.toml</li>
+          <li>KDF key (line 928), <code>kdf_input</code> (line 924), <code>cipher_key</code> (line 938) NOT zeroed after use</li>
+        </ol>
+
+        <p class="file-ref">Libraries/zipherx-ffi/src/lib.rs : lines 924, 928, 938, 965</p>
+      </div>
+    </div>
+
+    <!-- TASK 9 -->
+    <div class="task-card status-partial" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">TASK 09</span>
+          <span class="task-title">Fix P2P Message Validation</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-high">HIGH</span>
+          <span class="badge badge-partial">PARTIAL</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <h4>Vulnerability</h4>
+        <p>VUL-N-004</p>
+
+        <h4>What's Fixed</h4>
+        <p><code>parseIPAddress()</code> has proper buffer validation. Checksum validation via doubleSHA256 (FIX #1139). Protocol version validation rejects wrong-chain peers.</p>
+
+        <h4>What Remains</h4>
+        <ol>
+          <li><strong>NO maximum payload size</strong> in <code>receiveMessage()</code> and <code>receiveMessageTolerant()</code> &mdash; UInt32 length allows up to 4GB allocation &rarr; OOM crash from malicious peer</li>
+          <li><code>parseRejectTxid()</code> reads single-byte count instead of proper CompactSize varint</li>
+          <li><code>parseAddrPayload()</code> has same single-byte count parsing</li>
+        </ol>
+
+        <p class="file-ref">Sources/Core/Network/Peer.swift</p>
+
+        <h4>Required Changes</h4>
+<pre><span class="keyword">guard</span> payloadLength <= <span class="number">4_000_000</span> <span class="keyword">else</span> { <span class="comment">// 4MB max per Bitcoin protocol</span>
+    <span class="keyword">throw</span> <span class="type">NetworkError</span>.invalidMessage
+}</pre>
+      </div>
+    </div>
+
+    <!-- TASK 10 -->
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">TASK 10</span>
+          <span class="task-title">Fix SOCKS5 Authentication Verification</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-high">HIGH</span>
+          <span class="badge badge-fixed">FIXED</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <h4>Vulnerability</h4>
+        <p>VUL-N-007</p>
+        <p><code>performSocks5UsernameAuth()</code> validates: response length == 2, auth version == 0x01, status == 0x00. Dynamic random credentials per circuit with UUID-based passwords for Tor circuit isolation.</p>
+        <div class="note-box">No further changes needed.</div>
+      </div>
+    </div>
+
+    <!-- TASK 11 -->
+    <div class="task-card status-partial" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">TASK 11</span>
+          <span class="task-title">Fix Broadcast Handler Race Condition</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-high">HIGH</span>
+          <span class="badge badge-partial">PARTIAL</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <h4>Vulnerability</h4>
+        <p>VUL-N-005</p>
+
+        <h4>What's Fixed</h4>
+        <p>Primary path requires explicit txid matching. <code>PeerMessageDispatcher</code> is an <code>actor</code>. Timeout uses GCD-based <code>withReliableTimeout</code>.</p>
+
+        <h4>What Remains</h4>
+        <p>Lines 198-204 still deliver reject to "any broadcast handler" when txid doesn't match. If two broadcasts are in flight, a reject for TX-A could be delivered to TX-B's handler.</p>
+
+        <p class="file-ref">Sources/Core/Network/Peer.swift : lines 198-204</p>
+
+        <h4>Required Changes</h4>
+        <p>Remove the "any handler" fallback. If txid doesn't match, log and drop.</p>
+      </div>
+    </div>
+
+    <!-- TASK 12 -->
+    <div class="task-card status-open" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">TASK 12</span>
+          <span class="task-title">Implement Clipboard Auto-Clear Across All Views</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-high">HIGH</span>
+          <span class="badge badge-open">OPEN</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <h4>Vulnerability</h4>
+        <p>VUL-U-003</p>
+
+        <h4>Evidence</h4>
+        <p>12+ files write to clipboard with zero auto-clear. Each view has its own identical <code>copyToClipboard()</code> function using raw <code>NSPasteboard.general.setString()</code>. No shared utility exists.</p>
+
+        <h4>Affected Files</h4>
+        <p>SettingsView, SendView, ReceiveView, ChatView, HistoryView, ExplorerView, FullNodeWalletView, RPCSendView, RPCTransactionHistoryView, NodeManagementView, and more.</p>
+
+        <h4>Required Changes</h4>
+        <ol>
+          <li>Create a shared utility <code>copyWithAutoExpiry()</code></li>
+          <li>Replace ALL direct clipboard writes (10s for keys, 60s for addresses/txids)</li>
+        </ol>
+      </div>
+    </div>
+
+    <!-- TASK 13 -->
+    <div class="task-card status-partial" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">TASK 13</span>
+          <span class="task-title">Remove Localhost from P2P Seed List</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-high">HIGH</span>
+          <span class="badge badge-partial">PARTIAL</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <h4>Vulnerability</h4>
+        <p>VUL-N-003, VUL-N-014</p>
+
+        <h4>What's Fixed</h4>
+        <p>Runtime filters prevent actual connections in ZipherX mode: <code>validPeers.filter { $0.host != "127.0.0.1" }</code> and seed loop skip.</p>
+
+        <h4>What Remains</h4>
+        <p><code>127.0.0.1</code> is still in <code>HARDCODED_SEEDS</code> (line 749) and is exempt from cooldown (line 760).</p>
+
+        <p class="file-ref">Sources/Core/Network/NetworkManager.swift : line 749</p>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ================ PHASE 3: P2 ================ -->
+  <div class="section">
+    <div class="section-header">
+      <span class="phase-tag phase-p2">P2</span>
+      <h2 style="color: var(--neon-yellow);">Phase 3 &mdash; Medium Priority</h2>
+      <div class="line"></div>
+    </div>
+
+    <div class="controls">
+      <button onclick="toggleAll(this.parentElement.parentElement, true)">Expand All</button>
+      <button onclick="toggleAll(this.parentElement.parentElement, false)">Collapse All</button>
+    </div>
+
+    <!-- TASK 14 -->
+    <div class="task-card status-open" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">TASK 14</span>
+          <span class="task-title">Implement Per-User Random PIN Salt</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-medium">MEDIUM</span>
+          <span class="badge badge-open">OPEN</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <h4>Vulnerability</h4>
+        <p>VUL-U-004</p>
+        <h4>Evidence</h4>
+        <p>Fixed salt <code>"ZipherX_PIN_Salt_v1"</code> hardcoded at line 15. Only 10,000 rounds of SHA256 (not PBKDF2/Argon2). PIN verification uses non-constant-time <code>==</code>. With fixed salt and max 1M PIN combinations, offline brute-force takes under a second.</p>
+        <p class="file-ref">Sources/Features/Settings/SettingsView.swift : lines 15, 26-39, 72, 99</p>
+      </div>
+    </div>
+
+    <!-- TASK 15 -->
+    <div class="task-card status-partial" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">TASK 15</span>
+          <span class="task-title">Fix Database Race Conditions</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-critical">CRITICAL</span>
+          <span class="badge badge-partial">PARTIAL</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <h4>Vulnerability</h4>
+        <p>VUL-S-003</p>
+        <h4>What's Fixed</h4>
+        <p><code>SQLITE_OPEN_FULLMUTEX</code> applied. Some multi-statement operations ARE transactional.</p>
+        <h4>What Remains</h4>
+        <ol>
+          <li>Serial queue declared at line 156 but <strong>NEVER used</strong></li>
+          <li>Many multi-step operations NOT transactional (TOCTOU)</li>
+          <li>Migration 6 uses non-exclusive <code>BEGIN TRANSACTION</code> with discarded result</li>
+        </ol>
+        <p class="file-ref">Sources/Core/Storage/WalletDatabase.swift : lines 156, 211, 703</p>
+      </div>
+    </div>
+
+    <!-- TASK 16 -->
+    <div class="task-card status-partial" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">TASK 16</span>
+          <span class="task-title">Encrypt Remaining Sensitive Fields</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-critical">CRITICAL</span>
+          <span class="badge badge-partial">PARTIAL</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <h4>Vulnerability</h4>
+        <p>VUL-S-004</p>
+        <h4>Status</h4>
+        <p><strong>Encrypted:</strong> <code>diversifier</code>, <code>rcm</code>, <code>memo</code>, <code>witness</code>, <code>tree_state</code><br>
+        <strong>NOT Encrypted:</strong> <code>value</code>, <code>received_height</code>, <code>received_in_tx</code>, <code>spent_in_tx</code>, <code>spent_height</code>, <code>is_spent</code></p>
+        <div class="note-box">Encrypting <code>value</code> would break SQL aggregation &mdash; requires application-level computation.</div>
+      </div>
+    </div>
+
+    <!-- TASK 17 -->
+    <div class="task-card status-partial" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">TASK 17</span>
+          <span class="task-title">Add Screenshot Protection</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-medium">MEDIUM</span>
+          <span class="badge badge-partial">PARTIAL</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <h4>Vulnerability</h4>
+        <p>VUL-U-006</p>
+        <h4>What Remains</h4>
+        <ol>
+          <li><code>.inactive</code> phase does NOTHING &mdash; full wallet UI visible in app switcher</li>
+          <li>Screenshot notification only calls <code>recordUserActivity()</code></li>
+          <li>No <code>NSWindow.sharingType = .none</code> for macOS screen recording protection</li>
+        </ol>
+        <p class="file-ref">Sources/App/ContentView.swift</p>
+      </div>
+    </div>
+
+    <!-- TASK 18 -->
+    <div class="task-card status-partial" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">TASK 18</span>
+          <span class="task-title">Secure Log Files</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-medium">MEDIUM</span>
+          <span class="badge badge-partial">PARTIAL</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <h4>Vulnerability</h4>
+        <p>VUL-N-009</p>
+        <h4>What Remains</h4>
+        <ul>
+          <li>All 7 redaction functions are <strong>DEAD CODE</strong> &mdash; zero usage</li>
+          <li>No <code>LogLevel</code> enum or <code>secureLog()</code> function</li>
+          <li>Sensitive data actively logged in plaintext</li>
+          <li>No time-based retention</li>
+          <li>No log file encryption at rest</li>
+        </ul>
+        <p class="file-ref">Sources/Core/Services/DebugLogger.swift</p>
+      </div>
+    </div>
+
+    <!-- TASK 19 -->
+    <div class="task-card status-partial" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">TASK 19</span>
+          <span class="task-title">Fix TX Type Obfuscation</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-high">HIGH</span>
+          <span class="badge badge-partial">PARTIAL</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <h4>Vulnerability</h4>
+        <p>VUL-S-005</p>
+        <p>Greek letter substitution (<code>sent&rarr;&alpha;</code>, <code>received&rarr;&beta;</code>, <code>change&rarr;&gamma;</code>) is a fixed deterministic substitution cipher with only 3 symbols &mdash; NOT encryption. The CHECK constraint reveals the table in the schema.</p>
+        <p class="file-ref">Sources/Core/Storage/WalletDatabase.swift : lines 87-106</p>
+      </div>
+    </div>
+
+    <!-- TASK 20 -->
+    <div class="task-card status-open" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">TASK 20</span>
+          <span class="task-title">Fix Unbounded DELTA_CMUS Growth</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-medium">MEDIUM</span>
+          <span class="badge badge-open">OPEN</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <h4>Vulnerability</h4>
+        <p>VUL-F-008</p>
+        <p><code>DELTA_CMUS</code> is <code>Mutex&lt;Vec&lt;Node&gt;&gt;</code> with NO capacity limit. Push operations have no bounds check. <code>clear()</code> calls don't <code>shrink_to_fit()</code>.</p>
+        <p class="file-ref">Libraries/zipherx-ffi/src/lib.rs : line 2538</p>
+      </div>
+    </div>
+
+    <!-- TASK 21 -->
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">TASK 21</span>
+          <span class="task-title">Fix Prepared Transaction Race Condition</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-medium">MEDIUM</span>
+          <span class="badge badge-fixed">FIXED</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <h4>Vulnerability</h4>
+        <p>VUL-U-005</p>
+        <p><code>invalidatePreparedTransaction()</code> properly handles all race vectors. Called in all required places. <code>triggerPreparationIfNeeded()</code> validates prepared TX matches current input before reuse.</p>
+        <div class="note-box">No further changes needed.</div>
+      </div>
+    </div>
+
+    <!-- TASK 22 -->
+    <div class="task-card status-partial" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">TASK 22</span>
+          <span class="task-title">Implement P2P Rate Limiting</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-high">HIGH</span>
+          <span class="badge badge-partial">PARTIAL</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <h4>Vulnerability</h4>
+        <p>VUL-N-008</p>
+        <p><code>PeerRateLimiter</code> actor exists with token bucket algorithm (100 tokens, 10/sec refill). Each <code>Peer</code> creates one. But <code>tryConsume()</code> and <code>waitForToken()</code> are <strong>NEVER called</strong> &mdash; completely inert.</p>
+        <p class="file-ref">Sources/Core/Network/Peer.swift : lines 495-551</p>
+      </div>
+    </div>
+
+    <!-- TASK 23 -->
+    <div class="task-card status-partial" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">TASK 23</span>
+          <span class="task-title">Fix Migration Transaction Safety</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-medium">MEDIUM</span>
+          <span class="badge badge-partial">PARTIAL</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <h4>Vulnerability</h4>
+        <p>VUL-S-006</p>
+        <h4>What Remains</h4>
+        <ol>
+          <li>Migration 6 uses non-exclusive <code>BEGIN TRANSACTION</code></li>
+          <li>Migration 6 result discarded with <code>_ =</code></li>
+          <li>Migrations 1-5 and 7-14 NOT wrapped in any transaction</li>
+        </ol>
+        <p class="file-ref">Sources/Core/Storage/WalletDatabase.swift : lines 568-962, 703</p>
+      </div>
+    </div>
+
+    <!-- TASK 24 -->
+    <div class="task-card status-partial" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">TASK 24</span>
+          <span class="task-title">Validate IP Addresses for Reserved Ranges</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-medium">MEDIUM</span>
+          <span class="badge badge-partial">PARTIAL</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <h4>Vulnerability</h4>
+        <p>VUL-N-012</p>
+        <p><code>isReservedIPAddress()</code> exists covering ALL major reserved ranges. Only called at ONE site. NOT called in <code>addAddress()</code> (main entry point) or <code>parseIPAddress()</code>.</p>
+        <p class="file-ref">Sources/Core/Network/NetworkManager.swift : lines 1224, 1305, 7822</p>
+      </div>
+    </div>
+
+    <!-- TASK 25 -->
+    <div class="task-card status-open" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">TASK 25</span>
+          <span class="task-title">Fix macOS Key Access Security</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-critical">CRITICAL</span>
+          <span class="badge badge-open">OPEN</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <h4>Vulnerability</h4>
+        <p>VUL-U-007</p>
+
+        <h4>Severity Upgrade</h4>
+        <p style="color: var(--neon-red);">Upgraded from MEDIUM to <strong>CRITICAL</strong> &mdash; Hardware UUID is publicly readable via <code>ioreg</code> by any local process. Combined with the on-disk <code>.enc</code> file and salt, this is a deterministic spending key extraction path requiring zero privileges beyond same-user access. Any macOS malware running as the user can silently steal all funds.</p>
+
+        <h4>Evidence</h4>
+        <p>ALL macOS builds bypass Secure Enclave. File-based storage uses AES-GCM with encryption key derived from Hardware UUID via IOKit <code>kIOPlatformUUIDKey</code> &mdash; <strong>publicly readable by any process</strong>. Key retrieval requires ZERO authentication.</p>
+        <div class="warning-box">Any process running as the same user can read the .enc file + salt + Hardware UUID &rarr; derive key via HKDF-SHA256 &rarr; decrypt spending key.</div>
+
+        <h4>Required Changes</h4>
+        <ol>
+          <li>Migrate to macOS Keychain Services with <code>kSecAttrAccessibleWhenUnlockedThisDeviceOnly</code></li>
+          <li>Add <code>kSecUseUserPresence</code> context for biometric/password gating</li>
+          <li>Create migration: read existing .enc key, store in Keychain, securely delete .enc file</li>
+          <li>Fallback: if Keychain unavailable, use password-derived key (PBKDF2/Argon2) instead of Hardware UUID</li>
+        </ol>
+        <div class="warning-box">MUST be completed BEFORE TASK 2 (removing spending key from DB) &mdash; the DB copy is the only remaining backup if macOS key storage fails.</div>
+        <p class="file-ref">Sources/Core/Storage/SecureKeyStorage.swift : lines 73-80, 335-476, 398-437</p>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ================ NEW FINDINGS ================ -->
+  <div class="section">
+    <div class="section-header">
+      <span class="phase-tag phase-new">NEW</span>
+      <h2 style="color: var(--neon-magenta);">Post-Audit Findings</h2>
+      <div class="line"></div>
+    </div>
+
+    <div class="controls">
+      <button onclick="toggleAll(this.parentElement.parentElement, true)">Expand All</button>
+      <button onclick="toggleAll(this.parentElement.parentElement, false)">Collapse All</button>
+    </div>
+
+    <div class="task-card status-open" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">NEW-001</span>
+          <span class="task-title">LogRedaction Functions Are Dead Code</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-medium">MEDIUM</span>
+          <span class="badge badge-open">OPEN</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <p><code>LogRedaction</code> struct defines 7 redaction functions. <strong>Zero usage</strong> outside DebugLogger.swift. All sensitive <code>print()</code> statements use raw values. False sense of security.</p>
+        <p class="file-ref">Sources/Core/Services/DebugLogger.swift : lines 426-519</p>
+      </div>
+    </div>
+
+    <div class="task-card status-open" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">NEW-002</span>
+          <span class="task-title">PeerRateLimiter Is Dead Code</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-medium">MEDIUM</span>
+          <span class="badge badge-open">OPEN</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <p><code>PeerRateLimiter</code> actor &mdash; <code>tryConsume()</code> and <code>waitForToken()</code> are <strong>NEVER called</strong>. Rate limiter instantiated but completely inert. False sense of security.</p>
+        <p class="file-ref">Sources/Core/Network/Peer.swift : lines 495-551</p>
+      </div>
+    </div>
+
+    <div class="task-card status-open" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">NEW-003</span>
+          <span class="task-title">FullNodeWalletView Private Key Export Vulnerabilities</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-high">HIGH</span>
+          <span class="badge badge-open">OPEN</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <p>Identical issues to TASK 6: <code>exportedPrivateKey</code> never cleared, clipboard no auto-clear, no biometric auth before export.</p>
+        <p class="file-ref">Sources/Features/FullNodeWallet/FullNodeWalletView.swift</p>
+      </div>
+    </div>
+
+    <div class="task-card status-open" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">NEW-004</span>
+          <span class="task-title">Non-Constant-Time PIN Comparison</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-low">LOW</span>
+          <span class="badge badge-open">OPEN</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <p>Lines 72, 99 use <code>hashPIN(pin) == storedHash</code> &mdash; standard Swift <code>==</code> is NOT constant-time. Requires precise local timing measurements to exploit.</p>
+        <p class="file-ref">Sources/Features/Settings/SettingsView.swift : lines 72, 99</p>
+      </div>
+    </div>
+
+    <div class="task-card status-open" onclick="toggleCard(this)">
+      <div class="task-header">
+        <div class="task-title-group">
+          <span class="task-number">NEW-005</span>
+          <span class="task-title">Unguarded from_raw_parts in download.rs and tor.rs</span>
+        </div>
+        <div class="task-badges">
+          <span class="badge badge-medium">MEDIUM</span>
+          <span class="badge badge-open">OPEN</span>
+          <span class="toggle-icon">&#9654;</span>
+        </div>
+      </div>
+      <div class="task-body">
+        <p><code>download.rs</code> lines 108, 114, 340, 346 call <code>std::slice::from_raw_parts()</code> without null pointer validation or <code>safe_slice()</code> wrapper. These receive user-controlled lengths from the Swift caller.</p>
+        <p class="file-ref">Libraries/zipherx-ffi/src/download.rs : lines 108, 114, 340, 346</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================ EXECUTION ROADMAP ================ -->
+  <div class="section">
+    <div class="section-header">
+      <h2 style="color: var(--neon-cyan);">Execution Roadmap</h2>
+      <div class="line"></div>
+    </div>
+
+    <div class="sprint-block sprint-1">
+      <div class="sprint-title"><span class="dot"></span>Sprint 1 &mdash; P0 (Do First)</div>
+      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 3</strong>: Disable DEBUG_LOGGING (Rust FFI)</div>
+      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 6</strong>: Fix private key clipboard + add biometric auth</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 7</strong>: Add null pointer checks (Rust FFI)</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 1</strong>: Disable DEBUG_DISABLE_ENCRYPTION</div>
+      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 1</strong> (remaining): Remove vestigial flag</div>
+      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 5</strong>: Fix buffer overflow &mdash; add checked_mul</div>
+      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 4</strong>: Replace remaining 21 .unwrap() with safe_lock!</div>
+      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 25</strong>: Fix macOS key access security <em>(upgraded from P2 &mdash; blocks TASK 2)</em></div>
+      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 2</strong>: Remove spending keys from DB <em>(requires TASK 25 first)</em></div>
+    </div>
+
+    <div class="sprint-block sprint-2">
+      <div class="sprint-title"><span class="dot"></span>Sprint 2 &mdash; P1 (Before Launch)</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 10</strong>: Fix SOCKS5 auth verification</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 21</strong>: Fix prepared TX race condition</div>
+      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 12</strong>: Clipboard auto-clear across all views</div>
+      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 9</strong>: Fix P2P message validation (4MB max payload)</div>
+      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 13</strong>: Remove localhost from seeds</div>
+      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 11</strong>: Fix broadcast handler race</div>
+      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 8</strong>: Side-channel protections</div>
+      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>NEW-003</strong>: Fix FullNodeWalletView key export</div>
+      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>NEW-005</strong>: Fix unguarded from_raw_parts</div>
+    </div>
+
+    <div class="sprint-block sprint-3">
+      <div class="sprint-title"><span class="dot"></span>Sprint 3 &mdash; P2 (Next Release)</div>
+      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 14</strong>: Per-user PIN salt</div>
+      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 18</strong>: Secure log files</div>
+      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 15</strong>: Database race conditions</div>
+      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 16</strong>: Encrypt remaining sensitive fields</div>
+      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 23</strong>: Migration transaction safety</div>
+      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 24</strong>: IP address validation</div>
+      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 17</strong>: Screenshot protection</div>
+      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 22</strong>: P2P rate limiting</div>
+      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 19</strong>: TX type obfuscation</div>
+      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 20</strong>: Unbounded DELTA_CMUS</div>
+      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>NEW-001</strong>: Apply LogRedaction functions</div>
+      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>NEW-002</strong>: Integrate PeerRateLimiter</div>
+      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>NEW-004</strong>: Non-constant-time PIN comparison</div>
+    </div>
+  </div>
+
+  <!-- ================ LAYER SUMMARY ================ -->
+  <div class="section">
+    <div class="section-header">
+      <h2 style="color: var(--neon-magenta);">Layer-by-Layer Security Summary</h2>
+      <div class="line"></div>
+    </div>
+
+    <table class="layer-table">
+      <caption>Rust FFI Layer</caption>
+      <thead>
+        <tr><th>Control</th><th>Status</th><th>Notes</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Null pointer validation</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td><code>safe_slice()</code> with alignment + overflow checks</td></tr>
+        <tr><td>Buffer overflow protection</td><td class="status-partial"><span class="status-icon">~</span> PARTIAL</td><td>Missing <code>checked_mul</code> in parallel decryption</td></tr>
+        <tr><td>Thread safety (Mutex)</td><td class="status-partial"><span class="status-icon">~</span> PARTIAL</td><td>21 of 51 lock sites still use raw <code>.unwrap()</code></td></tr>
+        <tr><td>Integer overflow</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td><code>saturating_sub</code> in 6 tree-loading functions</td></tr>
+        <tr><td>Memory zeroing</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td><code>secure_zero()</code> for spending keys after TX build</td></tr>
+        <tr><td>Debug logging</td><td class="status-fail"><span class="status-icon">&#10007;</span> FAIL</td><td><strong>CRITICAL</strong> &mdash; <code>DEBUG_LOGGING = true</code> &mdash; IVK, shared secrets, KDF material actively written to unencrypted log</td></tr>
+        <tr><td>DELTA_CMUS bounds</td><td class="status-fail"><span class="status-icon">&#10007;</span> FAIL</td><td>No capacity limit, no <code>shrink_to_fit()</code></td></tr>
+        <tr><td>Dependencies</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>No known CVEs in pinned versions</td></tr>
+        <tr><td>download.rs pointers</td><td class="status-fail"><span class="status-icon">&#10007;</span> FAIL</td><td>4 unguarded <code>from_raw_parts</code> calls</td></tr>
+      </tbody>
+    </table>
+
+    <table class="layer-table">
+      <caption>Network Layer</caption>
+      <thead>
+        <tr><th>Control</th><th>Status</th><th>Notes</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>IP address filtering</td><td class="status-partial"><span class="status-icon">~</span> PARTIAL</td><td>Function exists, only called at 1 of 3+ entry points</td></tr>
+        <tr><td>Message checksum</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>doubleSHA256 validation</td></tr>
+        <tr><td>Protocol version</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>Rejects wrong-chain peers, permanent bans</td></tr>
+        <tr><td>Sybil detection</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>Equihash verification + peer banning</td></tr>
+        <tr><td>Connection limits</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>MIN=8, MAX=30 peers enforced</td></tr>
+        <tr><td>Rate limiting</td><td class="status-fail"><span class="status-icon">&#10007;</span> FAIL</td><td>Token bucket exists but NEVER called</td></tr>
+        <tr><td>Max payload size</td><td class="status-fail"><span class="status-icon">&#10007;</span> FAIL</td><td>No cap &mdash; UInt32 allows 4GB allocation</td></tr>
+        <tr><td>SOCKS5 auth</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>Full RFC 1928 compliance</td></tr>
+        <tr><td>Tor circuit isolation</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>Dynamic UUID-based credentials per circuit</td></tr>
+        <tr><td>Broadcast handler</td><td class="status-partial"><span class="status-icon">~</span> PARTIAL</td><td>"Any handler" fallback can misroute rejects</td></tr>
+        <tr><td>Localhost in seeds</td><td class="status-partial"><span class="status-icon">~</span> PARTIAL</td><td>Runtime filtered but still in hardcoded list</td></tr>
+      </tbody>
+    </table>
+
+    <table class="layer-table">
+      <caption>Storage Layer</caption>
+      <thead>
+        <tr><th>Control</th><th>Status</th><th>Notes</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>SQLCipher encryption</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>AES-256-CBC, HMAC-SHA512, 256K iterations</td></tr>
+        <tr><td>Field-level encryption</td><td class="status-partial"><span class="status-icon">~</span> PARTIAL</td><td>5 fields encrypted, 6 remain plaintext</td></tr>
+        <tr><td>SQL injection</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>100% parameterized queries</td></tr>
+        <tr><td>Thread safety</td><td class="status-partial"><span class="status-icon">~</span> PARTIAL</td><td>FULLMUTEX active, but serial queue never used</td></tr>
+        <tr><td>Transactions</td><td class="status-partial"><span class="status-icon">~</span> PARTIAL</td><td>Some ops transactional, many are not</td></tr>
+        <tr><td>Nullifier hashing</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>SHA256 before storage</td></tr>
+        <tr><td>TX type obfuscation</td><td class="status-partial"><span class="status-icon">~</span> PARTIAL</td><td>Substitution cipher, not real encryption</td></tr>
+        <tr><td>Spending key in DB</td><td class="status-fail"><span class="status-icon">&#10007;</span> FAIL</td><td>Plaintext BLOB in accounts table</td></tr>
+        <tr><td>macOS key storage</td><td class="status-fail"><span class="status-icon">&#10007;</span> FAIL</td><td><strong>CRITICAL</strong> &mdash; Hardware UUID (publicly readable) = deterministic key extraction</td></tr>
+        <tr><td>iOS key storage</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>Secure Enclave with biometric</td></tr>
+      </tbody>
+    </table>
+
+    <table class="layer-table">
+      <caption>UI Layer</caption>
+      <thead>
+        <tr><th>Control</th><th>Status</th><th>Notes</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Biometric auth (sends)</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>Fresh prompt, passcode fallback</td></tr>
+        <tr><td>Key export auth</td><td class="status-fail"><span class="status-icon">&#10007;</span> FAIL</td><td>No auth before exporting spending key</td></tr>
+        <tr><td>Clipboard auto-clear</td><td class="status-fail"><span class="status-icon">&#10007;</span> FAIL</td><td>12+ files write with no auto-clear</td></tr>
+        <tr><td>Private key memory</td><td class="status-fail"><span class="status-icon">&#10007;</span> FAIL</td><td>@State never cleared on dismissal</td></tr>
+        <tr><td>Address validation</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>FFI-based cryptographic validation</td></tr>
+        <tr><td>Fee validation</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>Prevents overflow, validated before send</td></tr>
+        <tr><td>Screenshot protection</td><td class="status-partial"><span class="status-icon">~</span> PARTIAL</td><td>Background lock works, .inactive doesn't blur</td></tr>
+        <tr><td>PIN security</td><td class="status-fail"><span class="status-icon">&#10007;</span> FAIL</td><td>Fixed salt, weak hashing, non-constant-time</td></tr>
+        <tr><td>TX race condition</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>Proper invalidation and validation</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- ================ FILES REFERENCE ================ -->
+  <div class="section">
+    <div class="section-header">
+      <h2 style="color: var(--neon-purple);">Files Reference</h2>
+      <div class="line"></div>
+    </div>
+
+    <table class="files-table">
+      <thead>
+        <tr><th>File</th><th>Lines</th><th>Layer</th><th>Tasks</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Libraries/zipherx-ffi/src/lib.rs</td><td>~7,864</td><td>Crypto/FFI</td><td>3, 4, 5, 7, 8, 20</td></tr>
+        <tr><td>Libraries/zipherx-ffi/src/download.rs</td><td>~400</td><td>Crypto/FFI</td><td>NEW-005</td></tr>
+        <tr><td>Libraries/zipherx-ffi/src/tor.rs</td><td>~1,600</td><td>Crypto/FFI</td><td>(safe)</td></tr>
+        <tr><td>Libraries/zipherx-ffi/Cargo.toml</td><td>~50</td><td>Crypto/FFI</td><td>8</td></tr>
+        <tr><td>Sources/Core/Storage/WalletDatabase.swift</td><td>~6,600+</td><td>Storage</td><td>1, 2, 15, 16, 19, 23</td></tr>
+        <tr><td>Sources/Core/Storage/SecureKeyStorage.swift</td><td>~700+</td><td>Storage</td><td>25</td></tr>
+        <tr><td>Sources/Core/Storage/DatabaseEncryption.swift</td><td>~230</td><td>Storage</td><td>(secure)</td></tr>
+        <tr><td>Sources/Core/Storage/SQLCipherManager.swift</td><td>~500+</td><td>Storage</td><td>(secure)</td></tr>
+        <tr><td>Sources/Core/Network/Peer.swift</td><td>~5,600+</td><td>Network</td><td>9, 10, 11, 22, 24</td></tr>
+        <tr><td>Sources/Core/Network/NetworkManager.swift</td><td>~8,000+</td><td>Network</td><td>13, 22, 24</td></tr>
+        <tr><td>Sources/Core/Network/TorManager.swift</td><td>~1,100+</td><td>Network</td><td>(secure)</td></tr>
+        <tr><td>Sources/Features/Settings/SettingsView.swift</td><td>~3,900+</td><td>UI</td><td>6, 14</td></tr>
+        <tr><td>Sources/Features/Send/SendView.swift</td><td>~1,800+</td><td>UI</td><td>12, 21</td></tr>
+        <tr><td>Sources/Features/FullNodeWallet/FullNodeWalletView.swift</td><td>~2,000+</td><td>UI</td><td>NEW-003</td></tr>
+        <tr><td>Sources/App/ContentView.swift</td><td>~2,400+</td><td>UI</td><td>12, 17</td></tr>
+        <tr><td>Sources/App/AppDelegate.swift</td><td>~147</td><td>UI</td><td>17</td></tr>
+        <tr><td>Sources/Core/Services/DebugLogger.swift</td><td>~519</td><td>Services</td><td>18, NEW-001</td></tr>
+        <tr><td>Sources/Core/Security/BiometricAuthManager.swift</td><td>~400+</td><td>Security</td><td>(secure)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- ================ SAFETY CONSTRAINTS ================ -->
+  <div class="section">
+    <div class="section-header">
+      <h2 style="color: var(--neon-red);">Safety Constraints</h2>
+      <div class="line"></div>
+    </div>
+
+    <div class="safety-grid">
+      <div class="safety-item never"><span class="safety-prefix">NEVER</span> Kill any processes &mdash; this crashes the app</div>
+      <div class="safety-item always"><span class="safety-prefix">ALWAYS</span> Test TX building after ANY change to lib.rs</div>
+      <div class="safety-item never"><span class="safety-prefix">NEVER</span> Change passwords without authorization</div>
+      <div class="safety-item always"><span class="safety-prefix">ALWAYS</span> Test DB reads after ANY WalletDatabase.swift change</div>
+      <div class="safety-item never"><span class="safety-prefix">NEVER</span> Run <code>kill</code> commands</div>
+      <div class="safety-item always"><span class="safety-prefix">ALWAYS</span> Verify Secure Enclave after SecureKeyStorage changes</div>
+      <div class="safety-item never"><span class="safety-prefix">NEVER</span> Modify or delete the boost file without approval</div>
+      <div class="safety-item always"><span class="safety-prefix">ALWAYS</span> Back up the database before running migrations</div>
+    </div>
+
+    <div class="note-box" style="margin-top:20px;">
+      Rust FFI changes require recompilation of the library. Database schema changes require migration logic. PIN salt changes require migration of existing PINs.
+    </div>
+  </div>
+
+  <!-- FOOTER -->
+  <div class="footer">
+    <p>ZipherX Security Audit Remediation &mdash; Consolidated Report v3.1</p>
+    <p class="cipher">4e 45 56 45 52 20 54 52 55 53 54 2e 20 41 4c 57 41 59 53 20 56 45 52 49 46 59 2e</p>
+  </div>
+
+</div>
+
+<script>
+function toggleCard(card) {
+  if (card.classList.contains('task-card')) {
+    card.classList.toggle('expanded');
+  }
+}
+
+function toggleAll(section, expand) {
+  const cards = section.querySelectorAll('.task-card');
+  cards.forEach(card => {
+    if (expand) {
+      card.classList.add('expanded');
+    } else {
+      card.classList.remove('expanded');
+    }
+  });
+}
+
+// Prevent toggle when clicking inside task-body
+document.querySelectorAll('.task-body').forEach(body => {
+  body.addEventListener('click', e => e.stopPropagation());
+});
+</script>
+
+</body>
+</html>

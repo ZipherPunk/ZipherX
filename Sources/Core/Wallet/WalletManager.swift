@@ -4120,6 +4120,14 @@ final class WalletManager: ObservableObject {
                                     print("✅ FIX #1250: Balance verified OK after nullifier check — cleared integrity flag")
                                 }
                             }
+                        } else if await WalletManager.shared.balanceIntegrityIssue {
+                            // FIX #1359: Balance is valid but flag was left set from a previous
+                            // correction (e.g., phantom cleanup during startup). Clear it now.
+                            await MainActor.run {
+                                WalletManager.shared.balanceIntegrityIssue = false
+                                WalletManager.shared.balanceIntegrityMessage = nil
+                                print("✅ FIX #1359: Balance verified OK in background — cleared stale integrity flag")
+                            }
                         }
                     } catch {
                         print("⚠️ FIX #1084: Balance verification failed: \(error)")

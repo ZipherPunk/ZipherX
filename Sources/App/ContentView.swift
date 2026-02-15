@@ -839,6 +839,20 @@ struct ContentView: View {
                                     print("   - \(result.checkName): passed=\(result.passed), critical=\(result.critical)")
                                 }
 
+                                // FIX #1359: After corrections, re-verify balance integrity.
+                                // Only flag as issue if UNCORRECTED problems remain.
+                                // Previously: flag was set permanently after corrections with no clearing path.
+                                if verificationDetectedSpends {
+                                    let recheckResult = try? WalletDatabase.shared.verifyBalanceIntegrity(accountId: 1)
+                                    let recheckValid = recheckResult?.0 ?? true
+                                    if recheckValid {
+                                        print("✅ FIX #1359: Balance corrections applied successfully — re-verification PASSED")
+                                        verificationDetectedSpends = false
+                                    } else {
+                                        print("⚠️ FIX #1359: Balance corrections applied but issues remain — flagging")
+                                    }
+                                }
+
                                 // FIX #1283: Include both health check results AND blockchain verification results
                                 let hasAnyBalanceIssue = healthResults.contains {
                                     $0.checkName == "Balance Integrity" && !$0.passed
@@ -1628,6 +1642,18 @@ struct ContentView: View {
                                 print("   Run 'Full Resync' in Settings if balance seems wrong")
                                 await MainActor.run {
                                     walletManager.updateSyncTask(id: "balance_verify", status: .failed("Error: \(error.localizedDescription)"))
+                                }
+                            }
+
+                            // FIX #1359: After corrections, re-verify balance integrity.
+                            if verificationDetectedSpendsFast {
+                                let recheckResult = try? WalletDatabase.shared.verifyBalanceIntegrity(accountId: 1)
+                                let recheckValid = recheckResult?.0 ?? true
+                                if recheckValid {
+                                    print("✅ FIX #1359: Balance corrections applied successfully — re-verification PASSED (FAST START)")
+                                    verificationDetectedSpendsFast = false
+                                } else {
+                                    print("⚠️ FIX #1359: Balance corrections applied but issues remain — flagging (FAST START)")
                                 }
                             }
 
