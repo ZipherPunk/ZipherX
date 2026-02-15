@@ -618,7 +618,7 @@ final class TransactionBuilder {
 
                 // Count CMUs for progress display
                 let cmuCount = cachedData.count >= 8 ?
-                    cachedData.prefix(8).withUnsafeBytes { $0.load(as: UInt64.self) } : 0
+                    cachedData.prefix(8).withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) } : 0
 
                 // Use the new FFI function with real progress callback
                 let success = ZipherXFFI.treeLoadFromCMUsWithProgress(data: cachedData) { current, total in
@@ -1739,7 +1739,7 @@ final class TransactionBuilder {
 
         // Parse CMU count
         guard cachedData.count >= 8 else { return nil }
-        let cachedCount = cachedData.prefix(8).withUnsafeBytes { $0.load(as: UInt64.self) }
+        let cachedCount = cachedData.prefix(8).withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
         print("📊 Downloaded tree has \(cachedCount) CMUs ending at height \(downloadedTreeHeight)")
 
         // 2. Initialize fresh tree
@@ -1931,7 +1931,7 @@ final class TransactionBuilder {
 
         // Parse CMU count from boost data
         guard boostCMUData.count >= 8 else { throw TransactionError.proofGenerationFailed }
-        let boostCMUCount = boostCMUData.prefix(8).withUnsafeBytes { $0.load(as: UInt64.self) }
+        let boostCMUCount = boostCMUData.prefix(8).withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
         print("📊 Boost file has \(boostCMUCount) CMUs up to height \(downloadedTreeHeight)")
 
         // 3. Get delta CMUs — prefer LOCAL DeltaCMUManager over P2P fetch

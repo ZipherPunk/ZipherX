@@ -394,8 +394,8 @@ struct AddTrustedPeerSheet: View {
             }
         }
         #if os(macOS)
-        .frame(minWidth: 500, idealWidth: 550, maxWidth: 600,
-               minHeight: 400, idealHeight: 450, maxHeight: 500)
+        .frame(minWidth: 550, idealWidth: 650, maxWidth: 750,
+               minHeight: 500, idealHeight: 600, maxHeight: 700)
         #endif
     }
 
@@ -547,8 +547,8 @@ struct EditTrustedPeerSheet: View {
             }
         }
         #if os(macOS)
-        .frame(minWidth: 500, idealWidth: 550, maxWidth: 600,
-               minHeight: 450, idealHeight: 500, maxHeight: 550)
+        .frame(minWidth: 550, idealWidth: 650, maxWidth: 750,
+               minHeight: 550, idealHeight: 650, maxHeight: 750)
         #endif
     }
 

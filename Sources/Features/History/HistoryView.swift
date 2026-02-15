@@ -111,13 +111,23 @@ struct HistoryView: View {
         .background(theme.backgroundColor)
     }
 
+    // FIX #1367: Color for transaction type (green=received, red=sent, orange=self-send)
+    private func txColor(_ type: TransactionType) -> Color {
+        switch type {
+        case .received: return theme.successColor
+        case .selfSend: return theme.warningColor
+        default: return theme.errorColor
+        }
+    }
+
     private func transactionRow(_ transaction: TransactionHistoryItem) -> some View {
         HStack(spacing: 12) {
-            // Type icon
+            // Type icon — FIX #1367: Self-sends use circular arrows icon
             VStack {
-                Image(systemName: transaction.type == .received ? "arrow.down.left" : "arrow.up.right")
+                Image(systemName: transaction.type == .selfSend ? "arrow.2.squarepath" :
+                      (transaction.type == .received ? "arrow.down.left" : "arrow.up.right"))
                     .font(.system(size: 16))
-                    .foregroundColor(transaction.type == .received ? theme.successColor : theme.errorColor)
+                    .foregroundColor(txColor(transaction.type))
             }
             .frame(width: 24)
 
@@ -125,15 +135,23 @@ struct HistoryView: View {
             VStack(alignment: .leading, spacing: 3) {
                 // Type and amount
                 HStack {
-                    Text(transaction.type == .received ? "Received" : "Sent")
+                    Text(transaction.type == .selfSend ? "Self-Send" :
+                         (transaction.type == .received ? "Received" : "Sent"))
                         .font(theme.bodyFont)
                         .foregroundColor(theme.textPrimary)
 
                     Spacer()
 
-                    Text("\(transaction.type == .received ? "+" : "-")\(String(format: "%.8f", transaction.valueInZCL)) ZCL")
-                        .font(theme.titleFont)
-                        .foregroundColor(transaction.type == .received ? theme.successColor : theme.errorColor)
+                    // FIX #1367: Self-sends show "Fee:" prefix since only the fee was spent
+                    if transaction.type == .selfSend {
+                        Text("Fee: \(String(format: "%.8f", transaction.valueInZCL)) ZCL")
+                            .font(theme.titleFont)
+                            .foregroundColor(txColor(transaction.type))
+                    } else {
+                        Text("\(transaction.type == .received ? "+" : "-")\(String(format: "%.8f", transaction.valueInZCL)) ZCL")
+                            .font(theme.titleFont)
+                            .foregroundColor(txColor(transaction.type))
+                    }
                 }
 
                 // Date and height
@@ -141,8 +159,7 @@ struct HistoryView: View {
                     if let dateString = transaction.dateString {
                         Text(dateString)
                             .font(theme.captionFont)
-                            // Red for sent, green for received
-                            .foregroundColor(transaction.type == .received ? theme.successColor : theme.errorColor)
+                            .foregroundColor(txColor(transaction.type))
                     }
 
                     Spacer()
@@ -193,7 +210,13 @@ struct HistoryView: View {
                         }
 
                         // Convert WalletTransactionType to TransactionType
-                        let txType: TransactionType = tx.type == .sent ? .sent : .received
+                        // FIX #1367: Detect self-sends (address == "self") for orange display
+                        let txType: TransactionType
+                        if tx.type == .sent && tx.address == "self" {
+                            txType = .selfSend
+                        } else {
+                            txType = tx.type == .sent ? .sent : .received
+                        }
 
                         // Determine status based on confirmations
                         let status: TransactionStatus
@@ -366,14 +389,25 @@ struct TransactionDetailView: View {
         #endif
     }
 
+    // FIX #1367: Color helper matching transactionRow
+    private func txColor(_ type: TransactionType) -> Color {
+        switch type {
+        case .received: return theme.successColor
+        case .selfSend: return theme.warningColor
+        default: return theme.errorColor
+        }
+    }
+
     private var transactionHeader: some View {
         VStack(spacing: 8) {
-            // Large icon
-            Image(systemName: transaction.type == .received ? "arrow.down.left.circle.fill" : "arrow.up.right.circle.fill")
+            // Large icon — FIX #1367: Self-sends use circular arrows
+            Image(systemName: transaction.type == .selfSend ? "arrow.triangle.2.circlepath.circle.fill" :
+                  (transaction.type == .received ? "arrow.down.left.circle.fill" : "arrow.up.right.circle.fill"))
                 .font(.system(size: 48))
-                .foregroundColor(transaction.type == .received ? theme.successColor : theme.errorColor)
+                .foregroundColor(txColor(transaction.type))
 
-            Text(transaction.type == .received ? "Received" : "Sent")
+            Text(transaction.type == .selfSend ? "Self-Send" :
+                 (transaction.type == .received ? "Received" : "Sent"))
                 .font(theme.titleFont)
                 .foregroundColor(theme.textPrimary)
 
@@ -394,17 +428,32 @@ struct TransactionDetailView: View {
 
     private var amountCard: some View {
         VStack(spacing: 8) {
-            Text(transaction.type == .received ? "+" : "-")
-                .font(.system(size: 14))
-                .foregroundColor(transaction.type == .received ? theme.successColor : theme.errorColor)
-            +
-            Text(String(format: "%.8f", transaction.valueInZCL))
-                .font(.system(size: 28, weight: .bold, design: .monospaced))
-                .foregroundColor(transaction.type == .received ? theme.successColor : theme.errorColor)
-            +
-            Text(" ZCL")
-                .font(theme.bodyFont)
-                .foregroundColor(theme.textSecondary)
+            // FIX #1367: Self-sends show "Fee:" prefix in orange
+            if transaction.type == .selfSend {
+                Text("Fee: ")
+                    .font(.system(size: 14))
+                    .foregroundColor(theme.warningColor)
+                +
+                Text(String(format: "%.8f", transaction.valueInZCL))
+                    .font(.system(size: 28, weight: .bold, design: .monospaced))
+                    .foregroundColor(theme.warningColor)
+                +
+                Text(" ZCL")
+                    .font(theme.bodyFont)
+                    .foregroundColor(theme.textSecondary)
+            } else {
+                Text(transaction.type == .received ? "+" : "-")
+                    .font(.system(size: 14))
+                    .foregroundColor(txColor(transaction.type))
+                +
+                Text(String(format: "%.8f", transaction.valueInZCL))
+                    .font(.system(size: 28, weight: .bold, design: .monospaced))
+                    .foregroundColor(txColor(transaction.type))
+                +
+                Text(" ZCL")
+                    .font(theme.bodyFont)
+                    .foregroundColor(theme.textSecondary)
+            }
         }
         .padding()
         .frame(maxWidth: .infinity)
@@ -438,9 +487,15 @@ struct TransactionDetailView: View {
             // Value in zatoshis
             detailRow("Amount (zatoshis)", "\(transaction.value)")
 
-            // Fee (if sent)
+            // Fee (if sent or self-send)
             if transaction.type == .sent, let fee = transaction.feeInZCL {
                 detailRow("Fee", "\(String(format: "%.8f", fee)) ZCL")
+            }
+
+            // FIX #1367: Self-send explanation
+            if transaction.type == .selfSend {
+                detailRow("Type", "Self-Send")
+                detailRow("Info", "All funds returned to your wallet. Only the network fee was spent.")
             }
 
             // FIX #1268: Don't display recipient address for privacy (defense in depth).
@@ -635,12 +690,8 @@ struct TransactionDetailView: View {
     }
 
     private func copyTxid() {
-        #if os(iOS)
-        UIPasteboard.general.string = transaction.txidString
-        #elseif os(macOS)
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(transaction.txidString, forType: .string)
-        #endif
+        // FIX #1360: TASK 12 — Use ClipboardManager with 60s expiry for txids
+        ClipboardManager.copyWithAutoExpiry(transaction.txidString, seconds: 60)
 
         withAnimation {
             showCopied = true

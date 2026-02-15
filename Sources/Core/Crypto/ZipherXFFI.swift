@@ -445,7 +445,7 @@ enum ZipherXFFI {
                 // Extract decrypted note data
                 let diversifier = Data(results[offset + 1 ..< offset + 12])
                 let valueBytes = Data(results[offset + 12 ..< offset + 20])
-                let value = valueBytes.withUnsafeBytes { $0.load(as: UInt64.self) }
+                let value = valueBytes.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
                 let rcm = Data(results[offset + 20 ..< offset + 52])
                 let memo = Data(results[offset + 52 ..< offset + 564])
 
@@ -1758,7 +1758,7 @@ enum ZipherXFFI {
         // Parse output: 11 div + 32 pk_d + 8 value + 32 rcm + 512 memo
         let diversifier = Data(output[0..<11])
         let pkd = Data(output[11..<43])
-        let value = output[43..<51].withUnsafeBytes { $0.load(as: UInt64.self) }
+        let value = output[43..<51].withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
         let rcm = Data(output[51..<83])
         let memo = Data(output[83..<595])
 

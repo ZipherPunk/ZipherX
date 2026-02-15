@@ -670,7 +670,7 @@ actor CommitmentTreeUpdater {
 
         // Read count from first 8 bytes
         let cachedCount = cachedData.prefix(8).withUnsafeBytes { raw in
-            raw.load(as: UInt64.self)
+            raw.loadUnaligned(as: UInt64.self)
         }
 
         // Validate count matches manifest

@@ -849,8 +849,9 @@ struct BalanceView: View {
                         }
                     }
 
-                    // Amount
-                    Text("\(tx.type == .sent ? "-" : "+")\(String(format: "%.8f", tx.valueInZCL))")
+                    // Amount — FIX #1367: Self-sends show "Fee:" prefix in orange
+                    Text(tx.type == .selfSend ? "Fee: \(String(format: "%.8f", tx.valueInZCL))" :
+                         "\(tx.type == .sent ? "-" : "+")\(String(format: "%.8f", tx.valueInZCL))")
                         .font(theme.monoFont)
                         .foregroundColor(tx.isPending ? theme.warningColor : txColor(for: tx.type))
 
@@ -1717,6 +1718,8 @@ struct BalanceView: View {
             return "arrow.down.circle.fill"
         case .change:
             return "arrow.triangle.2.circlepath"
+        case .selfSend:
+            return "arrow.2.squarepath"
         }
     }
 
@@ -1729,6 +1732,8 @@ struct BalanceView: View {
             return theme.successColor
         case .change:
             return theme.textSecondary
+        case .selfSend:
+            return theme.warningColor
         }
     }
 

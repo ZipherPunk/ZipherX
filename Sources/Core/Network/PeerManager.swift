@@ -258,6 +258,10 @@ public final class PeerManager: ObservableObject {
         }
 
         if !hosts.isEmpty {
+            // FIX #1363: Update bannedPeerCount after loading persisted bans.
+            // Without this, bannedPeerCount stays 0 until a ban/unban operation occurs,
+            // causing Settings UI to show "0 banned" despite having persisted bans.
+            updateBannedCount()
             print("🚫 FIX #424: Loaded \(hosts.count) persisted permanent bans")
         }
     }

@@ -27,7 +27,6 @@ final class WalletDatabase {
 
     // MARK: - Field-Level Encryption
     // FIX #226: Re-enabled field-level encryption - AES-GCM-256 active for sensitive fields
-    private static let DEBUG_DISABLE_ENCRYPTION = false
 
     /// Encrypt sensitive data before storing in database
     /// Returns: nonce (12 bytes) + ciphertext + tag (16 bytes)
@@ -58,8 +57,6 @@ final class WalletDatabase {
         }
     }
 
-    /// Check if encryption is enabled
-    var isEncryptionEnabled: Bool { !WalletDatabase.DEBUG_DISABLE_ENCRYPTION }
 
     /// Check if database connection is open
     var isOpen: Bool { db != nil }
@@ -1335,6 +1332,24 @@ final class WalletDatabase {
     }
 
     /// Get all unspent notes (regardless of witness status) - for diagnostics
+    /// FIX #1366: Get all known note CMUs for fast set-membership check.
+    /// Used at startup to detect undiscovered delta outputs.
+    func getAllKnownCMUs() -> Set<Data> {
+        guard db != nil else { return [] }
+        var result = Set<Data>()
+        let sql = "SELECT cmu FROM notes;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(stmt) }
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let blob = sqlite3_column_blob(stmt, 0) {
+                let len = Int(sqlite3_column_bytes(stmt, 0))
+                result.insert(Data(bytes: blob, count: len))
+            }
+        }
+        return result
+    }
+
     func getAllUnspentNotes(accountId: Int64) throws -> [WalletNote] {
         // FIX #940: Guard against nil database handle
         // sqlite3_errmsg(nil) returns "out of memory" which is misleading
@@ -2684,19 +2699,21 @@ final class WalletDatabase {
         // When history > notes, it could be:
         // 1. Normal accounting difference (change outputs)
         // 2. A note incorrectly marked as spent by a phantom TX (caught by FIX #1169 above)
-        // FIX #1286: If difference persists after FIX #1169/1233/1245 phantom cleanup,
-        // notes are incorrectly marked as spent with valid-looking TX entries.
-        // This is NOT a "minor accounting gap" — it means real funds are hidden.
-        // Flag as invalid so the UI can show a warning.
+        // 3. FIX #1360: Notes correctly marked spent by FIX #1319 delta nullifier scan,
+        //    but sent TX entries missing from history (imported wallet — sends on original device).
+        //    This is expected and NOT a balance issue.
+        // FIX #1286 DOWNGRADED to WARNING (FIX #1360):
+        // Previously set isValid=false, but this was a false positive for imported wallets
+        // and after FIX #1283 corrections. Real corruption is caught by:
+        //   - FIX #1169: phantom-spent (spent by non-existent TX)
+        //   - FIX #1233: orphan-spent (is_spent=1 but spent_in_tx IS NULL)
+        //   - FIX #1245: stale phantom TXs (confirmed but block_height=0)
+        // The history/notes comparison is unreliable because history may be incomplete.
         if changeInBalance < 0 {
             let diffZCL = Double(-changeInBalance) / 100_000_000.0
-            // FIX #1286: Threshold — differences > 0.0001 ZCL (10000 zatoshis) are significant.
-            // Tiny differences from fee rounding or change handling are ignorable.
             if -changeInBalance > 10000 {
-                isValid = false
-                issueFound = String(format: "Notes show %.8f ZCL less than history — possible phantom-spent notes", diffZCL)
-                details.append(String(format: "🚨 FIX #1286: History shows %.8f ZCL more than unspent notes", diffZCL))
-                details.append("   Run Full Resync in Settings to detect and restore incorrectly spent notes")
+                details.append(String(format: "⚠️ FIX #1286/1360: History shows %.8f ZCL more than unspent notes (informational)", diffZCL))
+                details.append("   This may indicate incomplete transaction history (e.g., imported wallet)")
             } else {
                 details.append(String(format: "⚠️ FIX #1130: History shows %.8f ZCL more than notes (minor difference)", diffZCL))
             }
@@ -2814,6 +2831,27 @@ final class WalletDatabase {
             throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
         }
         print("✅ FIX #1355: lastScannedHeight reset to \(boostHeight)")
+    }
+
+    /// FIX #1366: Reset lastScannedHeight backward for TX recovery.
+    /// When a broadcast TX is confirmed on chain but never recorded in history (crash between
+    /// broadcast and block confirmation), FilterScanner needs to rescan the blocks containing
+    /// the TX to discover change outputs and record the TX.
+    /// Bypasses FIX #1075 regression protection — used only for crash recovery.
+    func resetLastScannedHeightForRecovery(_ height: UInt64) throws {
+        let current = (try? getLastScannedHeight()) ?? 0
+        guard height < current else { return }  // Only lower, never raise
+        let sql = "UPDATE sync_state SET last_scanned_height = ? WHERE id = 1;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, Int64(height))
+        guard sqlite3_step(stmt) == SQLITE_DONE else {
+            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        print("⚠️ FIX #1366: lastScannedHeight lowered from \(current) to \(height) for TX recovery rescan")
     }
 
     /// FIX #1075: NEVER allow regression below checkpoint
@@ -4868,6 +4906,9 @@ final class WalletDatabase {
         // Check total count (excluding change outputs for accurate count)
         // VUL-015: Include both plaintext and obfuscated type codes for backwards compat
         // FIX #1083: Filter β entries where txid matches α OR note was spent in same tx
+        // FIX #1367: Add height-based change detection (handles txid byte-order mismatch)
+        //   When sent entry txid is display-format but received entry txid is wire-format,
+        //   exact BLOB comparison fails. Height-based check catches these cases.
         let countSql = """
             SELECT COUNT(*) FROM transaction_history t1
             WHERE t1.tx_type NOT IN ('change', 'γ')
@@ -4882,6 +4923,16 @@ final class WalletDatabase {
                     OR EXISTS (
                         SELECT 1 FROM notes n
                         WHERE n.spent_in_tx = t1.txid
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM transaction_history t2
+                        WHERE t2.block_height = t1.block_height
+                        AND t2.tx_type IN ('sent', 'α')
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM notes n
+                        WHERE n.is_spent = 1
+                        AND n.spent_height = t1.block_height
                     )
                 )
             );
@@ -4900,6 +4951,9 @@ final class WalletDatabase {
         // 2. Filter out β entries where there's an α entry with SAME txid (change from our send)
         // 3. Filter out β entries received in same tx where we spent a note (change output)
         // 4. Use subquery with DISTINCT to deduplicate BEFORE ordering
+        // FIX #1367: Add height-based change detection (Zclassic IsNoteSaplingChange logic)
+        //   - β at height H where α entry exists at height H → change (handles txid byte-order mismatch)
+        //   - β at height H where note was spent at height H → change (matches FIX #464 v3)
         let sql = """
             SELECT txid, block_height, block_time, tx_type, value, fee, to_address, memo, status, confirmations
             FROM transaction_history t1
@@ -4918,6 +4972,20 @@ final class WalletDatabase {
                     EXISTS (
                         SELECT 1 FROM notes n
                         WHERE n.spent_in_tx = t1.txid
+                    )
+                    OR
+                    -- FIX #1367: Height-based — α entry at same block height (handles txid format mismatch)
+                    EXISTS (
+                        SELECT 1 FROM transaction_history t2
+                        WHERE t2.block_height = t1.block_height
+                        AND t2.tx_type IN ('sent', 'α')
+                    )
+                    OR
+                    -- FIX #1367: Height-based — note spent at same block height (Zclassic logic)
+                    EXISTS (
+                        SELECT 1 FROM notes n
+                        WHERE n.is_spent = 1
+                        AND n.spent_height = t1.block_height
                     )
                 )
             )
@@ -4978,11 +5046,13 @@ final class WalletDatabase {
             let confirmations = Int(sqlite3_column_int(stmt, 9))
 
             let txidData = Data(bytes: txidPtr, count: Int(txidLen))
+            // FIX #1367: Detect self-send entries (to_address='self' marker)
+            let resolvedType: TransactionType = (txType == .sent && toAddress == "self") ? .selfSend : txType
             let item = TransactionHistoryItem(
                 txid: txidData,
                 height: height,
                 blockTime: blockTime,
-                type: txType,  // VUL-015: Use decrypted type
+                type: resolvedType,
                 value: value,
                 fee: fee,
                 toAddress: toAddress,
@@ -5201,15 +5271,20 @@ final class WalletDatabase {
             // Method 1: Direct txid match (original logic)
             var changeOutputs = allNotes.filter { $0.txid == spentTxid }
 
-            // Method 2: Height-based match for boost file notes (FIX #464 v3 parity)
-            // If a note was received at the same height where we spent, it's likely our change
-            if changeOutputs.isEmpty {
+            // Method 2: Height-based match (FIX #464 v3 parity)
+            // FIX #1367: ALWAYS run height-based check, not just when direct match is empty.
+            // When txid byte-order varies between notes, direct match may find PARTIAL change
+            // (e.g., 1 of 2 outputs), missing the rest → sent amount computed wrong.
+            // Height-based adds any unspent notes received at the spent height that aren't already found.
+            if txInfo.spentHeight > 0 {
                 let heightBasedChange = allNotes.filter {
                     !$0.isSpent && $0.receivedHeight == txInfo.spentHeight
                 }
-                if !heightBasedChange.isEmpty {
-                    changeOutputs = heightBasedChange
-                    print("📜 FIX #1125: Found \(heightBasedChange.count) change outputs by HEIGHT at \(txInfo.spentHeight)")
+                for note in heightBasedChange {
+                    if !changeOutputs.contains(where: { $0.txid == note.txid && $0.value == note.value }) {
+                        changeOutputs.append(note)
+                        print("📜 FIX #1367: Found additional change output by HEIGHT at \(txInfo.spentHeight): \(note.value) zatoshis")
+                    }
                 }
             }
 
@@ -5221,26 +5296,16 @@ final class WalletDatabase {
             // amountToRecipient = balance impact - fee (for display info)
             let amountToRecipient = totalBalanceImpact - fee
 
-            // FIX #464 v4: Skip SENT transactions where amountToRecipient is 0 or very small
-            // These are internal transactions (change consolidation, self-sends) that shouldn't appear in history
-            // If amountToRecipient <= 1000 zatoshis (0.00001 ZCL), it's essentially a change-only transaction
-            if amountToRecipient <= 1000 {
-                print("📜 FIX #464 v4: Skipping SENT txid=\(spentTxid.prefix(8).hexString)... - amountToRecipient=\(amountToRecipient) (change-only/self-send transaction)")
-                continue
+            // FIX #1367: Self-send detection — amountToRecipient <= 1000 means all outputs are change
+            let isSelfSend = amountToRecipient <= 1000
+            let displayValue = isSelfSend ? fee : UInt64(amountToRecipient)
+            let toAddressValue = isSelfSend ? "self" : nil
+
+            if isSelfSend {
+                print("📜 FIX #1367: Self-send txid=\(spentTxid.prefix(8).hexString)... - recording as self-send (fee only)")
+            } else {
+                print("📜 SENT: txid=\(spentTxid.prefix(8).hexString)..., input=\(txInfo.inputValue), change=\(totalChangeValue), fee=\(fee), toRecipient=\(amountToRecipient), balanceImpact=\(totalBalanceImpact)")
             }
-
-            // FIX #1125: Disable FIX #465's aggressive skip - it causes balance discrepancies!
-            // FIX #465 skipped SENT txs when recipientRatio > 95% AND totalChangeValue == 0
-            // But now with height-based change detection, totalChangeValue is usually found
-            // If still 0, it's better to record the SENT tx than skip it (prevents missing balance)
-            //
-            // OLD (broken):
-            // let recipientRatio = Double(amountToRecipient) / Double(txInfo.inputValue)
-            // if recipientRatio > 0.95 && totalChangeValue == 0 { continue }
-            //
-            // NEW: Always record SENT tx if amountToRecipient > 1000 (already checked above)
-
-            print("📜 SENT: txid=\(spentTxid.prefix(8).hexString)..., input=\(txInfo.inputValue), change=\(totalChangeValue), fee=\(fee), toRecipient=\(amountToRecipient), balanceImpact=\(totalBalanceImpact)")
 
             var spentStmt: OpaquePointer?
             // Use insertSentSql (INSERT OR IGNORE) - WalletManager already recorded correct amount
@@ -5265,12 +5330,15 @@ final class WalletDatabase {
             // This ensures UNIQUE(txid, tx_type) constraint works correctly
             let encryptedSentType = encryptTxType(.sent)
             sqlite3_bind_text(spentStmt, 4, encryptedSentType, -1, SQLITE_TRANSIENT)
-            // FIX #169: Store amountToRecipient (actual sent amount WITHOUT fee), not totalBalanceImpact
-            // The fee is stored separately in the fee column
-            // History display should show what was SENT TO RECIPIENT, not total balance decrease
-            sqlite3_bind_int64(spentStmt, 5, Int64(amountToRecipient))
+            // FIX #1367: Self-sends store fee as value; normal sends store amountToRecipient
+            sqlite3_bind_int64(spentStmt, 5, Int64(displayValue))
             sqlite3_bind_int64(spentStmt, 6, Int64(fee))
-            sqlite3_bind_null(spentStmt, 7)
+            // FIX #1367: Self-sends marked with to_address='self' for orange display
+            if let addr = toAddressValue {
+                sqlite3_bind_text(spentStmt, 7, addr, -1, SQLITE_TRANSIENT)
+            } else {
+                sqlite3_bind_null(spentStmt, 7)
+            }
             sqlite3_bind_null(spentStmt, 8)
             sqlite3_bind_null(spentStmt, 9)
 
@@ -6193,6 +6261,34 @@ final class WalletDatabase {
                 }
             }
 
+            // FIX #1367: Height-based fallback — if txid match fails (both formats),
+            // check if we spent notes at the same block height (Zclassic IsNoteSaplingChange logic)
+            if totalSpent == 0 {
+                let heightCheckSql = "SELECT SUM(value) FROM notes WHERE is_spent = 1 AND spent_height = ?;"
+                var heightStmt: OpaquePointer?
+                if sqlite3_prepare_v2(db, heightCheckSql, -1, &heightStmt, nil) == SQLITE_OK {
+                    sqlite3_bind_int64(heightStmt, 1, entry.blockHeight)
+                    if sqlite3_step(heightStmt) == SQLITE_ROW && sqlite3_column_type(heightStmt, 0) != SQLITE_NULL {
+                        totalSpent = sqlite3_column_int64(heightStmt, 0)
+                        if totalSpent > 0 {
+                            // Get the spent_in_tx from any note at that height for the sent entry
+                            let getTxidSql = "SELECT spent_in_tx FROM notes WHERE is_spent = 1 AND spent_height = ? AND spent_in_tx IS NOT NULL LIMIT 1;"
+                            var txidStmt: OpaquePointer?
+                            if sqlite3_prepare_v2(db, getTxidSql, -1, &txidStmt, nil) == SQLITE_OK {
+                                sqlite3_bind_int64(txidStmt, 1, entry.blockHeight)
+                                if sqlite3_step(txidStmt) == SQLITE_ROW, let blob = sqlite3_column_blob(txidStmt, 0) {
+                                    let len = sqlite3_column_bytes(txidStmt, 0)
+                                    matchedTxid = Data(bytes: blob, count: Int(len))
+                                }
+                                sqlite3_finalize(txidStmt)
+                            }
+                            print("🔄 FIX #1367: Found change by HEIGHT match at block \(entry.blockHeight)")
+                        }
+                    }
+                    sqlite3_finalize(heightStmt)
+                }
+            }
+
             if totalSpent > 0 {
                 mislabeledTxs.append(MislabeledTx(
                     txid: entry.txid,
@@ -6310,6 +6406,143 @@ final class WalletDatabase {
         }
 
         return cleanedCount
+    }
+
+    /// FIX #1367: Correct sent (α) entries where the value includes missed change outputs.
+    /// Root cause: populateHistoryFromNotes() FIX #1125 only ran height-based change detection
+    /// when direct txid match found ZERO change outputs. With partial match (1 of 2 found),
+    /// the missed change was counted as "sent to recipient" — inflating the α value.
+    /// Detection: For each α entry, recalculate: correctSent = totalSpentNotes - allChangeAtHeight - fee
+    /// If correctSent != stored value, update it.
+    func correctMiscomputedSentAmounts() throws -> Int {
+        guard let db = db else { throw DatabaseError.notOpened }
+
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        let fee: UInt64 = 10_000
+
+        // Get all sent entries
+        let getSentSql = """
+            SELECT rowid, txid, block_height, value
+            FROM transaction_history
+            WHERE tx_type IN ('sent', 'α') AND block_height > 0;
+        """
+
+        struct SentEntry {
+            let rowid: Int64
+            let txid: Data
+            let blockHeight: UInt64
+            let storedValue: UInt64
+        }
+        var sentEntries: [SentEntry] = []
+
+        var sentStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, getSentSql, -1, &sentStmt, nil) == SQLITE_OK else { return 0 }
+        while sqlite3_step(sentStmt) == SQLITE_ROW {
+            let rowid = sqlite3_column_int64(sentStmt, 0)
+            if let blob = sqlite3_column_blob(sentStmt, 1) {
+                let len = sqlite3_column_bytes(sentStmt, 1)
+                let txid = Data(bytes: blob, count: Int(len))
+                let h = UInt64(sqlite3_column_int64(sentStmt, 2))
+                let v = UInt64(sqlite3_column_int64(sentStmt, 3))
+                sentEntries.append(SentEntry(rowid: rowid, txid: txid, blockHeight: h, storedValue: v))
+            }
+        }
+        sqlite3_finalize(sentStmt)
+
+        var correctedCount = 0
+
+        for entry in sentEntries {
+            // Get total input: sum of notes spent in this TX (check both txid formats)
+            var totalInput: UInt64 = 0
+            var spentHeight: UInt64 = 0
+            let inputSql = "SELECT SUM(value), MAX(spent_height) FROM notes WHERE is_spent = 1 AND spent_in_tx = ?;"
+            var inputStmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, inputSql, -1, &inputStmt, nil) == SQLITE_OK {
+                _ = entry.txid.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(inputStmt, 1, ptr.baseAddress, Int32(entry.txid.count), SQLITE_TRANSIENT)
+                }
+                if sqlite3_step(inputStmt) == SQLITE_ROW && sqlite3_column_type(inputStmt, 0) != SQLITE_NULL {
+                    totalInput = UInt64(sqlite3_column_int64(inputStmt, 0))
+                    spentHeight = UInt64(sqlite3_column_int64(inputStmt, 1))
+                }
+                sqlite3_finalize(inputStmt)
+            }
+
+            // Try reversed txid if no match
+            if totalInput == 0 && entry.txid.count == 32 {
+                let reversed = Data(entry.txid.reversed())
+                var inputStmt2: OpaquePointer?
+                if sqlite3_prepare_v2(db, inputSql, -1, &inputStmt2, nil) == SQLITE_OK {
+                    _ = reversed.withUnsafeBytes { ptr in
+                        sqlite3_bind_blob(inputStmt2, 1, ptr.baseAddress, Int32(reversed.count), SQLITE_TRANSIENT)
+                    }
+                    if sqlite3_step(inputStmt2) == SQLITE_ROW && sqlite3_column_type(inputStmt2, 0) != SQLITE_NULL {
+                        totalInput = UInt64(sqlite3_column_int64(inputStmt2, 0))
+                        spentHeight = UInt64(sqlite3_column_int64(inputStmt2, 1))
+                    }
+                    sqlite3_finalize(inputStmt2)
+                }
+            }
+
+            guard totalInput > 0 else { continue }
+
+            // Get ALL change: unspent notes received at the same height (Zclassic IsNoteSaplingChange)
+            let height = spentHeight > 0 ? spentHeight : entry.blockHeight
+            let changeSql = "SELECT COALESCE(SUM(value), 0) FROM notes WHERE is_spent = 0 AND received_height = ?;"
+            var totalChange: UInt64 = 0
+            var changeStmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, changeSql, -1, &changeStmt, nil) == SQLITE_OK {
+                sqlite3_bind_int64(changeStmt, 1, Int64(height))
+                if sqlite3_step(changeStmt) == SQLITE_ROW {
+                    totalChange = UInt64(sqlite3_column_int64(changeStmt, 0))
+                }
+                sqlite3_finalize(changeStmt)
+            }
+
+            guard totalChange > 0 else { continue }
+
+            // Correct amount: input - all change - fee
+            let correctSent = totalInput > (totalChange + fee) ? totalInput - totalChange - fee : 0
+            guard correctSent != entry.storedValue else { continue }
+
+            if correctSent <= 1000 {
+                // FIX #1367: Self-send — mark with to_address='self' and value=fee for orange display
+                // All outputs are change, only the network fee was spent
+                let updateSql = "UPDATE transaction_history SET value = ?, to_address = 'self' WHERE rowid = ?;"
+                var updateStmt: OpaquePointer?
+                if sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK {
+                    sqlite3_bind_int64(updateStmt, 1, Int64(fee))
+                    sqlite3_bind_int64(updateStmt, 2, entry.rowid)
+                    if sqlite3_step(updateStmt) == SQLITE_DONE && sqlite3_changes(db) > 0 {
+                        let oldZCL = String(format: "%.8f", Double(entry.storedValue) / 100_000_000.0)
+                        print("🔧 FIX #1367: Marked self-send α entry at h=\(entry.blockHeight): was \(oldZCL) ZCL → fee only (all outputs are change)")
+                        correctedCount += 1
+                    }
+                    sqlite3_finalize(updateStmt)
+                }
+            } else {
+                // Update the entry with correct sent amount
+                let updateSql = "UPDATE transaction_history SET value = ? WHERE rowid = ?;"
+                var updateStmt: OpaquePointer?
+                if sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK {
+                    sqlite3_bind_int64(updateStmt, 1, Int64(correctSent))
+                    sqlite3_bind_int64(updateStmt, 2, entry.rowid)
+                    if sqlite3_step(updateStmt) == SQLITE_DONE && sqlite3_changes(db) > 0 {
+                        let oldZCL = String(format: "%.8f", Double(entry.storedValue) / 100_000_000.0)
+                        let newZCL = String(format: "%.8f", Double(correctSent) / 100_000_000.0)
+                        print("🔧 FIX #1367: Corrected sent amount at h=\(entry.blockHeight): \(oldZCL) → \(newZCL) ZCL (was missing \(totalChange) zatoshis change)")
+                        correctedCount += 1
+                    }
+                    sqlite3_finalize(updateStmt)
+                }
+            }
+        }
+
+        if correctedCount > 0 {
+            print("✅ FIX #1367: Corrected \(correctedCount) sent transaction(s) with miscomputed amounts")
+        }
+
+        return correctedCount
     }
 
     /// FIX #851: Delete mislabeled "received" transactions that are actually change outputs from our pending TXs
@@ -7531,6 +7764,7 @@ enum TransactionType: String {
     case sent = "sent"
     case received = "received"
     case change = "change"
+    case selfSend = "self-send"  // FIX #1367: Self-send TX (all outputs are change, only fee spent)
 }
 
 /// Transaction confirmation status

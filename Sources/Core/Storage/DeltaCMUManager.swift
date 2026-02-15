@@ -150,10 +150,10 @@ class DeltaCMUManager {
             guard data.count >= offset + DeltaCMUManager.OUTPUT_SIZE else { return nil }
 
             let height = data.subdata(in: offset..<(offset + 4)).withUnsafeBytes {
-                $0.load(as: UInt32.self).littleEndian
+                $0.loadUnaligned(as: UInt32.self).littleEndian
             }
             let index = data.subdata(in: (offset + 4)..<(offset + 8)).withUnsafeBytes {
-                $0.load(as: UInt32.self).littleEndian
+                $0.loadUnaligned(as: UInt32.self).littleEndian
             }
             let cmu = data.subdata(in: (offset + 8)..<(offset + 40))
             let epk = data.subdata(in: (offset + 40)..<(offset + 72))
@@ -186,7 +186,7 @@ class DeltaCMUManager {
         static func parse(from data: Data, at offset: Int) -> DeltaNullifier? {
             guard data.count >= offset + DeltaCMUManager.NULLIFIER_RECORD_SIZE else { return nil }
             let height = data.subdata(in: offset..<(offset + 4)).withUnsafeBytes {
-                $0.load(as: UInt32.self).littleEndian
+                $0.loadUnaligned(as: UInt32.self).littleEndian
             }
             let txid = data.subdata(in: (offset + 4)..<(offset + 36))
             let nullifier = data.subdata(in: (offset + 36)..<(offset + 68))
@@ -282,10 +282,10 @@ class DeltaCMUManager {
             let offset = i * Self.OUTPUT_SIZE
             // Parse height (bytes 0-4) and index (bytes 4-8)
             let height = rawData.subdata(in: offset..<(offset + 4)).withUnsafeBytes {
-                $0.load(as: UInt32.self).littleEndian
+                $0.loadUnaligned(as: UInt32.self).littleEndian
             }
             let index = rawData.subdata(in: (offset + 4)..<(offset + 8)).withUnsafeBytes {
-                $0.load(as: UInt32.self).littleEndian
+                $0.loadUnaligned(as: UInt32.self).littleEndian
             }
 
             // FIX #785: Skip duplicates - same (height, index) means same CMU
@@ -335,13 +335,13 @@ class DeltaCMUManager {
             let offset = i * Self.OUTPUT_SIZE
             // Parse height (bytes 0-4) and index (bytes 4-8)
             let height = rawData.subdata(in: offset..<(offset + 4)).withUnsafeBytes {
-                $0.load(as: UInt32.self).littleEndian
+                $0.loadUnaligned(as: UInt32.self).littleEndian
             }
 
             // Only include outputs in our height range
             if UInt64(height) >= startHeight && UInt64(height) <= endHeight {
                 let index = rawData.subdata(in: (offset + 4)..<(offset + 8)).withUnsafeBytes {
-                    $0.load(as: UInt32.self).littleEndian
+                    $0.loadUnaligned(as: UInt32.self).littleEndian
                 }
 
                 // FIX #785: Skip duplicates - same (height, index) means same CMU

@@ -1624,6 +1624,18 @@ final class WalletManager: ObservableObject {
             print("⚠️ FIX #852: Failed to auto-clean mislabeled change outputs: \(error)")
         }
 
+        // FIX #1367: Correct sent entries where amount includes missed change outputs
+        // populateHistoryFromNotes() FIX #1125 only ran height-based change detection when direct
+        // match found ZERO outputs. With partial match (1 of 2), missed change inflated sent value.
+        do {
+            let corrected = try WalletDatabase.shared.correctMiscomputedSentAmounts()
+            if corrected > 0 {
+                print("🔧 FIX #1367: Corrected \(corrected) sent transaction(s) with wrong amounts")
+            }
+        } catch {
+            print("⚠️ FIX #1367: Failed to correct sent amounts: \(error)")
+        }
+
         // FIX #851: Also clean based on persisted pending txids (for TXs sent after FIX #849)
         let pendingTxids = UserDefaults.standard.stringArray(forKey: "ZipherX_PendingOutgoingTxids") ?? []
         if !pendingTxids.isEmpty {
@@ -1911,6 +1923,130 @@ final class WalletManager: ObservableObject {
         }
     }
 
+    /// FIX #1366b: Discover undiscovered delta outputs at startup by comparing delta CMUs
+    /// against known notes. Trial-decrypts unknowns with spending key. If any decrypt → missing
+    /// note found → lower lastScannedHeight so FilterScanner rescans and properly inserts them.
+    ///
+    /// This catches missing change outputs even when no broadcast history or pending txids exist.
+    /// Performance: O(n) Set lookup over delta outputs (~200-2000), trial decryption only for
+    /// candidates (usually 0, at most 2-3 in crash scenario). Total: <100ms.
+    private func discoverMissingDeltaOutputsAtStartup(spendingKey: Data) {
+        let knownCMUs = WalletDatabase.shared.getAllKnownCMUs()
+        guard !knownCMUs.isEmpty else {
+            // No notes at all — nothing to compare against (fresh wallet)
+            return
+        }
+
+        let boostCMUCount = UInt64(UserDefaults.standard.integer(forKey: "BoostOutputCount"))
+        guard let deltaOutputs = DeltaCMUManager.shared.getOutputsForParallelDecryption(startGlobalPosition: boostCMUCount),
+              !deltaOutputs.isEmpty else {
+            return
+        }
+
+        // Find delta CMUs not in our notes table
+        var candidates: [(epk: Data, cmu: Data, ciphertext: Data, height: UInt32)] = []
+        for output in deltaOutputs {
+            if !knownCMUs.contains(output.cmu) {
+                candidates.append((epk: output.epk, cmu: output.cmu, ciphertext: output.ciphertext, height: output.height))
+            }
+        }
+
+        // Most startups: 0 candidates (all outputs are known or belong to others)
+        guard !candidates.isEmpty else { return }
+
+        // Trial-decrypt candidates with our spending key
+        var discoveredCount = 0
+        for candidate in candidates {
+            // Skip outputs with zeroed EPK/ciphertext (FIX #1311 fallback entries)
+            guard candidate.epk != Data(count: 32),
+                  candidate.ciphertext.count >= 580 else { continue }
+
+            if let _ = ZipherXFFI.tryDecryptNoteWithSK(
+                spendingKey: spendingKey,
+                epk: candidate.epk,
+                cmu: candidate.cmu,
+                ciphertext: candidate.ciphertext
+            ) {
+                discoveredCount += 1
+                print("⚠️ FIX #1366b: Undiscovered note found! CMU=\(candidate.cmu.prefix(8).map { String(format: "%02x", $0) }.joined())... height=\(candidate.height)")
+            }
+        }
+
+        if discoveredCount > 0 {
+            print("⚠️ FIX #1366b: Found \(discoveredCount) undiscovered note(s) in delta — lowering lastScannedHeight for rescan")
+            if let currentScanned = try? WalletDatabase.shared.getLastScannedHeight(), currentScanned > 100 {
+                let rescanFrom = currentScanned - 100
+                try? WalletDatabase.shared.resetLastScannedHeightForRecovery(rescanFrom)
+                print("⚠️ FIX #1366b: lastScannedHeight lowered from \(currentScanned) to \(rescanFrom)")
+            }
+        } else {
+            print("✅ FIX #1366b: All delta outputs accounted for (\(deltaOutputs.count) outputs, \(candidates.count) unknown, 0 ours)")
+        }
+    }
+
+    /// FIX #1366: Check broadcast history for confirmed TXs missing from transaction_history.
+    /// This catches the case where FIX #970 already removed the TX from pending (crash recovery).
+    /// Uses separate `ZipherX_BroadcastHistory` which survives FIX #970 cleanup.
+    func checkBroadcastHistoryForMissingTxs() async {
+        let broadcastHistory = UserDefaults.standard.stringArray(forKey: "ZipherX_BroadcastHistory") ?? []
+        guard !broadcastHistory.isEmpty else { return }
+
+        var missingCount = 0
+        var confirmedAndRecorded: [String] = []
+
+        for txid in broadcastHistory {
+            guard let txidData = Data(hexString: txid) else { continue }
+            let txidWire = Data(txidData.reversed())
+
+            let inHistory = (try? WalletDatabase.shared.transactionExistsInHistory(txid: txidWire)) ?? false
+            if inHistory {
+                confirmedAndRecorded.append(txid)
+            } else {
+                // TX was broadcast but not in history — check if confirmed on chain
+                let confirmed = await verifyTxConfirmedOnChain(txid: txid)
+                if confirmed == true {
+                    print("⚠️ FIX #1366: Broadcast TX \(txid.prefix(16))... confirmed on chain but NOT in history — needs rescan")
+                    missingCount += 1
+                } else if confirmed == false {
+                    // TX rejected/never mined — safe to remove from history
+                    confirmedAndRecorded.append(txid)
+                }
+                // nil = unable to verify — keep for next check
+            }
+        }
+
+        // Clean confirmed+recorded TXs from broadcast history
+        if !confirmedAndRecorded.isEmpty {
+            var updated = broadcastHistory.filter { !confirmedAndRecorded.contains($0) }
+            if updated.count > 20 { updated = Array(updated.suffix(20)) }
+            UserDefaults.standard.set(updated, forKey: "ZipherX_BroadcastHistory")
+        }
+
+        // Trigger rescan if any confirmed TXs are missing from history
+        if missingCount > 0 {
+            if let currentScanned = try? WalletDatabase.shared.getLastScannedHeight(), currentScanned > 100 {
+                let rescanFrom = currentScanned - 100
+                try? WalletDatabase.shared.resetLastScannedHeightForRecovery(rescanFrom)
+                print("⚠️ FIX #1366: Lowered lastScannedHeight by 100 blocks — FilterScanner will rescan for \(missingCount) missing TX change outputs")
+
+                // Re-add missing TXs to pending set so FilterScanner's FIX #859 path
+                // calls confirmOutgoingTx when it finds the nullifier during rescan.
+                // Without this, PHASE 2 skips the TX because it's not in pending.
+                for txid in broadcastHistory {
+                    guard let txidData = Data(hexString: txid) else { continue }
+                    let txidWire = Data(txidData.reversed())
+                    let inHistory = (try? WalletDatabase.shared.transactionExistsInHistory(txid: txidWire)) ?? false
+                    if !inHistory {
+                        await MainActor.run {
+                            NetworkManager.shared.addToPendingOutgoingSet(txid: txid)
+                        }
+                        print("⚠️ FIX #1366: Re-added \(txid.prefix(16))... to pending set for rescan discovery")
+                    }
+                }
+            }
+        }
+    }
+
     /// FIX #965: Detect and record missing sent transactions at startup
     /// Problem: TX was broadcast, VUL-002 showed error (TCP desync), but TX actually confirmed
     /// The TX was never recorded to database because confirmOutgoingTx couldn't find it
@@ -1961,10 +2097,17 @@ final class WalletManager: ObservableObject {
         print("   These transactions were broadcast but never recorded (likely VUL-002 error)")
         print("   They will be recorded when next detected in a block scan")
 
-        // For missing txids, we can't record them without knowing the block height
-        // The FilterScanner will detect them when scanning and trigger confirmOutgoingTx
-        // With FIX #964, confirmOutgoingTx will now properly record them
-        // But we can try to trigger a quick scan of recent blocks to find them
+        // FIX #1366: Ensure missing txids are in broadcast history.
+        // If FIX #970 removes them from pending before discovery, broadcast history
+        // ensures checkBroadcastHistoryForMissingTxs catches them on next startup.
+        var broadcastHistory = UserDefaults.standard.stringArray(forKey: "ZipherX_BroadcastHistory") ?? []
+        for txid in missingTxids {
+            if !broadcastHistory.contains(txid) {
+                broadcastHistory.append(txid)
+            }
+        }
+        if broadcastHistory.count > 20 { broadcastHistory = Array(broadcastHistory.suffix(20)) }
+        UserDefaults.standard.set(broadcastHistory, forKey: "ZipherX_BroadcastHistory")
 
         // Schedule a background check for these missing transactions
         Task {
@@ -2027,6 +2170,7 @@ final class WalletManager: ObservableObject {
     /// Also deletes phantom entries from transaction_history that were never confirmed on blockchain
     private func cleanOrphanedPendingTxids(txids: [String]) async {
         var orphanedCount = 0
+        var needsRescan = false  // FIX #1366: Track if we need to rescan for missing change outputs
 
         for txid in txids {
             // Convert display format txid to wire format for database lookup
@@ -2039,13 +2183,26 @@ final class WalletManager: ObservableObject {
 
             switch verificationResult {
             case .some(true):
-                // TX is confirmed - remove from pending tracking (it's done)
-                print("✅ FIX #970: TX \(txid.prefix(16))... is confirmed - removing from pending")
-                await MainActor.run {
-                    NetworkManager.shared.removePendingTxidFromPersistence(txid)
-                    NetworkManager.shared.removeFromPendingOutgoingSet(txid: txid)
+                // TX is confirmed on chain
+                // FIX #1366: Check if TX is actually in transaction_history.
+                // If NOT, the app crashed between broadcast and block confirmation.
+                // Change outputs were never discovered. DON'T remove from pending —
+                // lower lastScannedHeight to force FilterScanner rescan.
+                let inHistory = (try? WalletDatabase.shared.transactionExistsInHistory(txid: txidWireFormat)) ?? false
+                if inHistory {
+                    // TX confirmed AND in history - safe to remove
+                    print("✅ FIX #970: TX \(txid.prefix(16))... is confirmed - removing from pending")
+                    await MainActor.run {
+                        NetworkManager.shared.removePendingTxidFromPersistence(txid)
+                        NetworkManager.shared.removeFromPendingOutgoingSet(txid: txid)
+                    }
+                    _ = await NetworkManager.shared.removeFromActorTracking(txid: txid)
+                } else {
+                    // FIX #1366: TX confirmed but NOT in history — needs rescan for change outputs
+                    print("⚠️ FIX #1366: TX \(txid.prefix(16))... confirmed on chain but NOT in history — scheduling rescan")
+                    needsRescan = true
+                    // Keep in pending — will be cleaned up after rescan discovers it
                 }
-                _ = await NetworkManager.shared.removeFromActorTracking(txid: txid)
 
             case .some(false):
                 // TX definitely doesn't exist - it was rejected. Clean up everything.
@@ -2083,6 +2240,17 @@ final class WalletManager: ObservableObject {
                 // FIX #888: Unable to verify (network issues) - DO NOT DELETE!
                 // Keep the TX in pending, will check again later when network is available
                 print("⚠️ FIX #888: TX \(txid.prefix(16))... unable to verify - keeping in pending (network unavailable)")
+            }
+        }
+
+        // FIX #1366: If any confirmed TX is missing from history, lower lastScannedHeight
+        // to force FilterScanner to rescan recent blocks and discover change outputs.
+        // This handles crash-between-broadcast-and-confirmation recovery.
+        if needsRescan {
+            if let currentScanned = try? WalletDatabase.shared.getLastScannedHeight(), currentScanned > 100 {
+                let rescanFrom = currentScanned - 100
+                try? WalletDatabase.shared.resetLastScannedHeightForRecovery(rescanFrom)
+                print("⚠️ FIX #1366: Lowered lastScannedHeight by 100 blocks — FilterScanner will rescan to discover change outputs")
             }
         }
 
@@ -2143,6 +2311,11 @@ final class WalletManager: ObservableObject {
         }
         // Also check database for phantom transactions
         await cleanPendingTransactionsFromDatabase()
+
+        // FIX #1366: Check broadcast history for confirmed TXs missing from history.
+        // This catches crash-between-broadcast-and-confirmation — even after FIX #970
+        // already cleaned up pending txids, broadcast history persists separately.
+        await checkBroadcastHistoryForMissingTxs()
     }
 
     /// FIX #970 v3: Clean up phantom transactions from database
@@ -2400,6 +2573,26 @@ final class WalletManager: ObservableObject {
             // FIX #965: Detect sent transactions that were broadcast but never recorded
             // This handles: VUL-002 showed error (TCP desync), but TX actually confirmed
             detectMissingSentTransactionsAtStartup()
+
+            // FIX #1366: Check broadcast history for confirmed TXs not in transaction_history.
+            // This catches crash-between-broadcast-and-confirmation even after FIX #970
+            // already cleaned pending txids. Needs peers, so runs in background.
+            Task {
+                // Wait for network to be ready (peers needed for P2P verification)
+                var attempts1366 = 0
+                while await MainActor.run(body: { NetworkManager.shared.connectedPeers }) < 1 && attempts1366 < 30 {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    attempts1366 += 1
+                }
+                await self.checkBroadcastHistoryForMissingTxs()
+            }
+
+            // FIX #1366b: Automatic discovery of undiscovered delta outputs at startup.
+            // Compare delta CMUs against known notes — trial-decrypt any unknown ones.
+            // If any decrypt with our key → missing note → lower lastScannedHeight for rescan.
+            // This catches missing change outputs even when no broadcast history exists.
+            // Fast: delta on disk, Set lookup O(1), usually 0 candidates to decrypt.
+            discoverMissingDeltaOutputsAtStartup(spendingKey: spendingKey)
         } catch {
             print("⚠️ Failed to open database for tree preload: \(error)")
             return
@@ -5963,34 +6156,63 @@ final class WalletManager: ObservableObject {
                     print("✅ FIX #805: Step 2b - Witnesses already current (no update needed)")
                 }
 
-                // FIX #1292: Create fresh witnesses when delta sync grew tree without updating witnesses
+                // FIX #1292 + FIX #1361: Create fresh witnesses when delta sync grew tree without updating witnesses.
                 // This happens when syncDeltaBundleIfNeeded appends CMUs to tree+delta but witnesses
                 // in DB were saved at the previous tree size. FIX #1281's size guard says "skip" but
                 // witnesses are actually 1+ CMUs behind → root mismatch → FIX #1280 NULLs all.
-                // Fix: create fresh witnesses from the current (correct) FFI tree state.
+                //
+                // FIX #1361: Original FIX #1292 passed treeSerialize() (binary merkle tree) to
+                // treeCreateWitnessForPosition() which expects bundled CMU format [u64 count][cmu1: 32]...
+                // This format mismatch caused ALL witness creations to fail (0/N created).
+                // Fix: Use treeCreateWitnessesBatch with correct boost + delta CMU data.
                 if needFreshWitnesses && !witnessIndices.isEmpty {
-                    if let treeData = ZipherXFFI.treeSerialize() {
-                        print("🔧 FIX #1292: Creating \(witnessIndices.count) fresh witnesses from correct tree...")
+                    let batchStart = CFAbsoluteTimeGetCurrent()
+                    // Collect target CMUs from notes
+                    let targetCMUs = witnessIndices.compactMap { $0.note.cmu }
+                    if targetCMUs.isEmpty {
+                        print("⚠️ FIX #1361: No CMUs found in notes — witnesses will be rebuilt by FIX #1280")
+                    // Get boost CMU data from FastWalletCache (already in memory, ~33MB)
+                    } else if let boostCMUData = await FastWalletCache.shared.getTreeData(), boostCMUData.count >= 8 {
+                        let boostCMUCount = boostCMUData.prefix(8).withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
+                        let localDeltaCMUs = DeltaCMUManager.shared.loadDeltaCMUs() ?? []
+                        let totalCount = boostCMUCount + UInt64(localDeltaCMUs.count)
+
+                        // Build combined CMU data in bundled format: [count: u64][cmu1: 32]...[cmuN: 32]
+                        var combinedCMUData = Data(capacity: 8 + Int(totalCount) * 32)
+                        var count = totalCount
+                        withUnsafeBytes(of: &count) { combinedCMUData.append(contentsOf: $0) }
+                        combinedCMUData.append(boostCMUData.suffix(from: 8))
+                        for cmu in localDeltaCMUs { combinedCMUData.append(cmu) }
+
+                        print("🔧 FIX #1361: Creating \(targetCMUs.count) fresh witnesses via batch (boost:\(boostCMUCount) + delta:\(localDeltaCMUs.count) = \(totalCount) CMUs)...")
+
+                        let batchResults = ZipherXFFI.treeCreateWitnessesBatch(cmuData: combinedCMUData, targetCMUs: targetCMUs)
+
+                        // Map batch results back to witnessIndices
                         var freshCount = 0
                         var updatedIndices: [(note: WalletNote, position: UInt64)] = []
+                        // treeCreateWitnessesBatch returns results in same order as targetCMUs,
+                        // but witnessIndices may have notes WITHOUT cmu (filtered by compactMap).
+                        // Build a CMU→result lookup.
+                        var cmuResultMap: [Data: (position: UInt64, witness: Data)] = [:]
+                        for (i, result) in batchResults.enumerated() {
+                            if let res = result, i < targetCMUs.count {
+                                cmuResultMap[targetCMUs[i]] = res
+                            }
+                        }
+
                         for (note, arrayIndex) in witnessIndices {
-                            let treePosition = ZipherXFFI.witnessGetTreePosition(witnessIndex: arrayIndex)
-                            if treePosition != UInt64.max {
-                                if let result = ZipherXFFI.treeCreateWitnessForPosition(treeData: treeData, position: treePosition) {
-                                    // Load the fresh witness back into FFI — gets new array index
-                                    let newIdx = result.witness.withUnsafeBytes { ptr in
-                                        ZipherXFFI.treeLoadWitness(
-                                            witnessData: ptr.baseAddress!.assumingMemoryBound(to: UInt8.self),
-                                            witnessLen: result.witness.count
-                                        )
-                                    }
-                                    if newIdx != UInt64.max {
-                                        freshCount += 1
-                                        // Use NEW array index so Step 3 extracts the fresh witness
-                                        updatedIndices.append((note: note, position: newIdx))
-                                    } else {
-                                        updatedIndices.append((note: note, position: arrayIndex))
-                                    }
+                            if let cmu = note.cmu, let res = cmuResultMap[cmu] {
+                                // Load fresh witness into FFI — gets new array index
+                                let newIdx = res.witness.withUnsafeBytes { ptr in
+                                    ZipherXFFI.treeLoadWitness(
+                                        witnessData: ptr.baseAddress!.assumingMemoryBound(to: UInt8.self),
+                                        witnessLen: res.witness.count
+                                    )
+                                }
+                                if newIdx != UInt64.max {
+                                    freshCount += 1
+                                    updatedIndices.append((note: note, position: newIdx))
                                 } else {
                                     updatedIndices.append((note: note, position: arrayIndex))
                                 }
@@ -5998,11 +6220,12 @@ final class WalletManager: ObservableObject {
                                 updatedIndices.append((note: note, position: arrayIndex))
                             }
                         }
-                        // Replace witnessIndices so Step 3 extracts fresh witnesses
+
                         witnessIndices = updatedIndices
-                        print("✅ FIX #1292: Created \(freshCount)/\(witnessIndices.count) fresh witnesses")
+                        let batchElapsed = CFAbsoluteTimeGetCurrent() - batchStart
+                        print("✅ FIX #1361: Created \(freshCount)/\(witnessIndices.count) fresh witnesses (\(String(format: "%.1f", batchElapsed))s)")
                     } else {
-                        print("⚠️ FIX #1292: Could not serialize tree — witnesses will be rebuilt by FIX #1280")
+                        print("⚠️ FIX #1361: No boost CMU cache available — witnesses will be rebuilt by FIX #1280")
                     }
                 }
 
@@ -9150,7 +9373,7 @@ final class WalletManager: ObservableObject {
 
                     // Append delta CMUs to the boost CMU data
                     // Format: [count: UInt64 LE][cmu1: 32 bytes][cmu2: 32 bytes]...
-                    let boostCount = cmuData.prefix(8).withUnsafeBytes { $0.load(as: UInt64.self) }
+                    let boostCount = cmuData.prefix(8).withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
                     let newCount = boostCount + UInt64(deltaCMUs.count)
 
                     // Update count in header
@@ -9176,7 +9399,7 @@ final class WalletManager: ObservableObject {
                         print("   ✅ FIX #1142: Loaded \(diskDeltaCMUs.count) delta CMUs from disk bundle")
 
                         // Append disk delta CMUs to the boost CMU data
-                        let boostCount = cmuData.prefix(8).withUnsafeBytes { $0.load(as: UInt64.self) }
+                        let boostCount = cmuData.prefix(8).withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
                         let newCount = boostCount + UInt64(diskDeltaCMUs.count)
 
                         // Update count in header
@@ -9367,7 +9590,7 @@ final class WalletManager: ObservableObject {
                 print("   ❌ Invalid boost CMU data")
                 return 0
             }
-            let boostCMUCount = boostCMUData.prefix(8).withUnsafeBytes { $0.load(as: UInt64.self) }
+            let boostCMUCount = boostCMUData.prefix(8).withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
             if verbose {
                 print("   📊 Boost file has \(boostCMUCount) CMUs (up to position \(boostCMUCount - 1))")
             }

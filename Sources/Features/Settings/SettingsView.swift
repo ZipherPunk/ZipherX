@@ -208,6 +208,7 @@ struct SettingsView: View {
             .onAppear {
                 checkBiometricAvailability()
                 networkManager.updatePeerCountsForSettings()
+                loadTrustedPeersCount()  // FIX #1367: Show correct count immediately
             }
             // Sheets
             .sheet(isPresented: $showPINSetup) {
@@ -224,10 +225,24 @@ struct SettingsView: View {
             }
             // Export & error alerts
             .alert("Export Private Key", isPresented: $showExportAlert) {
-                Button("Copy to Clipboard") { copyToClipboard(exportedKey) }
-                Button("Cancel", role: .cancel) {}
+                Button("Copy Full Key") {
+                    // FIX #1360: TASK 6 — Auto-clear after 10 seconds for private keys
+                    ClipboardManager.copyWithAutoExpiry(exportedKey, seconds: 10)
+                }
+                Button("Cancel", role: .cancel) {
+                    // FIX #1360: TASK 6 — Clear sensitive data on dismissal
+                    exportedKey = ""
+                }
             } message: {
-                Text("Your private key:\n\n\(exportedKey)\n\nKeep this safe! Anyone with this key can spend your funds.")
+                // FIX #1360: TASK 6 — Show truncated key in alert, not full key
+                let displayKey = String(exportedKey.prefix(8)) + "..." + String(exportedKey.suffix(8))
+                Text("Your private key:\n\n\(displayKey)\n\nKeep this safe! Anyone with this key can spend your funds.")
+            }
+            .onDisappear {
+                // FIX #1360: TASK 6 — Clear sensitive data when alert is dismissed
+                if !showExportAlert {
+                    exportedKey = ""
+                }
             }
             .alert("Error", isPresented: $showError) {
                 Button("OK", role: .cancel) {}
@@ -289,11 +304,11 @@ struct SettingsView: View {
             } message: {
                 Text("⚠️ PRIVACY NOTICE ⚠️\n\nTor will be TEMPORARILY DISABLED during repair for faster P2P scanning. Your IP will be visible to blockchain peers during this operation.\n\n━━━━━━━━━━━━━━━━━━━━━━\n\nThis repairs database corruption by:\n• Re-scanning blockchain for spent notes\n• Clearing ALL block headers (fixes timestamps)\n• Reloading commitment tree from boost file\n• Recalculating nullifiers for all notes\n• Clearing and rebuilding delta bundle\n\nUse this if:\n• Balance shows wrong amount\n• Notes marked unspent but are spent\n• Transaction dates show NO DATE\n\nThis will take 5-15 minutes.\nTor will be restored after completion.\n\nDo you want to continue?")
             }
-            .alert("FULL RESYNC", isPresented: $showFullResyncWarning) {
+            .alert("Verify & Repair Wallet", isPresented: $showFullResyncWarning) {
                 Button("Cancel", role: .cancel) {}
-                Button("FULL RESYNC (Tor disabled)", role: .destructive) { startFullResync() }
+                Button("Verify & Repair", role: .destructive) { startFullResync() }
             } message: {
-                Text("🔴 NUCLEAR OPTION 🔴\n\nThis performs a COMPLETE blockchain rescan:\n\n• DELETES all notes from database\n• DELETES all transaction history\n• Clears ALL cached data\n• Re-downloads boost file from GitHub\n• Rescans ENTIRE blockchain from Sapling activation\n\nThis is the same as importing a private key - everything is rebuilt from scratch.\n\n⚠️ Tor will be disabled during resync\n⚠️ Takes 10-30 minutes\n⚠️ Uses significant data/bandwidth\n\nUse ONLY if regular Repair doesn't fix balance.\n\nContinue?")
+                Text("This will verify your wallet and repair any issues:\n\n• Rebuilds all notes from blockchain\n• Rebuilds transaction history\n• Re-downloads boost file from GitHub\n• Rescans entire blockchain\n\n⚠️ Tor will be disabled during repair\n⚠️ Uses significant data/bandwidth\n\nContinue?")
             }
             // Scan & rebuild alerts
             .alert("Scan for Unrecorded TX", isPresented: $showScanUnrecordedWarning) {
@@ -420,31 +435,12 @@ struct SettingsView: View {
                     .stroke(theme.primaryColor.opacity(0.5), lineWidth: 1)
             )
 
-            // Full Node specific options
+            // FIX #1367: Unified mode picker — always visible, "P2P" and "Full Node" labels
+            walletSourcePicker(modeManager: modeManager)
+
+            // Full Node specific options (daemon status, debug level, node management)
             if modeManager.currentMode == .fullNode {
-                // Full node status
                 fullNodeStatusView(modeManager: modeManager)
-            } else {
-                // Switch to Full Node button
-                Button(action: {
-                    showModeChangeAlert = true
-                }) {
-                    HStack {
-                        Image(systemName: "arrow.triangle.2.circlepath")
-                        Text("Switch to Full Node Mode")
-                        Spacer()
-                        Image(systemName: "chevron.right")
-                    }
-                    .font(theme.bodyFont)
-                    .foregroundColor(theme.textPrimary)
-                    .padding(12)
-                    .background(theme.surfaceColor)
-                    .overlay(
-                        Rectangle()
-                            .stroke(theme.textPrimary, lineWidth: 1)
-                    )
-                }
-                .buttonStyle(PlainButtonStyle())
             }
 
             // Info text
@@ -453,8 +449,8 @@ struct SettingsView: View {
                     .foregroundColor(.blue)
                     .font(.system(size: 12))
 
-                Text(modeManager.currentMode == .light ?
-                    "Light mode uses P2P network with bundled commitment tree for fast, mobile-friendly operation." :
+                Text(modeManager.walletSource == .zipherx ?
+                    "P2P mode uses direct peer-to-peer network for fast, mobile-friendly operation." :
                     "Full Node mode runs a local zclassicd daemon for complete blockchain verification.")
                     .font(theme.captionFont)
                     .foregroundColor(theme.textSecondary)
@@ -479,6 +475,7 @@ struct SettingsView: View {
                 // Check if daemon is already installed
                 if fullNodeManager.isDaemonInstalledAtPath {
                     // Daemon already installed, proceed directly
+                    modeManager.setWalletSource(.walletDat)
                     modeManager.setMode(.fullNode)
                     if bootstrapManager.needsBootstrap {
                         showBootstrapSheet = true
@@ -532,6 +529,7 @@ Thank you for strengthening the network! 🛡️
                         do {
                             try await fullNodeManager.installDaemonFromBundle()
                             await MainActor.run {
+                                modeManager.setWalletSource(.walletDat)
                                 modeManager.setMode(.fullNode)
                                 if bootstrapManager.needsBootstrap {
                                     showBootstrapSheet = true
@@ -575,6 +573,97 @@ Both binaries must be installed to /usr/local/bin:
                 .environmentObject(themeManager)
                 .frame(minWidth: 500, minHeight: 400)
         }
+    }
+
+    // FIX #1367: Unified wallet source picker — always visible with "P2P" / "Full Node" labels
+    private func walletSourcePicker(modeManager: WalletModeManager) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Image(systemName: "wallet.pass.fill")
+                    .font(.system(size: 12))
+                    .foregroundColor(theme.textSecondary)
+                Text("Wallet Source")
+                    .font(theme.captionFont)
+                    .foregroundColor(theme.textSecondary)
+            }
+
+            HStack(spacing: 8) {
+                // P2P (ZipherX) option
+                Button(action: {
+                    // FIX #1273: Require authentication when switching wallet modes
+                    if modeManager.walletSource != .zipherx {
+                        BiometricAuthManager.shared.authenticateForSensitiveOperation(
+                            reason: "Authenticate to switch to P2P mode"
+                        ) { success, _ in
+                            if success {
+                                modeManager.setWalletSource(.zipherx)
+                                modeManager.setMode(.light)
+                            }
+                        }
+                    }
+                }) {
+                    HStack {
+                        Image(systemName: "network")
+                        Text("P2P")
+                    }
+                    .font(theme.bodyFont)
+                    .foregroundColor(modeManager.walletSource == .zipherx ? .white : theme.textPrimary)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(modeManager.walletSource == .zipherx ? theme.primaryColor : theme.surfaceColor)
+                    .cornerRadius(theme.cornerRadius)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: theme.cornerRadius)
+                            .stroke(theme.borderColor, lineWidth: 1)
+                    )
+                }
+                .buttonStyle(PlainButtonStyle())
+
+                // Full Node (wallet.dat) option
+                Button(action: {
+                    // FIX #1273: Require authentication when switching wallet modes
+                    if modeManager.walletSource != .walletDat {
+                        BiometricAuthManager.shared.authenticateForSensitiveOperation(
+                            reason: "Authenticate to switch to Full Node mode"
+                        ) { success, _ in
+                            if success {
+                                // Show mode change alert (handles daemon install + bootstrap)
+                                showModeChangeAlert = true
+                            }
+                        }
+                    }
+                }) {
+                    HStack {
+                        Image(systemName: "server.rack")
+                        Text("Full Node")
+                    }
+                    .font(theme.bodyFont)
+                    .foregroundColor(modeManager.walletSource == .walletDat ? .white : theme.textPrimary)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(modeManager.walletSource == .walletDat ? theme.primaryColor : theme.surfaceColor)
+                    .cornerRadius(theme.cornerRadius)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: theme.cornerRadius)
+                            .stroke(theme.borderColor, lineWidth: 1)
+                    )
+                }
+                .buttonStyle(PlainButtonStyle())
+            }
+
+            Text(modeManager.walletSource == .zipherx ?
+                "Secure wallet with P2P network" :
+                "Full blockchain verification with local daemon")
+                .font(.system(size: 10))
+                .foregroundColor(theme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(10)
+        .background(theme.surfaceColor)
+        .overlay(
+            Rectangle()
+                .stroke(theme.textPrimary.opacity(0.3), lineWidth: 1)
+        )
     }
 
     private func fullNodeStatusView(modeManager: WalletModeManager) -> some View {
@@ -654,93 +743,7 @@ Both binaries must be installed to /usr/local/bin:
                 )
             }
 
-            // Wallet Source picker
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Image(systemName: "wallet.pass.fill")
-                        .font(.system(size: 12))
-                        .foregroundColor(theme.textSecondary)
-                    Text("Wallet Source")
-                        .font(theme.captionFont)
-                        .foregroundColor(theme.textSecondary)
-                }
-
-                HStack(spacing: 8) {
-                    // ZipherX Wallet option
-                    Button(action: {
-                        // FIX #1273: Require authentication when switching wallet modes
-                        // Different modes = different wallets with different private keys
-                        if modeManager.walletSource != .zipherx {
-                            BiometricAuthManager.shared.authenticateForSensitiveOperation(
-                                reason: "Authenticate to switch to ZipherX mode"
-                            ) { success, _ in
-                                if success {
-                                    modeManager.setWalletSource(.zipherx)
-                                }
-                            }
-                        }
-                    }) {
-                        HStack {
-                            Image(systemName: "shield.fill")
-                            Text("ZipherX")
-                        }
-                        .font(theme.bodyFont)
-                        .foregroundColor(modeManager.walletSource == .zipherx ? .white : theme.textPrimary)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .background(modeManager.walletSource == .zipherx ? theme.primaryColor : theme.surfaceColor)
-                        .cornerRadius(theme.cornerRadius)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: theme.cornerRadius)
-                                .stroke(theme.borderColor, lineWidth: 1)
-                        )
-                    }
-                    .buttonStyle(PlainButtonStyle())
-
-                    // wallet.dat option
-                    Button(action: {
-                        // FIX #1273: Require authentication when switching wallet modes
-                        if modeManager.walletSource != .walletDat {
-                            BiometricAuthManager.shared.authenticateForSensitiveOperation(
-                                reason: "Authenticate to switch to wallet.dat mode"
-                            ) { success, _ in
-                                if success {
-                                    modeManager.setWalletSource(.walletDat)
-                                }
-                            }
-                        }
-                    }) {
-                        HStack {
-                            Image(systemName: "externaldrive.fill")
-                            Text("wallet.dat")
-                        }
-                        .font(theme.bodyFont)
-                        .foregroundColor(modeManager.walletSource == .walletDat ? .white : theme.textPrimary)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .background(modeManager.walletSource == .walletDat ? theme.primaryColor : theme.surfaceColor)
-                        .cornerRadius(theme.cornerRadius)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: theme.cornerRadius)
-                                .stroke(theme.borderColor, lineWidth: 1)
-                        )
-                    }
-                    .buttonStyle(PlainButtonStyle())
-                }
-
-                Text(modeManager.walletSource.description)
-                    .font(.system(size: 10))
-                    .foregroundColor(theme.textSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .padding(10)
-            .background(theme.surfaceColor)
-            .overlay(
-                Rectangle()
-                    .stroke(theme.textPrimary.opacity(0.3), lineWidth: 1)
-            )
-
-            // Node Management button - only in wallet.dat mode
+            // Node Management button - only in Full Node mode
             if modeManager.walletSource == .walletDat {
                 Button(action: {
                     showNodeManagement = true
@@ -759,27 +762,6 @@ Both binaries must be installed to /usr/local/bin:
                 }
                 .buttonStyle(PlainButtonStyle())
             }
-
-            // Switch to Light mode button
-            Button(action: {
-                modeManager.setMode(.light)
-            }) {
-                HStack {
-                    Image(systemName: "bolt.fill")
-                    Text("Switch to Light Mode")
-                    Spacer()
-                    Image(systemName: "chevron.right")
-                }
-                .font(theme.bodyFont)
-                .foregroundColor(theme.textPrimary)
-                .padding(12)
-                .background(theme.surfaceColor)
-                .overlay(
-                    Rectangle()
-                        .stroke(theme.textPrimary, lineWidth: 1)
-                )
-            }
-            .buttonStyle(PlainButtonStyle())
         }
         .sheet(isPresented: $showNodeManagement) {
             NodeManagementView()
@@ -1435,7 +1417,7 @@ Both binaries must be installed to /usr/local/bin:
             Rectangle()
                 .stroke(theme.textPrimary, lineWidth: 1)
         )
-        .sheet(isPresented: $showBannedPeers) {
+        .sheet(isPresented: $showBannedPeers, onDismiss: { networkManager.updatePeerCountsForSettings() }) {
             bannedPeersSheet
                 #if os(macOS)
                 .frame(minWidth: 500, idealWidth: 600, maxWidth: 700,
@@ -1443,7 +1425,7 @@ Both binaries must be installed to /usr/local/bin:
                 #endif
         }
         // FIX #284: Parked Peers sheet
-        .sheet(isPresented: $showParkedPeers) {
+        .sheet(isPresented: $showParkedPeers, onDismiss: { networkManager.updatePeerCountsForSettings() }) {
             parkedPeersSheet
                 #if os(macOS)
                 .frame(minWidth: 500, idealWidth: 600, maxWidth: 700,
@@ -1451,14 +1433,14 @@ Both binaries must be installed to /usr/local/bin:
                 #endif
         }
         // FIX #284: Preferred Seeds sheet
-        .sheet(isPresented: $showPreferredSeeds) {
+        .sheet(isPresented: $showPreferredSeeds, onDismiss: { networkManager.updatePeerCountsForSettings() }) {
             preferredSeedsSheet
                 #if os(macOS)
                 .frame(minWidth: 500, idealWidth: 600, maxWidth: 700,
                        minHeight: 400, idealHeight: 500, maxHeight: 600)
                 #endif
         }
-        .sheet(isPresented: $showCustomNodes) {
+        .sheet(isPresented: $showCustomNodes, onDismiss: { networkManager.updatePeerCountsForSettings() }) {
             CustomNodesView()
                 .environmentObject(themeManager)
                 #if os(macOS)
@@ -1467,7 +1449,7 @@ Both binaries must be installed to /usr/local/bin:
                 #endif
         }
         // FIX #229: Trusted Peers sheet
-        .sheet(isPresented: $showTrustedPeers) {
+        .sheet(isPresented: $showTrustedPeers, onDismiss: { loadTrustedPeersCount() }) {
             TrustedPeersView()
                 .environmentObject(themeManager)
                 #if os(macOS)
@@ -1745,12 +1727,8 @@ Both binaries must be installed to /usr/local/bin:
                             HStack {
                                 // Copy onion address (without port)
                                 Button(action: {
-                                    #if os(iOS)
-                                    UIPasteboard.general.string = fullOnionWithSuffix
-                                    #elseif os(macOS)
-                                    NSPasteboard.general.clearContents()
-                                    NSPasteboard.general.setString(fullOnionWithSuffix, forType: .string)
-                                    #endif
+                                    // FIX #1360: TASK 12 — Use ClipboardManager with 60s expiry for onion addresses
+                                    ClipboardManager.copyWithAutoExpiry(fullOnionWithSuffix, seconds: 60)
                                 }) {
                                     HStack(spacing: 4) {
                                         Image(systemName: "doc.on.doc")
@@ -2138,30 +2116,10 @@ Both binaries must be installed to /usr/local/bin:
             .foregroundColor(theme.textPrimary)
 
             // Info box
-            Text("Use this to fix corrupted database, wrong balance, missing timestamps, or failed transactions that show as successful.")
+            Text("Verify wallet integrity and repair any issues with balance, witnesses, or transaction history.")
                 .font(theme.captionFont)
                 .foregroundColor(theme.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
-
-            // Repair Database button - PURPLE
-            Button(action: {
-                showRepairNotesWarning = true
-            }) {
-                HStack {
-                    Image(systemName: "wrench.and.screwdriver")
-                        .font(.system(size: 12))
-                    Text("Repair Database")
-                        .font(theme.bodyFont)
-                }
-                .foregroundColor(.white)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 8)
-                .background(Color.purple)
-                .overlay(
-                    Rectangle()
-                        .stroke(Color.purple.opacity(0.8), lineWidth: 2)
-                )
-            }
 
             // FIX #451: Force Reset Repair Flag - YELLOW (emergency unstuck button)
             // Only show when repair flag is stuck
@@ -2191,14 +2149,14 @@ Both binaries must be installed to /usr/local/bin:
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            // FIX #367: Full Resync button - RED (nuclear option, like import PK)
+            // FIX #367: Verify & Repair Wallet (Full Resync — comprehensive repair)
             Button(action: {
                 showFullResyncWarning = true
             }) {
                 HStack {
                     Image(systemName: "arrow.triangle.2.circlepath")
                         .font(.system(size: 12))
-                    Text("Full Resync")
+                    Text("Verify & Repair Wallet")
                         .font(theme.bodyFont)
                 }
                 .foregroundColor(.white)
@@ -2211,104 +2169,7 @@ Both binaries must be installed to /usr/local/bin:
                 )
             }
 
-            Text("Nuclear option: Deletes all notes & history, re-downloads boost file, rescans entire blockchain. Use if balance is wrong after regular repair.")
-                .font(theme.captionFont)
-                .foregroundColor(theme.textSecondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            // FIX #588: Rebuild Corrupted Witnesses button - YELLOW (fixes anchor mismatch)
-            Button(action: {
-                Task {
-                    await rebuildCorruptedWitnesses()
-                }
-            }) {
-                HStack {
-                    if isRebuildingCorruptedWitnesses {
-                        ProgressView()
-                            .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                            .scaleEffect(0.8)
-                    } else {
-                        Image(systemName: "wrench.and.screwdriver")
-                            .font(.system(size: 12))
-                    }
-                    Text(isRebuildingCorruptedWitnesses ? "Rebuilding..." : "Rebuild Corrupted Witnesses")
-                        .font(theme.bodyFont)
-                }
-                .foregroundColor(.white)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 8)
-                .background(Color.yellow.opacity(0.8))
-                .overlay(
-                    Rectangle()
-                        .stroke(Color.yellow, lineWidth: 2)
-                )
-            }
-
-            Text("FIX #588: Rebuilds witnesses with corrupted Merkle paths. Use if transaction fails with 'anchor mismatch' error.")
-                .font(theme.captionFont)
-                .foregroundColor(theme.textSecondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            // FIX #214: Scan for Unrecorded TX button - ORANGE (fast, from checkpoint only)
-            Button(action: {
-                showScanUnrecordedWarning = true
-            }) {
-                HStack {
-                    if isScanningUnrecorded {
-                        ProgressView()
-                            .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                            .scaleEffect(0.8)
-                    } else {
-                        Image(systemName: "magnifyingglass.circle")
-                            .font(.system(size: 12))
-                    }
-                    Text(isScanningUnrecorded ? "Scanning..." : "Scan for Unrecorded TX")
-                        .font(theme.bodyFont)
-                }
-                .foregroundColor(.white)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 8)
-                .background(Color.orange)
-                .overlay(
-                    Rectangle()
-                        .stroke(Color.orange.opacity(0.8), lineWidth: 2)
-                )
-            }
-            .disabled(isScanningUnrecorded)
-
-            Text("Quick scan from last checkpoint to find transactions that were broadcast but not recorded (e.g., Tor timeout).")
-                .font(theme.captionFont)
-                .foregroundColor(theme.textSecondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            // FIX: Force Rebuild All Witnesses button - CYAN (fixes balance/witness issues)
-            Button(action: {
-                showForceRebuildWitnessesWarning = true
-            }) {
-                HStack {
-                    if isRebuildingWitnesses {
-                        ProgressView()
-                            .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                            .scaleEffect(0.8)
-                    } else {
-                        Image(systemName: "arrow.clockwise")
-                            .font(.system(size: 12))
-                    }
-                    Text(isRebuildingWitnesses ? "Rebuilding..." : "Force Rebuild All Witnesses")
-                        .font(theme.bodyFont)
-                }
-                .foregroundColor(.white)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 8)
-                .background(Color.cyan)
-                .overlay(
-                    Rectangle()
-                        .stroke(Color.cyan.opacity(0.8), lineWidth: 2)
-                )
-            }
-            .disabled(isRebuildingWitnesses)
-
-            Text("Forces rebuild of all witnesses to fix balance issues where notes are excluded because their witness doesn't match the current tree root.")
+            Text("Verifies wallet integrity. If issues are found, re-downloads boost file and rescans the entire blockchain to rebuild notes, witnesses, and transaction history.")
                 .font(theme.captionFont)
                 .foregroundColor(theme.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -3176,13 +3037,23 @@ Both binaries must be installed to /usr/local/bin:
     }
 
     private func exportPrivateKey() {
-        do {
-            exportedKey = try walletManager.exportSpendingKey()
-            showExportAlert = true
-            // SECURITY: Never log private key operations
-        } catch {
-            errorMessage = "Failed to export key"
-            showError = true
+        // FIX #1360: TASK 6 — Biometric auth gate for key export
+        BiometricAuthManager.shared.authenticateForKeyExport { success, _ in
+            guard success else { return }
+
+            do {
+                let key = try walletManager.exportSpendingKey()
+                DispatchQueue.main.async {
+                    exportedKey = key
+                    showExportAlert = true
+                }
+                // SECURITY: Never log private key operations
+            } catch {
+                DispatchQueue.main.async {
+                    errorMessage = "Failed to export key"
+                    showError = true
+                }
+            }
         }
     }
 
@@ -3902,16 +3773,6 @@ Both binaries must be installed to /usr/local/bin:
         }
     }
 
-    // MARK: - Clipboard Helper
-
-    private func copyToClipboard(_ string: String) {
-        #if os(iOS)
-        UIPasteboard.general.string = string
-        #elseif os(macOS)
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(string, forType: .string)
-        #endif
-    }
 }
 
 // MARK: - Share Sheet
@@ -3946,8 +3807,8 @@ struct ShareSheet: View {
                     .foregroundColor(.secondary)
 
                 Button("Copy Path") {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(url.path, forType: .string)
+                    // FIX #1360: TASK 12 — Use ClipboardManager with 60s expiry for file paths
+                    ClipboardManager.copyWithAutoExpiry(url.path, seconds: 60)
                 }
 
                 Button("Open in Finder") {

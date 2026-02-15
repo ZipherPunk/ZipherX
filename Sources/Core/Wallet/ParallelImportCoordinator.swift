@@ -206,9 +206,9 @@ actor ParallelImportCoordinator {
                 let cmu = cmuData.subdata(in: (offset + 8)..<(offset + 40))
                 let epochBytes = cmuData.subdata(in: (offset + 40)..<(offset + 44))
 
-                let height = heightBytes.withUnsafeBytes { $0.load(as: UInt32.self) }
-                let outputIndex = outputIndexBytes.withUnsafeBytes { $0.load(as: UInt32.self) }
-                let epochValue = epochBytes.withUnsafeBytes { $0.load(as: UInt32.self) }
+                let height = heightBytes.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }
+                let outputIndex = outputIndexBytes.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }
+                let epochValue = epochBytes.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }
 
                 // Detect epoch changes (every ~500k blocks)
                 if Int(epochValue) > epoch {
@@ -487,12 +487,12 @@ extension ParallelImportCoordinator {
         let offset = 0
 
         // Parse header fields (Zclassic block header format)
-        let version = bytes.subdata(in: offset..<(offset + 4)).withUnsafeBytes { $0.load(as: UInt32.self) }
+        let version = bytes.subdata(in: offset..<(offset + 4)).withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }
         let prevHash = Data(bytes.subdata(in: (offset + 4)..<(offset + 36)))
         let merkleRoot = Data(bytes.subdata(in: (offset + 36)..<(offset + 68)))
         let saplingRoot = Data(bytes.subdata(in: (offset + 68)..<(offset + 100)))
-        let timestamp = bytes.subdata(in: (offset + 100)..<(offset + 104)).withUnsafeBytes { $0.load(as: UInt32.self) }
-        let bits = bytes.subdata(in: (offset + 104)..<(offset + 108)).withUnsafeBytes { $0.load(as: UInt32.self) }
+        let timestamp = bytes.subdata(in: (offset + 100)..<(offset + 104)).withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }
+        let bits = bytes.subdata(in: (offset + 104)..<(offset + 108)).withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }
         let nonce = Data(bytes.subdata(in: (offset + 108)..<(offset + 140)))
 
         // Compute hash (double SHA256)

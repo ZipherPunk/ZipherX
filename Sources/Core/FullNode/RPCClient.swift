@@ -1723,23 +1723,24 @@ public class RPCClient: ObservableObject {
                     return total + note.amount
                 } - changeAmount  // Subtract change to get self-received amount
 
-            // Estimate sent amount:
-            // For self-sends: the non-change amount is what was "sent to self"
-            // For external sends: we only know the change; approximate sent = (some input) - change - fee
-            // Best effort: if selfRecvAmount > 0, use that; otherwise use change as reference
+            // FIX #1367: Detect self-sends vs external sends
+            // Self-send: all outputs are change (selfRecvAmount <= 0), only fee was spent
+            // External send: some value went to a different address
             let sentAmount: UInt64
+            let txAddress: String
             if selfRecvAmount > 0 {
-                sentAmount = selfRecvAmount  // Self-send amount
+                sentAmount = selfRecvAmount  // External send amount
+                txAddress = "Shielded"
             } else {
-                // External send — we know change came back but not exact outflow.
-                // Use a placeholder that indicates a send happened.
-                // The change amount gives context about the transaction size.
-                sentAmount = changeAmount  // Show change as approximate reference
+                // FIX #1367: Self-send — all outputs are change, only fee was spent
+                // Mark with address "self" for orange display in HistoryView
+                sentAmount = 10000  // Fee only
+                txAddress = "self"
             }
 
             sentTransactions.append(WalletTransaction(
                 txid: txid,
-                address: "Shielded",
+                address: txAddress,
                 amount: sentAmount,
                 fee: 10000, // Default Zclassic fee
                 type: .sent,
@@ -1748,7 +1749,7 @@ public class RPCClient: ObservableObject {
                 height: height
             ))
 
-            print("📤 FIX #1269: Discovered sent z-TX: \(txid.prefix(16))... change=\(changeAmount), sent≈\(sentAmount)")
+            print("📤 FIX #1269: Discovered sent z-TX: \(txid.prefix(16))... change=\(changeAmount), sent≈\(sentAmount)\(txAddress == "self" ? " (SELF-SEND)" : "")")
         }
 
         // Step 5: Detect exact-amount sends (no change note — note disappeared without change)

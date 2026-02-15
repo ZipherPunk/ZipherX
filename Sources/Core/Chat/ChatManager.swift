@@ -507,23 +507,21 @@ final class ChatManager: ObservableObject {
 
         try await sendRawData(connection: connection, data: request)
 
-        // Step 4: Receive connection response
+        // FIX #1368: Step 4: Receive connection response — ATYP-aware variable-length parsing
         // VER(1) + REP(1) + RSV(1) + ATYP(1) + BND.ADDR(var) + BND.PORT(2)
-        let response = try await receiveRawData(connection: connection, length: 10)
+        // BUG: Was hardcoded to 10 bytes (IPv4 only). Tor returns ATYP=0x03 (domain) or 0x04 (IPv6)
+        // for .onion addresses — leftover bytes in TCP buffer caused stream desync → "Invalid magic bytes"
+        let header = try await receiveRawData(connection: connection, length: 4)
 
-        guard response.count >= 4 else {
+        guard header.count == 4, header[0] == 0x05 else {
             throw ChatError.connectionFailed("Invalid SOCKS5 connect response")
         }
 
-        guard response[0] == 0x05 else {
-            throw ChatError.connectionFailed("SOCKS5 version mismatch")
-        }
-
         // Check reply code
-        let replyCode = response[1]
+        let replyCode = header[1]
         switch replyCode {
         case 0x00:
-            print("💬 SOCKS5: Connection succeeded to \(targetHost.prefix(16))...")
+            break // Success — continue parsing
         case 0x01:
             throw ChatError.connectionFailed("SOCKS5: General failure")
         case 0x02:
@@ -543,6 +541,26 @@ final class ChatManager: ObservableObject {
         default:
             throw ChatError.connectionFailed("SOCKS5: Unknown error \(replyCode)")
         }
+
+        // FIX #1368: Parse ATYP to determine remaining bytes — drain them all from TCP buffer
+        let atyp = header[3]
+        var remainingBytes = 0
+
+        switch atyp {
+        case 0x01:  // IPv4: 4 addr + 2 port
+            remainingBytes = 6
+        case 0x03:  // Domain: 1 length + N domain + 2 port
+            let lenData = try await receiveRawData(connection: connection, length: 1)
+            remainingBytes = Int(lenData[0]) + 2
+        case 0x04:  // IPv6: 16 addr + 2 port
+            remainingBytes = 18
+        default:
+            throw ChatError.connectionFailed("SOCKS5: Unknown address type \(atyp)")
+        }
+
+        // Drain remaining bind address + port bytes
+        _ = try await receiveRawData(connection: connection, length: remainingBytes)
+        print("💬 SOCKS5: Connection succeeded to \(targetHost.prefix(16))... (ATYP=\(atyp))")
     }
 
     /// Send raw data to connection
@@ -996,7 +1014,7 @@ final class ChatManager: ObservableObject {
                 }
 
                 // Parse length
-                let length = headerData.prefix(4).withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
+                let length = headerData.prefix(4).withUnsafeBytes { $0.loadUnaligned(as: UInt32.self).bigEndian }
 
                 guard length <= ChatProtocol.MAX_MESSAGE_SIZE else {
                     continuation.resume(throwing: ChatError.invalidMessage("Message too large"))

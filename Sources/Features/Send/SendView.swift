@@ -359,14 +359,12 @@ struct SendView: View {
                         HStack(spacing: 16) {
                             // Copy button - cypherpunk style
                             Button(action: {
+                                // FIX #1360: TASK 12 — Use ClipboardManager with 60s expiry for txids
+                                ClipboardManager.copyWithAutoExpiry(txId, seconds: 60)
                                 #if os(iOS)
-                                UIPasteboard.general.string = txId
                                 // Haptic feedback
                                 let generator = UIImpactFeedbackGenerator(style: .medium)
                                 generator.impactOccurred()
-                                #elseif os(macOS)
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(txId, forType: .string)
                                 #endif
                             }) {
                                 HStack {
@@ -429,12 +427,8 @@ struct SendView: View {
         .alert("Transaction Issue", isPresented: $showError) {
             if !failedTxId.isEmpty {
                 Button("Copy TXID") {
-                    #if os(iOS)
-                    UIPasteboard.general.string = failedTxId
-                    #elseif os(macOS)
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(failedTxId, forType: .string)
-                    #endif
+                    // FIX #1360: TASK 12 — Use ClipboardManager with 60s expiry for txids
+                    ClipboardManager.copyWithAutoExpiry(failedTxId, seconds: 60)
                 }
             }
             Button("OK", role: .cancel) {
@@ -1900,36 +1894,36 @@ struct SendView: View {
                 firstProofTime = Date()
             }
 
+            // FIX #1364: Show percentage + estimated time remaining instead of note counts.
+            // Displaying "3/5" reveals the number of notes being spent (privacy leak).
+            let percent = Int(Double(completed) / Double(total) * 100)
             let remaining = total - completed
             var timeEstimate = ""
 
             if completed > 0, let firstTime = firstProofTime {
                 // MEASURED rate: use actual time since first proof completed
                 let elapsed = Date().timeIntervalSince(firstTime)
-                // completed-1 because the first proof completion is our baseline
                 if completed > 1 {
                     let secondsPerProof = elapsed / Double(completed - 1)
                     let remainingSeconds = Int(ceil(Double(remaining) * secondsPerProof))
-                    timeEstimate = " (\(remainingSeconds)s remaining)"
+                    timeEstimate = " — \(remainingSeconds)s remaining"
                 } else {
                     // Only 1 proof done, use thread-based estimate for remaining
                     let threads = max(1, ZipherXFFI.getProofThreads())
                     let batchesRemaining = Int(ceil(Double(remaining) / Double(threads)))
-                    // First batch took this long:
                     let firstBatchTime = Date().timeIntervalSince(startTime)
                     let remainingSeconds = Int(ceil(Double(batchesRemaining) * firstBatchTime))
-                    timeEstimate = " (\(remainingSeconds)s remaining)"
+                    timeEstimate = " — \(remainingSeconds)s remaining"
                 }
             } else {
-                // No proofs done yet — use initial estimate
-                // ~1.0s per proof on Apple Silicon, divided by thread count
+                // No proofs done yet — estimate ~1s per proof, divided by thread count
                 let threads = max(1, ZipherXFFI.getProofThreads())
                 let batches = Int(ceil(Double(total) / Double(threads)))
                 let estimatedTotal = batches  // ~1s per batch
-                timeEstimate = " (\(estimatedTotal)s remaining)"
+                timeEstimate = " — \(estimatedTotal)s remaining"
             }
 
-            self.preparationProgress = "Generating zk-SNARK \(completed)/\(total)\(timeEstimate)"
+            self.preparationProgress = "Generating zk-SNARK \(percent)%\(timeEstimate)"
         }
     }
 
@@ -1965,14 +1959,6 @@ struct SendView: View {
         }
     }
 
-    private func copyToClipboard(_ string: String) {
-        #if os(iOS)
-        UIPasteboard.general.string = string
-        #elseif os(macOS)
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(string, forType: .string)
-        #endif
-    }
 
     // MARK: - Progress Overlay
 

@@ -792,7 +792,8 @@ struct FullNodeWalletView: View {
 
                 // Copy button
                 Button {
-                    copyToClipboard(address.address)
+                    // FIX #1360: TASK 12 — Use ClipboardManager with 60s expiry for addresses
+                    ClipboardManager.copyWithAutoExpiry(address.address, seconds: 60)
                 } label: {
                     HStack(spacing: 2) {
                         Image(systemName: "doc.on.doc")
@@ -921,6 +922,10 @@ struct FullNodeWalletView: View {
         .background(theme.backgroundColor)
         .sheet(isPresented: $showingExportPK) {
             exportPrivateKeySheet
+                .onDisappear {
+                    // FIX #1360: NEW-003 — Clear sensitive data when export sheet is dismissed
+                    exportedPrivateKey = ""
+                }
         }
         .sheet(isPresented: $showingImportPK) {
             importPrivateKeySheet
@@ -1101,7 +1106,9 @@ struct FullNodeWalletView: View {
                                 .font(theme.captionFont)
                                 .foregroundColor(theme.textSecondary)
 
-                            Text(exportedPrivateKey)
+                            // FIX #1360: NEW-003 — Show truncated key, not full key
+                            let displayKey = String(exportedPrivateKey.prefix(8)) + "..." + String(exportedPrivateKey.suffix(8))
+                            Text(displayKey)
                                 .font(.system(size: 11, design: .monospaced))
                                 .foregroundColor(theme.textPrimary)
                                 .padding()
@@ -1109,7 +1116,10 @@ struct FullNodeWalletView: View {
                                 .cornerRadius(4)
                                 .textSelection(.enabled)
 
-                            Button(action: { copyToClipboard(exportedPrivateKey) }) {
+                            Button(action: {
+                                // FIX #1360: NEW-003 — Auto-clear after 10 seconds for private keys
+                                ClipboardManager.copyWithAutoExpiry(exportedPrivateKey, seconds: 10)
+                            }) {
                                 Label("Copy to Clipboard", systemImage: "doc.on.doc")
                             }
                             .buttonStyle(System7ButtonStyle())
@@ -1383,6 +1393,18 @@ struct FullNodeWalletView: View {
 
     private func exportPrivateKey() async {
         guard let address = selectedExportAddress else { return }
+
+        // FIX #1360: NEW-003 — Biometric auth gate for key export
+        var authSuccess = false
+        let authSemaphore = DispatchSemaphore(value: 0)
+
+        BiometricAuthManager.shared.authenticateForKeyExport { success, _ in
+            authSuccess = success
+            authSemaphore.signal()
+        }
+
+        authSemaphore.wait()
+        guard authSuccess else { return }
 
         await MainActor.run {
             isExporting = true
@@ -1867,7 +1889,8 @@ struct FullNodeWalletView: View {
                         .textSelection(.enabled)
 
                     Button("Copy") {
-                        copyToClipboard(firstZ.address)
+                        // FIX #1360: TASK 12 — Use ClipboardManager with 60s expiry for addresses
+                        ClipboardManager.copyWithAutoExpiry(firstZ.address, seconds: 60)
                     }
                     .buttonStyle(System7ButtonStyle())
                 }
@@ -1888,7 +1911,8 @@ struct FullNodeWalletView: View {
                         .textSelection(.enabled)
 
                     Button("Copy") {
-                        copyToClipboard(firstT.address)
+                        // FIX #1360: TASK 12 — Use ClipboardManager with 60s expiry for addresses
+                        ClipboardManager.copyWithAutoExpiry(firstT.address, seconds: 60)
                     }
                     .buttonStyle(System7ButtonStyle())
                 }
@@ -1965,10 +1989,6 @@ struct FullNodeWalletView: View {
         return address
     }
 
-    private func copyToClipboard(_ text: String) {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
-    }
 
     // MARK: - FIX #286 v11: Rescan Time Helpers
 

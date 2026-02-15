@@ -3684,7 +3684,7 @@ final class FilterScanner {
 
             let diversifier = decryptedData.prefix(11)
             let valueBytes = Data(decryptedData[11..<19])
-            let value = valueBytes.withUnsafeBytes { $0.load(as: UInt64.self) }
+            let value = valueBytes.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
             let rcm = decryptedData[19..<51]
             let memo = decryptedData.count >= 563 ? decryptedData[51..<563] : Data()
 
@@ -4430,7 +4430,7 @@ final class FilterScanner {
 
             let diversifier = decryptedData.prefix(11)
             let valueBytes = Data(decryptedData[11..<19])
-            let value = valueBytes.withUnsafeBytes { $0.load(as: UInt64.self) }
+            let value = valueBytes.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
             let rcm = decryptedData[19..<51]
             let memo = decryptedData.count >= 563 ? decryptedData[51..<563] : Data()
 
@@ -4600,7 +4600,7 @@ final class FilterScanner {
 
             let diversifier = decryptedData.prefix(11)
             let valueBytes = Data(decryptedData[11..<19])
-            let value = valueBytes.withUnsafeBytes { $0.load(as: UInt64.self) }
+            let value = valueBytes.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
             let rcm = decryptedData[19..<51]
             let memo = decryptedData.count >= 564 ? decryptedData[52..<564] : Data()
 

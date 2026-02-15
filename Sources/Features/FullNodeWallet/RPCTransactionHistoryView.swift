@@ -320,17 +320,23 @@ struct RPCTransactionHistoryView: View {
         // are Color.black in System 7 theme, making the arrow backgrounds grey.
         let txGreen = Color(red: 0.1, green: 0.7, blue: 0.2)
         let txRed = Color(red: 0.85, green: 0.15, blue: 0.15)
+        let txOrange = Color.orange  // FIX #1367: Self-send color
+
+        // FIX #1367: Detect self-sends (address == "self")
+        let isSelfSend = tx.type == .sent && tx.address == "self"
+        let txColor = isSelfSend ? txOrange : (tx.type == .received ? txGreen : txRed)
 
         return HStack(spacing: 12) {
             // Direction icon + address type indicator
             ZStack {
                 Circle()
-                    .fill(tx.type == .received ? txGreen.opacity(0.2) : txRed.opacity(0.2))
+                    .fill(txColor.opacity(0.2))
                     .frame(width: 36, height: 36)
 
-                Image(systemName: tx.type == .received ? "arrow.down" : "arrow.up")
+                Image(systemName: isSelfSend ? "arrow.2.squarepath" :
+                      (tx.type == .received ? "arrow.down" : "arrow.up"))
                     .font(.system(size: 14, weight: .bold))
-                    .foregroundColor(tx.type == .received ? txGreen : txRed)
+                    .foregroundColor(txColor)
 
                 // FIX #286 v7: Address type badge
                 if isTAddress {
@@ -338,7 +344,7 @@ struct RPCTransactionHistoryView: View {
                         .font(.system(size: 8))
                         .foregroundColor(transparentAmber)
                         .offset(x: 12, y: 12)
-                } else if !tx.address.isEmpty {
+                } else if !tx.address.isEmpty && tx.address != "self" {
                     Image(systemName: "shield.fill")
                         .font(.system(size: 8))
                         .foregroundColor(theme.primaryColor)
@@ -349,7 +355,8 @@ struct RPCTransactionHistoryView: View {
             // Details
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
-                    Text(tx.type == .received ? "Received" : "Sent")
+                    Text(isSelfSend ? "Self-Send" :
+                         (tx.type == .received ? "Received" : "Sent"))
                         .font(theme.bodyFont)
                         .foregroundColor(theme.textPrimary)
 
@@ -383,10 +390,12 @@ struct RPCTransactionHistoryView: View {
             Spacer()
 
             // Amount — FIX #1275: Use explicit green/red (theme colors are black in System 7)
+            // FIX #1367: Self-sends show "Fee:" prefix in orange
             VStack(alignment: .trailing, spacing: 4) {
-                Text("\(tx.type == .received ? "+" : "-")\(formatBalance(tx.amount))")
+                Text(isSelfSend ? "Fee: \(formatBalance(tx.amount))" :
+                     "\(tx.type == .received ? "+" : "-")\(formatBalance(tx.amount))")
                     .font(theme.monoFont)
-                    .foregroundColor(tx.type == .received ? txGreen : txRed)
+                    .foregroundColor(txColor)
 
                 if tx.confirmations > 0 {
                     Text("\(tx.confirmations) conf")
@@ -435,16 +444,28 @@ struct RPCTransactionHistoryView: View {
             ScrollView {
                 VStack(spacing: 16) {
                     // Amount — FIX #1275: Explicit green/red
+                    // FIX #1367: Self-send in orange
                     let detailGreen = Color(red: 0.1, green: 0.7, blue: 0.2)
                     let detailRed = Color(red: 0.85, green: 0.15, blue: 0.15)
+                    let detailIsSelfSend = tx.type == .sent && tx.address == "self"
+                    let detailColor = detailIsSelfSend ? Color.orange : (tx.type == .received ? detailGreen : detailRed)
                     VStack(spacing: 4) {
-                        Text("\(tx.type == .received ? "+" : "-")\(formatBalance(tx.amount))")
+                        Text(detailIsSelfSend ? "Fee: \(formatBalance(tx.amount))" :
+                             "\(tx.type == .received ? "+" : "-")\(formatBalance(tx.amount))")
                             .font(.system(size: 28, weight: .bold, design: .monospaced))
-                            .foregroundColor(tx.type == .received ? detailGreen : detailRed)
+                            .foregroundColor(detailColor)
 
-                        Text(tx.type == .received ? "Received" : "Sent")
+                        Text(detailIsSelfSend ? "Self-Send" :
+                             (tx.type == .received ? "Received" : "Sent"))
                             .font(theme.bodyFont)
                             .foregroundColor(theme.textSecondary)
+
+                        if detailIsSelfSend {
+                            Text("All funds returned to your wallet. Only the network fee was spent.")
+                                .font(theme.captionFont)
+                                .foregroundColor(theme.textSecondary)
+                                .multilineTextAlignment(.center)
+                        }
                     }
                     .padding()
 
@@ -493,8 +514,8 @@ struct RPCTransactionHistoryView: View {
 
                 if copyable {
                     Button(action: {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(value, forType: .string)
+                        // FIX #1360: TASK 12 — Use ClipboardManager with 60s expiry
+                        ClipboardManager.copyWithAutoExpiry(value, seconds: 60)
                     }) {
                         HStack(spacing: 2) {
                             Image(systemName: "doc.on.doc")

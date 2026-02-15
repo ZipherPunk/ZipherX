@@ -327,7 +327,7 @@ struct ChatProtocol {
 
         // Read length
         let lengthBytes = data.prefix(4)
-        let length = lengthBytes.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
+        let length = lengthBytes.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self).bigEndian }
 
         guard length <= MAX_MESSAGE_SIZE else {
             throw ChatError.invalidMessage("Message too large")

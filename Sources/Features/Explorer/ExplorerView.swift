@@ -434,7 +434,10 @@ struct ExplorerView: View {
                 .frame(width: 120, alignment: .leading)
 
             if copyable {
-                Button(action: { copyToClipboard(value) }) {
+                Button(action: {
+                    // FIX #1360: TASK 12 — Use ClipboardManager with 60s expiry for explorer data
+                    ClipboardManager.copyWithAutoExpiry(value, seconds: 60)
+                }) {
                     Text(value)
                         .font(theme.monoFont)
                         .foregroundColor(theme.primaryColor)
@@ -459,15 +462,6 @@ struct ExplorerView: View {
     private func shortenAddress(_ address: String) -> String {
         guard address.count > 20 else { return address }
         return "\(address.prefix(12))...\(address.suffix(8))"
-    }
-
-    private func copyToClipboard(_ text: String) {
-        #if os(iOS)
-        UIPasteboard.general.string = text
-        #elseif os(macOS)
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
-        #endif
     }
 }
 

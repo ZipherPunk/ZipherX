@@ -142,7 +142,8 @@ struct ReceiveView: View {
     // MARK: - Actions
 
     private func copyAddress() {
-        copyToClipboard(walletManager.zAddress)
+        // FIX #1360: TASK 12 — Use ClipboardManager with 60s expiry for addresses
+        ClipboardManager.copyWithAutoExpiry(walletManager.zAddress, seconds: 60)
 
         withAnimation {
             showCopied = true
@@ -153,15 +154,6 @@ struct ReceiveView: View {
                 showCopied = false
             }
         }
-    }
-
-    private func copyToClipboard(_ string: String) {
-        #if os(iOS)
-        UIPasteboard.general.string = string
-        #elseif os(macOS)
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(string, forType: .string)
-        #endif
     }
 }
 

@@ -195,32 +195,65 @@ actor PeerMessageDispatcher {
                     return true
                 }
             }
-            // Even if we can't parse txid, deliver to ANY broadcast handler
-            // (there should typically be only one active broadcast)
-            if let (key, handler) = broadcastHandlers.first {
-                broadcastHandlers.removeValue(forKey: key)
-                handler.resume(returning: (command, payload))
-                return true
-            }
+            // FIX #1360: TASK 11 — SECURITY: Remove "any handler" fallback
+            // Delivering unmatched rejects to wrong handler causes TX-A reject → TX-B failure
+            print("⚠️ Reject message with unmatched txid — dropping")
+            return false
         }
 
         return false
+    }
+
+    /// FIX #1365 / Security audit TASK 9: Decode CompactSize varint per Bitcoin protocol
+    /// Used by parseRejectTxid to properly decode variable-length fields
+    private func readCompactSize(from data: Data, at offset: inout Int) -> UInt64? {
+        guard offset < data.count else { return nil }
+        let first = data[offset]
+        offset += 1
+
+        switch first {
+        case 0x00...0xFC:
+            return UInt64(first)
+        case 0xFD:
+            guard offset + 2 <= data.count else { return nil }
+            let val = data[offset..<offset+2].withUnsafeBytes { $0.loadUnaligned(as: UInt16.self).littleEndian }
+            offset += 2
+            return UInt64(val)
+        case 0xFE:
+            guard offset + 4 <= data.count else { return nil }
+            let val = data[offset..<offset+4].withUnsafeBytes { $0.loadUnaligned(as: UInt32.self).littleEndian }
+            offset += 4
+            return UInt64(val)
+        case 0xFF:
+            guard offset + 8 <= data.count else { return nil }
+            let val = data[offset..<offset+8].withUnsafeBytes { $0.loadUnaligned(as: UInt64.self).littleEndian }
+            offset += 8
+            return UInt64(val)
+        default:
+            return nil
+        }
     }
 
     /// FIX #883: Parse txid from reject message payload
     private func parseRejectTxid(payload: Data) -> String? {
         guard payload.count > 0 else { return nil }
         var offset = 0
-        // Skip message type (varint string)
-        let msgLen = Int(payload[0])
-        offset = 1 + msgLen
-        // Skip reject code
-        if offset < payload.count { offset += 1 }
-        // Skip reason (varint string)
-        if offset < payload.count {
-            let reasonLen = Int(payload[offset])
-            offset += 1 + reasonLen
-        }
+
+        // FIX #1365 / Security audit TASK 9: Use proper CompactSize varint decoding
+        // Skip message type (CompactSize string)
+        guard let msgLen = readCompactSize(from: payload, at: &offset) else { return nil }
+        guard msgLen <= 1000 else { return nil }  // FIX #1365: Sanity check
+        offset += Int(msgLen)
+
+        // Skip reject code (1 byte)
+        guard offset < payload.count else { return nil }
+        offset += 1
+
+        // Skip reason (CompactSize string)
+        guard let reasonLen = readCompactSize(from: payload, at: &offset) else { return nil }
+        guard reasonLen <= 1000 else { return nil }  // FIX #1365: Sanity check
+        offset += Int(reasonLen)
+
         // Next 32 bytes should be txid (for tx rejects)
         if offset + 32 <= payload.count {
             let txidBytes = payload[offset..<offset+32]
@@ -2628,6 +2661,12 @@ public final class Peer {
         // Parse length (safe loading)
         let length = header.loadUInt32(at: 16)
 
+        // FIX #1365 / Security audit TASK 9: Max payload size per Bitcoin protocol (4MB cap)
+        guard length <= 4_000_000 else {
+            print("⚠️  FIX #1365: Rejecting oversized payload: \(length) bytes from \(host)")
+            throw NetworkError.invalidData
+        }
+
         // FIX #1139: Extract expected checksum from header (bytes 20-24)
         let expectedChecksum = header.loadUInt32(at: 20)
 
@@ -2641,7 +2680,7 @@ public final class Peer {
         // This is CRITICAL: if we read wrong length due to corrupted header,
         // the checksum will fail and we detect the desync immediately!
         let payloadHash = payload.doubleSHA256()
-        let actualChecksum = payloadHash.prefix(4).withUnsafeBytes { $0.load(as: UInt32.self) }
+        let actualChecksum = payloadHash.prefix(4).withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }
 
         if actualChecksum != expectedChecksum {
             print("🚨 FIX #1139: [\(host)] Block listener checksum mismatch for '\(command)'!")
@@ -3335,10 +3374,11 @@ public final class Peer {
         var addresses: [PeerAddress] = []
         var offset = 0
 
-        // First byte is count (varint, simplified as single byte for now)
+        // FIX #1365 / Security audit TASK 9: Use proper CompactSize varint decoding for address count
         guard data.count > 0 else { return [] }
-        let count = Int(data[0])
-        offset = 1
+        guard let countValue = readCompactSize(from: data, at: &offset) else { return [] }
+        let count = Int(countValue)
+        guard count <= 1000 else { return [] }  // FIX #1365: Sanity cap — no peer sends 1000+ addresses
 
         // Each addr entry: timestamp (4) + services (8) + IPv6 (16) + port (2) = 30 bytes
         let entrySize = 30
@@ -3364,6 +3404,39 @@ public final class Peer {
         }
 
         return addresses
+    }
+
+    /// FIX #1365 / Security audit TASK 9: Decode CompactSize varint per Bitcoin protocol
+    /// - 0x00-0xFC: 1-byte value (direct)
+    /// - 0xFD: next 2 bytes (UInt16 little-endian)
+    /// - 0xFE: next 4 bytes (UInt32 little-endian)
+    /// - 0xFF: next 8 bytes (UInt64 little-endian)
+    private func readCompactSize(from data: Data, at offset: inout Int) -> UInt64? {
+        guard offset < data.count else { return nil }
+        let first = data[offset]
+        offset += 1
+
+        switch first {
+        case 0x00...0xFC:
+            return UInt64(first)
+        case 0xFD:
+            guard offset + 2 <= data.count else { return nil }
+            let val = data[offset..<offset+2].withUnsafeBytes { $0.loadUnaligned(as: UInt16.self).littleEndian }
+            offset += 2
+            return UInt64(val)
+        case 0xFE:
+            guard offset + 4 <= data.count else { return nil }
+            let val = data[offset..<offset+4].withUnsafeBytes { $0.loadUnaligned(as: UInt32.self).littleEndian }
+            offset += 4
+            return UInt64(val)
+        case 0xFF:
+            guard offset + 8 <= data.count else { return nil }
+            let val = data[offset..<offset+8].withUnsafeBytes { $0.loadUnaligned(as: UInt64.self).littleEndian }
+            offset += 8
+            return UInt64(val)
+        default:
+            return nil
+        }
     }
 
     private func parseIPAddress(_ bytes: [UInt8]) -> String? {
@@ -3398,6 +3471,8 @@ public final class Peer {
             // Validate: reject 255.255.x.x (invalid/reserved) and 0.x.x.x
             if bytes[12] == 255 && bytes[13] == 255 { return nil }
             if bytes[12] == 0 { return nil }
+            // FIX #1365 / Security audit TASK 24: Validate reserved IPs
+            if NetworkManager.shared.isReservedIPAddress(ip) { return nil }
             return ip
         }
 
@@ -3408,6 +3483,8 @@ public final class Peer {
             // Validate: reject 255.255.x.x (invalid/reserved) and 0.x.x.x
             if bytes[12] == 255 && bytes[13] == 255 { return nil }
             if bytes[12] == 0 { return nil }
+            // FIX #1365 / Security audit TASK 24: Validate reserved IPs
+            if NetworkManager.shared.isReservedIPAddress(ip) { return nil }
             return ip
         }
 
@@ -3487,6 +3564,12 @@ public final class Peer {
     // MARK: - Message Protocol
 
     func sendMessage(command: String, payload: Data) async throws {
+        // FIX #1365 / Security audit TASK 22: Rate limit outbound P2P messages
+        // Skip rate limiting for ping/pong (keepalive must always go through)
+        if command != "ping" && command != "pong" {
+            await rateLimiter.waitForToken()
+        }
+
         var message = Data()
 
         // Magic bytes
@@ -3602,6 +3685,12 @@ public final class Peer {
         // Parse length (safe loading)
         let length = header.loadUInt32(at: 16)
 
+        // FIX #1365 / Security audit TASK 9: Max payload size per Bitcoin protocol (4MB cap)
+        guard length <= 4_000_000 else {
+            print("⚠️  FIX #1365: Rejecting oversized payload: \(length) bytes from \(host)")
+            throw NetworkError.invalidData
+        }
+
         // FIX #880: Extract checksum from header (bytes 20-24) - matches Zclassic main.cpp:6688-6695
         let expectedChecksum = header.loadUInt32(at: 20)
 
@@ -3615,7 +3704,7 @@ public final class Peer {
         // Zclassic/Bitcoin protocol: checksum = first 4 bytes of Hash(payload)
         // This catches corrupted data from TCP stream desync or malicious peers
         let payloadHash = payload.doubleSHA256()
-        let actualChecksum = payloadHash.prefix(4).withUnsafeBytes { $0.load(as: UInt32.self) }
+        let actualChecksum = payloadHash.prefix(4).withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }
 
         if actualChecksum != expectedChecksum {
             print("🚨 FIX #880: [\(host)] CHECKSUM MISMATCH for '\(command)' message!")

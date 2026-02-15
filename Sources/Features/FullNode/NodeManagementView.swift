@@ -2333,8 +2333,8 @@ class NodeManagementViewModel: ObservableObject {
     func showEncryptInstructions() {
         // Copy command to clipboard
         let command = "zclassic-cli encryptwallet \"YOUR_PASSPHRASE_HERE\""
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(command, forType: .string)
+        // FIX #1360: TASK 12 — Use ClipboardManager with 60s expiry for commands
+        ClipboardManager.copyWithAutoExpiry(command, seconds: 60)
 
         // Show terminal with instructions
         let script = """

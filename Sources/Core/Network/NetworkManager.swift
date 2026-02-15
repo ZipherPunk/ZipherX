@@ -803,8 +803,8 @@ public final class NetworkManager: ObservableObject {
     // These are known-good nodes that should always be retried immediately
     // NOTE: Keep in sync with PeerManager.shared.HARDCODED_SEEDS
     // FIX #931: PRODUCTION MODE - All hardcoded seeds enabled
+    // FIX #1360: TASK 13 - Remove localhost from hardcoded seeds (added dynamically only for full-node mode)
     private let HARDCODED_SEEDS = Set<String>([
-        "127.0.0.1",          // Local node first (highest priority if running)
         "140.174.189.3",      // MagicBean node cluster
         "140.174.189.17",     // MagicBean node cluster
         "205.209.104.118",    // MagicBean node
@@ -1224,6 +1224,17 @@ public final class NetworkManager: ObservableObject {
             UserDefaults.standard.set(txids, forKey: PENDING_TXIDS_KEY)
             print("💾 FIX #849: Persisted pending txid: \(txid.prefix(16))... (total: \(txids.count))")
         }
+
+        // FIX #1366: Also persist to broadcast history (separate from pending).
+        // This survives FIX #970 cleanup — used at startup to detect confirmed TXs
+        // missing from history (crash between broadcast and block confirmation).
+        var history = UserDefaults.standard.stringArray(forKey: "ZipherX_BroadcastHistory") ?? []
+        if !history.contains(txid) {
+            history.append(txid)
+            // Keep max 20 entries to prevent unbounded growth
+            if history.count > 20 { history = Array(history.suffix(20)) }
+            UserDefaults.standard.set(history, forKey: "ZipherX_BroadcastHistory")
+        }
     }
 
     /// FIX #849: Remove a pending txid from UserDefaults when confirmed
@@ -1292,6 +1303,11 @@ public final class NetworkManager: ObservableObject {
 
         // Skip invalid/corrupted addresses (255.255.x.x from bad addr parsing, 0.x.x.x reserved)
         if normalizedHost.hasPrefix("255.255.") || normalizedHost.hasPrefix("0.") {
+            return
+        }
+
+        // FIX #1365 / Security audit TASK 24: Filter reserved IPs at main entry point
+        if isReservedIPAddress(normalizedHost) {
             return
         }
 
@@ -1364,7 +1380,8 @@ public final class NetworkManager: ObservableObject {
     /// FIX #427: Check if IP address is in reserved/invalid ranges
     /// These IPs cannot be routed on the public internet and should never be used for P2P
     /// See IANA IPv4 Special-Purpose Address Registry
-    private func isReservedIPAddress(_ host: String) -> Bool {
+    /// FIX #1365 / Security audit TASK 24: Used by both addAddress() and Peer.parseIPAddress()
+    nonisolated func isReservedIPAddress(_ host: String) -> Bool {
         // Skip .onion addresses
         if host.hasSuffix(".onion") {
             return false
@@ -1383,11 +1400,15 @@ public final class NetworkManager: ObservableObject {
         // 169.254.x.x - Link-local
         // 172.16-31.x.x - Private network
         // 192.168.x.x - Private network
+        // 100.64-127.x.x - RFC 6598 Shared Address Space (CGN)
         // 224-239.x.x.x - Multicast
         // 240-255.x.x.x - Reserved/Broadcast (includes 254.x.x.x)
         switch first {
         case 0, 10, 127:
             return true
+        case 100:
+            // FIX #1365 / Security audit TASK 24: RFC 6598 — Shared Address Space (CGN)
+            return parts[1] >= 64 && parts[1] <= 127
         case 169:
             return parts[1] == 254
         case 172:
@@ -1588,8 +1609,16 @@ public final class NetworkManager: ObservableObject {
     /// Update all reactive peer counts for Settings/Network UI
     /// This should be called whenever peer states change to keep the UI in sync
     func updatePeerCountsForSettings() {
-        DispatchQueue.main.async {
+        // FIX #1363: Execute synchronously when already on main thread (e.g., SwiftUI onAppear).
+        // DispatchQueue.main.async defers to next run loop → view renders with stale 0 values first.
+        // When called from background (keepalive ping), dispatch to main as before.
+        let updateBlock = {
             // CPU OPTIMIZATION: Only update @Published if value changed (avoids SwiftUI re-render)
+            // FIX #1363: Also update bannedPeersCount — was missing, causing all counters to show 0
+            // on Settings appearance until user tapped one (which fetched data and triggered re-render).
+            let newBanned = PeerManager.shared.bannedPeerCount
+            if self.bannedPeersCount != newBanned { self.bannedPeersCount = newBanned }
+
             let newParked = PeerManager.shared.getParkedPeers().count
             if self.parkedPeersCount != newParked { self.parkedPeersCount = newParked }
 
@@ -1598,6 +1627,12 @@ public final class NetworkManager: ObservableObject {
 
             let newPreferred = (try? WalletDatabase.shared.getPreferredSeeds().count) ?? 0
             if self.preferredSeedsCount != newPreferred { self.preferredSeedsCount = newPreferred }
+        }
+
+        if Thread.isMainThread {
+            updateBlock()
+        } else {
+            DispatchQueue.main.async { updateBlock() }
         }
     }
 
@@ -4323,7 +4358,7 @@ public final class NetworkManager: ObservableObject {
                         // Found incoming payment!
                         if decrypted.count >= 19 {
                             let valueBytes = Data(decrypted[11..<19])
-                            let value = valueBytes.withUnsafeBytes { $0.load(as: UInt64.self) }
+                            let value = valueBytes.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
                             txIncomingAmount += value
                             print("🔮 MEMPOOL: Found incoming \(value) zatoshis in tx \(txHashHex.prefix(12))...")
                         }
@@ -4500,7 +4535,7 @@ public final class NetworkManager: ObservableObject {
             ) {
                 if decrypted.count >= 19 {
                     let valueBytes = Data(decrypted[11..<19])
-                    let value = valueBytes.withUnsafeBytes { $0.load(as: UInt64.self) }
+                    let value = valueBytes.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
                     txIncomingAmount += value
                     print("🔮 FIX #1333: 💰 INSTANT DETECT — incoming \(value) zatoshis in TX \(txidDisplayHex.prefix(12))... from [\(fromPeer)]")
                 }
@@ -6282,7 +6317,7 @@ public final class NetworkManager: ObservableObject {
         // FIX #562 v3: Add try-catch to prevent crashes
         do {
             // Read transaction version (first 4 bytes)
-            let txVersion = txData.subdata(in: 0..<4).withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
+            let txVersion = txData.subdata(in: 0..<4).withUnsafeBytes { $0.loadUnaligned(as: UInt32.self).littleEndian }
 
             // Only parse v4+ transactions
             guard txVersion >= 4 else {
@@ -6304,21 +6339,21 @@ public final class NetworkManager: ObservableObject {
                     guard offset + 2 <= data.count else {
                         throw NetworkError.invalidTransaction("Compact size 253: insufficient bytes")
                     }
-                    let value = data.subdata(in: offset..<offset+2).withUnsafeBytes { $0.load(as: UInt16.self).littleEndian }
+                    let value = data.subdata(in: offset..<offset+2).withUnsafeBytes { $0.loadUnaligned(as: UInt16.self).littleEndian }
                     offset += 2
                     return UInt64(value)
                 } else if first == 254 {
                     guard offset + 4 <= data.count else {
                         throw NetworkError.invalidTransaction("Compact size 254: insufficient bytes")
                     }
-                    let value = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
+                    let value = data.subdata(in: offset..<offset+4).withUnsafeBytes { $0.loadUnaligned(as: UInt32.self).littleEndian }
                     offset += 4
                     return UInt64(value)
                 } else { // 255
                     guard offset + 8 <= data.count else {
                         throw NetworkError.invalidTransaction("Compact size 255: insufficient bytes")
                     }
-                    let value = data.subdata(in: offset..<offset+8).withUnsafeBytes { $0.load(as: UInt64.self).littleEndian }
+                    let value = data.subdata(in: offset..<offset+8).withUnsafeBytes { $0.loadUnaligned(as: UInt64.self).littleEndian }
                     offset += 8
                     return value
                 }
@@ -8703,6 +8738,21 @@ public final class NetworkManager: ObservableObject {
             do {
                 try await self.connect()
                 debugLog(.network, "📶 FIX #268: Successfully reconnected after network path change")
+
+                // FIX #1362: Restart block listeners IMMEDIATELY after network path change recovery.
+                // Without this, listeners are dead until FIX #1263 timer fires (~30-88s on iOS).
+                // During this gap: no inv messages → no mempool detection → no block confirmation.
+                // iOS log showed 88s gap after network path change at app launch → 2m26s to detect
+                // incoming TX in mempool, 5m55s to detect block confirmation.
+                if !PeerManager.shared.areBlockListenersBlocked() {
+                    // Brief wait for TCP connections to stabilize after connect()
+                    try? await Task.sleep(nanoseconds: 1_000_000_000) // 1s
+                    // Verify generation is still current (another path change may have fired)
+                    if self.getNetworkGeneration() == capturedGeneration {
+                        await self.startBlockListenersOnMainScreen()
+                        print("📶 FIX #1362: Block listeners restarted after network path change recovery")
+                    }
+                }
             } catch {
                 debugLog(.network, "📶 FIX #268: Failed to reconnect after path change: \(error.localizedDescription)")
             }

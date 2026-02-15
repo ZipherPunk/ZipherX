@@ -341,8 +341,8 @@ struct RPCSendView: View {
                                 .foregroundColor(theme.textSecondary)
 
                             Button("Copy TxID") {
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(txid, forType: .string)
+                                // FIX #1360: TASK 12 — Use ClipboardManager with 60s expiry for txids
+                                ClipboardManager.copyWithAutoExpiry(txid, seconds: 60)
                             }
                             .buttonStyle(System7ButtonStyle())
                         }

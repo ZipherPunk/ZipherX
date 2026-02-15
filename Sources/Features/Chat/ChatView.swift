@@ -1343,12 +1343,8 @@ struct MessageBubble: View {
                             .font(.system(size: 10, design: .monospaced))
                             .foregroundColor(theme.accentColor)
                         Button(action: {
-                            #if os(iOS)
-                            UIPasteboard.general.string = txid
-                            #else
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(txid, forType: .string)
-                            #endif
+                            // FIX #1360: TASK 12 — Use ClipboardManager with 60s expiry for txids
+                            ClipboardManager.copyWithAutoExpiry(txid, seconds: 60)
                             // Show brief feedback
                             withAnimation {
                                 copiedTxId = txid
@@ -1406,12 +1402,8 @@ struct MessageBubble: View {
                             .font(.system(size: 10, design: .monospaced))
                             .foregroundColor(theme.accentColor)
                         Button(action: {
-                            #if os(iOS)
-                            UIPasteboard.general.string = txid
-                            #else
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(txid, forType: .string)
-                            #endif
+                            // FIX #1360: TASK 12 — Use ClipboardManager with 60s expiry for txids
+                            ClipboardManager.copyWithAutoExpiry(txid, seconds: 60)
                             withAnimation {
                                 copiedTxId = txid
                             }
@@ -1959,12 +1951,8 @@ struct ChatSettingsSheet: View {
 
                                             // Copy button
                                             Button(action: {
-                                                #if os(iOS)
-                                                UIPasteboard.general.string = onion
-                                                #else
-                                                NSPasteboard.general.clearContents()
-                                                NSPasteboard.general.setString(onion, forType: .string)
-                                                #endif
+                                                // FIX #1360: TASK 12 — Use ClipboardManager with 60s expiry for onion addresses
+                                                ClipboardManager.copyWithAutoExpiry(onion, seconds: 60)
                                                 withAnimation {
                                                     showCopiedFeedback = true
                                                 }
