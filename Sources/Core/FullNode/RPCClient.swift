@@ -1121,7 +1121,8 @@ public class RPCClient: ObservableObject {
                let amounts = params["amounts"] as? [[String: Any]] {
                 for amt in amounts {
                     if let amtDouble = amt["amount"] as? Double {
-                        totalAmount += UInt64(amtDouble * 100_000_000)
+                        // FIX #1391: Use round() to avoid floating point truncation
+                        totalAmount += UInt64(round(amtDouble * 100_000_000))
                     }
                     if let addr = amt["address"] as? String, toAddress.isEmpty {
                         toAddress = addr
@@ -1161,7 +1162,8 @@ public class RPCClient: ObservableObject {
             allTransactions.append(WalletTransaction(
                 txid: txid,
                 address: toAddress,
-                amount: UInt64(amount * 100_000_000),
+                // FIX #1391: Use round() to avoid floating point truncation
+                amount: UInt64(round(amount * 100_000_000)),
                 fee: 10000, // Default fee
                 type: .sent,
                 timestamp: Date(timeIntervalSince1970: timestamp),
@@ -1561,7 +1563,8 @@ public class RPCClient: ObservableObject {
             // We must call gettransaction to get the actual confirmations
 
             let amountDouble = tx["amount"] as? Double ?? 0
-            let amount = UInt64(amountDouble * 100_000_000)
+            // FIX #1391: Use round() to avoid floating point truncation
+            let amount = UInt64(round(amountDouble * 100_000_000))
             let memoHex = tx["memo"] as? String
             let memo = memoHex.flatMap { Self.decodeMemo($0) }
 

@@ -120,6 +120,15 @@ struct ContentView: View {
                     // wallet.dat mode (task returns early), switching to ZipherX mode
                     // never triggers the P2P startup sequence.
                     .task(id: startupTaskId) {
+                        // FIX #1393: Reset sync completion flag when .task(id:) re-fires.
+                        // .task(id:) only re-fires when startupTaskId changes (mode switch)
+                        // or on initial view appearance. Without this reset, switching from
+                        // Full Node → P2P mode hits the hasCompletedInitialSync guard and
+                        // P2P startup NEVER runs — missed blocks are never scanned.
+                        await MainActor.run {
+                            hasCompletedInitialSync = false
+                        }
+
                         // FIX #1273: Skip entire P2P startup in wallet.dat (Full Node) mode.
                         // FullNodeWalletView has its own .task for RPC-based startup.
                         // Running P2P tree loading, header sync, etc. is wasteful and causes
@@ -136,6 +145,19 @@ struct ContentView: View {
                             return
                         }
                         #endif
+
+                        // FIX #1393: When switching FROM Full Node TO P2P, only show sync overlay
+                        // if the tree needs loading (first launch). If tree is already loaded from a
+                        // previous P2P session, skip the overlay — just do quick header catch-up in
+                        // the FAST START path. A valid delta + boost = no full rescan needed.
+                        await MainActor.run {
+                            if !walletManager.isTreeLoaded && !isInitialSync {
+                                isInitialSync = true
+                                print("🔄 FIX #1393: Tree not loaded — showing sync overlay for P2P startup")
+                            } else if walletManager.isTreeLoaded {
+                                print("🔄 FIX #1393: Tree already loaded — quick catch-up only (no sync overlay)")
+                            }
+                        }
 
                         // FIX #1273: SECURITY — Wait for authentication before starting ANY wallet operations.
                         // The lock screen is a visual overlay, but the .task fires immediately.
@@ -163,7 +185,7 @@ struct ContentView: View {
 
                         print("DEBUGZIPHERX: 🚀 Task: Starting initial sync task...")
 
-                        // Only run initial sync once
+                        // Only run initial sync once (per mode switch — reset by FIX #1393 above)
                         guard !hasCompletedInitialSync else {
                             print("DEBUGZIPHERX: 🚀 Task: Already completed, returning")
                             return
@@ -1289,43 +1311,53 @@ struct ContentView: View {
                                 $0.checkName == "Balance Integrity" && !$0.passed && $0.critical
                             }
 
-                            // FIX #1302: Auto Full Rescan DISABLED — Phase 2 P2P creates phantom notes.
-                            // Log the issue, user can manually Full Rescan from Settings.
-                            if false && hasCritical && (hasTreeRootMismatch || hasBalanceCorruption) {
-                                // FIX #1078: Balance corruption or Tree Root mismatch - auto-trigger Full Rescan (DISABLED by FIX #1302)
-                                if hasBalanceCorruption {
-                                    print("🔧 FIX #1078: Balance corruption detected - AUTO-triggering Full Rescan to rebuild notes...")
-                                }
-                                if hasTreeRootMismatch {
-                                    print("🔧 FIX #439: Tree Root mismatch detected - triggering Full Rescan to rebuild tree...")
-                                }
-                                let statusMsg = hasBalanceCorruption ? "Balance issue - rebuilding..." : "Tree mismatch - rebuilding..."
+                            // FIX #1394: Efficient tree rebuild for tree root mismatch.
+                            // Instead of nuclear Full Rescan (deletes notes, re-downloads everything),
+                            // just reset the FFI tree and re-load from existing local data (boost + delta).
+                            // preloadCommitmentTree() handles: boost deserialize → delta append → validate.
+                            // Preserves: notes, delta CMUs, headers, transaction history. Zero P2P needed.
+                            if hasCritical && hasTreeRootMismatch && !hasBalanceCorruption {
+                                print("🔧 FIX #1394: Tree root mismatch (FAST START) — rebuilding tree from local data...")
+                                print("🔧 FIX #1394: Preserving notes, delta, headers — zero P2P needed")
                                 await MainActor.run {
-                                    walletManager.setConnecting(true, status: statusMsg)
-                                    walletManager.syncTasks.append(SyncTask(id: "tree_rebuild", title: "Rebuilding wallet data", status: .inProgress, progress: 0.0))
+                                    walletManager.setConnecting(true, status: "Rebuilding tree from local data...")
                                 }
 
-                                // Trigger Full Rescan to rebuild the commitment tree
+                                // Step 1: Reset FFI tree to empty
+                                _ = ZipherXFFI.treeInit()
+                                // Step 2: Clear DB tree snapshot (forces reload from boost file)
+                                try? WalletDatabase.shared.clearTreeStateOnly()
+                                // Step 3: Mark tree as unloaded so ensureTreeLoaded() re-runs
+                                await MainActor.run { walletManager.setTreeLoaded(false) }
+                                // Step 4: Re-load tree from boost + existing delta (all local, fast)
+                                await walletManager.ensureTreeLoaded()
+                                // Wait for tree to finish loading
+                                var treeRebuildWait = 0
+                                while !walletManager.isTreeLoaded && treeRebuildWait < 600 { // max 60s
+                                    try? await Task.sleep(nanoseconds: 100_000_000)
+                                    treeRebuildWait += 1
+                                }
+                                if walletManager.isTreeLoaded {
+                                    print("✅ FIX #1394: Tree rebuilt from local data (FAST START)")
+                                } else {
+                                    print("❌ FIX #1394: Tree rebuild timed out — proceeding to UI for manual repair")
+                                }
+                                // Continue to main UI — tree is rebuilt, witnesses will be rebuilt in background
+                            } else if hasCritical && hasBalanceCorruption {
+                                // Balance corruption is more serious — trigger full repair
+                                print("🔧 FIX #1394: Balance corruption detected (FAST START) — triggering repair...")
+                                await MainActor.run {
+                                    walletManager.setConnecting(true, status: "Verifying balance...")
+                                }
                                 do {
                                     try await walletManager.repairNotesAfterDownloadedTree(onProgress: { progress, current, total in
-                                        print("🔧 FIX #439: Tree rebuild progress \(Int(progress * 100))% (\(current)/\(total))")
-                                        Task { @MainActor in
-                                            walletManager.updateSyncTask(id: "tree_rebuild", status: .inProgress, detail: "\(current)/\(total) blocks", progress: progress)
-                                        }
-                                    }, forceFullRescan: true)
-                                    await MainActor.run {
-                                        walletManager.updateSyncTask(id: "tree_rebuild", status: .completed)
-                                    }
-                                    print("✅ FIX #439: Tree rebuild complete - continuing startup")
-                                    // Continue to main UI after successful repair
+                                        print("🔧 FIX #1394: Repair progress \(Int(progress * 100))% (\(current)/\(total))")
+                                    }, forceFullRescan: false)
+                                    print("✅ FIX #1394: Balance repair complete (FAST START)")
                                 } catch {
-                                    print("❌ FIX #439: Tree rebuild failed: \(error.localizedDescription)")
-                                    await MainActor.run {
-                                        walletManager.updateSyncTask(id: "tree_rebuild", status: .failed("Rebuild failed"))
-                                        walletManager.setConnecting(true, status: "Tree rebuild failed - please try Full Rescan in Settings")
-                                    }
-                                    return
+                                    print("❌ FIX #1394: Balance repair failed: \(error.localizedDescription)")
                                 }
+                                // Continue to UI regardless
                             } else if hasCritical {
                                 print("❌ FAST START: Critical health check failures detected - wallet may not function correctly")
                                 // FIX #120: Stay on sync screen for critical failures
@@ -2123,40 +2155,47 @@ struct ContentView: View {
                             $0.checkName == "Balance Integrity" && !$0.passed && $0.critical
                         }
 
-                        // FIX #1302: Auto Full Rescan DISABLED — Phase 2 P2P creates phantom notes.
-                        // Log the issue, user can manually Full Rescan from Settings.
-                        if false && fullStartHasCritical && (fullStartHasTreeRootMismatch || fullStartHasBalanceCorruption) {
-                            // FIX #1078: Balance corruption or Tree Root mismatch - auto-trigger Full Rescan (DISABLED by FIX #1302)
-                            if fullStartHasBalanceCorruption {
-                                print("🔧 FIX #1078: Balance corruption detected (FULL START) - AUTO-triggering Full Rescan...")
-                            }
-                            if fullStartHasTreeRootMismatch {
-                                print("🔧 FIX #439: Tree Root mismatch detected (FULL START) - triggering Full Rescan...")
-                            }
-                            let fullStartStatusMsg = fullStartHasBalanceCorruption ? "Balance issue - rebuilding..." : "Tree mismatch - rebuilding..."
+                        // FIX #1394: Efficient tree rebuild for tree root mismatch.
+                        // Instead of nuclear Full Rescan (deletes notes, re-downloads everything),
+                        // just reset the FFI tree and re-load from existing local data (boost + delta).
+                        // A valid delta is like the boost — NEVER delete good data.
+                        if fullStartHasCritical && fullStartHasTreeRootMismatch && !fullStartHasBalanceCorruption {
+                            print("🔧 FIX #1394: Tree root mismatch (FULL START) — rebuilding tree from local data...")
+                            print("🔧 FIX #1394: Preserving notes, delta, headers — zero P2P needed")
                             await MainActor.run {
-                                walletManager.setConnecting(true, status: fullStartStatusMsg)
-                                walletManager.syncTasks.append(SyncTask(id: "tree_rebuild", title: "Rebuilding wallet data", status: .inProgress, progress: 0.0))
+                                walletManager.setConnecting(true, status: "Rebuilding tree from local data...")
                             }
 
+                            // Step 1: Reset FFI tree to empty
+                            _ = ZipherXFFI.treeInit()
+                            // Step 2: Clear DB tree snapshot (forces reload from boost file)
+                            try? WalletDatabase.shared.clearTreeStateOnly()
+                            // Step 3: Mark tree as unloaded so ensureTreeLoaded() re-runs
+                            await MainActor.run { walletManager.setTreeLoaded(false) }
+                            // Step 4: Re-load tree from boost + existing delta (all local, fast)
+                            await walletManager.ensureTreeLoaded()
+                            var treeRebuildWait = 0
+                            while !walletManager.isTreeLoaded && treeRebuildWait < 600 {
+                                try? await Task.sleep(nanoseconds: 100_000_000)
+                                treeRebuildWait += 1
+                            }
+                            if walletManager.isTreeLoaded {
+                                print("✅ FIX #1394: Tree rebuilt from local data (FULL START)")
+                            } else {
+                                print("❌ FIX #1394: Tree rebuild timed out — proceeding to UI for manual repair")
+                            }
+                        } else if fullStartHasCritical && fullStartHasBalanceCorruption {
+                            print("🔧 FIX #1394: Balance corruption detected (FULL START) — triggering repair...")
+                            await MainActor.run {
+                                walletManager.setConnecting(true, status: "Verifying balance...")
+                            }
                             do {
                                 try await walletManager.repairNotesAfterDownloadedTree(onProgress: { progress, current, total in
-                                    print("🔧 FIX #439: Tree rebuild progress \(Int(progress * 100))% (\(current)/\(total))")
-                                    Task { @MainActor in
-                                        walletManager.updateSyncTask(id: "tree_rebuild", status: .inProgress, detail: "\(current)/\(total) blocks", progress: progress)
-                                    }
-                                }, forceFullRescan: true)
-                                await MainActor.run {
-                                    walletManager.updateSyncTask(id: "tree_rebuild", status: .completed)
-                                }
-                                print("✅ FIX #439: Tree rebuild complete (FULL START)")
+                                    print("🔧 FIX #1394: Repair progress \(Int(progress * 100))% (\(current)/\(total))")
+                                }, forceFullRescan: false)
+                                print("✅ FIX #1394: Balance repair complete (FULL START)")
                             } catch {
-                                print("❌ FIX #439: Tree rebuild failed: \(error.localizedDescription)")
-                                await MainActor.run {
-                                    walletManager.updateSyncTask(id: "tree_rebuild", status: .failed("Rebuild failed"))
-                                    walletManager.setConnecting(true, status: "Tree rebuild failed - please try Full Rescan in Settings")
-                                }
-                                return
+                                print("❌ FIX #1394: Balance repair failed: \(error.localizedDescription)")
                             }
                         } else if fullStartHasCritical {
                             print("❌ FULL START: Critical health check failures detected - wallet may not function correctly")

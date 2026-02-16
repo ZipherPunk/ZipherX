@@ -2593,7 +2593,8 @@ struct SendViewForPayment: View {
 
     private var hasEnoughBalance: Bool {
         guard let amount = Double(prefilledAmount) else { return false }
-        let amountZatoshis = UInt64(amount * 100_000_000)
+        // FIX #1391: Use round() to avoid floating point truncation
+        let amountZatoshis = UInt64(round(amount * 100_000_000))
         let fee: UInt64 = 10_000
         return walletManager.shieldedBalance >= amountZatoshis + fee
     }

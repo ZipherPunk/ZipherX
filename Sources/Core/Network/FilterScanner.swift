@@ -3554,7 +3554,10 @@ final class FilterScanner {
                                     }
                                     // Track this TX for reconciliation when we find the change output
                                     externalSpendTxids.insert(txid)
-                                    externalSpendNoteValue = spentNote.value
+                                    // FIX #1395: ACCUMULATE total input value (not overwrite)
+                                    // When 2+ notes are spent in same TX, we need total to compute sentAmount correctly
+                                    // Bug: was `= spentNote.value` → only last note's value → wrong sentAmount
+                                    externalSpendNoteValue += spentNote.value
                                 }
                             }
                         }

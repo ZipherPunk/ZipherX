@@ -4039,7 +4039,8 @@ public final class NetworkManager: ObservableObject {
             // FIX #161: P2P-based confirmation check
             // Check if this tx exists in our transaction history (means it was confirmed during sync)
             let historyItems = (try? WalletDatabase.shared.getTransactionHistory(limit: 50, offset: 0)) ?? []
-            let txExists = historyItems.contains { item in
+            // FIX #1396: Find the MATCHING item (not just existence) so we can check tx_type
+            let matchingItem = historyItems.first { item in
                 // FIX #1331: Compare BOTH wire and display format hex.
                 // Pending txids are tracked in DISPLAY format (reversed, line 4152)
                 // but DB stores txids in WIRE format (little-endian).
@@ -4049,7 +4050,32 @@ public final class NetworkManager: ObservableObject {
                 return itemWireHex == txid || itemDisplayHex == txid
             }
 
-            if txExists {
+            if let matchingItem = matchingItem {
+                // FIX #1396: Check tx_type — if this is a SENT TX (external spend via FIX #843),
+                // do NOT confirm as incoming. Clear pending tracking instead.
+                // Bug: checkPendingIncomingConfirmations didn't check type → SENT TXs were
+                // confirmed as "incoming" → wrong "+0.001 ZCL" notification + wrong direction
+                if matchingItem.type == .sent || matchingItem.type == .selfSend {
+                    print("⛏️ FIX #1396: TX \(txid.prefix(16))... found in history as \(matchingItem.type.rawValue) — clearing pending incoming (NOT confirming as received)")
+                    // Clear tracking state (don't leave stale pending entries)
+                    _ = await txTrackingState.confirmIncoming(txid: txid)
+                    await txTrackingState.clearIncomingNotification(txid: txid)
+                    await MainActor.run {
+                        if self.mempoolIncoming >= amount {
+                            self.mempoolIncoming -= amount
+                        } else {
+                            self.mempoolIncoming = 0
+                        }
+                        if self.mempoolTxCount > 0 {
+                            self.mempoolTxCount -= 1
+                        }
+                        // Refresh UI to show correct state
+                        NotificationCenter.default.post(name: Notification.Name("transactionHistoryUpdated"), object: nil)
+                    }
+                    confirmedCount += 1
+                    continue
+                }
+
                 print("⛏️ FIX #161: Confirmed incoming tx found in history: \(txid.prefix(16))...")
                 print("⛏️ BALANCE CARD should now clear 'awaiting...' message!")
                 await confirmIncomingTx(txid: txid, amount: amount)
@@ -4372,6 +4398,14 @@ public final class NetworkManager: ObservableObject {
                     let txidData = txHashWire
                     var isChangeOutput = (try? WalletDatabase.shared.transactionExists(txid: txidData, type: .sent)) ?? false
 
+                    // FIX #1392: External spend detection — our decrypted output in this TX is CHANGE, not received.
+                    // When pendingExternalSpend is set, we know this TX spends our note from another wallet.
+                    // Any output we can decrypt in the same TX is the change back to our address.
+                    if !isChangeOutput && pendingExternalSpend != nil {
+                        isChangeOutput = true
+                        print("🔔 FIX #1392: External spend detected in same TX — marking output as change (not received)")
+                    }
+
                     if !isChangeOutput {
                         let isPending = await txTrackingState.isPendingOutgoing(txid: txHashHex)
                         if isPending {
@@ -4518,6 +4552,24 @@ public final class NetworkManager: ObservableObject {
         if mempoolOutgoing > 0 {
             print("🔮 FIX #1333: Skipping \(txidDisplayHex.prefix(12))... (mempoolOutgoing > 0 — likely change)")
             return
+        }
+
+        // FIX #1397: Check for external spends BEFORE treating as incoming
+        // Parse shielded spends (nullifiers) and check if any match our notes
+        // This detects when another wallet (e.g. full node daemon) spent our notes
+        if let nullifiers = parseShieldedSpends(from: rawTx) {
+            for nullifier in nullifiers {
+                if let noteInfo = try? WalletDatabase.shared.getNoteByNullifier(nullifier: nullifier) {
+                    // This TX spends our note! Check it's not our own pending TX
+                    let isOurPending = pendingOutgoingTxids.contains(txidDisplayHex) || isPendingOutgoingSync(txid: txidDisplayHex)
+                    let isOurRecorded = (try? WalletDatabase.shared.transactionExists(txid: txidWire, type: .sent)) ?? false
+                    if !isOurPending && !isOurRecorded {
+                        print("🔮 FIX #1397: EXTERNAL SPEND detected in instant mempool TX \(txidDisplayHex.prefix(12))... (note value: \(noteInfo.value) zat) — suppressing incoming notification")
+                        // Don't show as incoming — block scanner will handle via FIX #843
+                        return
+                    }
+                }
+            }
         }
 
         // Parse and trial decrypt shielded outputs

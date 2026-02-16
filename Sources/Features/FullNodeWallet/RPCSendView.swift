@@ -91,7 +91,8 @@ struct RPCSendView: View {
         // FIX #1274: Use robust normalization for amount parsing
         let normalized = normalizeAmount(amount)
         guard let amountValue = Double(normalized), amountValue > 0 else { return false }
-        let amountZatoshis = UInt64(amountValue * 100_000_000)
+        // FIX #1391: Use round() to avoid floating point truncation (0.0012 → 119999 instead of 120000)
+        let amountZatoshis = UInt64(round(amountValue * 100_000_000))
         return amountZatoshis <= from.balance
     }
 
@@ -569,7 +570,8 @@ struct RPCSendView: View {
         }
 
         // FIX #1267: Require biometric/passcode auth before sending (was completely missing)
-        let zatoshis = UInt64(amountValue * 100_000_000)
+        // FIX #1391: Use round() to avoid floating point truncation
+        let zatoshis = UInt64(round(amountValue * 100_000_000))
         let authSuccess = await withCheckedContinuation { continuation in
             BiometricAuthManager.shared.authenticateForSend(amount: zatoshis) { success, error in
                 if !success {
@@ -591,7 +593,8 @@ struct RPCSendView: View {
         }
 
         do {
-            let amountZatoshis = UInt64(amountValue * 100_000_000)
+            // FIX #1391: Use round() to avoid floating point truncation (0.0012 → 119999 instead of 120000)
+            let amountZatoshis = UInt64(round(amountValue * 100_000_000))
             let txid: String
 
             if from.isShielded {
