@@ -9,8 +9,13 @@ pub mod tor;
 // FIX #342: Fast HTTP downloads using reqwest (replaces slow Swift URLSession)
 pub mod download;
 
-// Set to true for verbose debug output, false for production
-const DEBUG_LOGGING: bool = true;  // FIX #514: Enabled to verify CMU byte order handling
+// FIX #1385: DEBUG_LOGGING disabled in release builds via cfg gate.
+// Only enabled in debug/development builds to prevent sensitive data leakage in production.
+// FIX #514: Originally enabled to verify CMU byte order handling.
+#[cfg(debug_assertions)]
+const DEBUG_LOGGING: bool = true;
+#[cfg(not(debug_assertions))]
+const DEBUG_LOGGING: bool = false;
 
 // Macro for conditional debug output
 macro_rules! debug_log {
@@ -78,6 +83,7 @@ use zcash_proofs::sapling::SaplingVerificationContext;
 use zcash_proofs::ZcashParameters;
 use group::{GroupEncoding, cofactor::CofactorGroup, Curve};
 use ff::{PrimeField, Field};
+use subtle::ConstantTimeEq;  // FIX #1385: Side-channel resistant comparison for crypto data
 use rand::rngs::OsRng;
 
 // Global prover instance
@@ -207,6 +213,57 @@ fn safe_try_into<const N: usize>(slice: &[u8]) -> Option<[u8; N]> {
     slice.try_into().ok()
 }
 
+// =============================================================================
+// FIX #1385: Standardized FFI Error Codes
+// =============================================================================
+//
+// All extern "C" functions returning i32 should use these constants for
+// consistent error reporting across the Swift/Rust boundary.
+// Positive values = success, negative values = specific error categories.
+//
+// NOTE: Many existing functions use 0/1 or function-specific codes.
+// These constants are for NEW code and gradual migration — existing return
+// values are NOT changed to preserve backward compatibility with Swift callers.
+
+/// Operation completed successfully
+pub const FFI_SUCCESS: i32 = 1;
+/// Null pointer passed where non-null was required
+pub const FFI_ERROR_NULL_POINTER: i32 = -1;
+/// Length parameter is invalid (zero, too large, or mismatched)
+pub const FFI_ERROR_INVALID_LENGTH: i32 = -2;
+/// Integer overflow detected in size calculation
+pub const FFI_ERROR_OVERFLOW: i32 = -3;
+/// Failed to acquire mutex lock
+pub const FFI_ERROR_LOCK_FAILED: i32 = -4;
+/// Panic caught at FFI boundary (catch_unwind)
+pub const FFI_ERROR_PANIC: i32 = -5;
+/// Input data is malformed or cannot be parsed
+pub const FFI_ERROR_INVALID_DATA: i32 = -6;
+/// Output buffer too small for result
+pub const FFI_ERROR_BUFFER_TOO_SMALL: i32 = -7;
+/// Cryptographic operation failed (proof generation, key derivation, etc.)
+pub const FFI_ERROR_CRYPTO_FAILED: i32 = -8;
+/// Commitment tree is corrupted or in an invalid state
+pub const FFI_ERROR_TREE_CORRUPTED: i32 = -9;
+/// Witness operation failed (creation, update, serialization)
+pub const FFI_ERROR_WITNESS_FAILED: i32 = -10;
+
+/// FIX #1385: Macro to wrap FFI function bodies in catch_unwind.
+/// Prevents Rust panics from unwinding across the FFI boundary into Swift,
+/// which would be instant undefined behavior / crash.
+/// Usage: ffi_catch_unwind!(error_value, { ... body ... })
+macro_rules! ffi_catch_unwind {
+    ($error_val:expr, $body:block) => {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
+            Ok(result) => result,
+            Err(_panic) => {
+                eprintln!("❌ FIX #1385: Panic caught at FFI boundary");
+                $error_val
+            }
+        }
+    };
+}
+
 // Zclassic network parameters
 #[derive(Clone, Copy, Debug)]
 struct ZclassicNetwork;
@@ -273,28 +330,35 @@ impl Parameters for ZclassicNetwork {
 /// Generate a 24-word BIP-39 mnemonic
 #[no_mangle]
 pub unsafe extern "C" fn zipherx_generate_mnemonic(output: *mut u8) -> usize {
-    let mnemonic: Mnemonic<English> = Mnemonic::generate(Count::Words24);
+    // FIX #1385: Null pointer validation
+    if output.is_null() { return 0; }
+    // FIX #1385: catch_unwind to prevent panics crossing FFI boundary
+    ffi_catch_unwind!(0, {
+        let mnemonic: Mnemonic<English> = Mnemonic::generate(Count::Words24);
 
-    let phrase = mnemonic.phrase();
-    let bytes = phrase.as_bytes();
+        let phrase = mnemonic.phrase();
+        let bytes = phrase.as_bytes();
 
-    if bytes.len() > 256 {
-        return 0;
-    }
+        if bytes.len() > 256 {
+            return 0;
+        }
 
-    std::ptr::copy_nonoverlapping(bytes.as_ptr(), output, bytes.len());
-    bytes.len()
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), output, bytes.len());
+        bytes.len()
+    })
 }
 
 /// Validate a BIP-39 mnemonic
 #[no_mangle]
 pub unsafe extern "C" fn zipherx_validate_mnemonic(mnemonic: *const i8) -> bool {
+    ffi_catch_unwind!(false, {
     let c_str = match std::ffi::CStr::from_ptr(mnemonic).to_str() {
         Ok(s) => s,
         Err(_) => return false,
     };
 
     Mnemonic::<English>::from_phrase(c_str).is_ok()
+    })
 }
 
 /// Derive seed from mnemonic (PBKDF2-SHA512)
@@ -303,19 +367,24 @@ pub unsafe extern "C" fn zipherx_mnemonic_to_seed(
     mnemonic: *const i8,
     output: *mut u8,
 ) -> bool {
-    let phrase = match std::ffi::CStr::from_ptr(mnemonic).to_str() {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
+    // FIX #1385: Null pointer validation
+    if mnemonic.is_null() || output.is_null() { return false; }
+    // FIX #1385: catch_unwind to prevent panics crossing FFI boundary
+    ffi_catch_unwind!(false, {
+        let phrase = match std::ffi::CStr::from_ptr(mnemonic).to_str() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
 
-    let mnemonic: Mnemonic<English> = match Mnemonic::from_phrase(phrase) {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
+        let mnemonic: Mnemonic<English> = match Mnemonic::from_phrase(phrase) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
 
-    let seed = mnemonic.to_seed("");
-    std::ptr::copy_nonoverlapping(seed.as_ptr(), output, 64);
-    true
+        let seed = mnemonic.to_seed("");
+        std::ptr::copy_nonoverlapping(seed.as_ptr(), output, 64);
+        true
+    })
 }
 
 // =============================================================================
@@ -331,6 +400,7 @@ pub unsafe extern "C" fn zipherx_derive_spending_key(
     account: u32,
     sk_out: *mut u8,
 ) -> bool {
+    ffi_catch_unwind!(false, {
     // FIX #230: Validate input pointers and create safe slice
     let seed_slice = match safe_slice(seed, 64) {
         Some(s) => s,
@@ -371,6 +441,7 @@ pub unsafe extern "C" fn zipherx_derive_spending_key(
     std::ptr::copy_nonoverlapping(serialized.as_ptr(), sk_out, 169);
 
     true
+    })
 }
 
 /// Derive payment address from serialized ExtendedSpendingKey (169 bytes)
@@ -381,6 +452,7 @@ pub unsafe extern "C" fn zipherx_derive_address(
     diversifier_index: u64,
     address_out: *mut u8,
 ) -> bool {
+    ffi_catch_unwind!(false, {
     // FIX #230: Validate input pointer
     let sk_slice = match safe_slice(sk, 169) {
         Some(s) => s,
@@ -417,6 +489,7 @@ pub unsafe extern "C" fn zipherx_derive_address(
     std::ptr::copy_nonoverlapping(addr_bytes.as_ptr(), address_out, 43);
 
     true
+    })
 }
 
 /// Derive incoming viewing key from serialized ExtendedSpendingKey (169 bytes)
@@ -426,6 +499,7 @@ pub unsafe extern "C" fn zipherx_derive_ivk(
     sk: *const u8,
     ivk_out: *mut u8,
 ) -> bool {
+    ffi_catch_unwind!(false, {
     // FIX #230: Validate input pointer
     let sk_slice = match safe_slice(sk, 169) {
         Some(s) => s,
@@ -454,6 +528,7 @@ pub unsafe extern "C" fn zipherx_derive_ivk(
     std::ptr::copy_nonoverlapping(ivk_bytes.as_ptr(), ivk_out, 32);
 
     true
+    })
 }
 
 
@@ -469,6 +544,7 @@ pub unsafe extern "C" fn zipherx_compute_nullifier(
     position: u64,
     nf_out: *mut u8,
 ) -> bool {
+    ffi_catch_unwind!(false, {
     use zcash_primitives::sapling::{Diversifier, Rseed};
     use zcash_primitives::zip32::ExtendedSpendingKey;
     use jubjub::Fr;
@@ -552,6 +628,7 @@ pub unsafe extern "C" fn zipherx_compute_nullifier(
     std::ptr::copy_nonoverlapping(nullifier.0.as_ptr(), nf_out, 32);
 
     true
+    })
 }
 
 // =============================================================================
@@ -565,6 +642,7 @@ pub unsafe extern "C" fn zipherx_encode_address(
     address: *const u8,
     output: *mut u8,
 ) -> usize {
+    ffi_catch_unwind!(0, {
     // FIX #230: Validate input pointers
     let addr_slice = match safe_slice(address, 43) {
         Some(s) => s,
@@ -589,6 +667,7 @@ pub unsafe extern "C" fn zipherx_encode_address(
 
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), output, bytes.len());
     bytes.len()
+    })
 }
 
 /// Decode Zclassic z-address string to bytes
@@ -597,6 +676,9 @@ pub unsafe extern "C" fn zipherx_decode_address(
     address_str: *const i8,
     output: *mut u8,
 ) -> bool {
+    ffi_catch_unwind!(false, {
+    // FIX #1385: Null pointer validation
+    if address_str.is_null() || output.is_null() { return false; }
     let addr = match std::ffi::CStr::from_ptr(address_str).to_str() {
         Ok(s) => s,
         Err(_) => return false,
@@ -624,11 +706,13 @@ pub unsafe extern "C" fn zipherx_decode_address(
 
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), output, 43);
     true
+    })
 }
 
 /// Validate a z-address
 #[no_mangle]
 pub unsafe extern "C" fn zipherx_validate_address(address_str: *const i8) -> bool {
+    ffi_catch_unwind!(false, {
     let addr = match std::ffi::CStr::from_ptr(address_str).to_str() {
         Ok(s) => s,
         Err(_) => return false,
@@ -650,6 +734,7 @@ pub unsafe extern "C" fn zipherx_validate_address(address_str: *const i8) -> boo
         Ok(b) => b.len() == 43,
         Err(_) => false,
     }
+    })
 }
 
 // =============================================================================
@@ -667,6 +752,7 @@ pub unsafe extern "C" fn zipherx_try_decrypt_note(
     ciphertext: *const u8,
     output: *mut u8,
 ) -> usize {
+    ffi_catch_unwind!(0, {
     use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, aead::Aead, KeyInit};
 
     // FIX #230: Validate all input pointers
@@ -748,7 +834,10 @@ pub unsafe extern "C" fn zipherx_try_decrypt_note(
     let symmetric_key = kdf_hasher.finalize();
 
     // Decrypt with ChaCha20Poly1305
-    let key = Key::from_slice(symmetric_key.as_bytes());
+    // FIX #1389: Copy key bytes into mutable buffer so we can zero after use
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(symmetric_key.as_bytes());
+    let key = Key::from_slice(&key_bytes);
     let cipher = ChaCha20Poly1305::new(key);
     let nonce = Nonce::from_slice(&[0u8; 12]);
 
@@ -756,9 +845,14 @@ pub unsafe extern "C" fn zipherx_try_decrypt_note(
     let decrypted = match cipher.decrypt(nonce, &ciphertext_slice[..580]) {
         Ok(p) => p,
         Err(_) => {
+            // FIX #1389: Zero cipher key material before returning
+            secure_zero(&mut key_bytes);
             return 0;
         }
     };
+
+    // FIX #1389: Zero cipher key material after decryption
+    secure_zero(&mut key_bytes);
 
     if decrypted.len() < 51 {
         return 0;
@@ -768,6 +862,7 @@ pub unsafe extern "C" fn zipherx_try_decrypt_note(
     let out_len = decrypted.len().min(564);
     std::ptr::copy_nonoverlapping(decrypted.as_ptr(), output, out_len);
     out_len
+    })
 }
 
 /// Try to decrypt a Sapling note using the spending key directly
@@ -802,6 +897,7 @@ pub unsafe extern "C" fn zipherx_try_decrypt_note_with_sk(
     ciphertext: *const u8,
     output: *mut u8,
 ) -> usize {
+    ffi_catch_unwind!(0, {
     // FIX #230: Validate all input pointers
     let sk_slice = match safe_slice(sk, 169) {
         Some(s) => s,
@@ -932,10 +1028,16 @@ pub unsafe extern "C" fn zipherx_try_decrypt_note_with_sk(
         .update(&kdf_input)
         .finalize();
 
+    // FIX #1385: Zero KDF input (contains shared secret + EPK) after use
+    secure_zero(&mut kdf_input);
+
     debug_log!("DEBUG: KDF key first 4 bytes: {:02x?}", &key.as_bytes()[0..4]);
 
     // Try ChaCha20Poly1305 decryption
-    let cipher_key = GenericArray::from_slice(key.as_bytes());
+    // FIX #1389: Copy key bytes into mutable buffer so we can zero after use
+    let mut cipher_key_bytes = [0u8; 32];
+    cipher_key_bytes.copy_from_slice(key.as_bytes());
+    let cipher_key = GenericArray::from_slice(&cipher_key_bytes);
     let cipher = ChaCha20Poly1305::new(cipher_key);
     let nonce = GenericArray::from_slice(&[0u8; 12]);
 
@@ -955,14 +1057,17 @@ pub unsafe extern "C" fn zipherx_try_decrypt_note_with_sk(
             // FIX #761: Safe bounds check instead of unwrap panic
             if plaintext.len() < 20 {
                 debug_log!("DEBUG: ❌ Plaintext too short for value extraction: {} bytes", plaintext.len());
+                // FIX #1389: Zero cipher key material before returning
+                secure_zero(&mut cipher_key_bytes);
                 return 0;
             }
             let value = u64::from_le_bytes(plaintext[12..20].try_into().unwrap_or([0u8; 8]));
             debug_log!("DEBUG: Decrypted value: {} zatoshis ({} ZCL)", value, value as f64 / 100_000_000.0);
 
             // Check if diversifier matches our address
+            // FIX #1385: Use constant-time comparison to prevent timing side-channel attacks
             let our_div = default_addr.diversifier().0;
-            if plaintext[1..12] == our_div {
+            if bool::from(plaintext[1..12].ct_eq(&our_div[..])) {
                 debug_log!("DEBUG: ✅ Diversifier MATCHES! This note is for us!");
             } else {
                 debug_log!("DEBUG: ❌ Diversifier does not match. Note is for someone else.");
@@ -974,6 +1079,9 @@ pub unsafe extern "C" fn zipherx_try_decrypt_note_with_sk(
             debug_log!("DEBUG: ❌ ChaCha20Poly1305 auth tag verification failed");
         }
     }
+
+    // FIX #1389: Zero cipher key material after decryption
+    secure_zero(&mut cipher_key_bytes);
 
     let shielded_output = RawShieldedOutput {
         epk: epk_bytes,
@@ -1018,6 +1126,7 @@ pub unsafe extern "C" fn zipherx_try_decrypt_note_with_sk(
         }
         None => 0,
     }
+    })
 }
 
 // =============================================================================
@@ -1062,6 +1171,7 @@ pub unsafe extern "C" fn zipherx_try_decrypt_notes_parallel(
     height: u64,
     results: *mut u8,
 ) -> usize {
+    ffi_catch_unwind!(0, {
     if output_count == 0 {
         return 0;
     }
@@ -1091,15 +1201,31 @@ pub unsafe extern "C" fn zipherx_try_decrypt_notes_parallel(
 
     let block_height = BlockHeight::from_u32(height as u32);
 
+    // FIX #1385: Use checked_mul to prevent integer overflow in size calculations
+    let outputs_total_len = match output_count.checked_mul(644) {
+        Some(len) => len,
+        None => {
+            eprintln!("❌ FIX #1385: output_count * 644 overflows");
+            return 0;
+        }
+    };
+    let results_total_len = match output_count.checked_mul(564) {
+        Some(len) => len,
+        None => {
+            eprintln!("❌ FIX #1385: output_count * 564 overflows");
+            return 0;
+        }
+    };
+
     // FIX #230: Validate output data and results pointers
-    let outputs_slice = match safe_slice(outputs_data, output_count * 644) {
+    let outputs_slice = match safe_slice(outputs_data, outputs_total_len) {
         Some(s) => s,
         None => {
             debug_log!("zipherx_try_decrypt_notes_parallel: invalid outputs_data pointer");
             return 0;
         }
     };
-    let results_slice = match safe_slice_mut(results, output_count * 564) {
+    let results_slice = match safe_slice_mut(results, results_total_len) {
         Some(s) => s,
         None => {
             debug_log!("zipherx_try_decrypt_notes_parallel: invalid results pointer");
@@ -1177,12 +1303,15 @@ pub unsafe extern "C" fn zipherx_try_decrypt_notes_parallel(
     });
 
     decrypted_count.load(Ordering::Relaxed)
+    })
 }
 
 /// Get the number of CPU threads Rayon will use for parallel decryption
 #[no_mangle]
 pub extern "C" fn zipherx_get_rayon_threads() -> usize {
+    ffi_catch_unwind!(0, {
     rayon::current_num_threads()
+    })
 }
 
 // =============================================================================
@@ -1197,21 +1326,27 @@ use zcash_primitives::transaction::components::sapling::builder::{
 /// Returns 0 when no proof generation is in progress.
 #[no_mangle]
 pub extern "C" fn zipherx_get_proof_total() -> u32 {
+    ffi_catch_unwind!(0, {
     GROTH16_PROOFS_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+    })
 }
 
 /// FIX #1326: Get number of spend proofs completed so far.
 /// Swift polls this every ~200ms to update the countdown timer.
 #[no_mangle]
 pub extern "C" fn zipherx_get_proof_completed() -> u32 {
+    ffi_catch_unwind!(0, {
     GROTH16_PROOFS_COMPLETED.load(std::sync::atomic::Ordering::Relaxed)
+    })
 }
 
 /// FIX #1326: Get number of threads in the Groth16 proof pool.
 /// Swift uses: estimatedSeconds = ceil(total / threads) * ~1.0s
 #[no_mangle]
 pub extern "C" fn zipherx_get_proof_threads() -> u32 {
+    ffi_catch_unwind!(0, {
     GROTH16_PROOF_THREADS.load(std::sync::atomic::Ordering::Relaxed)
+    })
 }
 
 /// FIX #1328: Cancel any in-progress Groth16 proof generation.
@@ -1220,11 +1355,13 @@ pub extern "C" fn zipherx_get_proof_threads() -> u32 {
 /// Safe to call even when no proofs are running — the flag is reset at next proof start.
 #[no_mangle]
 pub extern "C" fn zipherx_cancel_proof_generation() {
+    let _ = ffi_catch_unwind!((), {
     GROTH16_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
     // Also reset counters so Swift UI doesn't show stale progress
     GROTH16_PROOFS_TOTAL.store(0, std::sync::atomic::Ordering::Relaxed);
     GROTH16_PROOFS_COMPLETED.store(0, std::sync::atomic::Ordering::Relaxed);
     GROTH16_PROOF_THREADS.store(0, std::sync::atomic::Ordering::Relaxed);
+    });
 }
 
 // =============================================================================
@@ -1234,7 +1371,9 @@ pub extern "C" fn zipherx_cancel_proof_generation() {
 /// Get the library version
 #[no_mangle]
 pub extern "C" fn zipherx_version() -> u32 {
+    ffi_catch_unwind!(0, {
     3 // Version 3 with ZclassicButtercup branch ID support (0x930b540d)
+    })
 }
 
 /// Get the consensus branch ID for a given height on Zclassic
@@ -1243,6 +1382,7 @@ pub extern "C" fn zipherx_version() -> u32 {
 /// @return Branch ID as u32 (e.g., 0x930b540d for Buttercup)
 #[no_mangle]
 pub extern "C" fn zipherx_get_branch_id(height: u64) -> u32 {
+    ffi_catch_unwind!(0, {
     let block_height = BlockHeight::from_u32(height as u32);
     let branch_id = zcash_primitives::consensus::BranchId::for_height(&ZclassicNetwork, block_height);
     let branch_id_u32: u32 = branch_id.into();
@@ -1250,12 +1390,14 @@ pub extern "C" fn zipherx_get_branch_id(height: u64) -> u32 {
     debug_log!("🔍 zipherx_get_branch_id({}) = 0x{:08x} ({:?})", height, branch_id_u32, branch_id);
 
     branch_id_u32
+    })
 }
 
 /// Verify the library is using the correct ZclassicButtercup fork
 /// @return true if using local fork with Buttercup support
 #[no_mangle]
 pub extern "C" fn zipherx_verify_buttercup_support() -> bool {
+    ffi_catch_unwind!(false, {
     // Test at height 2,923,000 (current chain)
     let test_height = BlockHeight::from_u32(2_923_000);
     let branch_id = zcash_primitives::consensus::BranchId::for_height(&ZclassicNetwork, test_height);
@@ -1276,6 +1418,7 @@ pub extern "C" fn zipherx_verify_buttercup_support() -> bool {
     }
 
     has_buttercup
+    })
 }
 
 /// Double SHA256 hash
@@ -1285,6 +1428,7 @@ pub unsafe extern "C" fn zipherx_double_sha256(
     len: usize,
     output: *mut u8,
 ) -> bool {
+    ffi_catch_unwind!(false, {
     use sha2::{Sha256, Digest};
 
     // FIX #230: Use safe_slice for bounds checking
@@ -1306,14 +1450,20 @@ pub unsafe extern "C" fn zipherx_double_sha256(
 
     std::ptr::copy_nonoverlapping(hash2.as_ptr(), output, 32);
     true
+    })
 }
 
 /// Free a buffer allocated by this library
+/// SAFETY: `ptr` must have been allocated by Rust's global allocator (e.g., from a Vec),
+/// and `len` must exactly match the original allocation size. Passing a mismatched `len`
+/// or a non-Rust-allocated pointer is undefined behavior.
 #[no_mangle]
 pub unsafe extern "C" fn zipherx_free(ptr: *mut u8, len: usize) {
-    if !ptr.is_null() && len > 0 {
-        let _ = Vec::from_raw_parts(ptr, len, len);
+    // FIX #1385: Null check + sanity cap on len to catch obvious misuse
+    if ptr.is_null() || len == 0 || len > 1_073_741_824 {
+        return; // 1GB max — no single FFI allocation should ever be this large
     }
+    let _ = Vec::from_raw_parts(ptr, len, len);
 }
 
 // =============================================================================
@@ -1327,6 +1477,7 @@ pub unsafe extern "C" fn zipherx_encode_spending_key(
     sk: *const u8,
     output: *mut u8,
 ) -> usize {
+    ffi_catch_unwind!(0, {
     if sk.is_null() || output.is_null() {
         return 0;
     }
@@ -1364,6 +1515,7 @@ pub unsafe extern "C" fn zipherx_encode_spending_key(
     let encoded_bytes = encoded.as_bytes();
     std::ptr::copy_nonoverlapping(encoded_bytes.as_ptr(), output, encoded_bytes.len());
     encoded_bytes.len()
+    })
 }
 
 /// Decode Bech32 spending key string to bytes
@@ -1373,6 +1525,7 @@ pub unsafe extern "C" fn zipherx_decode_spending_key(
     encoded: *const i8,
     output: *mut u8,
 ) -> bool {
+    ffi_catch_unwind!(false, {
     if encoded.is_null() || output.is_null() {
         return false;
     }
@@ -1412,6 +1565,7 @@ pub unsafe extern "C" fn zipherx_decode_spending_key(
     }
     std::ptr::copy_nonoverlapping(sk_bytes.as_ptr(), output, 169);
     true
+    })
 }
 
 // =============================================================================
@@ -1428,9 +1582,10 @@ pub unsafe extern "C" fn zipherx_init_prover_from_bytes(
     output_data: *const u8,
     output_len: usize,
 ) -> bool {
-    eprintln!("📁 Loading Sapling params from memory:");
-    eprintln!("   Spend:  {} bytes", spend_len);
-    eprintln!("   Output: {} bytes", output_len);
+    ffi_catch_unwind!(false, {
+    debug_log!("📁 Loading Sapling params from memory:");
+    debug_log!("   Spend:  {} bytes", spend_len);
+    debug_log!("   Output: {} bytes", output_len);
 
     // Verify expected file sizes
     if spend_len != 47958396 {
@@ -1458,7 +1613,7 @@ pub unsafe extern "C" fn zipherx_init_prover_from_bytes(
         }
     };
 
-    eprintln!("📂 Loading prover from memory...");
+    debug_log!("📂 Loading prover from memory...");
 
     // Load the prover with Sapling parameters from bytes
     let prover = std::panic::catch_unwind(|| {
@@ -1472,13 +1627,20 @@ pub unsafe extern "C" fn zipherx_init_prover_from_bytes(
 
     match prover {
         Ok(p) => {
-            let mut global_prover = PROVER.lock().unwrap();
+            // FIX #1385: Replace .lock().unwrap() with safe_lock!
+            let mut global_prover = match safe_lock!(PROVER) {
+                Some(g) => g,
+                None => return false,
+            };
             *global_prover = Some(p);
             eprintln!("✅ Prover initialized from memory");
 
             // Store verifying keys for VUL-002 transaction verification
             if let Ok(params) = vk_result {
-                let mut global_vk = VERIFYING_KEYS.lock().unwrap();
+                let mut global_vk = match safe_lock!(VERIFYING_KEYS) {
+                    Some(g) => g,
+                    None => return false,
+                };
                 *global_vk = Some(params);
                 eprintln!("✅ Verifying keys stored for TX validation (VUL-002 FIX)");
             } else {
@@ -1493,6 +1655,7 @@ pub unsafe extern "C" fn zipherx_init_prover_from_bytes(
             false
         }
     }
+    })
 }
 
 /// Initialize the prover with Sapling parameters from file paths
@@ -1504,6 +1667,7 @@ pub unsafe extern "C" fn zipherx_init_prover(
     spend_path: *const i8,
     output_path: *const i8,
 ) -> bool {
+    ffi_catch_unwind!(false, {
     let spend = match std::ffi::CStr::from_ptr(spend_path).to_str() {
         Ok(s) => s,
         Err(e) => {
@@ -1540,7 +1704,7 @@ pub unsafe extern "C" fn zipherx_init_prover(
     // Get file sizes for verification
     let spend_size = match std::fs::metadata(spend_path) {
         Ok(m) => {
-            eprintln!("   Spend file size: {} bytes (expected: 47958396)", m.len());
+            debug_log!("   Spend file size: {} bytes (expected: 47958396)", m.len());
             m.len()
         }
         Err(e) => {
@@ -1551,7 +1715,7 @@ pub unsafe extern "C" fn zipherx_init_prover(
 
     let output_size = match std::fs::metadata(output_path) {
         Ok(m) => {
-            eprintln!("   Output file size: {} bytes (expected: 3592860)", m.len());
+            debug_log!("   Output file size: {} bytes (expected: 3592860)", m.len());
             m.len()
         }
         Err(e) => {
@@ -1570,7 +1734,7 @@ pub unsafe extern "C" fn zipherx_init_prover(
         return false;
     }
 
-    eprintln!("📂 File sizes verified, loading prover...");
+    debug_log!("📂 File sizes verified, loading prover...");
 
     // Load the prover with Sapling parameters (can panic on invalid files)
     let prover = std::panic::catch_unwind(|| {
@@ -1584,13 +1748,20 @@ pub unsafe extern "C" fn zipherx_init_prover(
 
     match prover {
         Ok(p) => {
-            let mut global_prover = PROVER.lock().unwrap();
+            // FIX #1385: Replace .lock().unwrap() with safe_lock!
+            let mut global_prover = match safe_lock!(PROVER) {
+                Some(g) => g,
+                None => return false,
+            };
             *global_prover = Some(p);
             eprintln!("✅ Prover initialized with Sapling parameters");
 
             // Store verifying keys for VUL-002 transaction verification
             if let Ok(params) = vk_result {
-                let mut global_vk = VERIFYING_KEYS.lock().unwrap();
+                let mut global_vk = match safe_lock!(VERIFYING_KEYS) {
+                    Some(g) => g,
+                    None => return false,
+                };
                 *global_vk = Some(params);
                 eprintln!("✅ Verifying keys stored for TX validation (VUL-002 FIX)");
             } else {
@@ -1605,6 +1776,7 @@ pub unsafe extern "C" fn zipherx_init_prover(
             false
         }
     }
+    })
 }
 
 /// Build a complete shielded transaction
@@ -1639,6 +1811,7 @@ pub unsafe extern "C" fn zipherx_build_transaction(
     tx_out: *mut u8,
     tx_out_len: *mut usize,
 ) -> bool {
+    ffi_catch_unwind!(false, {
     // FIX #230: Use safe_lock! to avoid panic on poisoned mutex
     let prover_guard = match safe_lock!(PROVER) {
         Some(g) => g,
@@ -1984,6 +2157,7 @@ pub unsafe extern "C" fn zipherx_build_transaction(
     *tx_out_len = tx_bytes.len();
 
     true
+    })
 }
 
 /// Spend information for multi-input transactions
@@ -2034,6 +2208,7 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi(
     tx_out_len: *mut usize,
     nullifiers_out: *mut u8,
 ) -> bool {
+    ffi_catch_unwind!(false, {
     if spend_count == 0 || spend_count > 100 {
         eprintln!("❌ Invalid spend count: {} (must be 1-100)", spend_count);
         return false;
@@ -2104,8 +2279,17 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi(
     // Calculate fee (standard 10000 zatoshis)
     let fee = 10000u64;
 
+    // FIX #1385: Sanity cap on spend_count to prevent extreme allocations
+    if spend_count > 1000 {
+        eprintln!("❌ FIX #1385: spend_count {} exceeds maximum", spend_count);
+        return false;
+    }
     // FIX #230: Parse all spends with safe pointer validation
-    let spend_infos = match safe_slice(spends as *const *const SpendInfo as *const u8, spend_count * std::mem::size_of::<*const SpendInfo>()) {
+    let spend_total_bytes = match spend_count.checked_mul(std::mem::size_of::<*const SpendInfo>()) {
+        Some(len) => len,
+        None => return false,
+    };
+    let spend_infos = match safe_slice(spends as *const *const SpendInfo as *const u8, spend_total_bytes) {
         Some(_) => slice::from_raw_parts(spends, spend_count),
         None => {
             eprintln!("❌ Invalid spends pointer");
@@ -2421,6 +2605,7 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi(
     *tx_out_len = tx_bytes.len();
 
     true
+    })
 }
 
 /// Create a value commitment
@@ -2430,6 +2615,9 @@ pub unsafe extern "C" fn zipherx_compute_value_commitment(
     rcv: *const u8,
     cv_out: *mut u8,
 ) -> bool {
+    ffi_catch_unwind!(false, {
+    // FIX #1385: Null pointer validation for output
+    if cv_out.is_null() { return false; }
     // FIX #230: Use safe_slice for bounds checking
     let rcv_slice = match safe_slice(rcv, 32) {
         Some(s) => s,
@@ -2454,15 +2642,20 @@ pub unsafe extern "C" fn zipherx_compute_value_commitment(
 
     std::ptr::copy_nonoverlapping(cv_bytes.as_ptr(), cv_out, 32);
     true
+    })
 }
 
 /// Generate a random scalar for value commitment
 #[no_mangle]
 pub unsafe extern "C" fn zipherx_random_scalar(output: *mut u8) -> bool {
+    ffi_catch_unwind!(false, {
+    // FIX #1385: Null pointer validation
+    if output.is_null() { return false; }
     let scalar = jubjub::Fr::random(&mut OsRng);
     let bytes = scalar.to_repr();
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), output, 32);
     true
+    })
 }
 
 /// Encrypt note plaintext for Sapling output
@@ -2476,7 +2669,11 @@ pub unsafe extern "C" fn zipherx_encrypt_note(
     epk_out: *mut u8,
     enc_out: *mut u8,
 ) -> bool {
+    ffi_catch_unwind!(false, {
     use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, aead::Aead, KeyInit};
+
+    // FIX #1385: Null pointer validation for output pointers
+    if epk_out.is_null() || enc_out.is_null() { return false; }
 
     // FIX #230: Use safe_slice for all input parameters
     let div_slice = match safe_slice(diversifier, 11) {
@@ -2552,19 +2749,30 @@ pub unsafe extern "C" fn zipherx_encrypt_note(
     }
 
     // Encrypt with ChaCha20Poly1305
-    let key = Key::from_slice(symmetric_key.as_bytes());
+    // FIX #1389: Copy key bytes into mutable buffer so we can zero after use
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(symmetric_key.as_bytes());
+    let key = Key::from_slice(&key_bytes);
     let cipher = ChaCha20Poly1305::new(key);
     let nonce = Nonce::from_slice(&[0u8; 12]);
 
     let ciphertext = match cipher.encrypt(nonce, plaintext.as_slice()) {
         Ok(c) => c,
-        Err(_) => return false,
+        Err(_) => {
+            // FIX #1389: Zero cipher key material before returning
+            secure_zero(&mut key_bytes);
+            return false;
+        }
     };
+
+    // FIX #1389: Zero cipher key material after encryption
+    secure_zero(&mut key_bytes);
 
     // Output is 564 + 16 = 580 bytes
     std::ptr::copy_nonoverlapping(ciphertext.as_ptr(), enc_out, 580);
 
     true
+    })
 }
 
 // =============================================================================
@@ -2580,30 +2788,39 @@ static TREE_POSITION: Mutex<u64> = Mutex::new(0);
 // FIX #562 v8: Store delta CMUs to properly update witnesses
 // These are CMUs added after the boost file (during PHASE 2 sync)
 static DELTA_CMUS: Mutex<Vec<zcash_primitives::sapling::Node>> = Mutex::new(Vec::new());
+// FIX #1385: Cap delta CMUs to prevent unbounded memory growth.
+// 200,000 CMUs × 32 bytes = ~6.4MB maximum — well within memory limits.
+// Normal chain growth: ~100-500 CMUs/day. 200K = ~1+ year of delta CMUs.
+const MAX_DELTA_CMUS: usize = 200_000;
 
 /// Initialize a new empty Sapling commitment tree
 #[no_mangle]
 pub extern "C" fn zipherx_tree_init() -> bool {
-    let mut tree_guard = COMMITMENT_TREE.lock().unwrap();
-    *tree_guard = Some(CommitmentTree::empty());
+    // FIX #1385: catch_unwind to prevent panics crossing FFI boundary
+    ffi_catch_unwind!(false, {
+        // FIX #1385: Replace .lock().unwrap() with safe_lock!
+        let mut tree_guard = match safe_lock!(COMMITMENT_TREE) { Some(g) => g, None => return false };
+        *tree_guard = Some(CommitmentTree::empty());
 
-    let mut witnesses_guard = WITNESSES.lock().unwrap();
-    witnesses_guard.clear();
+        let mut witnesses_guard = match safe_lock!(WITNESSES) { Some(g) => g, None => return false };
+        witnesses_guard.clear();
 
-    let mut pos_guard = TREE_POSITION.lock().unwrap();
-    *pos_guard = 0;
+        let mut pos_guard = match safe_lock!(TREE_POSITION) { Some(g) => g, None => return false };
+        *pos_guard = 0;
 
-    // FIX #764: CRITICAL - Clear delta CMUs when tree is reset
-    // Without this, stale CMUs from previous session remain in memory
-    // This caused 210 stale CMUs to be used after Full Rescan, corrupting tree root
-    let mut delta_guard = DELTA_CMUS.lock().unwrap();
-    let old_count = delta_guard.len();
-    delta_guard.clear();
-    if old_count > 0 {
-        debug_log!("🗑️ FIX #764: Cleared {} stale delta CMUs from FFI memory", old_count);
-    }
+        // FIX #764: CRITICAL - Clear delta CMUs when tree is reset
+        // Without this, stale CMUs from previous session remain in memory
+        // This caused 210 stale CMUs to be used after Full Rescan, corrupting tree root
+        let mut delta_guard = match safe_lock!(DELTA_CMUS) { Some(g) => g, None => return false };
+        let old_count = delta_guard.len();
+        delta_guard.clear();
+        delta_guard.shrink_to_fit(); // FIX #1385: Release memory after clear
+        if old_count > 0 {
+            debug_log!("🗑️ FIX #764: Cleared {} stale delta CMUs from FFI memory", old_count);
+        }
 
-    true
+        true
+    })
 }
 
 /// FIX #996: Clear WITNESSES array without affecting the tree
@@ -2613,6 +2830,7 @@ pub extern "C" fn zipherx_tree_init() -> bool {
 /// Returns the number of witnesses that were cleared.
 #[no_mangle]
 pub extern "C" fn zipherx_witnesses_clear() -> u64 {
+    ffi_catch_unwind!(0, {
     let mut witnesses_guard = match safe_lock!(WITNESSES) {
         Some(g) => g,
         None => return 0,
@@ -2623,6 +2841,7 @@ pub extern "C" fn zipherx_witnesses_clear() -> u64 {
         debug_log!("🗑️ FIX #996: Cleared {} witnesses from FFI WITNESSES array", count);
     }
     count
+    })
 }
 
 /// Add a note commitment (cmu) to the tree
@@ -2630,6 +2849,7 @@ pub extern "C" fn zipherx_witnesses_clear() -> u64 {
 /// Returns the position of the added commitment
 #[no_mangle]
 pub unsafe extern "C" fn zipherx_tree_append(cmu: *const u8) -> u64 {
+    ffi_catch_unwind!(u64::MAX, {
     // FIX #230: Use safe_slice for bounds checking
     let cmu_slice = match safe_slice(cmu, 32) {
         Some(s) => s,
@@ -2664,7 +2884,13 @@ pub unsafe extern "C" fn zipherx_tree_append(cmu: *const u8) -> u64 {
 
     // FIX #562 v8: Store delta CMU for proper witness updates
     {
-        let mut delta_guard = DELTA_CMUS.lock().unwrap();
+        // FIX #1385: Replace .lock().unwrap() with safe_lock!
+        let mut delta_guard = match safe_lock!(DELTA_CMUS) { Some(g) => g, None => return u64::MAX };
+        // FIX #1385: Cap delta CMUs to prevent unbounded memory growth
+        if delta_guard.len() >= MAX_DELTA_CMUS {
+            debug_log!("⚠️ FIX #1385: DELTA_CMUS at capacity ({}) — dropping oldest", MAX_DELTA_CMUS);
+            delta_guard.drain(..1);
+        }
         delta_guard.push(node.clone());
         // Log every 100 delta CMUs to avoid spam
         if delta_guard.len() % 100 == 0 {
@@ -2673,16 +2899,18 @@ pub unsafe extern "C" fn zipherx_tree_append(cmu: *const u8) -> u64 {
     }
 
     // Update all existing witnesses with this new node
-    let mut witnesses_guard = WITNESSES.lock().unwrap();
+    // FIX #1385: Replace .lock().unwrap() with safe_lock!
+    let mut witnesses_guard = match safe_lock!(WITNESSES) { Some(g) => g, None => return u64::MAX };
     for witness in witnesses_guard.iter_mut() {
         witness.append(node).ok();
     }
 
-    let mut pos_guard = TREE_POSITION.lock().unwrap();
+    let mut pos_guard = match safe_lock!(TREE_POSITION) { Some(g) => g, None => return u64::MAX };
     let position = *pos_guard;
     *pos_guard += 1;
 
     position
+    })
 }
 
 /// Batch append multiple CMUs to the tree (MUCH faster than individual appends)
@@ -2694,12 +2922,19 @@ pub unsafe extern "C" fn zipherx_tree_append_batch(
     cmus_data: *const u8,
     cmu_count: usize,
 ) -> u64 {
+    ffi_catch_unwind!(u64::MAX, {
     if cmus_data.is_null() || cmu_count == 0 {
         return u64::MAX;
     }
 
+    // FIX #1385: Checked multiplication to prevent overflow
+    let total_len = match cmu_count.checked_mul(32) {
+        Some(len) => len,
+        None => return u64::MAX,
+    };
+
     // FIX #230: Use safe_slice for bounds checking
-    let data = match safe_slice(cmus_data, cmu_count * 32) {
+    let data = match safe_slice(cmus_data, total_len) {
         Some(s) => s,
         None => {
             eprintln!("❌ Invalid CMUs data pointer in tree_append_batch");
@@ -2741,7 +2976,8 @@ pub unsafe extern "C" fn zipherx_tree_append_batch(
     }
 
     // Update all existing witnesses with all new nodes (batch)
-    let mut witnesses_guard = WITNESSES.lock().unwrap();
+    // FIX #1385: Replace .lock().unwrap() with safe_lock!
+    let mut witnesses_guard = match safe_lock!(WITNESSES) { Some(g) => g, None => return u64::MAX };
     for node in &nodes {
         for witness in witnesses_guard.iter_mut() {
             witness.append(*node).ok();
@@ -2751,6 +2987,7 @@ pub unsafe extern "C" fn zipherx_tree_append_batch(
     *pos_guard += cmu_count as u64;
 
     start_position
+    })
 }
 
 /// FIX #840: ATOMIC delta CMU append - prevents race condition double-append
@@ -2788,13 +3025,20 @@ pub unsafe extern "C" fn zipherx_tree_append_delta_atomic(
     cmu_count: usize,
     expected_boost_size: u64,
 ) -> u32 {
+    ffi_catch_unwind!(0, {
     if cmus_data.is_null() || cmu_count == 0 {
         debug_log!("❌ FIX #840: Invalid parameters (null={}, count={})", cmus_data.is_null(), cmu_count);
         return 0;
     }
 
+    // FIX #1385: Checked multiplication to prevent overflow
+    let total_len = match cmu_count.checked_mul(32) {
+        Some(len) => len,
+        None => return 0,
+    };
+
     // FIX #230: Use safe_slice for bounds checking
-    let data = match safe_slice(cmus_data, cmu_count * 32) {
+    let data = match safe_slice(cmus_data, total_len) {
         Some(s) => s,
         None => {
             eprintln!("❌ FIX #840: Invalid CMUs data pointer in tree_append_delta_atomic");
@@ -2879,9 +3123,18 @@ pub unsafe extern "C" fn zipherx_tree_append_delta_atomic(
                 return 0;
             }
         };
+        // FIX #1385: Cap delta CMUs to prevent unbounded memory growth
+        let remaining_capacity = MAX_DELTA_CMUS.saturating_sub(delta_guard.len());
+        if nodes.len() > remaining_capacity {
+            // Drain oldest entries to make room for the new batch
+            let drain_count = nodes.len() - remaining_capacity;
+            debug_log!("⚠️ FIX #1385: DELTA_CMUS near capacity — draining {} oldest entries", drain_count);
+            delta_guard.drain(..drain_count);
+        }
         for node in &nodes {
             delta_guard.push(node.clone());
         }
+        delta_guard.shrink_to_fit();
         debug_log!("📊 FIX #840: Stored {} delta CMUs (total={})", cmu_count, delta_guard.len());
     }
 
@@ -2907,6 +3160,7 @@ pub unsafe extern "C" fn zipherx_tree_append_delta_atomic(
 
     debug_log!("✅ FIX #840: SUCCESS - Appended {} delta CMUs (new size={})", cmu_count, *pos_guard);
     1 // SUCCESS
+    })
 }
 
 /// Create a witness for the current position in the tree
@@ -2914,7 +3168,9 @@ pub unsafe extern "C" fn zipherx_tree_append_delta_atomic(
 /// Returns the witness index (to retrieve later) or u64::MAX on error
 #[no_mangle]
 pub extern "C" fn zipherx_tree_witness_current() -> u64 {
-    let tree_guard = COMMITMENT_TREE.lock().unwrap();
+    ffi_catch_unwind!(u64::MAX, {
+    // FIX #1385: Replace .lock().unwrap() with safe_lock!
+    let tree_guard = match safe_lock!(COMMITMENT_TREE) { Some(g) => g, None => return u64::MAX };
     let tree = match tree_guard.as_ref() {
         Some(t) => t.clone(),
         None => return u64::MAX,
@@ -2922,11 +3178,12 @@ pub extern "C" fn zipherx_tree_witness_current() -> u64 {
 
     let witness = IncrementalWitness::from_tree(tree);
 
-    let mut witnesses_guard = WITNESSES.lock().unwrap();
+    let mut witnesses_guard = match safe_lock!(WITNESSES) { Some(g) => g, None => return u64::MAX };
     let index = witnesses_guard.len();
     witnesses_guard.push(witness);
 
     index as u64
+    })
 }
 
 /// Load a witness from serialized data into the WITNESSES array
@@ -2937,6 +3194,7 @@ pub unsafe extern "C" fn zipherx_tree_load_witness(
     witness_data: *const u8,
     witness_len: usize,
 ) -> u64 {
+    ffi_catch_unwind!(u64::MAX, {
     if witness_len < 1028 {
         debug_log!("❌ Witness data too short: {} bytes", witness_len);
         return u64::MAX;
@@ -3021,6 +3279,7 @@ pub unsafe extern "C" fn zipherx_tree_load_witness(
     // Tree position is embedded in witness data and extracted during spend creation.
     debug_log!("📝 FIX #1177: Loaded witness at array index {}, tree position {}", array_index, tree_position);
     array_index as u64
+    })
 }
 
 /// FIX #1177: Get tree position (witnessed_position) from a loaded witness
@@ -3029,6 +3288,7 @@ pub unsafe extern "C" fn zipherx_tree_load_witness(
 /// Returns tree position or u64::MAX on error
 #[no_mangle]
 pub extern "C" fn zipherx_witness_get_tree_position(witness_index: u64) -> u64 {
+    ffi_catch_unwind!(u64::MAX, {
     let witnesses_guard = match safe_lock!(WITNESSES) {
         Some(g) => g,
         None => return u64::MAX,
@@ -3044,12 +3304,14 @@ pub extern "C" fn zipherx_witness_get_tree_position(witness_index: u64) -> u64 {
             u64::MAX
         }
     }
+    })
 }
 
 /// Get the root of the tree
 /// root_out: 32-byte output buffer for the root
 #[no_mangle]
 pub unsafe extern "C" fn zipherx_tree_root(root_out: *mut u8) -> bool {
+    ffi_catch_unwind!(false, {
     // FIX #230: Use safe_lock for mutex
     let tree_guard = match safe_lock!(COMMITMENT_TREE) {
         Some(g) => g,
@@ -3069,6 +3331,7 @@ pub unsafe extern "C" fn zipherx_tree_root(root_out: *mut u8) -> bool {
 
     std::ptr::copy_nonoverlapping(root_bytes.as_ptr(), root_out, 32);
     true
+    })
 }
 
 /// FIX #739: Update ALL loaded witnesses with a CMU (WITHOUT modifying the tree)
@@ -3077,45 +3340,47 @@ pub unsafe extern "C" fn zipherx_tree_root(root_out: *mut u8) -> bool {
 /// Returns number of witnesses updated
 #[no_mangle]
 pub unsafe extern "C" fn zipherx_update_all_witnesses_with_cmu(cmu: *const u8) -> u64 {
-    if cmu.is_null() {
-        return 0;
-    }
-
-    // FIX #230: Use safe_slice for bounds checking
-    let cmu_slice = match safe_slice(cmu, 32) {
-        Some(s) => s,
-        None => {
-            eprintln!("❌ Invalid CMU pointer in update_all_witnesses_with_cmu");
+    ffi_catch_unwind!(0, {
+        if cmu.is_null() {
             return 0;
         }
-    };
 
-    // Parse CMU into Node
-    let mut cmu_bytes = [0u8; 32];
-    cmu_bytes.copy_from_slice(cmu_slice);
+        // FIX #230: Use safe_slice for bounds checking
+        let cmu_slice = match safe_slice(cmu, 32) {
+            Some(s) => s,
+            None => {
+                eprintln!("❌ Invalid CMU pointer in update_all_witnesses_with_cmu");
+                return 0;
+            }
+        };
 
-    let node = match bls12_381::Scalar::from_repr(cmu_bytes).into() {
-        Some(scalar) => zcash_primitives::sapling::Node::from_scalar(scalar),
-        None => {
-            eprintln!("❌ Invalid scalar in update_all_witnesses_with_cmu");
-            return 0;
+        // Parse CMU into Node
+        let mut cmu_bytes = [0u8; 32];
+        cmu_bytes.copy_from_slice(cmu_slice);
+
+        let node = match bls12_381::Scalar::from_repr(cmu_bytes).into() {
+            Some(scalar) => zcash_primitives::sapling::Node::from_scalar(scalar),
+            None => {
+                eprintln!("❌ Invalid scalar in update_all_witnesses_with_cmu");
+                return 0;
+            }
+        };
+
+        // Update all loaded witnesses
+        let mut witnesses_guard = match safe_lock!(WITNESSES) {
+            Some(g) => g,
+            None => return 0,
+        };
+
+        let mut updated = 0u64;
+        for witness in witnesses_guard.iter_mut() {
+            if witness.append(node.clone()).is_ok() {
+                updated += 1;
+            }
         }
-    };
 
-    // Update all loaded witnesses
-    let mut witnesses_guard = match safe_lock!(WITNESSES) {
-        Some(g) => g,
-        None => return 0,
-    };
-
-    let mut updated = 0u64;
-    for witness in witnesses_guard.iter_mut() {
-        if witness.append(node.clone()).is_ok() {
-            updated += 1;
-        }
-    }
-
-    updated
+        updated
+    })
 }
 
 /// FIX #739: Batch update ALL loaded witnesses with multiple CMUs (WITHOUT modifying the tree)
@@ -3127,66 +3392,76 @@ pub unsafe extern "C" fn zipherx_update_all_witnesses_batch(
     cmus_data: *const u8,
     cmu_count: usize,
 ) -> u64 {
-    if cmus_data.is_null() || cmu_count == 0 {
-        return 0;
-    }
-
-    // FIX #230: Use safe_slice for bounds checking
-    let data = match safe_slice(cmus_data, cmu_count * 32) {
-        Some(s) => s,
-        None => {
-            eprintln!("❌ Invalid CMUs data pointer in update_all_witnesses_batch");
+    ffi_catch_unwind!(0, {
+        if cmus_data.is_null() || cmu_count == 0 {
             return 0;
         }
-    };
 
-    // Parse all CMUs into Nodes
-    let mut nodes: Vec<zcash_primitives::sapling::Node> = Vec::with_capacity(cmu_count);
-    for i in 0..cmu_count {
-        let offset = i * 32;
-        let mut cmu_bytes = [0u8; 32];
-        cmu_bytes.copy_from_slice(&data[offset..offset + 32]);
-
-        let node = match bls12_381::Scalar::from_repr(cmu_bytes).into() {
-            Some(scalar) => zcash_primitives::sapling::Node::from_scalar(scalar),
-            None => continue,
+        // FIX #1385: Checked multiplication to prevent overflow
+        let total_len = match cmu_count.checked_mul(32) {
+            Some(len) => len,
+            None => return 0,
         };
-        nodes.push(node);
-    }
 
-    debug_log!("🔧 FIX #739: Updating all witnesses with {} CMUs (no tree modification)", nodes.len());
+        // FIX #230: Use safe_slice for bounds checking
+        let data = match safe_slice(cmus_data, total_len) {
+            Some(s) => s,
+            None => {
+                eprintln!("❌ Invalid CMUs data pointer in update_all_witnesses_batch");
+                return 0;
+            }
+        };
 
-    // Update all loaded witnesses with all CMUs
-    let mut witnesses_guard = match safe_lock!(WITNESSES) {
-        Some(g) => g,
-        None => return 0,
-    };
+        // Parse all CMUs into Nodes
+        let mut nodes: Vec<zcash_primitives::sapling::Node> = Vec::with_capacity(cmu_count);
+        for i in 0..cmu_count {
+            let offset = i * 32;
+            let mut cmu_bytes = [0u8; 32];
+            cmu_bytes.copy_from_slice(&data[offset..offset + 32]);
 
-    let witness_count = witnesses_guard.len();
-
-    // FIX #989: PERFORMANCE - Parallel witness update for INSTANT rebuild
-    // Each witness is independent, so use Rayon's par_iter_mut for multi-core speedup
-    // Before: 14+ seconds for 96 witnesses × 558 CMUs (sequential)
-    // After: ~2 seconds (8x speedup on multi-core device)
-    witnesses_guard.par_iter_mut().for_each(|witness| {
-        for node in &nodes {
-            witness.append(node.clone()).ok();
+            let node = match bls12_381::Scalar::from_repr(cmu_bytes).into() {
+                Some(scalar) => zcash_primitives::sapling::Node::from_scalar(scalar),
+                None => continue,
+            };
+            nodes.push(node);
         }
-    });
 
-    debug_log!("✅ FIX #989: Updated {} witnesses with {} CMUs (PARALLEL)", witness_count, nodes.len());
-    witness_count as u64
+        debug_log!("🔧 FIX #739: Updating all witnesses with {} CMUs (no tree modification)", nodes.len());
+
+        // Update all loaded witnesses with all CMUs
+        let mut witnesses_guard = match safe_lock!(WITNESSES) {
+            Some(g) => g,
+            None => return 0,
+        };
+
+        let witness_count = witnesses_guard.len();
+
+        // FIX #989: PERFORMANCE - Parallel witness update for INSTANT rebuild
+        // Each witness is independent, so use Rayon's par_iter_mut for multi-core speedup
+        // Before: 14+ seconds for 96 witnesses × 558 CMUs (sequential)
+        // After: ~2 seconds (8x speedup on multi-core device)
+        witnesses_guard.par_iter_mut().for_each(|witness| {
+            for node in &nodes {
+                witness.append(node.clone()).ok();
+            }
+        });
+
+        debug_log!("✅ FIX #989: Updated {} witnesses with {} CMUs (PARALLEL)", witness_count, nodes.len());
+        witness_count as u64
+    })
 }
 
 /// FIX #739 v4: Get delta CMUs count from memory (not file)
 /// Returns number of delta CMUs stored in DELTA_CMUS array
 #[no_mangle]
 pub extern "C" fn zipherx_get_delta_cmus_count() -> u64 {
-    let delta_guard = match DELTA_CMUS.lock() {
-        Ok(g) => g,
-        Err(_) => return 0,
-    };
-    delta_guard.len() as u64
+    ffi_catch_unwind!(0, {
+        let delta_guard = match DELTA_CMUS.lock() {
+            Ok(g) => g,
+            Err(_) => return 0,
+        };
+        delta_guard.len() as u64
+    })
 }
 
 /// FIX #739 v4: Get delta CMUs from memory (not file)
@@ -3199,33 +3474,35 @@ pub unsafe extern "C" fn zipherx_get_delta_cmus(
     cmus_out: *mut u8,
     max_count: usize,
 ) -> u64 {
-    if cmus_out.is_null() || max_count == 0 {
-        return 0;
-    }
-
-    let delta_guard = match DELTA_CMUS.lock() {
-        Ok(g) => g,
-        Err(_) => return 0,
-    };
-
-    let count = std::cmp::min(delta_guard.len(), max_count);
-    debug_log!("🔧 FIX #739 v4: Exporting {} delta CMUs from memory", count);
-
-    for (i, node) in delta_guard.iter().take(count).enumerate() {
-        // Serialize node to bytes
-        let mut node_bytes = Vec::new();
-        if node.write(&mut node_bytes).is_err() {
-            continue;
-        }
-        if node_bytes.len() != 32 {
-            continue;
+    ffi_catch_unwind!(0, {
+        if cmus_out.is_null() || max_count == 0 {
+            return 0;
         }
 
-        let out_ptr = cmus_out.add(i * 32);
-        std::ptr::copy_nonoverlapping(node_bytes.as_ptr(), out_ptr, 32);
-    }
+        let delta_guard = match DELTA_CMUS.lock() {
+            Ok(g) => g,
+            Err(_) => return 0,
+        };
 
-    count as u64
+        let count = std::cmp::min(delta_guard.len(), max_count);
+        debug_log!("🔧 FIX #739 v4: Exporting {} delta CMUs from memory", count);
+
+        for (i, node) in delta_guard.iter().take(count).enumerate() {
+            // Serialize node to bytes
+            let mut node_bytes = Vec::new();
+            if node.write(&mut node_bytes).is_err() {
+                continue;
+            }
+            if node_bytes.len() != 32 {
+                continue;
+            }
+
+            let out_ptr = cmus_out.add(i * 32);
+            std::ptr::copy_nonoverlapping(node_bytes.as_ptr(), out_ptr, 32);
+        }
+
+        count as u64
+    })
 }
 
 /// Update a witness with a new CMU
@@ -3241,6 +3518,9 @@ pub unsafe extern "C" fn zipherx_witness_update(
     cmu: *const u8,
     witness_out: *mut u8,
 ) -> bool {
+    ffi_catch_unwind!(false, {
+    // FIX #1385: Null pointer validation for output
+    if witness_out.is_null() { return false; }
     if witness_len < 1028 {
         return false;
     }
@@ -3300,6 +3580,7 @@ pub unsafe extern "C" fn zipherx_witness_update(
     // For now, return false to indicate this needs the full witness updating approach.
 
     false
+    })
 }
 
 /// Get witness data for a specific witness index
@@ -3311,7 +3592,11 @@ pub unsafe extern "C" fn zipherx_tree_get_witness(
     witness_index: u64,
     witness_out: *mut u8,
 ) -> bool {
-    let witnesses_guard = WITNESSES.lock().unwrap();
+    ffi_catch_unwind!(false, {
+    // FIX #1385: Null pointer validation for output
+    if witness_out.is_null() { return false; }
+    // FIX #1385: Replace .lock().unwrap() with safe_lock!
+    let witnesses_guard = match safe_lock!(WITNESSES) { Some(g) => g, None => return false };
     let witness = match witnesses_guard.get(witness_index as usize) {
         Some(w) => w,
         None => {
@@ -3347,13 +3632,17 @@ pub unsafe extern "C" fn zipherx_tree_get_witness(
 
     debug_log!("📝 Serialized witness: {} bytes", serialized.len());
     true
+    })
 }
 
 /// Get current tree size (number of commitments)
 #[no_mangle]
 pub extern "C" fn zipherx_tree_size() -> u64 {
-    let pos_guard = TREE_POSITION.lock().unwrap();
+    ffi_catch_unwind!(0, {
+    // FIX #1385: Replace .lock().unwrap() with safe_lock!
+    let pos_guard = match safe_lock!(TREE_POSITION) { Some(g) => g, None => return 0 };
     *pos_guard
+    })
 }
 
 /// Serialize tree state for persistence
@@ -3365,6 +3654,9 @@ pub unsafe extern "C" fn zipherx_tree_serialize(
     tree_out: *mut u8,
     tree_out_len: *mut usize,
 ) -> bool {
+    ffi_catch_unwind!(false, {
+    // FIX #1385: Null pointer validation for outputs
+    if tree_out.is_null() || tree_out_len.is_null() { return false; }
     // FIX #230: Use safe_lock for mutex
     let tree_guard = match safe_lock!(COMMITMENT_TREE) {
         Some(g) => g,
@@ -3400,6 +3692,7 @@ pub unsafe extern "C" fn zipherx_tree_serialize(
     *tree_out_len = data.len();
 
     true
+    })
 }
 
 /// Deserialize tree state from persistence
@@ -3411,6 +3704,7 @@ pub unsafe extern "C" fn zipherx_tree_deserialize(
     tree_data: *const u8,
     tree_len: usize,
 ) -> bool {
+    ffi_catch_unwind!(false, {
     if tree_len < 8 {
         return false;
     }
@@ -3493,12 +3787,14 @@ pub unsafe extern "C" fn zipherx_tree_deserialize(
         };
         let old_count = delta_guard.len();
         delta_guard.clear();
+        delta_guard.shrink_to_fit(); // FIX #1385: Release memory after clear
         if old_count > 0 {
             debug_log!("🗑️ FIX #771: Cleared {} stale delta CMUs on tree deserialize", old_count);
         }
     }
 
     true
+    })
 }
 
 /// Load tree from raw CMUs file format
@@ -3509,6 +3805,7 @@ pub unsafe extern "C" fn zipherx_tree_load_from_cmus(
     data: *const u8,
     data_len: usize,
 ) -> bool {
+    ffi_catch_unwind!(false, {
     if data_len < 8 {
         return false;
     }
@@ -3591,6 +3888,7 @@ pub unsafe extern "C" fn zipherx_tree_load_from_cmus(
         };
         let old_count = delta_guard.len();
         delta_guard.clear();
+        delta_guard.shrink_to_fit(); // FIX #1385: Release memory after clear
         if old_count > 0 {
             debug_log!("🗑️ FIX #771: Cleared {} stale delta CMUs on tree load from CMUs", old_count);
         }
@@ -3599,6 +3897,7 @@ pub unsafe extern "C" fn zipherx_tree_load_from_cmus(
     debug_log!("✅ Tree loaded with {} commitments", count);
 
     true
+    })
 }
 
 /// Progress callback type for tree loading
@@ -3613,6 +3912,7 @@ pub unsafe extern "C" fn zipherx_tree_load_from_cmus_with_progress(
     data_len: usize,
     progress_callback: TreeLoadProgressCallback,
 ) -> bool {
+    ffi_catch_unwind!(false, {
     if data_len < 8 {
         return false;
     }
@@ -3701,6 +4001,7 @@ pub unsafe extern "C" fn zipherx_tree_load_from_cmus_with_progress(
         };
         let old_count = delta_guard.len();
         delta_guard.clear();
+        delta_guard.shrink_to_fit(); // FIX #1385: Release memory after clear
         if old_count > 0 {
             debug_log!("🗑️ FIX #771: Cleared {} stale delta CMUs on tree load with progress", old_count);
         }
@@ -3709,6 +4010,7 @@ pub unsafe extern "C" fn zipherx_tree_load_from_cmus_with_progress(
     debug_log!("✅ Tree loaded with {} commitments", count);
 
     true
+    })
 }
 
 /// FIX #197: Load tree from CMU data AND create witnesses for target CMUs in SINGLE PASS
@@ -3734,6 +4036,7 @@ pub unsafe extern "C" fn zipherx_tree_load_with_witnesses(
     witnesses_out: *mut u8,
     progress_callback: TreeLoadProgressCallback,
 ) -> usize {
+    ffi_catch_unwind!(0, {
     if data_len < 8 {
         return 0;
     }
@@ -3770,8 +4073,12 @@ pub unsafe extern "C" fn zipherx_tree_load_with_witnesses(
     let start_time = std::time::Instant::now();
 
     // FIX #230: Build HashMap of target CMUs for O(1) lookup with safe slice
+    // FIX #1385: Checked multiplication to prevent overflow
     let targets = if target_count > 0 {
-        safe_slice(target_cmus, target_count * 32)
+        match target_count.checked_mul(32) {
+            Some(len) => safe_slice(target_cmus, len),
+            None => None,
+        }
     } else {
         None
     };
@@ -3942,10 +4249,11 @@ pub unsafe extern "C" fn zipherx_tree_load_with_witnesses(
     }
 
     // Store tree in global
-    let mut tree_guard = COMMITMENT_TREE.lock().unwrap();
+    // FIX #1385: Replace .lock().unwrap() with safe_lock!
+    let mut tree_guard = match safe_lock!(COMMITMENT_TREE) { Some(g) => g, None => return 0 };
     *tree_guard = Some(tree);
 
-    let mut pos_guard = TREE_POSITION.lock().unwrap();
+    let mut pos_guard = match safe_lock!(TREE_POSITION) { Some(g) => g, None => return 0 };
     *pos_guard = count;
 
     // FIX #771: CRITICAL - Clear delta CMUs when tree is loaded with witnesses
@@ -3957,6 +4265,7 @@ pub unsafe extern "C" fn zipherx_tree_load_with_witnesses(
         };
         let old_count = delta_guard.len();
         delta_guard.clear();
+        delta_guard.shrink_to_fit(); // FIX #1385: Release memory after clear
         if old_count > 0 {
             debug_log!("🗑️ FIX #771: Cleared {} stale delta CMUs on tree load with witnesses", old_count);
         }
@@ -4010,6 +4319,7 @@ pub unsafe extern "C" fn zipherx_tree_load_with_witnesses(
     debug_log!("✅ FIX #197: Tree loaded + {} witnesses created in {:.1}s (PHASE 1.5 eliminated!)",
                success_count, start_time.elapsed().as_secs_f64());
     success_count
+    })
 }
 
 /// Create a witness for a specific CMU from CURRENT GLOBAL TREE state
@@ -4033,6 +4343,7 @@ pub unsafe extern "C" fn zipherx_tree_create_witness_for_cmu(
     witness_out: *mut u8,
     witness_out_len: *mut usize,
 ) -> u64 {
+    ffi_catch_unwind!(u64::MAX, {
     if cmu_data_len < 8 {
         return u64::MAX;
     }
@@ -4153,7 +4464,8 @@ pub unsafe extern "C" fn zipherx_tree_create_witness_for_cmu(
     // This is CRITICAL - the witness was created from boost file tree only,
     // but the global tree has additional CMUs that were added during PHASE 2 sync
     {
-        let delta_guard = DELTA_CMUS.lock().unwrap();
+        // FIX #1385: Replace .lock().unwrap() with safe_lock!
+        let delta_guard = match safe_lock!(DELTA_CMUS) { Some(g) => g, None => return u64::MAX };
         if !delta_guard.is_empty() {
             debug_log!("🔧 FIX #562 v8: Updating witness with {} delta CMUs...", delta_guard.len());
             for delta_node in delta_guard.iter() {
@@ -4165,7 +4477,8 @@ pub unsafe extern "C" fn zipherx_tree_create_witness_for_cmu(
 
     // FIX #562 v8: Add witness to global WITNESSES array so it gets updated with FUTURE CMUs
     {
-        let mut witnesses_guard = WITNESSES.lock().unwrap();
+        // FIX #1385: Replace .lock().unwrap() with safe_lock!
+        let mut witnesses_guard = match safe_lock!(WITNESSES) { Some(g) => g, None => return u64::MAX };
         witnesses_guard.push(witness.clone());
         debug_log!("🔧 FIX #562 v8: Added witness to global WITNESSES array (total: {} witnesses)", witnesses_guard.len());
     }
@@ -4186,6 +4499,7 @@ pub unsafe extern "C" fn zipherx_tree_create_witness_for_cmu(
     *witness_out_len = serialized.len();
 
     target_pos
+    })
 }
 
 /// Find the position of a CMU in bundled CMU data (fast - no tree building)
@@ -4196,6 +4510,7 @@ pub unsafe extern "C" fn zipherx_find_cmu_position(
     cmu_data_len: usize,
     target_cmu: *const u8,
 ) -> u64 {
+    ffi_catch_unwind!(u64::MAX, {
     if cmu_data_len < 8 {
         return u64::MAX;
     }
@@ -4244,6 +4559,7 @@ pub unsafe extern "C" fn zipherx_find_cmu_position(
     }
 
     u64::MAX
+    })
 }
 
 /// FIX #562: Create a fresh witness from CURRENT GLOBAL TREE (not boost file!)
@@ -4261,6 +4577,7 @@ pub unsafe extern "C" fn zipherx_tree_create_witness_from_current_tree(
     cmu_position: u64,
     witness_out: *mut u8,
 ) -> bool {
+    ffi_catch_unwind!(false, {
     // Validate inputs
     let target_bytes = match safe_slice(target_cmu, 32) {
         Some(s) => s,
@@ -4336,6 +4653,7 @@ pub unsafe extern "C" fn zipherx_tree_create_witness_from_current_tree(
     eprintln!("   Fallback: Try Repair Database → Full Rescan to rebuild all witnesses");
 
     false
+    })
 }
 
 /// Create witnesses for MULTIPLE CMUs in a SINGLE tree pass (batch operation)
@@ -4360,6 +4678,7 @@ pub unsafe extern "C" fn zipherx_tree_create_witnesses_batch(
     positions_out: *mut u64,
     witnesses_out: *mut u8,
 ) -> usize {
+    ffi_catch_unwind!(0, {
     if cmu_data_len < 8 || target_count == 0 {
         return 0;
     }
@@ -4372,7 +4691,12 @@ pub unsafe extern "C" fn zipherx_tree_create_witnesses_batch(
             return 0;
         }
     };
-    let targets = match safe_slice(target_cmus, target_count * 32) {
+    // FIX #1385: Checked multiplication to prevent overflow
+    let targets_total_len = match target_count.checked_mul(32) {
+        Some(len) => len,
+        None => return 0,
+    };
+    let targets = match safe_slice(target_cmus, targets_total_len) {
         Some(s) => s,
         None => {
             eprintln!("❌ Invalid targets pointer in create_witnesses_batch");
@@ -4627,6 +4951,7 @@ pub unsafe extern "C" fn zipherx_tree_create_witnesses_batch(
 
     debug_log!("✅ FIX #557 v24: Created {}/{} witnesses (all with same root)", success_count, target_count);
     success_count
+    })
 }
 
 /// FIX #588: Rebuild corrupted witnesses at SPECIFIC positions (not all at end)
@@ -4656,6 +4981,7 @@ pub unsafe extern "C" fn zipherx_tree_rebuild_witnesses_at_positions(
     target_count: usize,
     witnesses_out: *mut u8,
 ) -> usize {
+    ffi_catch_unwind!(0, {
     if cmu_data_len < 8 || target_count == 0 {
         return 0;
     }
@@ -4670,7 +4996,12 @@ pub unsafe extern "C" fn zipherx_tree_rebuild_witnesses_at_positions(
             return 0;
         }
     };
-    let targets = match safe_slice(target_cmus, target_count * 32) {
+    // FIX #1385: Checked multiplication to prevent overflow
+    let targets_total_len = match target_count.checked_mul(32) {
+        Some(len) => len,
+        None => return 0,
+    };
+    let targets = match safe_slice(target_cmus, targets_total_len) {
         Some(s) => s,
         None => {
             eprintln!("❌ FIX #588: Invalid targets pointer");
@@ -4807,6 +5138,7 @@ pub unsafe extern "C" fn zipherx_tree_rebuild_witnesses_at_positions(
 
     debug_log!("✅ FIX #588: Rebuilt {}/{} witnesses at specific positions", success_count, target_count);
     success_count
+    })
 }
 
 /// Extract the root (anchor) from serialized witness data
@@ -4822,6 +5154,7 @@ pub unsafe extern "C" fn zipherx_witness_get_root(
     witness_len: usize,
     root_out: *mut u8,
 ) -> bool {
+    ffi_catch_unwind!(false, {
     if witness_len < 100 {
         return false;
     }
@@ -4904,6 +5237,7 @@ pub unsafe extern "C" fn zipherx_witness_get_root(
     std::ptr::copy_nonoverlapping(root_bytes.as_ptr(), root_out, 32);
     debug_log!("✅ zipherx_witness_get_root: extracted root {}...", hex::encode(&root_bytes[..8]));
     true
+    })
 }
 
 /// Check if a witness path is valid (non-empty)
@@ -4920,6 +5254,7 @@ pub unsafe extern "C" fn zipherx_witness_path_is_valid(
     witness_data: *const u8,
     witness_len: usize,
 ) -> bool {
+    ffi_catch_unwind!(false, {
     if witness_len < 100 {
         return false;
     }
@@ -4945,6 +5280,7 @@ pub unsafe extern "C" fn zipherx_witness_path_is_valid(
     let path_is_valid = witness.path().is_some();
     debug_log!("🔍 witness_path_is_valid: path_is_some={}", path_is_valid);
     path_is_valid
+    })
 }
 
 /// FIX #827: Check if a witness is internally consistent (anchor matches path computation)
@@ -4965,6 +5301,7 @@ pub unsafe extern "C" fn zipherx_witness_verify_anchor(
     witness_len: usize,
     cmu_data: *const u8,
 ) -> bool {
+    ffi_catch_unwind!(false, {
     if witness_len < 100 {
         debug_log!("❌ FIX #827: witness too short ({})", witness_len);
         return false;
@@ -5057,6 +5394,7 @@ pub unsafe extern "C" fn zipherx_witness_verify_anchor(
     }
 
     is_consistent
+    })
 }
 
 /// Create witnesses for multiple CMUs using BATCH processing (OPTIMIZED)
@@ -5086,12 +5424,18 @@ pub unsafe extern "C" fn zipherx_tree_create_witnesses_parallel(
     positions_out: *mut u64,
     witnesses_out: *mut u8,
 ) -> usize {
+    ffi_catch_unwind!(0, {
     if target_count == 0 || cmu_data_len < 8 {
         return 0;
     }
 
+    // FIX #1385: Checked multiplication to prevent overflow
+    let targets_total_len = match target_count.checked_mul(32) {
+        Some(len) => len,
+        None => return 0,
+    };
     // FIX #230: Validate pointers with safe_slice
-    let targets = match safe_slice(target_cmus, target_count * 32) {
+    let targets = match safe_slice(target_cmus, targets_total_len) {
         Some(s) => s,
         None => {
             eprintln!("❌ Invalid target_cmus pointer in create_witnesses_parallel");
@@ -5287,6 +5631,7 @@ pub unsafe extern "C" fn zipherx_tree_create_witnesses_parallel(
                success_count, target_count, total_time.as_secs_f64(),
                tree_build_time.as_secs_f64(), update_time.as_secs_f64());
     success_count
+    })
 }
 
 /// FIX #580: Create witness from tree data + CMU position (instant, no P2P needed)
@@ -5311,6 +5656,7 @@ pub unsafe extern "C" fn zipherx_tree_create_witness_for_position(
     witness_out: *mut u8,
     witness_out_len: *mut usize,
 ) -> bool {
+    ffi_catch_unwind!(false, {
     debug_log!("🔧 FIX #580: Creating witness at position {} (instant generation)", position);
 
     // Validate inputs
@@ -5401,8 +5747,11 @@ pub unsafe extern "C" fn zipherx_tree_create_witness_for_position(
 
     if witness_root_bytes != tree_root_bytes {
         eprintln!("❌ FIX #580: Witness root mismatch! This would cause network rejection");
-        eprintln!("   Witness root: {}", hex::encode(&witness_root_bytes[..8]));
-        eprintln!("   Tree root:    {}", hex::encode(&tree_root_bytes[..8]));
+        // FIX #1385: Gate hex dumps behind DEBUG_LOGGING to prevent data leakage in production
+        if DEBUG_LOGGING {
+            eprintln!("   Witness root: {}", hex::encode(&witness_root_bytes[..8]));
+            eprintln!("   Tree root:    {}", hex::encode(&tree_root_bytes[..8]));
+        }
         return false;
     }
 
@@ -5434,6 +5783,7 @@ pub unsafe extern "C" fn zipherx_tree_create_witness_for_position(
     debug_log!("✅ FIX #580: Witness created in <1ms (vs 84s P2P rebuild), {} bytes", serialized.len());
 
     true
+    })
 }
 
 // =============================================================================
@@ -5463,6 +5813,7 @@ pub unsafe extern "C" fn zipherx_try_recover_output_with_ovk(
     out_ciphertext: *const u8,
     output: *mut u8,
 ) -> usize {
+    ffi_catch_unwind!(0, {
     use zcash_primitives::sapling::value::ValueCommitment;
 
     // FIX #230: Parse OVK with safe_slice
@@ -5635,6 +5986,7 @@ pub unsafe extern "C" fn zipherx_try_recover_output_with_ovk(
         }
         None => 0,
     }
+    })
 }
 
 /// Derive OVK from extended spending key
@@ -5646,6 +5998,9 @@ pub unsafe extern "C" fn zipherx_derive_ovk(
     sk: *const u8,
     ovk_out: *mut u8,
 ) -> bool {
+    ffi_catch_unwind!(false, {
+    // FIX #1385: Null pointer validation for output
+    if ovk_out.is_null() { return false; }
     // FIX #230: Use safe_slice for bounds checking
     let sk_bytes = match safe_slice(sk, 169) {
         Some(s) => s,
@@ -5668,6 +6023,7 @@ pub unsafe extern "C" fn zipherx_derive_ovk(
     std::ptr::copy_nonoverlapping(ovk.0.as_ptr(), ovk_out, 32);
 
     true
+    })
 }
 
 // =============================================================================
@@ -5699,6 +6055,7 @@ pub unsafe extern "C" fn zipherx_verify_equihash(
     solution: *const u8,
     solution_len: usize,
 ) -> bool {
+    ffi_catch_unwind!(false, {
     // FIX #668: Auto-detect Equihash parameters based on solution length
     // Zclassic changed Equihash parameters at the Bubbles upgrade (block 585,318)
     let (n, k, expected_len) = match solution_len {
@@ -5744,6 +6101,7 @@ pub unsafe extern "C" fn zipherx_verify_equihash(
             false
         }
     }
+    })
 }
 
 /// Compute the block hash for a Zclassic block header
@@ -5763,8 +6121,11 @@ pub unsafe extern "C" fn zipherx_compute_block_hash(
     solution_len: usize,
     hash_out: *mut u8,
 ) -> bool {
+    ffi_catch_unwind!(false, {
     use sha2::{Sha256, Digest};
 
+    // FIX #1385: Null pointer validation for output
+    if hash_out.is_null() { return false; }
     // FIX #230: Use safe_slice for bounds checking
     let header = match safe_slice(header_bytes, 140) {
         Some(s) => s,
@@ -5811,6 +6172,7 @@ pub unsafe extern "C" fn zipherx_compute_block_hash(
     std::ptr::copy_nonoverlapping(hash2.as_ptr(), hash_out, 32);
 
     true
+    })
 }
 
 /// Verify a chain of block headers for continuity and valid PoW
@@ -5833,6 +6195,7 @@ pub unsafe extern "C" fn zipherx_verify_header_chain(
     header_offsets: *const usize,
     header_sizes: *const usize,
 ) -> bool {
+    ffi_catch_unwind!(false, {
     if headers_count == 0 {
         return true;
     }
@@ -5892,8 +6255,11 @@ pub unsafe extern "C" fn zipherx_verify_header_chain(
         if i > 0 || has_expected_prev {
             if header_prev_hash != prev_hash {
                 eprintln!("❌ Header {} prevHash mismatch - chain broken!", i);
-                eprintln!("   Expected: {}", hex::encode(&prev_hash));
-                eprintln!("   Got:      {}", hex::encode(header_prev_hash));
+                // FIX #1385: Gate hex dumps behind DEBUG_LOGGING
+                if DEBUG_LOGGING {
+                    eprintln!("   Expected: {}", hex::encode(&prev_hash));
+                    eprintln!("   Got:      {}", hex::encode(header_prev_hash));
+                }
                 return false;
             }
         }
@@ -5932,6 +6298,7 @@ pub unsafe extern "C" fn zipherx_verify_header_chain(
 
     eprintln!("✅ All {} headers verified successfully", headers_count);
     true
+    })
 }
 
 /// Verify a single block header's Equihash and return its hash
@@ -5949,6 +6316,7 @@ pub unsafe extern "C" fn zipherx_verify_block_header(
     total_len: usize,
     hash_out: *mut u8,
 ) -> bool {
+    ffi_catch_unwind!(false, {
     if total_len < 141 {
         eprintln!("❌ Header data too small: {} bytes", total_len);
         return false;
@@ -5994,6 +6362,7 @@ pub unsafe extern "C" fn zipherx_verify_block_header(
     zipherx_compute_block_hash(header_and_solution, solution_ptr, solution_len, hash_out);
 
     true
+    })
 }
 
 // =============================================================================
@@ -6106,6 +6475,7 @@ pub unsafe extern "C" fn zipherx_build_transaction_encrypted(
     tx_out: *mut u8,
     tx_out_len: *mut usize,
 ) -> bool {
+    ffi_catch_unwind!(false, {
     // Validate input lengths
     if encrypted_sk_len != 197 {
         eprintln!("❌ Invalid encrypted key length: {} (expected 197)", encrypted_sk_len);
@@ -6595,6 +6965,7 @@ pub unsafe extern "C" fn zipherx_build_transaction_encrypted(
     *tx_out_len = tx_bytes.len();
 
     true
+    })
 }
 
 /// Build a shielded transaction with multiple inputs using encrypted spending key (VUL-002 secure)
@@ -6620,6 +6991,7 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi_encrypted(
     tx_out_len: *mut usize,
     nullifiers_out: *mut u8,
 ) -> bool {
+    ffi_catch_unwind!(false, {
     if spend_count == 0 || spend_count > 100 {
         eprintln!("❌ Invalid spend count: {} (must be 1-100)", spend_count);
         return false;
@@ -6716,8 +7088,17 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi_encrypted(
     // Calculate fee
     let fee = 10000u64;
 
+    // FIX #1385: Sanity cap on spend_count + checked multiplication
+    if spend_count > 1000 {
+        secure_zero(&mut decrypted_sk);
+        return false;
+    }
+    let spend_total_bytes = match spend_count.checked_mul(std::mem::size_of::<*const SpendInfo>()) {
+        Some(len) => len,
+        None => { secure_zero(&mut decrypted_sk); return false; }
+    };
     // FIX #230: Parse all spends with safe pointer validation
-    let spend_infos = match safe_slice(spends as *const *const SpendInfo as *const u8, spend_count * std::mem::size_of::<*const SpendInfo>()) {
+    let spend_infos = match safe_slice(spends as *const *const SpendInfo as *const u8, spend_total_bytes) {
         Some(_) => std::slice::from_raw_parts(spends, spend_count),
         None => {
             secure_zero(&mut decrypted_sk);
@@ -6893,8 +7274,11 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi_encrypted(
         if !anchor_matches {
             secure_zero(&mut decrypted_sk);
             eprintln!("❌ FIX #962: ANCHOR MISMATCH for spend {} - witness is corrupted!", i);
-            eprintln!("   Path root:    {}...", hex::encode(&path_root_bytes[..8]));
-            eprintln!("   Witness root: {}...", hex::encode(&witness_root_bytes[..8]));
+            // FIX #1385: Gate hex dumps behind DEBUG_LOGGING
+            if DEBUG_LOGGING {
+                eprintln!("   Path root:    {}...", hex::encode(&path_root_bytes[..8]));
+                eprintln!("   Witness root: {}...", hex::encode(&witness_root_bytes[..8]));
+            }
             eprintln!("   💡 Run 'Settings → Full Resync' to rebuild witnesses");
             return false;
         }
@@ -7058,6 +7442,7 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi_encrypted(
     *tx_out_len = tx_bytes.len();
 
     true
+    })
 }
 
 // =============================================================================
@@ -7136,6 +7521,7 @@ pub unsafe extern "C" fn zipherx_scan_boost_outputs(
     max_notes: usize,
     result_out: *mut BoostScanResult,
 ) -> usize {
+    ffi_catch_unwind!(0, {
     use std::collections::HashSet;
     use zcash_primitives::sapling::{Diversifier, Rseed};
     use jubjub::Fr;
@@ -7207,7 +7593,7 @@ pub unsafe extern "C" fn zipherx_scan_boost_outputs(
             nullifier_map.insert(nullifier, (spend_height, txid));
         }
     }
-    eprintln!("📊 Indexed {} nullifiers with spend heights and txids", nullifier_map.len());
+    debug_log!("📊 Indexed {} nullifiers with spend heights and txids", nullifier_map.len());
 
     // FIX #230: Parse outputs for parallel processing with safe slice validation
     let outputs_slice = match safe_slice(outputs_data, output_count * BOOST_OUTPUT_SIZE) {
@@ -7275,7 +7661,7 @@ pub unsafe extern "C" fn zipherx_scan_boost_outputs(
         })
         .collect();
 
-    eprintln!("⚡ Decrypted {} notes from {} outputs", decrypted.len(), output_count);
+    debug_log!("⚡ Decrypted {} notes from {} outputs", decrypted.len(), output_count);
 
     // Now compute nullifiers (need extsk, so sequential, but this is fast)
     let mut notes_written = 0;
@@ -7331,20 +7717,26 @@ pub unsafe extern "C" fn zipherx_scan_boost_outputs(
 
         let cmu_to_store = if computed_cmu_bytes == cmu {
             // Direct match - use boost file CMU
-            eprintln!("✅ FIX #585: CMU match (direct) for note at pos {} ({}...)", position, hex::encode(&cmu[0..4]));
+            debug_log!("✅ FIX #585: CMU match (direct) for note at pos {} ({}...)", position, hex::encode(&cmu[0..4]));
             cmu
         } else if computed_cmu_bytes == cmu_reversed {
             // Byte order reversed - use computed CMU (transaction building format)
-            eprintln!("⚠️ FIX #585: CMU match (reversed) for note at pos {} - using computed CMU", position);
-            eprintln!("   Boost CMU:    {}...", hex::encode(&cmu[0..8]));
-            eprintln!("   Computed CMU: {}...", hex::encode(&computed_cmu_bytes[0..8]));
+            debug_log!("⚠️ FIX #585: CMU match (reversed) for note at pos {} - using computed CMU", position);
+            // FIX #1385: Gate hex dumps behind DEBUG_LOGGING
+            if DEBUG_LOGGING {
+                eprintln!("   Boost CMU:    {}...", hex::encode(&cmu[0..8]));
+                eprintln!("   Computed CMU: {}...", hex::encode(&computed_cmu_bytes[0..8]));
+            }
             computed_cmu_bytes
         } else {
             // NO MATCH - this is a bug, but use computed CMU for safety
             eprintln!("❌ FIX #585: CMU MISMATCH for note at pos {}!", position);
-            eprintln!("   Boost CMU:    {}", hex::encode(&cmu));
-            eprintln!("   Reversed:     {}", hex::encode(&cmu_reversed));
-            eprintln!("   Computed CMU: {}", hex::encode(&computed_cmu_bytes));
+            // FIX #1385: Gate hex dumps behind DEBUG_LOGGING
+            if DEBUG_LOGGING {
+                eprintln!("   Boost CMU:    {}", hex::encode(&cmu));
+                eprintln!("   Reversed:     {}", hex::encode(&cmu_reversed));
+                eprintln!("   Computed CMU: {}", hex::encode(&computed_cmu_bytes));
+            }
             computed_cmu_bytes
         };
 
@@ -7356,9 +7748,10 @@ pub unsafe extern "C" fn zipherx_scan_boost_outputs(
         if is_spent == 1 {
             total_spent += value;
             notes_spent += 1;
-            eprintln!("   💸 Spent: {} zatoshis @ height {} (txid {:02x}{:02x}...)", value, height, spent_txid[0], spent_txid[1]);
+            // FIX #1385: Gate value/txid logging (financial data) behind DEBUG_LOGGING
+            debug_log!("   💸 Spent: {} zatoshis @ height {} (txid {:02x}{:02x}...)", value, height, spent_txid[0], spent_txid[1]);
         } else {
-            eprintln!("   💰 Unspent: {} zatoshis @ height {} (pos {})", value, height, position);
+            debug_log!("   💰 Unspent: {} zatoshis @ height {} (pos {})", value, height, position);
         }
 
         // Write to output buffer with all data needed for database/transactions
@@ -7392,10 +7785,12 @@ pub unsafe extern "C" fn zipherx_scan_boost_outputs(
         };
     }
 
-    eprintln!("✅ Scan complete: {} notes, {} spent, balance: {:.8} ZCL",
+    // FIX #1385: Gate balance logging (financial data) behind DEBUG_LOGGING
+    debug_log!("✅ Scan complete: {} notes, {} spent, balance: {:.8} ZCL",
         notes_written, notes_spent, (total_received - total_spent) as f64 / 100_000_000.0);
 
     notes_written
+    })
 }
 
 /// Helper struct for boost output decryption (implements ShieldedOutput trait)
@@ -7460,6 +7855,7 @@ pub unsafe extern "C" fn zipherx_verify_transaction(
     chain_height: u64,
     error_out: *mut u32,
 ) -> bool {
+    ffi_catch_unwind!(false, {
     use zcash_primitives::transaction::Transaction;
     use zcash_primitives::consensus::BranchId;
     use std::io::Cursor;
@@ -7487,7 +7883,7 @@ pub unsafe extern "C" fn zipherx_verify_transaction(
     let height = BlockHeight::from_u32(chain_height as u32);
     let branch_id = BranchId::for_height(&ZclassicNetwork, height);
 
-    eprintln!("🔍 VUL-002 FIX: Verifying transaction ({} bytes) at height {} with branch ID {:?}",
+    debug_log!("🔍 VUL-002 FIX: Verifying transaction ({} bytes) at height {} with branch ID {:?}",
         tx_len, chain_height, branch_id);
 
     // Parse the transaction
@@ -7530,7 +7926,8 @@ pub unsafe extern "C" fn zipherx_verify_transaction(
     }
 
     // Get verifying keys from our static storage (populated during prover init)
-    let vk_guard = VERIFYING_KEYS.lock().unwrap();
+    // FIX #1385: Replace .lock().unwrap() with safe_lock!
+    let vk_guard = match safe_lock!(VERIFYING_KEYS) { Some(g) => g, None => return false };
     let vk_params = match vk_guard.as_ref() {
         Some(params) => params,
         None => {
@@ -7700,6 +8097,7 @@ pub unsafe extern "C" fn zipherx_verify_transaction(
         *error_out = TxVerifyError::Success as u32;
     }
     true
+    })
 }
 
 // =============================================================================
@@ -7726,6 +8124,7 @@ pub extern "C" fn zipherx_zstd_decompress(
     out_ptr: *mut *mut u8,
     out_len: *mut usize,
 ) -> u32 {
+    ffi_catch_unwind!(0, {
     // Validate inputs
     if compressed_ptr.is_null() || out_ptr.is_null() || out_len.is_null() {
         eprintln!("❌ ZSTD decompress: null pointer");
@@ -7769,8 +8168,9 @@ pub extern "C" fn zipherx_zstd_decompress(
         *out_len = out_len_value;
     }
 
-    eprintln!("✅ ZSTD decompressed {} bytes -> {} bytes", compressed_len, out_len_value);
+    debug_log!("✅ ZSTD decompressed {} bytes -> {} bytes", compressed_len, out_len_value);
     1
+    })
 }
 
 /// FIX #1338: Streaming file-to-file ZSTD decompression
@@ -7785,8 +8185,17 @@ pub extern "C" fn zipherx_zstd_decompress_file(
     dest_path_ptr: *const u8,
     dest_path_len: usize,
 ) -> i32 {
+    ffi_catch_unwind!(-1, {
     use std::io::BufReader;
     use std::io::BufWriter;
+
+    // FIX #1385: Null pointer + length validation before unsafe from_raw_parts
+    if source_path_ptr.is_null() || source_path_len == 0 || source_path_len > 4096 {
+        return 1;
+    }
+    if dest_path_ptr.is_null() || dest_path_len == 0 || dest_path_len > 4096 {
+        return 1;
+    }
 
     // Parse source path
     let source_path = match unsafe { std::str::from_utf8(std::slice::from_raw_parts(source_path_ptr, source_path_len)) } {
@@ -7831,6 +8240,7 @@ pub extern "C" fn zipherx_zstd_decompress_file(
             4
         }
     }
+    })
 }
 
 /// FIX #577: Verify that stored CMU matches computed CMU from note components
@@ -7842,6 +8252,7 @@ pub unsafe extern "C" fn zipherx_verify_note_cmu(
     value: u64,
     spending_key: *const u8,
 ) -> u32 {
+    ffi_catch_unwind!(0, {
     let stored_cmu_slice = match safe_slice(stored_cmu, 32) {
         Some(s) => s,
         None => { eprintln!("❌ FIX #577: Invalid stored_cmu pointer"); return 2; }
@@ -7905,6 +8316,7 @@ pub unsafe extern "C" fn zipherx_verify_note_cmu(
         debug_log!("   Computed: {}", hex::encode(&computed_cmu_bytes));
         return 0;
     }
+    })
 }
 
 /// FIX #1138: Compute CMU from note parts and return it
@@ -7925,6 +8337,7 @@ pub unsafe extern "C" fn zipherx_compute_note_cmu(
     spending_key: *const u8,
     cmu_out: *mut u8,
 ) -> bool {
+    ffi_catch_unwind!(false, {
     let div_slice = match safe_slice(diversifier, 11) {
         Some(s) => s,
         None => { eprintln!("❌ FIX #1138: Invalid diversifier pointer"); return false; }
@@ -7976,6 +8389,7 @@ pub unsafe extern "C" fn zipherx_compute_note_cmu(
 
     debug_log!("✅ FIX #1138: Computed CMU: {}...", hex::encode(&computed_cmu_bytes[0..8]));
     true
+    })
 }
 
 /// Free a buffer allocated by Rust FFI

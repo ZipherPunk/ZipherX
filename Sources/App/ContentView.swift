@@ -21,6 +21,10 @@ struct ContentView: View {
     @State private var wasInBackground: Bool = false  // FIX #258: Track if we were in background
     @State private var hasAcceptedDisclaimer: Bool = UserDefaults.standard.bool(forKey: "hasAcceptedDisclaimer")
 
+    // Security audit TASK 17: Privacy overlay for app switcher + screenshot warning
+    @State private var showPrivacyOverlay: Bool = false
+    @State private var showScreenshotWarning: Bool = false
+
     // Startup timing - uses walletCreationTime from WalletManager
     // This ensures timing starts from when user clicks create/import/restore, not app launch
     @State private var syncCompletionDuration: TimeInterval? = nil
@@ -2546,6 +2550,18 @@ struct ContentView: View {
                 })
                 .transition(.opacity)
             }
+
+            // Security audit TASK 17: Privacy overlay — covers wallet content in app switcher
+            if showPrivacyOverlay {
+                Color.black
+                    .ignoresSafeArea()
+                    .transition(.opacity)
+            }
+        }
+        .alert("Screenshot Detected", isPresented: $showScreenshotWarning) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text("Screenshots may contain sensitive wallet information. Be careful when sharing screenshots.")
         }
         .onChange(of: scenePhase) { newPhase in
             handleScenePhaseChange(newPhase)
@@ -2554,6 +2570,8 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.userDidTakeScreenshotNotification)) { _ in
             // Record activity on screenshot (user is interacting)
             recordUserActivity()
+            // Security audit TASK 17: Warn user about screenshots
+            showScreenshotWarning = true
         }
         #endif
     }
@@ -2572,6 +2590,9 @@ struct ContentView: View {
             isShowingLockScreen = true
 
         case .active:
+            // Security audit TASK 17: Clear privacy overlay when returning to foreground
+            showPrivacyOverlay = false
+
             // App became active
             if hasCompletedInitialSync {
                 // Check if we need to re-authenticate (inactivity timeout)
@@ -2606,8 +2627,8 @@ struct ContentView: View {
             }
 
         case .inactive:
-            // Brief transition state - don't change lock status
-            break
+            // Security audit TASK 17: Blur wallet content in app switcher
+            showPrivacyOverlay = true
 
         @unknown default:
             break

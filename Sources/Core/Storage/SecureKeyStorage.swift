@@ -71,11 +71,12 @@ final class SecureKeyStorage {
         }
 
         if isMacOS {
-            // macOS: Use simple storage without accessibility constraints
-            // This avoids -67068 errSecMissingEntitlement on unsigned builds
-            print("🖥️ macOS detected, using simple keychain storage")
-            try storeKeySimpleMacOS(key, tag: spendingKeyTag)
-            print("✅ SecureKeyStorage: Key stored in macOS keychain")
+            // Security audit TASK 25: Use macOS Keychain instead of Hardware UUID file storage
+            print("🖥️ macOS detected, using Keychain storage (TASK 25)")
+            try storeKeyInKeychain(key, tag: spendingKeyTag)
+            // Also store in file as backup during migration period
+            try? storeKeySimpleMacOS(key, tag: spendingKeyTag)
+            print("✅ SecureKeyStorage: Key stored in macOS Keychain")
             return
         }
 
@@ -330,7 +331,104 @@ final class SecureKeyStorage {
         return decryptedData
     }
 
-    /// macOS file-based storage with AES-GCM encryption
+    // MARK: - Security audit TASK 25: macOS Keychain Storage
+
+    /// Store key in macOS Keychain (replaces Hardware UUID file-based storage)
+    /// Security audit TASK 25: Keychain is protected by macOS login password + SIP
+    private func storeKeyInKeychain(_ key: Data, tag: String) throws {
+        // Delete any existing item
+        let deleteQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "com.zipherx.wallet",
+            kSecAttrAccount as String: tag
+        ]
+        SecItemDelete(deleteQuery as CFDictionary)
+
+        // Add new item with access control
+        var addQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "com.zipherx.wallet",
+            kSecAttrAccount as String: tag,
+            kSecValueData as String: key,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        ]
+
+        // Add biometric protection if available
+        if let access = SecAccessControlCreateWithFlags(
+            nil,
+            kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+            .userPresence,
+            nil
+        ) {
+            addQuery[kSecAttrAccessControl as String] = access
+        }
+
+        let status = SecItemAdd(addQuery as CFDictionary, nil)
+        guard status == errSecSuccess else {
+            throw SecureStorageError.keychainStoreFailed(status)
+        }
+        print("🔐 Security audit TASK 25: Key stored in macOS Keychain")
+    }
+
+    /// Retrieve key from macOS Keychain
+    /// Security audit TASK 25: Replaces Hardware UUID file-based retrieval
+    private func retrieveKeyFromKeychain(tag: String) throws -> Data {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "com.zipherx.wallet",
+            kSecAttrAccount as String: tag,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecReturnData as String: true
+        ]
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess, let data = result as? Data else {
+            throw SecureStorageError.keyNotFound
+        }
+        return data
+    }
+
+    /// Check if a key exists in macOS Keychain
+    private func keychainKeyExists(tag: String) -> Bool {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "com.zipherx.wallet",
+            kSecAttrAccount as String: tag,
+            kSecReturnAttributes as String: true,
+            kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail
+        ]
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        return status == errSecSuccess || status == errSecInteractionNotAllowed
+    }
+
+    /// Migrate key from old file-based storage to Keychain
+    /// Security audit TASK 25: One-time migration, old file deleted after successful migration
+    private func migrateFromFileToKeychain(tag: String) -> Bool {
+        // Try to read key using old file-based method
+        guard let key = try? retrieveKeyFromFile(tag: tag) else {
+            return false
+        }
+        // Store in Keychain
+        guard let _ = try? storeKeyInKeychain(key, tag: tag) else {
+            return false
+        }
+        // Delete old file
+        try? deleteMacOSKeyFile(for: tag)
+        print("🔐 Security audit TASK 25: Migrated key '\(tag)' from file to Keychain")
+        return true
+    }
+
+    /// Legacy: Retrieve key from file-based storage (for migration only)
+    /// Security audit TASK 25: Renamed from storeKeySimpleMacOS retrieval path
+    private func retrieveKeyFromFile(tag: String) -> Data? {
+        guard macOSKeyFileExists(for: tag) else { return nil }
+        guard let encryptedData = try? readMacOSKeyFile(for: tag) else { return nil }
+        return try? decryptMacOSData(encryptedData)
+    }
+
+    /// Legacy: macOS file-based storage with AES-GCM encryption
+    /// Security audit TASK 25: Kept as private legacy method for migration only
     /// Uses encrypted file instead of keychain to avoid -67068 errSecMissingEntitlement on unsigned builds
     private func storeKeySimpleMacOS(_ key: Data, tag: String) throws {
         print("🖥️ macOS: Storing \(key.count) bytes with tag: \(tag) (encrypted file)")
@@ -491,8 +589,14 @@ final class SecureKeyStorage {
     func hasSpendingKey() -> Bool {
         print("🔐 hasSpendingKey: Checking key existence...")
 
-        // macOS: Check file-based storage (keychain doesn't work on unsigned builds)
+        // Security audit TASK 25: macOS checks Keychain first, then file-based storage
         if isMacOS {
+            // Check Keychain (new TASK 25 path)
+            if keychainKeyExists(tag: spendingKeyTag) {
+                print("🔐 hasSpendingKey: macOS Keychain key exists (TASK 25)")
+                return true
+            }
+            // Fallback: check file-based storage (pre-TASK 25)
             let fileExists = macOSKeyFileExists(for: spendingKeyTag)
             print("🔐 hasSpendingKey: macOS file exists = \(fileExists)")
             if fileExists {
@@ -643,9 +747,20 @@ final class SecureKeyStorage {
     }
 
     func retrieveSpendingKey() throws -> Data {
-        // macOS: Use file-based storage (keychain doesn't work on unsigned builds)
+        // Security audit TASK 25: macOS prefers Keychain, falls back to file + migrates
         if isMacOS {
-            print("🖥️ macOS: Reading encrypted key from file")
+            // Try Keychain first (new TASK 25 path)
+            if keychainKeyExists(tag: spendingKeyTag) {
+                print("🖥️ macOS: Reading key from Keychain (TASK 25)")
+                return try retrieveKeyFromKeychain(tag: spendingKeyTag)
+            }
+            // Migration: try old file-based method and migrate to Keychain
+            if migrateFromFileToKeychain(tag: spendingKeyTag) {
+                print("🖥️ macOS: Migrated key to Keychain, reading from Keychain")
+                return try retrieveKeyFromKeychain(tag: spendingKeyTag)
+            }
+            // Last resort: try file-based storage directly
+            print("🖥️ macOS: Falling back to file-based storage")
             let encryptedData = try readMacOSKeyFile(for: spendingKeyTag)
             return try decryptMacOSData(encryptedData)
         }

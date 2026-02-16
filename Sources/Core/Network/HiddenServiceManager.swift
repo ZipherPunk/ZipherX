@@ -325,7 +325,8 @@ public final class HiddenServiceManager: ObservableObject {
                     if self.onionAddress != address {
                         self.onionAddress = address
                         HiddenServiceManager.cachedOnionAddress = address
-                        print("🧅 Hidden service running at: \(address)")
+                        // Security audit TASK 18: Log redaction
+                        print("🧅 Hidden service running at: \(address.redactedAddress)")
                     }
                 }
             } else if newState == .stopped {

@@ -391,7 +391,8 @@ final class InsightAPI: NSObject {
             do {
                 let (exists, confirmations) = try await verifyTransactionExists(txid: txid)
                 if exists {
-                    print("✅ Transaction verified on-chain: \(txid) (\(confirmations) confirmations)")
+                    // Security audit TASK 18: Log redaction
+                    print("✅ Transaction verified on-chain: \(txid.redactedTxid) (\(confirmations) confirmations)")
                     return true
                 }
             } catch {
@@ -453,7 +454,7 @@ final class InsightAPI: NSObject {
             throw InsightError.invalidData
         }
 
-        print("✅ Transaction broadcast via InsightAPI: \(txid)")
+        print("✅ Transaction broadcast via InsightAPI: \(txid.redactedTxid)")
         return txid
     }
 

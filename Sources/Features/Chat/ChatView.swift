@@ -2692,8 +2692,7 @@ struct SendViewForPayment: View {
         sendProgress = [
             SendProgressStep(id: "build", title: "Building transaction", status: .inProgress),
             SendProgressStep(id: "sign", title: "Signing with spending key", status: .pending),
-            SendProgressStep(id: "broadcast", title: "Broadcasting to network", status: .pending),
-            SendProgressStep(id: "verify", title: "Verifying in mempool", status: .pending)
+            SendProgressStep(id: "broadcast", title: "Broadcasting to network", status: .pending)
         ]
 
         Task {
@@ -2704,20 +2703,49 @@ struct SendViewForPayment: View {
                     memo: prefilledMemo
                 ) { phase, detail, progress in
                     Task { @MainActor in
-                        updateProgress(phase: phase, detail: detail ?? "", progress: progress ?? 0.0)
+                        self.updateProgress(phase: phase, detail: detail ?? "", progress: progress ?? 0.0)
+
+                        // FIX #1390: Show success as soon as first peer accepts TX with txid.
+                        // P2P mempool verification can take 5-15s+ (especially on iOS),
+                        // but balance already shows "Awaiting confirmations" via setPendingBroadcast.
+                        // Don't make the chat progress overlay wait for full verification.
+                        if phase == "peers", let detail = detail, detail.contains("[txid:") {
+                            if let range = detail.range(of: "[txid:"),
+                               let endRange = detail.range(of: "]", range: range.upperBound..<detail.endIndex) {
+                                let extractedTxId = String(detail[range.upperBound..<endRange.lowerBound])
+                                if !extractedTxId.isEmpty && !self.showSuccess {
+                                    // Mark all steps completed and show success immediately
+                                    for i in 0..<self.sendProgress.count {
+                                        self.sendProgress[i].status = .completed
+                                    }
+                                    self.txId = extractedTxId
+                                    self.showSuccess = true
+                                    self.isSending = false
+                                }
+                            }
+                        }
                     }
                 }
 
+                // Fallback: show success from function return if not already shown
                 await MainActor.run {
-                    txId = result
-                    showSuccess = true
-                    isSending = false
+                    if !showSuccess {
+                        txId = result
+                        showSuccess = true
+                        isSending = false
+                    }
                 }
             } catch {
                 await MainActor.run {
-                    errorMessage = error.localizedDescription
-                    showError = true
-                    isSending = false
+                    // FIX #1390: Don't show error if success was already shown from peer accept.
+                    // Post-broadcast errors (e.g. P2P verify timeout) are handled by the wallet
+                    // system (phantom TX cleanup, block scanner confirmation). The TX is already
+                    // tracked via setPendingBroadcast.
+                    if !showSuccess {
+                        errorMessage = error.localizedDescription
+                        showError = true
+                        isSending = false
+                    }
                 }
             }
         }
@@ -2736,13 +2764,18 @@ struct SendViewForPayment: View {
             sendProgress[0].status = .completed
             sendProgress[1].status = .completed
             sendProgress[2].status = progress >= 1.0 ? .completed : .inProgress
-            sendProgress[2].detail = detail
+            // FIX #1390: Strip txid tag from display text
+            let displayDetail = detail.replacingOccurrences(of: #"\s*\[txid:[^\]]+\]"#, with: "", options: .regularExpression)
+            sendProgress[2].detail = displayDetail
         case "verify":
+            // FIX #1390: Pre-broadcast verification (proofs, anchor) maps to broadcast step.
+            // Post-broadcast mempool verification is handled by early success on peer accept.
             sendProgress[0].status = .completed
             sendProgress[1].status = .completed
-            sendProgress[2].status = .completed
-            sendProgress[3].status = progress >= 1.0 ? .completed : .inProgress
-            sendProgress[3].detail = detail
+            if !showSuccess {
+                sendProgress[2].status = progress >= 1.0 ? .completed : .inProgress
+                sendProgress[2].detail = detail
+            }
         default:
             break
         }

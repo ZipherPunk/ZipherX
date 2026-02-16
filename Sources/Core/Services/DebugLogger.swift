@@ -150,6 +150,7 @@ final class DebugLogger {
     }
 
     /// Remove old backup logs, keeping only the most recent ones
+    /// Security audit TASK 18: Also enforces 7-day time-based retention
     private func cleanupOldBackups(keepCount: Int) {
         let fm = FileManager.default
 
@@ -169,9 +170,20 @@ final class DebugLogger {
                 return date1 > date2
             }
 
-            // Delete old backups beyond keepCount
-            if sortedBackups.count > keepCount {
-                for url in sortedBackups.dropFirst(keepCount) {
+            // Security audit TASK 18: Time-based log retention — delete logs older than 7 days
+            let sevenDaysAgo = Date().addingTimeInterval(-7 * 24 * 60 * 60)
+            for url in sortedBackups {
+                let creationDate = (try? url.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date.distantPast
+                if creationDate < sevenDaysAgo {
+                    try fm.removeItem(at: url)
+                    Swift.print("[TASK 18] 🗑️ Deleted log older than 7 days: \(url.lastPathComponent)")
+                }
+            }
+
+            // Also apply count-based limit (FIX #763)
+            let remainingBackups = sortedBackups.filter { fm.fileExists(atPath: $0.path) }
+            if remainingBackups.count > keepCount {
+                for url in remainingBackups.dropFirst(keepCount) {
                     try fm.removeItem(at: url)
                     Swift.print("[FIX #763] 🗑️ Deleted old log backup: \(url.lastPathComponent)")
                 }
@@ -409,6 +421,24 @@ enum LogCategory: String {
     case health = "HEALTH"   // FIX #763: Added for health checks
     case p2p = "P2P"         // FIX #763: Added for P2P operations
     case tor = "TOR"         // FIX #763: Added for Tor operations
+}
+
+// MARK: - Security audit TASK 18: Log Level Control
+
+/// Log severity levels for controlling output verbosity
+enum LogLevel: Int, Comparable {
+    case debug = 0, info = 1, warning = 2, error = 3
+    static func < (lhs: LogLevel, rhs: LogLevel) -> Bool {
+        lhs.rawValue < rhs.rawValue
+    }
+}
+
+extension DebugLogger {
+    #if DEBUG
+    static let minimumLevel: LogLevel = .debug
+    #else
+    static let minimumLevel: LogLevel = .warning
+    #endif
 }
 
 // MARK: - Global Debug Log Function

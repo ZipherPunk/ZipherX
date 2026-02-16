@@ -1,6 +1,7 @@
 import SwiftUI
 import LocalAuthentication
 import CryptoKit
+import CommonCrypto  // Security audit TASK 14: PBKDF2 key derivation
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -22,8 +23,9 @@ enum PINSecurity {
     private static let failedAttemptsKey = "pinFailedAttempts"
     private static let lockoutEndKey = "pinLockoutEnd"
 
-    /// Hash PIN using SHA256 with salt (100,000 iterations simulated via multiple rounds)
-    static func hashPIN(_ pin: String) -> String {
+    /// Legacy hash PIN using SHA256 with fixed salt (for migration only)
+    /// Security audit TASK 14: Kept for backwards compatibility during migration to PBKDF2
+    static func legacyHashPIN(_ pin: String) -> String {
         guard let pinData = pin.data(using: .utf8) else { return "" }
 
         // Combine salt + PIN
@@ -37,6 +39,95 @@ enum PINSecurity {
         }
 
         return hash.compactMap { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Hash PIN using PBKDF2 with random per-user salt (100,000 rounds)
+    /// Security audit TASK 14: Replaces legacy SHA256 with proper KDF
+    static func hashPIN(_ pin: String, salt: Data) -> String {
+        var derivedKey = Data(count: 32)
+        let result = derivedKey.withUnsafeMutableBytes { derivedBytes in
+            salt.withUnsafeBytes { saltBytes in
+                CCKeyDerivationPBKDF(
+                    CCPBKDFAlgorithm(kCCPBKDF2),
+                    pin, pin.utf8.count,
+                    saltBytes.baseAddress!.assumingMemoryBound(to: UInt8.self), salt.count,
+                    CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA256),
+                    100_000,
+                    derivedBytes.baseAddress!.assumingMemoryBound(to: UInt8.self), 32
+                )
+            }
+        }
+        guard result == kCCSuccess else { return "" }
+        return derivedKey.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Legacy hashPIN for backwards compatibility (uses fixed salt)
+    /// Security audit TASK 14: Used only during migration to PBKDF2
+    static func hashPIN(_ pin: String) -> String {
+        if let salt = retrievePINSalt() {
+            // New PBKDF2 path
+            return hashPIN(pin, salt: salt)
+        }
+        // Legacy path (no salt stored yet)
+        return legacyHashPIN(pin)
+    }
+
+    // MARK: - Security audit TASK 14: Per-user random salt with Keychain storage
+
+    /// Generate a random 32-byte salt for PIN hashing
+    static func generateSalt() -> Data {
+        var salt = Data(count: 32)
+        _ = salt.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
+        return salt
+    }
+
+    /// Store PIN salt in Keychain (NOT UserDefaults)
+    static func storePINSalt(_ salt: Data) {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "com.zipherx.pin-salt",
+            kSecValueData as String: salt
+        ]
+        SecItemDelete(query as CFDictionary)
+        SecItemAdd(query as CFDictionary, nil)
+    }
+
+    /// Retrieve PIN salt from Keychain
+    static func retrievePINSalt() -> Data? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "com.zipherx.pin-salt",
+            kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecReturnData as String: true
+        ]
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        return status == errSecSuccess ? result as? Data : nil
+    }
+
+    /// Migrate existing PIN from legacy SHA256 to PBKDF2 with random salt
+    /// Security audit TASK 14: Called on successful legacy verification
+    static func migratePINToNewFormat(_ pin: String) {
+        let salt = generateSalt()
+        storePINSalt(salt)
+        let newHash = hashPIN(pin, salt: salt)
+        UserDefaults.standard.set(newHash, forKey: "walletPIN")
+        print("🔐 Security audit TASK 14: Migrated PIN to PBKDF2 with random salt")
+    }
+
+    // MARK: - Security audit NEW-004: Constant-time comparison
+
+    /// Constant-time string comparison to prevent timing attacks on PIN verification
+    /// Security audit NEW-004: Replaces == which leaks hash prefix via timing
+    static func constantTimeEqual(_ a: String, _ b: String) -> Bool {
+        let aBytes = Array(a.utf8)
+        let bBytes = Array(b.utf8)
+        guard aBytes.count == bBytes.count else { return false }
+        var diff: UInt8 = 0
+        for (x, y) in zip(aBytes, bBytes) {
+            diff |= x ^ y
+        }
+        return diff == 0
     }
 
     /// Check if PIN verification is currently locked out
@@ -62,14 +153,15 @@ enum PINSecurity {
 
     /// Verify PIN against stored hash with rate limiting
     /// Returns: (success, isLocked, remainingAttempts)
+    /// Security audit TASK 14: Supports both PBKDF2 (new) and legacy SHA256 (migration)
     static func verifyPINWithRateLimit(_ pin: String, storedHash: String) -> (success: Bool, isLocked: Bool, remainingAttempts: Int) {
         // Check if locked out
         if isLockedOut() {
             return (false, true, 0)
         }
 
-        // Verify PIN
-        let success = hashPIN(pin) == storedHash
+        // Security audit NEW-004: Constant-time PIN comparison
+        let success = verifyPIN(pin, storedHash: storedHash)
 
         if success {
             // Reset failed attempts on success
@@ -94,9 +186,23 @@ enum PINSecurity {
         }
     }
 
-    /// Simple verify PIN (for backwards compatibility)
+    /// Verify PIN with migration support
+    /// Security audit TASK 14: Tries PBKDF2 first, falls back to legacy, migrates on success
+    /// Security audit NEW-004: Uses constant-time comparison
     static func verifyPIN(_ pin: String, storedHash: String) -> Bool {
-        return hashPIN(pin) == storedHash
+        if let salt = retrievePINSalt() {
+            // New method: PBKDF2 with random salt
+            let computed = hashPIN(pin, salt: salt)
+            return constantTimeEqual(computed, storedHash)
+        } else {
+            // Legacy: old fixed salt SHA256, migrate on success
+            let oldHash = legacyHashPIN(pin)
+            if constantTimeEqual(oldHash, storedHash) {
+                migratePINToNewFormat(pin)
+                return true
+            }
+            return false
+        }
     }
 
     /// Reset lockout (for testing or admin purposes)
@@ -3128,8 +3234,10 @@ Both binaries must be installed to /usr/local/bin:
             return
         }
 
-        // SECURITY: Hash PIN with PBKDF2-like derivation before storing
-        let hashedPIN = PINSecurity.hashPIN(pinCode)
+        // Security audit TASK 14: Hash PIN with PBKDF2 + random salt
+        let salt = PINSecurity.generateSalt()
+        PINSecurity.storePINSalt(salt)
+        let hashedPIN = PINSecurity.hashPIN(pinCode, salt: salt)
         UserDefaults.standard.set(hashedPIN, forKey: "walletPIN")
         pinCode = ""
         confirmPIN = ""

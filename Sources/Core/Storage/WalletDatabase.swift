@@ -61,6 +61,125 @@ final class WalletDatabase {
     /// Check if database connection is open
     var isOpen: Bool { db != nil }
 
+    // MARK: - Security audit TASK 16: Encrypted Shadow Column Helpers
+
+    /// Encrypt a UInt64 value for shadow column storage
+    /// Security audit TASK 16: Defense-in-depth encryption for note values
+    private func encryptUInt64(_ value: UInt64) -> Data? {
+        var v = value
+        return try? encryptBlob(Data(bytes: &v, count: 8))
+    }
+
+    /// Decrypt a UInt64 value from shadow column
+    private func decryptUInt64(_ encrypted: Data) -> UInt64? {
+        guard let decrypted = try? decryptBlob(encrypted), decrypted.count >= 8 else { return nil }
+        return decrypted.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
+    }
+
+    /// Encrypt an Int64 value for shadow column storage
+    private func encryptInt64(_ value: Int64) -> Data? {
+        var v = value
+        return try? encryptBlob(Data(bytes: &v, count: 8))
+    }
+
+    /// Decrypt an Int64 value from shadow column
+    private func decryptInt64(_ encrypted: Data) -> Int64? {
+        guard let decrypted = try? decryptBlob(encrypted), decrypted.count >= 8 else { return nil }
+        return decrypted.withUnsafeBytes { $0.loadUnaligned(as: Int64.self) }
+    }
+
+    /// Encrypt Data (txid) for shadow column storage
+    private func encryptDataField(_ data: Data) -> Data? {
+        return try? encryptBlob(data)
+    }
+
+    /// Decrypt Data (txid) from shadow column
+    private func decryptDataField(_ encrypted: Data) -> Data? {
+        return try? decryptBlob(encrypted)
+    }
+
+    /// Write encrypted shadow columns for a note after INSERT
+    /// Security audit TASK 16: Writes value_enc, received_height_enc, received_in_tx_enc
+    private func writeNoteEncryptedShadows(noteId: Int64, value: UInt64, height: UInt64, txid: Data) {
+        let updateSql = "UPDATE notes SET value_enc = ?, received_height_enc = ?, received_in_tx_enc = ? WHERE id = ?;"
+        var updateStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(updateStmt) }
+
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+        if let encValue = encryptUInt64(value) {
+            _ = encValue.withUnsafeBytes { ptr in
+                sqlite3_bind_blob(updateStmt, 1, ptr.baseAddress, Int32(encValue.count), SQLITE_TRANSIENT)
+            }
+        } else { sqlite3_bind_null(updateStmt, 1) }
+
+        if let encHeight = encryptUInt64(height) {
+            _ = encHeight.withUnsafeBytes { ptr in
+                sqlite3_bind_blob(updateStmt, 2, ptr.baseAddress, Int32(encHeight.count), SQLITE_TRANSIENT)
+            }
+        } else { sqlite3_bind_null(updateStmt, 2) }
+
+        if let encTxid = encryptDataField(txid) {
+            _ = encTxid.withUnsafeBytes { ptr in
+                sqlite3_bind_blob(updateStmt, 3, ptr.baseAddress, Int32(encTxid.count), SQLITE_TRANSIENT)
+            }
+        } else { sqlite3_bind_null(updateStmt, 3) }
+
+        sqlite3_bind_int64(updateStmt, 4, noteId)
+        sqlite3_step(updateStmt)
+    }
+
+    /// Write encrypted spent shadow columns after marking a note spent
+    /// Security audit TASK 16: Writes spent_height_enc, spent_in_tx_enc
+    private func writeSpentEncryptedShadows(hashedNullifier: Data, spentHeight: UInt64, txid: Data) {
+        let updateSql = "UPDATE notes SET spent_height_enc = ?, spent_in_tx_enc = ? WHERE nf = ?;"
+        var updateStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(updateStmt) }
+
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+        if let encHeight = encryptUInt64(spentHeight) {
+            _ = encHeight.withUnsafeBytes { ptr in
+                sqlite3_bind_blob(updateStmt, 1, ptr.baseAddress, Int32(encHeight.count), SQLITE_TRANSIENT)
+            }
+        } else { sqlite3_bind_null(updateStmt, 1) }
+
+        if let encTxid = encryptDataField(txid) {
+            _ = encTxid.withUnsafeBytes { ptr in
+                sqlite3_bind_blob(updateStmt, 2, ptr.baseAddress, Int32(encTxid.count), SQLITE_TRANSIENT)
+            }
+        } else { sqlite3_bind_null(updateStmt, 2) }
+
+        _ = hashedNullifier.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(updateStmt, 3, ptr.baseAddress, Int32(hashedNullifier.count), SQLITE_TRANSIENT)
+        }
+
+        sqlite3_step(updateStmt)
+    }
+
+    // MARK: - Security audit TASK 23: Transaction Safety Helper
+
+    /// Execute a block within an exclusive database transaction.
+    /// If the block throws, the transaction is rolled back automatically.
+    /// Security audit TASK 23: Ensures migration and multi-step operations are atomic.
+    private func executeInTransaction(_ block: () throws -> Void) throws {
+        guard sqlite3_exec(db, "BEGIN EXCLUSIVE TRANSACTION;", nil, nil, nil) == SQLITE_OK else {
+            throw DatabaseError.transactionFailed("BEGIN failed: \(String(cString: sqlite3_errmsg(db)))")
+        }
+        do {
+            try block()
+            guard sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
+                sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+                throw DatabaseError.transactionFailed("COMMIT failed: \(String(cString: sqlite3_errmsg(db)))")
+            }
+        } catch {
+            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+            throw error
+        }
+    }
+
     // MARK: - VUL-009: Nullifier Hashing
 
     /// Hash a nullifier for privacy-preserving storage
@@ -100,6 +219,34 @@ final class WalletDatabase {
     /// Encrypt transaction type for database storage
     private func encryptTxType(_ type: TransactionType) -> String {
         return WalletDatabase.txTypeEncryptionMap[type] ?? type.rawValue
+    }
+
+    // MARK: - Security audit TASK 19: Encrypted TX Type Shadow Column
+
+    /// Encrypt transaction type as BLOB for tx_type_enc column
+    /// Security audit TASK 19: Integer code encrypted with AES-GCM
+    private func encryptTxTypeBlob(_ type: TransactionType) -> Data? {
+        let typeInt: UInt8 = switch type {
+            case .sent: 0
+            case .received: 1
+            case .change: 2
+            case .selfSend: 3
+        }
+        return try? encryptBlob(Data([typeInt]))
+    }
+
+    /// Decrypt transaction type from tx_type_enc BLOB column
+    /// Security audit TASK 19: Returns nil if decryption fails (fallback to text column)
+    private func decryptTxTypeBlob(_ encrypted: Data) -> TransactionType? {
+        guard let decrypted = try? decryptBlob(encrypted),
+              let byte = decrypted.first else { return nil }
+        switch byte {
+            case 0: return .sent
+            case 1: return .received
+            case 2: return .change
+            case 3: return .selfSend
+            default: return nil
+        }
     }
 
     /// Decrypt transaction type from database storage
@@ -150,7 +297,6 @@ final class WalletDatabase {
 
     private var db: OpaquePointer?
     private let dbPath: String
-    private let queue = DispatchQueue(label: "com.zipherx.database", qos: .userInitiated)
 
     private init() {
         dbPath = AppDirectories.database.appendingPathComponent("zipherx_wallet.db").path
@@ -956,6 +1102,157 @@ final class WalletDatabase {
                 print("📂 Migration 14: Added last_success column to trusted_peers (FIX #1085)")
             }
         }
+
+        // Migration 15: Security audit TASK 2 — Zero spending keys in database
+        // Spending keys are now stored in SecureKeyStorage (Secure Enclave / Keychain)
+        // Check if spending keys in accounts table are non-zero (need migration)
+        var needsKeyZeroing = false
+        var checkStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, "SELECT spending_key FROM accounts LIMIT 1;", -1, &checkStmt, nil) == SQLITE_OK {
+            if sqlite3_step(checkStmt) == SQLITE_ROW {
+                let skLen = sqlite3_column_bytes(checkStmt, 0)
+                if skLen > 0, let skPtr = sqlite3_column_blob(checkStmt, 0) {
+                    let dbKey = Data(bytes: skPtr, count: Int(skLen))
+                    needsKeyZeroing = !dbKey.allSatisfy({ $0 == 0 })
+                }
+            }
+            sqlite3_finalize(checkStmt)
+        }
+        if needsKeyZeroing {
+            try executeInTransaction {
+                let zeroResult = sqlite3_exec(db,
+                    "UPDATE accounts SET spending_key = zeroblob(length(spending_key));",
+                    nil, nil, nil)
+                if zeroResult == SQLITE_OK {
+                    print("🔐 Security audit TASK 2: Zeroed spending keys in database")
+                }
+            }
+        }
+
+        // Migration 16: Security audit TASK 19 — Add tx_type_enc column for encrypted TX type
+        var historyColumns: Set<String> = []
+        var histCheckStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, "PRAGMA table_info(transaction_history);", -1, &histCheckStmt, nil) == SQLITE_OK {
+            while sqlite3_step(histCheckStmt) == SQLITE_ROW {
+                if let colName = sqlite3_column_text(histCheckStmt, 1) {
+                    historyColumns.insert(String(cString: colName))
+                }
+            }
+            sqlite3_finalize(histCheckStmt)
+        }
+
+        if !historyColumns.contains("tx_type_enc") {
+            let alterSql = "ALTER TABLE transaction_history ADD COLUMN tx_type_enc BLOB;"
+            if sqlite3_exec(db, alterSql, nil, nil, nil) == SQLITE_OK {
+                print("📂 Migration 16: Added tx_type_enc column to transaction_history (TASK 19)")
+
+                // Security audit TASK 19: Backfill tx_type_enc for existing rows
+                // Read existing rows and encrypt their tx_type values
+                var backfillStmt: OpaquePointer?
+                if sqlite3_prepare_v2(db, "SELECT id, tx_type FROM transaction_history WHERE tx_type_enc IS NULL;", -1, &backfillStmt, nil) == SQLITE_OK {
+                    var rows: [(Int64, String)] = []
+                    while sqlite3_step(backfillStmt) == SQLITE_ROW {
+                        let rowId = sqlite3_column_int64(backfillStmt, 0)
+                        if let typeStr = sqlite3_column_text(backfillStmt, 1) {
+                            rows.append((rowId, String(cString: typeStr)))
+                        }
+                    }
+                    sqlite3_finalize(backfillStmt)
+
+                    for (rowId, typeStr) in rows {
+                        let txType = decryptTxType(typeStr)
+                        if let encType = encryptTxTypeBlob(txType) {
+                            let updateSql = "UPDATE transaction_history SET tx_type_enc = ? WHERE id = ?;"
+                            var updateStmt: OpaquePointer?
+                            if sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK {
+                                _ = encType.withUnsafeBytes { ptr in
+                                    sqlite3_bind_blob(updateStmt, 1, ptr.baseAddress, Int32(encType.count), nil)
+                                }
+                                sqlite3_bind_int64(updateStmt, 2, rowId)
+                                sqlite3_step(updateStmt)
+                                sqlite3_finalize(updateStmt)
+                            }
+                        }
+                    }
+                    if !rows.isEmpty {
+                        print("🔐 Migration 16: Backfilled tx_type_enc for \(rows.count) existing rows (TASK 19)")
+                    }
+                }
+            }
+        }
+
+        // Migration 17: Security audit TASK 16 — Add encrypted shadow columns to notes
+        var notesColumnsTask16: Set<String> = []
+        var notesCheckStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, pragmaSql, -1, &notesCheckStmt, nil) == SQLITE_OK {
+            while sqlite3_step(notesCheckStmt) == SQLITE_ROW {
+                if let colName = sqlite3_column_text(notesCheckStmt, 1) {
+                    notesColumnsTask16.insert(String(cString: colName))
+                }
+            }
+            sqlite3_finalize(notesCheckStmt)
+        }
+
+        let task16Columns = ["value_enc", "received_height_enc", "spent_height_enc", "received_in_tx_enc", "spent_in_tx_enc"]
+        for colName in task16Columns {
+            if !notesColumnsTask16.contains(colName) {
+                let alterSql = "ALTER TABLE notes ADD COLUMN \(colName) BLOB;"
+                if sqlite3_exec(db, alterSql, nil, nil, nil) == SQLITE_OK {
+                    print("📂 Migration 17: Added \(colName) column to notes (TASK 16)")
+                }
+            }
+        }
+
+        // Security audit TASK 16: Backfill encrypted shadow columns for existing notes
+        var backfillStmt16: OpaquePointer?
+        let backfillSql = "SELECT id, value, received_height, received_in_tx, spent_height, spent_in_tx FROM notes WHERE value_enc IS NULL LIMIT 5000;"
+        if sqlite3_prepare_v2(db, backfillSql, -1, &backfillStmt16, nil) == SQLITE_OK {
+            var backfillCount = 0
+            while sqlite3_step(backfillStmt16) == SQLITE_ROW {
+                let noteId = sqlite3_column_int64(backfillStmt16, 0)
+                let value = UInt64(sqlite3_column_int64(backfillStmt16, 1))
+                let recHeight = UInt64(sqlite3_column_int64(backfillStmt16, 2))
+                let recTxLen = sqlite3_column_bytes(backfillStmt16, 3)
+                let recTxid: Data = recTxLen > 0 && sqlite3_column_blob(backfillStmt16, 3) != nil
+                    ? Data(bytes: sqlite3_column_blob(backfillStmt16, 3), count: Int(recTxLen))
+                    : Data()
+
+                // Write receive-side shadow columns
+                writeNoteEncryptedShadows(noteId: noteId, value: value, height: recHeight, txid: recTxid)
+
+                // Write spent-side shadow columns if spent
+                let spentHeight = UInt64(sqlite3_column_int64(backfillStmt16, 4))
+                if spentHeight > 0 {
+                    let spentTxLen = sqlite3_column_bytes(backfillStmt16, 5)
+                    let spentTxid: Data = spentTxLen > 0 && sqlite3_column_blob(backfillStmt16, 5) != nil
+                        ? Data(bytes: sqlite3_column_blob(backfillStmt16, 5), count: Int(spentTxLen))
+                        : Data()
+                    // Use direct UPDATE for spent columns since we have the note ID
+                    let spentSql = "UPDATE notes SET spent_height_enc = ?, spent_in_tx_enc = ? WHERE id = ?;"
+                    var spentStmt: OpaquePointer?
+                    if sqlite3_prepare_v2(db, spentSql, -1, &spentStmt, nil) == SQLITE_OK {
+                        if let encH = encryptUInt64(spentHeight) {
+                            _ = encH.withUnsafeBytes { ptr in
+                                sqlite3_bind_blob(spentStmt, 1, ptr.baseAddress, Int32(encH.count), nil)
+                            }
+                        } else { sqlite3_bind_null(spentStmt, 1) }
+                        if let encTx = encryptDataField(spentTxid) {
+                            _ = encTx.withUnsafeBytes { ptr in
+                                sqlite3_bind_blob(spentStmt, 2, ptr.baseAddress, Int32(encTx.count), nil)
+                            }
+                        } else { sqlite3_bind_null(spentStmt, 2) }
+                        sqlite3_bind_int64(spentStmt, 3, noteId)
+                        sqlite3_step(spentStmt)
+                        sqlite3_finalize(spentStmt)
+                    }
+                }
+                backfillCount += 1
+            }
+            sqlite3_finalize(backfillStmt16)
+            if backfillCount > 0 {
+                print("🔐 Migration 17: Backfilled encrypted shadow columns for \(backfillCount) notes (TASK 16)")
+            }
+        }
     }
 
     // MARK: - Account Operations
@@ -980,8 +1277,11 @@ final class WalletDatabase {
         defer { sqlite3_finalize(stmt) }
 
         sqlite3_bind_int(stmt, 1, Int32(accountIndex))
-        _ = spendingKey.withUnsafeBytes { ptr in
-            sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(spendingKey.count), nil)
+        // Security audit TASK 2: Don't store spending key in DB
+        // Key is stored in SecureKeyStorage (Secure Enclave / Keychain)
+        let zeroKey = Data(repeating: 0, count: spendingKey.count)
+        _ = zeroKey.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(zeroKey.count), nil)
         }
         _ = viewingKey.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 3, ptr.baseAddress, Int32(viewingKey.count), nil)
@@ -1029,16 +1329,36 @@ final class WalletDatabase {
         }
 
         let id = sqlite3_column_int64(stmt, 0)
-        let skPtr = sqlite3_column_blob(stmt, 1)
-        let skLen = sqlite3_column_bytes(stmt, 1)
         let vkPtr = sqlite3_column_blob(stmt, 2)
         let vkLen = sqlite3_column_bytes(stmt, 2)
         let address = String(cString: sqlite3_column_text(stmt, 3))
         let birthday = UInt64(sqlite3_column_int64(stmt, 4))
 
+        // Security audit TASK 2: Get spending key from Secure Enclave / Keychain
+        let spendingKey: Data
+        do {
+            spendingKey = try SecureKeyStorage.shared.retrieveSpendingKey()
+        } catch {
+            print("⚠️ TASK 2: Failed to retrieve spending key from SecureKeyStorage: \(error)")
+            // Fallback: try DB (for migration period)
+            let skPtr = sqlite3_column_blob(stmt, 1)
+            let skLen = sqlite3_column_bytes(stmt, 1)
+            if skLen > 0, let ptr = skPtr {
+                let dbKey = Data(bytes: ptr, count: Int(skLen))
+                if dbKey.allSatisfy({ $0 == 0 }) {
+                    // Key is zeroed in DB and not in SecureKeyStorage — can't recover
+                    print("❌ TASK 2: Spending key zeroed in DB and not in SecureKeyStorage")
+                    return nil
+                }
+                spendingKey = dbKey
+            } else {
+                return nil
+            }
+        }
+
         return Account(
             accountId: id,
-            spendingKey: Data(bytes: skPtr!, count: Int(skLen)),
+            spendingKey: spendingKey,
             viewingKey: Data(bytes: vkPtr!, count: Int(vkLen)),
             address: address,
             birthdayHeight: birthday
@@ -1156,6 +1476,9 @@ final class WalletDatabase {
             return 0
         }
 
+        // Security audit TASK 16: Write encrypted shadow columns
+        writeNoteEncryptedShadows(noteId: insertedId, value: value, height: height, txid: txid)
+
         return insertedId
     }
 
@@ -1255,6 +1578,9 @@ final class WalletDatabase {
                 if sqlite3_step(stmt) == SQLITE_DONE {
                     if sqlite3_changes(db) > 0 {
                         insertedCount += 1
+                        // Security audit TASK 16: Write encrypted shadow columns
+                        let noteId = sqlite3_last_insert_rowid(db)
+                        writeNoteEncryptedShadows(noteId: noteId, value: note.value, height: note.height, txid: note.txid)
                     }
                 }
             }
@@ -1670,44 +1996,49 @@ final class WalletDatabase {
     func markNoteSpentByHashedNullifier(hashedNullifier: Data, txid: Data, spentHeight: UInt64) throws {
         // SECURITY: Never log nullifiers - they are sensitive privacy data
 
-        // First, get the note's value so we can record it in transaction history
-        var noteValue: UInt64 = 0
-        let selectSql = "SELECT value FROM notes WHERE nf = ?;"
-        var selectStmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, selectSql, -1, &selectStmt, nil) == SQLITE_OK {
+        // Security audit TASK 15: Wrap SELECT+UPDATE in transaction to prevent race conditions
+        try executeInTransaction {
+            // First, get the note's value so we can record it in transaction history
+            var noteValue: UInt64 = 0
+            let selectSql = "SELECT value FROM notes WHERE nf = ?;"
+            var selectStmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, selectSql, -1, &selectStmt, nil) == SQLITE_OK {
+                _ = hashedNullifier.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(selectStmt, 1, ptr.baseAddress, Int32(hashedNullifier.count), nil)
+                }
+                if sqlite3_step(selectStmt) == SQLITE_ROW {
+                    noteValue = UInt64(sqlite3_column_int64(selectStmt, 0))
+                }
+                sqlite3_finalize(selectStmt)
+            }
+
+            // Update the note as spent
+            let sql = "UPDATE notes SET is_spent = 1, spent_in_tx = ?, spent_height = ? WHERE nf = ?;"
+
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            defer { sqlite3_finalize(stmt) }
+
+            _ = txid.withUnsafeBytes { ptr in
+                sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), nil)
+            }
+            sqlite3_bind_int64(stmt, 2, Int64(spentHeight))
             _ = hashedNullifier.withUnsafeBytes { ptr in
-                sqlite3_bind_blob(selectStmt, 1, ptr.baseAddress, Int32(hashedNullifier.count), nil)
+                sqlite3_bind_blob(stmt, 3, ptr.baseAddress, Int32(hashedNullifier.count), nil)
             }
-            if sqlite3_step(selectStmt) == SQLITE_ROW {
-                noteValue = UInt64(sqlite3_column_int64(selectStmt, 0))
+
+            guard sqlite3_step(stmt) == SQLITE_DONE else {
+                throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
             }
-            sqlite3_finalize(selectStmt)
-        }
 
-        // Update the note as spent
-        let sql = "UPDATE notes SET is_spent = 1, spent_in_tx = ?, spent_height = ? WHERE nf = ?;"
-
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
-        }
-        defer { sqlite3_finalize(stmt) }
-
-        _ = txid.withUnsafeBytes { ptr in
-            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), nil)
-        }
-        sqlite3_bind_int64(stmt, 2, Int64(spentHeight))
-        _ = hashedNullifier.withUnsafeBytes { ptr in
-            sqlite3_bind_blob(stmt, 3, ptr.baseAddress, Int32(hashedNullifier.count), nil)
-        }
-
-        guard sqlite3_step(stmt) == SQLITE_DONE else {
-            throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
-        }
-
-        let changedRows = sqlite3_changes(db)
-        if changedRows > 0 {
-            print("✅ Marked \(changedRows) note(s) as spent at height \(spentHeight)")
+            let changedRows = sqlite3_changes(db)
+            if changedRows > 0 {
+                print("✅ Marked \(changedRows) note(s) as spent at height \(spentHeight)")
+                // Security audit TASK 16: Write encrypted spent shadow columns
+                writeSpentEncryptedShadows(hashedNullifier: hashedNullifier, spentHeight: spentHeight, txid: txid)
+            }
         }
 
         // NOTE: SENT transactions are now recorded by populateHistoryFromNotes() which
@@ -1757,6 +2088,8 @@ final class WalletDatabase {
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
         }
+        // FIX #1390 / Security audit TASK 16: Write encrypted spent shadows
+        writeSpentEncryptedShadows(hashedNullifier: hashedNullifier, spentHeight: spentHeight, txid: syntheticTxid)
         print("📜 Marked note spent at height \(spentHeight) with synthetic txid")
     }
 
@@ -1823,6 +2156,8 @@ final class WalletDatabase {
                 print("⚠️ FIX #688: Note not found for nullifier (deleted during resync?), recording TX history anyway")
             } else {
                 print("✅ FIX #688: Note marked as spent (changedRows=\(changedRows))")
+                // FIX #1390 / Security audit TASK 16: Write encrypted spent shadows
+                writeSpentEncryptedShadows(hashedNullifier: hashedNullifier, spentHeight: spentHeight, txid: txid)
             }
 
             // STEP 2: Insert transaction history (ALWAYS do this, even if note was missing)
@@ -1876,6 +2211,20 @@ final class WalletDatabase {
             }
 
             let historyId = sqlite3_last_insert_rowid(db)
+
+            // Security audit TASK 19: Write encrypted TX type
+            if let encType = encryptTxTypeBlob(.sent) {
+                let updateSql = "UPDATE transaction_history SET tx_type_enc = ? WHERE id = ?;"
+                var updateStmt: OpaquePointer?
+                if sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK {
+                    _ = encType.withUnsafeBytes { ptr in
+                        sqlite3_bind_blob(updateStmt, 1, ptr.baseAddress, Int32(encType.count), nil)
+                    }
+                    sqlite3_bind_int64(updateStmt, 2, historyId)
+                    sqlite3_step(updateStmt)
+                    sqlite3_finalize(updateStmt)
+                }
+            }
 
             // COMMIT - both operations succeeded
             let commitResult = sqlite3_exec(db, "COMMIT;", nil, nil, nil)
@@ -1968,6 +2317,22 @@ final class WalletDatabase {
 
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.insertFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        let historyId = sqlite3_last_insert_rowid(db)
+
+        // Security audit TASK 19: Write encrypted TX type
+        if let encType = encryptTxTypeBlob(.sent) {
+            let updateSql = "UPDATE transaction_history SET tx_type_enc = ? WHERE id = ?;"
+            var updateStmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK {
+                _ = encType.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(updateStmt, 1, ptr.baseAddress, Int32(encType.count), nil)
+                }
+                sqlite3_bind_int64(updateStmt, 2, historyId)
+                sqlite3_step(updateStmt)
+                sqlite3_finalize(updateStmt)
+            }
         }
 
         print("✅ FIX #964: Recorded minimal sent TX at height \(confirmedHeight) (amount: \(amount), fee: \(fee))")
@@ -2103,7 +2468,8 @@ final class WalletDatabase {
         // VUL-009: Hash the incoming nullifier to match stored hashed nullifiers
         let hashedNullifier = hashNullifier(nullifier)
 
-        let sql = "UPDATE notes SET is_spent = 0, spent_in_tx = NULL WHERE nf = ?;"
+        // FIX #1390: Clear spent shadow columns when restoring note
+        let sql = "UPDATE notes SET is_spent = 0, spent_in_tx = NULL, spent_height_enc = NULL, spent_in_tx_enc = NULL WHERE nf = ?;"
 
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -2475,8 +2841,9 @@ final class WalletDatabase {
                     details.append("🔧 FIX #1233: Auto-restoring orphan spent notes to unspent...")
 
                     // Auto-fix: Restore orphan spent notes to unspent
+                    // FIX #1390: Clear spent shadow columns when restoring orphan notes
                     let restoreOrphanSql = """
-                        UPDATE notes SET is_spent = 0, spent_in_tx = NULL, spent_height = NULL
+                        UPDATE notes SET is_spent = 0, spent_in_tx = NULL, spent_height = NULL, spent_height_enc = NULL, spent_in_tx_enc = NULL
                         WHERE is_spent = 1 AND (spent_in_tx IS NULL OR spent_in_tx = '') AND account_id = ?;
                     """
                     var restoreOrphanStmt: OpaquePointer?
@@ -2537,8 +2904,9 @@ final class WalletDatabase {
                 details.append("🔧 FIX #1169: Auto-restoring notes spent by phantom TXs...")
 
                 // Auto-fix: Restore these notes to unspent
+                // FIX #1390: Clear spent shadow columns when restoring phantom TX notes
                 let restoreSql = """
-                    UPDATE notes SET is_spent = 0, spent_in_tx = NULL, spent_height = NULL
+                    UPDATE notes SET is_spent = 0, spent_in_tx = NULL, spent_height = NULL, spent_height_enc = NULL, spent_in_tx_enc = NULL
                     WHERE is_spent = 1 AND spent_in_tx IS NOT NULL AND account_id = ?
                     AND id IN (
                         SELECT n2.id FROM notes n2
@@ -2610,8 +2978,9 @@ final class WalletDatabase {
 
                 for txid in stalePhantomTxids {
                     // Restore notes spent by this phantom TX
+                    // FIX #1390: Clear spent shadow columns when restoring stale phantom TX notes
                     let restoreNotesSql = """
-                        UPDATE notes SET is_spent = 0, spent_in_tx = NULL, spent_height = NULL
+                        UPDATE notes SET is_spent = 0, spent_in_tx = NULL, spent_height = NULL, spent_height_enc = NULL, spent_in_tx_enc = NULL
                         WHERE is_spent = 1 AND spent_in_tx = ? AND account_id = ?;
                     """
                     var restoreNotesStmt: OpaquePointer?
@@ -3791,7 +4160,8 @@ final class WalletDatabase {
         }
 
         // Restore all affected notes to unspent
-        let updateSql = "UPDATE notes SET is_spent = 0, spent_in_tx = NULL, spent_height = NULL WHERE spent_in_tx = ?;"
+        // FIX #1390: Clear spent shadow columns when restoring phantom TX notes
+        let updateSql = "UPDATE notes SET is_spent = 0, spent_in_tx = NULL, spent_height = NULL, spent_height_enc = NULL, spent_in_tx_enc = NULL WHERE spent_in_tx = ?;"
         var updateStmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK else {
             throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
@@ -3828,9 +4198,10 @@ final class WalletDatabase {
         let nullifierToUse = isNullifierHashed(nullifier) ? nullifier : hashNullifier(nullifier)
 
         // FIX: Column is named 'nf' not 'nullifier' in the notes table schema
+        // FIX #1390: Clear spent shadow columns when unmarking note
         let sql = """
             UPDATE notes
-            SET is_spent = 0, spent_in_tx = NULL, spent_height = NULL
+            SET is_spent = 0, spent_in_tx = NULL, spent_height = NULL, spent_height_enc = NULL, spent_in_tx_enc = NULL
             WHERE nf = ?;
         """
 
@@ -3888,9 +4259,10 @@ final class WalletDatabase {
         }
 
         // Now unmark all boost placeholder spent notes
+        // FIX #1390: Clear spent shadow columns when unmarking boost placeholders
         let updateSql = """
             UPDATE notes
-            SET is_spent = 0, spent_in_tx = NULL, spent_height = NULL
+            SET is_spent = 0, spent_in_tx = NULL, spent_height = NULL, spent_height_enc = NULL, spent_in_tx_enc = NULL
             WHERE is_spent = 1 AND hex(spent_in_tx) LIKE '626F6F7374%';
         """
 
@@ -4008,6 +4380,20 @@ final class WalletDatabase {
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
         }
+
+        // FIX #1390 / Security audit TASK 16: Update received_in_tx_enc shadow
+        if let encTxid = encryptDataField(realTxid) {
+            let shadowSql = "UPDATE notes SET received_in_tx_enc = ? WHERE rowid = ?;"
+            var shadowStmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, shadowSql, -1, &shadowStmt, nil) == SQLITE_OK {
+                _ = encTxid.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(shadowStmt, 1, ptr.baseAddress, Int32(encTxid.count), nil)
+                }
+                sqlite3_bind_int64(shadowStmt, 2, rowid)
+                sqlite3_step(shadowStmt)
+                sqlite3_finalize(shadowStmt)
+            }
+        }
     }
 
     /// FIX #371: Update a note's spent_in_tx with the real transaction ID
@@ -4034,6 +4420,23 @@ final class WalletDatabase {
 
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        // FIX #1390 / Security audit TASK 16: Update spent_in_tx_enc shadow
+        if let encTxid = encryptDataField(realTxid) {
+            let shadowSql = "UPDATE notes SET spent_in_tx_enc = ? WHERE nf = ?;"
+            var shadowStmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, shadowSql, -1, &shadowStmt, nil) == SQLITE_OK {
+                let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+                _ = encTxid.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(shadowStmt, 1, ptr.baseAddress, Int32(encTxid.count), SQLITE_TRANSIENT)
+                }
+                _ = hashedNullifier.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(shadowStmt, 2, ptr.baseAddress, Int32(hashedNullifier.count), SQLITE_TRANSIENT)
+                }
+                sqlite3_step(shadowStmt)
+                sqlite3_finalize(shadowStmt)
+            }
         }
     }
 
@@ -4095,6 +4498,23 @@ final class WalletDatabase {
 
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
+        }
+
+        // FIX #1390 / Security audit TASK 16: Update received_in_tx_enc shadow
+        if let encTxid = encryptDataField(realTxid) {
+            let shadowSql = "UPDATE notes SET received_in_tx_enc = ? WHERE cmu = ?;"
+            var shadowStmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, shadowSql, -1, &shadowStmt, nil) == SQLITE_OK {
+                let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+                _ = encTxid.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(shadowStmt, 1, ptr.baseAddress, Int32(encTxid.count), SQLITE_TRANSIENT)
+                }
+                _ = cmu.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(shadowStmt, 2, ptr.baseAddress, Int32(cmu.count), SQLITE_TRANSIENT)
+                }
+                sqlite3_step(shadowStmt)
+                sqlite3_finalize(shadowStmt)
+            }
         }
     }
 
@@ -4844,6 +5264,21 @@ final class WalletDatabase {
 
         let rowsChanged = sqlite3_changes(db)
         let rowId = sqlite3_last_insert_rowid(db)
+
+        // Security audit TASK 19: Write encrypted TX type
+        if let encType = encryptTxTypeBlob(type) {
+            let updateSql = "UPDATE transaction_history SET tx_type_enc = ? WHERE id = ?;"
+            var updateStmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK {
+                _ = encType.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(updateStmt, 1, ptr.baseAddress, Int32(encType.count), nil)
+                }
+                sqlite3_bind_int64(updateStmt, 2, rowId)
+                sqlite3_step(updateStmt)
+                sqlite3_finalize(updateStmt)
+            }
+        }
+
         print("📜 DB: Insert result - rowId=\(rowId), rowsChanged=\(rowsChanged), txid=\(txid.prefix(8).map { String(format: "%02x", $0) }.joined())..., type=\(type.rawValue)")
 
         return rowId
@@ -5569,6 +6004,22 @@ final class WalletDatabase {
         if result == SQLITE_DONE {
             let changes = sqlite3_changes(db)
             if changes > 0 {
+                let historyId = sqlite3_last_insert_rowid(db)
+
+                // Security audit TASK 19: Write encrypted TX type
+                if let encType = encryptTxTypeBlob(.received) {
+                    let updateSql = "UPDATE transaction_history SET tx_type_enc = ? WHERE id = ?;"
+                    var updateStmt: OpaquePointer?
+                    if sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK {
+                        _ = encType.withUnsafeBytes { ptr in
+                            sqlite3_bind_blob(updateStmt, 1, ptr.baseAddress, Int32(encType.count), nil)
+                        }
+                        sqlite3_bind_int64(updateStmt, 2, historyId)
+                        sqlite3_step(updateStmt)
+                        sqlite3_finalize(updateStmt)
+                    }
+                }
+
                 print("📜 Recorded received transaction: height=\(height), value=\(value) zatoshis, time=\(actualBlockTime ?? 0)")
             }
         }
@@ -5643,6 +6094,23 @@ final class WalletDatabase {
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.insertFailed(String(cString: sqlite3_errmsg(db)))
         }
+
+        let historyId = sqlite3_last_insert_rowid(db)
+
+        // Security audit TASK 19: Write encrypted TX type
+        if let encType = encryptTxTypeBlob(.sent) {
+            let updateSql = "UPDATE transaction_history SET tx_type_enc = ? WHERE id = ?;"
+            var updateStmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK {
+                _ = encType.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(updateStmt, 1, ptr.baseAddress, Int32(encType.count), nil)
+                }
+                sqlite3_bind_int64(updateStmt, 2, historyId)
+                sqlite3_step(updateStmt)
+                sqlite3_finalize(updateStmt)
+            }
+        }
+
         print("📜 Recorded sent transaction: height=\(height), value=\(value) zatoshis, fee=\(fee), status=\(status.rawValue)")
     }
 
@@ -5689,6 +6157,23 @@ final class WalletDatabase {
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.insertFailed(String(cString: sqlite3_errmsg(db)))
         }
+
+        let historyId = sqlite3_last_insert_rowid(db)
+
+        // Security audit TASK 19: Write encrypted TX type
+        if let encType = encryptTxTypeBlob(type) {
+            let updateSql = "UPDATE transaction_history SET tx_type_enc = ? WHERE id = ?;"
+            var updateStmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK {
+                _ = encType.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(updateStmt, 1, ptr.baseAddress, Int32(encType.count), nil)
+                }
+                sqlite3_bind_int64(updateStmt, 2, historyId)
+                sqlite3_step(updateStmt)
+                sqlite3_finalize(updateStmt)
+            }
+        }
+
         let txidHex = txid.map { String(format: "%02x", $0) }.joined()
         print("📜 Recorded pending transaction: txid=\(txidHex.prefix(16))..., type=\(type.rawValue), value=\(value)")
     }
@@ -6434,6 +6919,21 @@ final class WalletDatabase {
                         sqlite3_bind_int64(insertStmt, 5, tx.timestamp)  // block_time uses timestamp value
 
                         if sqlite3_step(insertStmt) == SQLITE_DONE {
+                            // FIX #1390 / Security audit TASK 19: Write encrypted TX type
+                            let newHistId = sqlite3_last_insert_rowid(db)
+                            if let encType = encryptTxTypeBlob(.sent) {
+                                let encSql = "UPDATE transaction_history SET tx_type_enc = ? WHERE id = ?;"
+                                var encStmt: OpaquePointer?
+                                if sqlite3_prepare_v2(db, encSql, -1, &encStmt, nil) == SQLITE_OK {
+                                    _ = encType.withUnsafeBytes { ptr in
+                                        sqlite3_bind_blob(encStmt, 1, ptr.baseAddress, Int32(encType.count), nil)
+                                    }
+                                    sqlite3_bind_int64(encStmt, 2, newHistId)
+                                    sqlite3_step(encStmt)
+                                    sqlite3_finalize(encStmt)
+                                }
+                            }
+
                             // Display in display format (reversed from wire)
                             let displayTxid = Data(tx.spentTxid.reversed())
                             let txidHex = displayTxid.map { String(format: "%02x", $0) }.joined()
@@ -6829,6 +7329,21 @@ final class WalletDatabase {
                     sqlite3_bind_int64(insertStmt, 2, rx.blockHeight)
                     sqlite3_bind_int64(insertStmt, 3, sentAmount)
                     if sqlite3_step(insertStmt) == SQLITE_DONE {
+                        // FIX #1390 / Security audit TASK 19: Write encrypted TX type
+                        let newHistId = sqlite3_last_insert_rowid(db)
+                        if let encType = encryptTxTypeBlob(.sent) {
+                            let encSql = "UPDATE transaction_history SET tx_type_enc = ? WHERE id = ?;"
+                            var encStmt: OpaquePointer?
+                            if sqlite3_prepare_v2(db, encSql, -1, &encStmt, nil) == SQLITE_OK {
+                                _ = encType.withUnsafeBytes { ptr in
+                                    sqlite3_bind_blob(encStmt, 1, ptr.baseAddress, Int32(encType.count), nil)
+                                }
+                                sqlite3_bind_int64(encStmt, 2, newHistId)
+                                sqlite3_step(encStmt)
+                                sqlite3_finalize(encStmt)
+                            }
+                        }
+
                         print("   ✅ Added 'sent' history entry for \(sentZCL) ZCL at height \(rx.blockHeight)")
                     }
                     sqlite3_finalize(insertStmt)
@@ -6854,9 +7369,10 @@ final class WalletDatabase {
     func unmarkNoteAsSpentById(noteId: Int64) throws {
         guard let db = db else { throw DatabaseError.notOpened }
 
+        // FIX #1390: Clear spent shadow columns when unmarking note by ID
         let sql = """
             UPDATE notes
-            SET is_spent = 0, spent_in_tx = NULL, spent_height = NULL
+            SET is_spent = 0, spent_in_tx = NULL, spent_height = NULL, spent_height_enc = NULL, spent_in_tx_enc = NULL
             WHERE id = ?;
         """
 

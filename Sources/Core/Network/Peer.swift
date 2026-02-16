@@ -3297,7 +3297,8 @@ public final class Peer {
         case 0x03: // Tor v2 (deprecated, 10 bytes)
             guard addrBytes.count == 10 else { return nil }
             let onionAddress = base32Encode(addrBytes).lowercased()
-            print("🧅 Discovered Tor v2 onion peer (addrv2): \(onionAddress).onion")
+            // Security audit TASK 18: Log redaction
+            print("🧅 Discovered Tor v2 onion peer (addrv2): \(LogRedaction.redactAddress("\(onionAddress).onion"))")
             return "\(onionAddress).onion"
 
         case 0x04: // Tor v3 (32 bytes + 1 byte checksum version)
@@ -3305,7 +3306,7 @@ public final class Peer {
             // Tor v3 onion address is base32(pubkey + checksum + version)
             // The pubkey is the 32 bytes we have, we need to add checksum + version
             let onionAddress = encodeOnionV3(publicKey: addrBytes)
-            print("🧅 Discovered Tor v3 onion peer (addrv2): \(onionAddress).onion")
+            print("🧅 Discovered Tor v3 onion peer (addrv2): \(LogRedaction.redactAddress("\(onionAddress).onion"))")
             return "\(onionAddress).onion"
 
         case 0x05: // I2P (32 bytes)
@@ -3460,7 +3461,7 @@ public final class Peer {
             // Extract 10-byte onion address and encode as base32
             let onionBytes = Array(bytes[6..<16])
             let onionAddress = base32Encode(onionBytes).lowercased()
-            print("🧅 Discovered Tor v2 onion peer: \(onionAddress).onion")
+            print("🧅 Discovered Tor v2 onion peer: \(LogRedaction.redactAddress("\(onionAddress).onion"))")
             return "\(onionAddress).onion"
         }
 
@@ -5745,7 +5746,7 @@ public final class Peer {
         try await withExclusiveAccess {
             // Send addrv2 message
             try await sendMessage(command: "addrv2", payload: payload)
-            print("🧅 Advertised our .onion address to peer \(host): \(onionAddress):\(port)")
+            print("🧅 Advertised our .onion address to peer \(LogRedaction.redactIP(host)): \(LogRedaction.redactAddress(onionAddress)):\(port)")
         }
     }
 

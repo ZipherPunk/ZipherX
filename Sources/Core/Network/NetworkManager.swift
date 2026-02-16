@@ -2647,13 +2647,14 @@ public final class NetworkManager: ObservableObject {
 
                         do {
                             if self.verbose {
-                                print("🔄 Trying \(address.host):\(address.port)...")
+                                // Security audit TASK 18: Log redaction
+                                print("🔄 Trying \(LogRedaction.redactIP(address.host)):\(address.port)...")
                             }
                             let connectStart = Date()
                             let peer = try await self.connectToPeer(address)
                             let responseTimeMs = Int(Date().timeIntervalSince(connectStart) * 1000)
                             if self.verbose {
-                                print("✅ Connected to \(address.host):\(address.port) (\(responseTimeMs)ms)")
+                                print("✅ Connected to \(LogRedaction.redactIP(address.host)):\(address.port) (\(responseTimeMs)ms)")
                             }
                             // FIX #284: Unpark peer on successful connection
                             // FIX #908: Reset handshake failures on successful connection
@@ -2688,14 +2689,14 @@ public final class NetworkManager: ObservableObject {
                                 }
                                 print("🚫 [FIX #229] Banned Zcash peer \(host) - wrong chain (requires 170020+)")
                             }
-                            print("❌ Failed: \(address.host) - \(error.localizedDescription)")
+                            print("❌ Failed: \(LogRedaction.redactIP(address.host)) - \(error.localizedDescription)")
                             // FIX #1115: Record failure to database for peer scoring
                             await MainActor.run {
                                 WalletDatabase.shared.recordPeerFailure(host: address.host, port: address.port)
                             }
                             return (nil, address)
                         } catch {
-                            print("❌ Failed: \(address.host) - \(error.localizedDescription)")
+                            print("❌ Failed: \(LogRedaction.redactIP(address.host)) - \(error.localizedDescription)")
                             // FIX #1115: Record failure to database for peer scoring
                             await MainActor.run {
                                 WalletDatabase.shared.recordPeerFailure(host: address.host, port: address.port)
@@ -2840,7 +2841,7 @@ public final class NetworkManager: ObservableObject {
                     let address = PeerAddress(host: String(components[0]), port: port)
 
                     do {
-                        print("🔄 [FIX #229] Trying trusted peer \(address.host):\(address.port) (direct)...")
+                        print("🔄 [FIX #229] Trying trusted peer \(LogRedaction.redactIP(address.host)):\(address.port) (direct)...")
                         let peer = try await connectToPeer(address)
                         peers.append(peer)
                         // FIX #478: Also add to PeerManager to keep peer lists in sync
@@ -2848,13 +2849,13 @@ public final class NetworkManager: ObservableObject {
                         connectedCount += 1
                         setupBlockListener(for: peer)
                         resetSybilCounter()
-                        print("✅ [FIX #173] Connected to legitimate peer \(address.host)!")
+                        print("✅ [FIX #173] Connected to legitimate peer \(LogRedaction.redactIP(address.host))!")
 
                         if connectedCount >= 3 {
                             break // Got enough peers
                         }
                     } catch {
-                        print("❌ [FIX #173] Hardcoded peer \(address.host) failed: \(error.localizedDescription)")
+                        print("❌ [FIX #173] Hardcoded peer \(LogRedaction.redactIP(address.host)) failed: \(error.localizedDescription)")
                     }
                 }
 
@@ -3455,7 +3456,7 @@ public final class NetworkManager: ObservableObject {
             print("📤 Actor tracking set for: \(txid.prefix(12))...")
         }
 
-        print("⚡ Pending broadcast set: txid=\(txid.prefix(12))..., amount=\(amount) zatoshis (added to tracking)")
+        print("⚡ Pending broadcast set: txid=\(txid.prefix(12))..., amount=\(LogRedaction.redactAmount(amount)) (added to tracking)")
     }
 
     /// Called when mempool verification completes
@@ -3472,7 +3473,7 @@ public final class NetworkManager: ObservableObject {
             }
             justClearedOutgoing = (txid: txid, amount: pendingBroadcastAmount, fee: pendingBroadcastFee, clearingTime: clearingTime)
             outgoingClearingTrigger += 1
-            print("🏦 CLEARING! Outgoing tx \(txid.prefix(12))... verified in mempool after \(String(format: "%.1f", clearingTime))s (amount: \(pendingBroadcastAmount), fee: \(pendingBroadcastFee))")
+            print("🏦 CLEARING! Outgoing tx \(txid.prefix(12))... verified in mempool after \(String(format: "%.1f", clearingTime))s (amount: \(LogRedaction.redactAmount(pendingBroadcastAmount)), fee: \(LogRedaction.redactAmount(pendingBroadcastFee)))")
         }
     }
 
@@ -8256,7 +8257,7 @@ public final class NetworkManager: ObservableObject {
             }
             // FIX #427: Skip invalid IP addresses (reserved ranges)
             if isReservedIPAddress(parked.address) {
-                print("⚠️ FIX #427: Skipping reserved IP \(parked.address)")
+                print("⚠️ FIX #427: Skipping reserved IP \(LogRedaction.redactIP(parked.address))")
                 continue
             }
             let address = PeerAddress(host: parked.address, port: parked.port)
@@ -8296,7 +8297,7 @@ public final class NetworkManager: ObservableObject {
                         let peer = try await self.connectToPeer(address)
                         return (peer, address, source)
                     } catch {
-                        print("❌ FIX #394: Failed \(source) peer \(address.host): \(error.localizedDescription)")
+                        print("❌ FIX #394: Failed \(source) peer \(LogRedaction.redactIP(address.host)): \(error.localizedDescription)")
                         return (nil, address, source)
                     }
                 }
@@ -8309,7 +8310,7 @@ public final class NetworkManager: ObservableObject {
                     // This can happen when recovery runs while previous peer is still in array
                     let isDuplicate = peers.contains { $0.host == peer.host }
                     if isDuplicate {
-                        print("⚠️ FIX #850: Skipping duplicate peer \(address.host) - already in peers array")
+                        print("⚠️ FIX #850: Skipping duplicate peer \(LogRedaction.redactIP(address.host)) - already in peers array")
                         peer.disconnect()
                         continue
                     }

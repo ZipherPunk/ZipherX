@@ -104,6 +104,14 @@ pub extern "C" fn zipherx_download_file(
     resume_from: u64,
     expected_size: u64,
 ) -> i32 {
+    // FIX #1385: Validate pointers before unsafe from_raw_parts
+    if url_ptr.is_null() || url_len == 0 || url_len > 8192 {
+        return 4;
+    }
+    if dest_path_ptr.is_null() || dest_path_len == 0 || dest_path_len > 4096 {
+        return 4;
+    }
+
     // Parse URL
     let url = match unsafe { std::str::from_utf8(std::slice::from_raw_parts(url_ptr, url_len)) } {
         Ok(s) => s.to_string(),
@@ -343,6 +351,14 @@ pub extern "C" fn zipherx_verify_sha256(
 ) -> i32 {
     use sha2::{Sha256, Digest};
     use std::io::Read;
+
+    // FIX #1385: Validate pointers before unsafe from_raw_parts
+    if file_path_ptr.is_null() || file_path_len == 0 || file_path_len > 4096 {
+        return -1;
+    }
+    if expected_hash_ptr.is_null() || expected_hash_len == 0 || expected_hash_len > 256 {
+        return -1;
+    }
 
     // Parse file path
     let file_path = match unsafe { std::str::from_utf8(std::slice::from_raw_parts(file_path_ptr, file_path_len)) } {

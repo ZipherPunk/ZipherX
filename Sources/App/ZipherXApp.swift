@@ -66,6 +66,15 @@ struct ZipherXApp: App {
             await TorManager.shared.start()
         }
 
+        // Security audit TASK 17: Prevent screen recording/sharing on macOS
+        #if os(macOS)
+        DispatchQueue.main.async {
+            if let window = NSApplication.shared.windows.first {
+                window.sharingType = .none
+            }
+        }
+        #endif
+
         // FIX #894: Register for app termination notification to checkpoint WAL databases
         // Without this, headers loaded during the session could be lost on app quit
         #if os(macOS)
