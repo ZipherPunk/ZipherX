@@ -3806,7 +3806,7 @@ public final class NetworkManager: ObservableObject {
             // Receiver doesn't have send click time, so clearingTime/settlementTime are nil
             self.justConfirmedTx = (txid: txid, amount: finalAmount, fee: 0, isOutgoing: false, clearingTime: nil, settlementTime: nil)
             self.settlementCelebrationTrigger += 1  // Increment to trigger onChange
-            print("⛏️ Confirmed: +\(Double(finalAmount) / 100_000_000.0) ZCL")
+            print("⛏️ Confirmed: +\(finalAmount.redactedAmount)")
 
             // Also send system notification
             NotificationManager.shared.notifyReceivedConfirmed(amount: finalAmount, txid: txid)
@@ -4499,7 +4499,7 @@ public final class NetworkManager: ObservableObject {
             await MainActor.run {
                 self.justDetectedIncomingMempool = (txid: txid, amount: amount, clearingTime: nil)
                 self.mempoolIncomingCelebrationTrigger += 1  // Increment to trigger onChange
-                print("🏦 CLEARING! Set justDetectedIncomingMempool: txid=\(txid.prefix(12))..., amount=\(amount), trigger=\(self.mempoolIncomingCelebrationTrigger)")
+                print("🏦 CLEARING! Set justDetectedIncomingMempool: txid=\(txid.prefix(12))..., amount=\(amount.redactedAmount), trigger=\(self.mempoolIncomingCelebrationTrigger)")
             }
         }
 
@@ -4555,44 +4555,63 @@ public final class NetworkManager: ObservableObject {
         }
 
         // FIX #1397: Check for external spends BEFORE treating as incoming
-        // Parse shielded spends (nullifiers) and check if any match our notes
+        // Parse shielded spends (nullifiers) and check if ANY match our notes
         // This detects when another wallet (e.g. full node daemon) spent our notes
+        // FIX #1398: Accumulate total input and compute sent amount for pending display
+        var externalSpendTotal: UInt64 = 0
         if let nullifiers = parseShieldedSpends(from: rawTx) {
             for nullifier in nullifiers {
                 if let noteInfo = try? WalletDatabase.shared.getNoteByNullifier(nullifier: nullifier) {
-                    // This TX spends our note! Check it's not our own pending TX
                     let isOurPending = pendingOutgoingTxids.contains(txidDisplayHex) || isPendingOutgoingSync(txid: txidDisplayHex)
                     let isOurRecorded = (try? WalletDatabase.shared.transactionExists(txid: txidWire, type: .sent)) ?? false
                     if !isOurPending && !isOurRecorded {
-                        print("🔮 FIX #1397: EXTERNAL SPEND detected in instant mempool TX \(txidDisplayHex.prefix(12))... (note value: \(noteInfo.value) zat) — suppressing incoming notification")
-                        // Don't show as incoming — block scanner will handle via FIX #843
-                        return
+                        externalSpendTotal += noteInfo.value
                     }
                 }
             }
         }
 
         // Parse and trial decrypt shielded outputs
-        guard let outputs = parseShieldedOutputs(from: rawTx) else {
-            print("🔮 FIX #1333: No shielded outputs in \(txidDisplayHex.prefix(12))...")
-            return
-        }
+        let outputs = parseShieldedOutputs(from: rawTx)
 
         var txIncomingAmount: UInt64 = 0
-        for output in outputs {
-            if let decrypted = ZipherXFFI.tryDecryptNoteWithSK(
-                spendingKey: spendingKey,
-                epk: output.epk,
-                cmu: output.cmu,
-                ciphertext: output.ciphertext
-            ) {
-                if decrypted.count >= 19 {
-                    let valueBytes = Data(decrypted[11..<19])
-                    let value = valueBytes.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
-                    txIncomingAmount += value
-                    print("🔮 FIX #1333: 💰 INSTANT DETECT — incoming \(value) zatoshis in TX \(txidDisplayHex.prefix(12))... from [\(fromPeer)]")
+        if let outputs = outputs {
+            for output in outputs {
+                if let decrypted = ZipherXFFI.tryDecryptNoteWithSK(
+                    spendingKey: spendingKey,
+                    epk: output.epk,
+                    cmu: output.cmu,
+                    ciphertext: output.ciphertext
+                ) {
+                    if decrypted.count >= 19 {
+                        let valueBytes = Data(decrypted[11..<19])
+                        let value = valueBytes.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
+                        txIncomingAmount += value
+                        if externalSpendTotal == 0 {
+                            // Only log as "incoming" if NOT an external spend
+                            print("🔮 FIX #1333: 💰 INSTANT DETECT — incoming \(value) zatoshis in TX \(txidDisplayHex.prefix(12))... from [\(fromPeer)]")
+                        }
+                    }
                 }
             }
+        }
+
+        // FIX #1397/1398: External spend detected — show as pending OUTGOING, not incoming
+        if externalSpendTotal > 0 {
+            let fee: UInt64 = 10_000
+            let changeAmount = txIncomingAmount  // Our decryptable outputs = change back to us
+            let sentAmount = externalSpendTotal > (changeAmount + fee) ? externalSpendTotal - changeAmount - fee : 0
+            print("🔮 FIX #1398: EXTERNAL SPEND in TX \(txidDisplayHex.prefix(12))... — input: \(externalSpendTotal), change: \(changeAmount), sent: \(sentAmount), fee: \(fee) zat")
+
+            // Track as pending outgoing so BalanceView shows "awaiting confirmation"
+            await MainActor.run {
+                self.mempoolOutgoing = sentAmount + fee
+                WalletManager.shared.balanceBeforeLastSend = WalletManager.shared.shieldedBalance
+                WalletManager.shared.lastSendTimestamp = Date()
+            }
+            // Track TX for confirmation monitoring
+            _ = await txTrackingState.trackOutgoingSimple(txid: txidDisplayHex, amount: sentAmount)
+            return
         }
 
         guard txIncomingAmount > 0 else { return }
@@ -4628,7 +4647,7 @@ public final class NetworkManager: ObservableObject {
             self.mempoolTxCount = 1
             self.justDetectedIncomingMempool = (txid: txidDisplayHex, amount: txIncomingAmount, clearingTime: nil)
             self.mempoolIncomingCelebrationTrigger += 1
-            print("🏦 FIX #1333: CLEARING! Instant mempool detection: txid=\(txidDisplayHex.prefix(12))..., amount=\(txIncomingAmount)")
+            print("🏦 FIX #1333: CLEARING! Instant mempool detection: txid=\(txidDisplayHex.prefix(12))..., amount=\(txIncomingAmount.redactedAmount)")
         }
     }
 
@@ -5771,9 +5790,15 @@ public final class NetworkManager: ObservableObject {
             // FIX #158: Exclude banned Sybil attackers
             // FIX #335: Prefer healthy peers (recent activity)
             // FIX #387: Use actualBroadcastPeers (verified-responsive from PeerManager)
-            for peer in actualBroadcastPeers {
+            for (peerIndex, peer) in actualBroadcastPeers.enumerated() {
                 let peerHost = "\(peer.host):\(peer.port)"
                 group.addTask {
+                    // PRIVACY: P-NET-001 — Broadcast timing jitter to prevent source-IP correlation
+                    // First peer broadcasts immediately; subsequent peers have random staggered delay
+                    if peerIndex > 0 {
+                        let jitterMs = UInt64.random(in: 200_000_000...2_000_000_000) // 200ms - 2s
+                        try? await Task.sleep(nanoseconds: jitterMs)
+                    }
                     do {
                         // FIX #160: Dynamic timeout based on Tor mode (15s for Tor, 5s for direct)
                         let id = try await withThrowingTaskGroup(of: String.self) { timeoutGroup in

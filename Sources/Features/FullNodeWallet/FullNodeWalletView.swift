@@ -39,6 +39,8 @@ struct FullNodeWalletView: View {
     @State private var pendingOperations: [RPCClient.PendingOperation] = []
     @State private var pendingUnconfirmedBalance: (transparent: Double, private_: Double) = (0, 0)
     @State private var recentlyConfirmedTxid: String? = nil
+    // FIX #1399: Track gap between z_sendmany completion and block mining
+    @State private var awaitingBlockConfirmation: Bool = false
     @State private var lastKnownTxids: Set<String> = []
     @State private var pendingTxMonitorTask: Task<Void, Never>? = nil
 
@@ -336,6 +338,8 @@ struct FullNodeWalletView: View {
                 // FIX #286 v17: Refresh wallet data after successful send
                 Task {
                     print("📊 FIX #286 v17: Transaction sent - refreshing wallet data")
+                    // FIX #1399: Immediately show "awaiting block confirmation" banner
+                    await MainActor.run { awaitingBlockConfirmation = true }
                     await loadWalletData()
                 }
             })
@@ -653,6 +657,7 @@ struct FullNodeWalletView: View {
 
     // FIX #286 v17: Check if we have pending transactions
     // FIX #861: Only consider truly pending operations (not completed/failed)
+    // FIX #1399: Also show banner while awaiting block confirmation after z_sendmany completes
     private var hasPendingTransactions: Bool {
         // Filter for operations that are still executing or queued (not success/failed)
         let trulyPendingOps = pendingOperations.filter { op in
@@ -660,7 +665,8 @@ struct FullNodeWalletView: View {
         }
         return !trulyPendingOps.isEmpty ||
         pendingUnconfirmedBalance.transparent != 0 ||
-        pendingUnconfirmedBalance.private_ != 0
+        pendingUnconfirmedBalance.private_ != 0 ||
+        awaitingBlockConfirmation
     }
 
     // FIX #861: Get only truly pending operations for display
@@ -692,6 +698,11 @@ struct FullNodeWalletView: View {
                             .foregroundColor(theme.textSecondary)
                     } else if pendingUnconfirmedBalance.transparent != 0 || pendingUnconfirmedBalance.private_ != 0 {
                         Text("Waiting for confirmation...")
+                            .font(.system(size: 10))
+                            .foregroundColor(theme.textSecondary)
+                    } else if awaitingBlockConfirmation {
+                        // FIX #1399: z_sendmany completed but block not yet mined
+                        Text("Awaiting block confirmation...")
                             .font(.system(size: 10))
                             .foregroundColor(theme.textSecondary)
                     }
@@ -2390,7 +2401,12 @@ struct FullNodeWalletView: View {
         do {
             // FIX #1272: Capture pending state BEFORE updating — otherwise hadPendingBefore
             // reads the NEW state and the transition is never detected.
-            let hadPendingBefore = hasPendingTransactions
+            // FIX #1399: Use raw pending state (excluding awaitingBlockConfirmation)
+            // to avoid false transition detection on every poll cycle
+            let hadRawPendingBefore: Bool = {
+                let trulyPendingOps = pendingOperations.filter { $0.status == "executing" || $0.status == "queued" }
+                return !trulyPendingOps.isEmpty || pendingUnconfirmedBalance.transparent != 0 || pendingUnconfirmedBalance.private_ != 0
+            }()
 
             // 1. Check for pending z_sendmany operations
             let operations = try await RPCClient.shared.getPendingOperations()
@@ -2399,22 +2415,24 @@ struct FullNodeWalletView: View {
             let unconfirmed = try await RPCClient.shared.getUnconfirmedBalance()
 
             // 3. Detect newly completed operations by comparing with previous state
-            let previousOpids = Set(pendingOperations.map { $0.opid })
             let currentOpids = Set(operations.map { $0.opid })
 
-            // Find completed operations (were pending, now gone or success)
-            let completedOps = pendingOperations.filter { op in
-                !currentOpids.contains(op.opid) || operations.first { $0.opid == op.opid }?.status == "success"
+            // FIX #1399: Only detect ops that TRANSITIONED from executing/queued to success/gone
+            let newlyCompletedOps = pendingOperations.filter { prevOp in
+                (prevOp.status == "executing" || prevOp.status == "queued") &&
+                (operations.first { $0.opid == prevOp.opid }?.status == "success" ||
+                 !currentOpids.contains(prevOp.opid))
             }
 
             await MainActor.run {
                 pendingOperations = operations
                 pendingUnconfirmedBalance = unconfirmed
 
-                // If an operation just completed, mark for notification
-                for completedOp in completedOps {
+                // FIX #1399: If an operation just completed, keep banner until block is mined
+                for completedOp in newlyCompletedOps {
                     if let txid = completedOp.txid {
-                        print("📊 FIX #286 v17: Operation completed - txid: \(txid.prefix(16))...")
+                        print("📊 FIX #1399: Operation completed — txid: \(txid.prefix(16))... — awaiting block confirmation")
+                        awaitingBlockConfirmation = true
                     }
                 }
             }
@@ -2424,7 +2442,7 @@ struct FullNodeWalletView: View {
             let trulyPendingNow = operations.filter { $0.status == "executing" || $0.status == "queued" }
             let hasPendingNow = !trulyPendingNow.isEmpty || unconfirmed.transparent != 0 || unconfirmed.private_ != 0
 
-            if hadPendingBefore && !hasPendingNow {
+            if hadRawPendingBefore && !hasPendingNow {
                 print("📊 FIX #1272: Pending→confirmed transition detected — refreshing all wallet data")
                 await loadWalletData()
             }
@@ -2444,6 +2462,8 @@ struct FullNodeWalletView: View {
                     let current = totalBalance
                     if total != current.total || transparent != current.transparent || privateBalance != current.private {
                         print("📊 FIX #1272: Balance changed \(formatBalance(current.total)) → \(formatBalance(total)) — refreshing all wallet data")
+                        // FIX #1399: Block confirmed — balance changed, clear awaiting state
+                        await MainActor.run { awaitingBlockConfirmation = false }
                         await loadWalletData()
                     }
                 }
@@ -2475,6 +2495,11 @@ struct FullNodeWalletView: View {
                         // New confirmed transaction detected
                         await MainActor.run {
                             recentlyConfirmedTxid = newTxid
+                            // FIX #1399: TX mined in block — clear awaiting state
+                            if awaitingBlockConfirmation {
+                                print("📊 FIX #1399: TX \(newTxid.prefix(16))... confirmed in block — clearing awaiting state")
+                                awaitingBlockConfirmation = false
+                            }
                         }
                         // Refresh wallet data to update balance
                         await loadWalletData()
