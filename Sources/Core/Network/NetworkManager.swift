@@ -5018,10 +5018,18 @@ public final class NetworkManager: ObservableObject {
         let addedCount = isFullNodeMode ? ZclassicCheckpoints.seedNodes.count : ZclassicCheckpoints.seedNodes.count - 1
         print("🌱 FIX #234: Added \(addedCount) hardcoded Zclassic seed nodes\(isFullNodeMode ? "" : " (localhost skipped - ZipherX mode)")")
 
-        // Then try DNS seeds (may return Zcash nodes which will be filtered by version check)
-        for seed in dnsSeedsZCL {
-            let resolved = await resolveDNSSeed(seed)
-            addresses.append(contentsOf: resolved)
+        // FIX #1401 (NET-003): Skip DNS seeds when Tor is enabled.
+        // DNS resolution uses system DNS (clearnet) — leaks to ISP that user is
+        // looking up Zclassic seed nodes. Hardcoded seeds + P2P addr gossip are sufficient.
+        let torEnabled = await TorManager.shared.mode == .enabled
+        if torEnabled {
+            print("🧅 FIX #1401: Skipping DNS seed resolution (Tor enabled — prevents DNS leak to ISP)")
+        } else {
+            // Then try DNS seeds (may return Zcash nodes which will be filtered by version check)
+            for seed in dnsSeedsZCL {
+                let resolved = await resolveDNSSeed(seed)
+                addresses.append(contentsOf: resolved)
+            }
         }
 
         // Add .onion seed nodes if Tor is available

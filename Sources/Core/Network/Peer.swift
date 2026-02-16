@@ -583,6 +583,11 @@ actor PeerRateLimiter {
     }
 }
 
+/// FIX #1401: Semaphore to limit concurrent SOCKS5 handshakes to the Arti proxy.
+/// Without this, 45+ concurrent Tor connection attempts overwhelm the proxy,
+/// causing 30-second timeouts and starving other tasks.
+private let socksSemaphore = DispatchSemaphore(value: 6)
+
 /// Individual peer connection for Zclassic P2P network
 public final class Peer {
     let id: String
@@ -624,7 +629,8 @@ public final class Peer {
     private static let zclassicV2MinVersion: Int32 = 170100
     private static let zclassicV2MaxVersion: Int32 = 170199
     private let services: UInt64 = 1 // NODE_NETWORK
-    private let userAgent = "/ZipherX:1.0.0/"
+    // PRIVACY: P-NET-004 — Mimic full node user agent to prevent wallet fingerprinting
+    private let userAgent = "/MagicBean:2.1.2/"
 
     // Peer scoring
     var score: PeerScore
@@ -1484,6 +1490,18 @@ public final class Peer {
     /// Connect to peer via Tor SOCKS5 proxy
     /// Used for .onion addresses and when Tor mode is enabled for privacy
     private func connectViaSocks5() async throws {
+        // FIX #1401: Rate-limit concurrent SOCKS5 handshakes to prevent Arti proxy saturation.
+        // Without this, 45+ concurrent waiters pile up → 30s timeouts → task starvation.
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global(qos: .utility).async {
+                socksSemaphore.wait()
+                cont.resume()
+            }
+        }
+        defer {
+            socksSemaphore.signal()
+        }
+
         var socksPort = await TorManager.shared.socksPort
         var torConnected = await TorManager.shared.connectionState.isConnected
 

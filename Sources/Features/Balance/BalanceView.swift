@@ -218,7 +218,7 @@ struct BalanceView: View {
             withAnimation {
                 showClearingCelebration = true
             }
-            print("🏦 CLEARING (onAppear)! Incoming \(clearingTxAmount) ZCL in tx \(mempool.txid.prefix(12))...")
+            print("🏦 CLEARING (onAppear)! Incoming \(LogRedaction.redactAmount(mempool.amount)) in tx \(mempool.txid.prefix(12))...")
 
             // Clear the trigger after handling
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
@@ -237,7 +237,7 @@ struct BalanceView: View {
             withAnimation {
                 showClearingCelebration = true
             }
-            print("🏦 CLEARING (onAppear)! Sent \(clearingTxAmount) ZCL (fee: \(clearingTxFee)) in \(String(format: "%.1f", cleared.clearingTime))s")
+            print("🏦 CLEARING (onAppear)! Sent \(LogRedaction.redactAmount(cleared.amount)) (fee: \(LogRedaction.redactAmount(cleared.fee))) in \(String(format: "%.1f", cleared.clearingTime))s")
 
             // Clear the trigger after handling
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
@@ -257,7 +257,7 @@ struct BalanceView: View {
             withAnimation {
                 showSettlementCelebration = true
             }
-            print("⛏️ SETTLEMENT (onAppear)! \(settlementIsOutgoing ? "Sent" : "Received") \(settlementTxAmount) ZCL (fee: \(settlementTxFee))")
+            print("⛏️ SETTLEMENT (onAppear)! \(settlementIsOutgoing ? "Sent" : "Received") \(LogRedaction.redactAmount(confirmed.amount)) (fee: \(LogRedaction.redactAmount(confirmed.fee)))")
 
             // When outgoing tx is confirmed, clear balance tracking
             if confirmed.isOutgoing {
@@ -319,7 +319,7 @@ struct BalanceView: View {
             }
 
             if isLikelyChangeOutput {
-                print("💰 Balance increased by \(Double(increase) / 100_000_000.0) ZCL (change output - no celebration)")
+                print("💰 Balance increased by \(LogRedaction.redactAmount(increase)) (change output - no celebration)")
                 // Change output detected means our tx was mined!
                 // Clear tracking after a brief delay to ensure UI is stable
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
@@ -335,7 +335,7 @@ struct BalanceView: View {
                 // Real incoming transaction detected!
                 // Don't show fireworks - the Settlement celebration will be shown via justConfirmedTx
                 // or Clearing celebration via justDetectedIncomingMempool
-                print("📥 Received \(Double(increase) / 100_000_000.0) ZCL (celebration will be triggered by confirmation/mempool handler)")
+                print("📥 Received \(LogRedaction.redactAmount(increase)) (celebration will be triggered by confirmation/mempool handler)")
                 // Clear tracking after real incoming is processed
                 walletManager.clearBalanceBeforeLastSend()
             }
@@ -399,7 +399,7 @@ struct BalanceView: View {
             withAnimation {
                 showSettlementCelebration = true
             }
-            print("⛏️ SETTLEMENT (BalanceView)! \(settlementIsOutgoing ? "Sent" : "Received") \(settlementTxAmount) ZCL (fee: \(settlementTxFee)) in \(String(format: "%.1f", confirmed.settlementTime ?? 0))s")
+            print("⛏️ SETTLEMENT (BalanceView)! \(settlementIsOutgoing ? "Sent" : "Received") \(LogRedaction.redactAmount(confirmed.amount)) (fee: \(LogRedaction.redactAmount(confirmed.fee))) in \(String(format: "%.1f", confirmed.settlementTime ?? 0))s")
 
             // When outgoing tx is confirmed, clear balance tracking
             // This happens AFTER change output is detected and added to balance
@@ -426,7 +426,7 @@ struct BalanceView: View {
             withAnimation {
                 showClearingCelebration = true
             }
-            print("🏦 CLEARING! Incoming \(clearingTxAmount) ZCL in tx \(mempool.txid.prefix(12))...")
+            print("🏦 CLEARING! Incoming \(LogRedaction.redactAmount(mempool.amount)) in tx \(mempool.txid.prefix(12))...")
 
             // Clear the trigger after handling
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
@@ -446,7 +446,7 @@ struct BalanceView: View {
             withAnimation {
                 showClearingCelebration = true
             }
-            print("🏦 CLEARING! Sent \(clearingTxAmount) ZCL (fee: \(clearingTxFee)) in \(String(format: "%.1f", cleared.clearingTime))s")
+            print("🏦 CLEARING! Sent \(LogRedaction.redactAmount(cleared.amount)) (fee: \(LogRedaction.redactAmount(cleared.fee))) in \(String(format: "%.1f", cleared.clearingTime))s")
 
             // Clear the trigger after handling
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
@@ -577,10 +577,10 @@ struct BalanceView: View {
                     let isMempoolVerified = networkManager.isMempoolVerified
 
                     print("📊 BALANCE CARD STATE:")
-                    print("   pendingBroadcast=\(pendingBroadcast) (\(Double(pendingBroadcast)/100_000_000) ZCL), isMempoolVerified=\(isMempoolVerified)")
-                    print("   mempoolIncoming=\(mempoolIn) (\(Double(mempoolIn)/100_000_000) ZCL)")
-                    print("   mempoolOutgoing=\(mempoolOut) (\(Double(mempoolOut)/100_000_000) ZCL)")
-                    print("   pendingBalance=\(pending) (\(Double(pending)/100_000_000) ZCL)")
+                    print("   pendingBroadcast=\(pendingBroadcast) (\(LogRedaction.redactAmount(pendingBroadcast))), isMempoolVerified=\(isMempoolVerified)")
+                    print("   mempoolIncoming=\(mempoolIn) (\(LogRedaction.redactAmount(mempoolIn)))")
+                    print("   mempoolOutgoing=\(mempoolOut) (\(LogRedaction.redactAmount(mempoolOut)))")
+                    print("   pendingBalance=\(pending) (\(LogRedaction.redactAmount(pending)))")
                     print("   justConfirmedTx=\(justConfirmed != nil ? "\(justConfirmed!.txid.prefix(12))... isOutgoing=\(justConfirmed!.isOutgoing)" : "nil")")
                     print("   isLikelyChange=\(isLikelyChange), alreadyMined=\(alreadyMined)")
                     print("   lastSendTimestamp=\(lastSend?.description ?? "nil"), ago=\(Int(lastSendAgo))s")
@@ -588,7 +588,7 @@ struct BalanceView: View {
                     // What will be displayed:
                     let hasPendingOut = pendingBroadcast > 0 || mempoolOut > 0
                     if mempoolIn > 0 && !isLikelyChange && !alreadyMined && !hasPendingOut {
-                        print("   >>> DISPLAYING: GREEN mempool incoming +\(Double(mempoolIn)/100_000_000) ZCL (awaiting confirmation)")
+                        print("   >>> DISPLAYING: GREEN mempool incoming +\(LogRedaction.redactAmount(mempoolIn)) (awaiting confirmation)")
                     } else if mempoolIn > 0 && alreadyMined {
                         print("   >>> HIDING mempool incoming: tx already mined (alreadyMined=true)")
                     } else if mempoolIn > 0 && hasPendingOut {
@@ -596,13 +596,13 @@ struct BalanceView: View {
                     }
                     if pendingBroadcast > 0 {
                         let status = isMempoolVerified ? "in mempool, waiting for miners" : "awaiting confirmation"
-                        print("   >>> DISPLAYING: ORANGE outgoing -\(Double(pendingBroadcast)/100_000_000) ZCL (\(status))")
+                        print("   >>> DISPLAYING: ORANGE outgoing -\(LogRedaction.redactAmount(pendingBroadcast)) (\(status))")
                     } else if mempoolOut > 0 {
-                        print("   >>> DISPLAYING: ORANGE outgoing -\(Double(mempoolOut)/100_000_000) ZCL (in mempool)")
+                        print("   >>> DISPLAYING: ORANGE outgoing -\(LogRedaction.redactAmount(mempoolOut)) (in mempool)")
                     } else if pending > 0 && !isLikelyChange {
-                        print("   >>> DISPLAYING: GREEN pending +\(Double(pending)/100_000_000) ZCL (0 confirmations)")
+                        print("   >>> DISPLAYING: GREEN pending +\(LogRedaction.redactAmount(pending)) (0 confirmations)")
                     } else if pending > 0 && isLikelyChange {
-                        print("   >>> SUPPRESSING: Change output \(Double(pending)/100_000_000) ZCL (isLikelyChange=true)")
+                        print("   >>> SUPPRESSING: Change output \(LogRedaction.redactAmount(pending)) (isLikelyChange=true)")
                     }
                 }()
 
@@ -1336,7 +1336,15 @@ struct BalanceView: View {
 
             // Privacy/Tor status with colored pill - MATRIX STYLE - ALL ON ONE LINE
             HStack(spacing: 6) {
-                if torManager.connectionState.isConnected {
+                if torManager.isBypassActive && torManager.mode == .enabled {
+                    // FIX #1401: Tor temporarily bypassed — IP exposed
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 12))
+                        .foregroundColor(.orange)
+                    Text("TOR BYPASSED")
+                        .font(.system(size: 10, weight: .black, design: .monospaced))
+                        .foregroundColor(.orange)
+                } else if torManager.connectionState.isConnected {
                     // Tor connected - MATRIX NEON GREEN
                     Text("🧅")
                         .font(.system(size: 14))

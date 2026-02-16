@@ -1637,6 +1637,34 @@ Both binaries must be installed to /usr/local/bin:
                     .stroke(theme.textPrimary, lineWidth: 1)
             )
 
+            // FIX #1401: Strict privacy toggle — never bypass Tor for speed
+            if TorManager.shared.mode == .enabled {
+                VStack(alignment: .leading, spacing: 8) {
+                    Toggle(isOn: Binding(
+                        get: { TorManager.shared.strictPrivacyMode },
+                        set: { TorManager.shared.strictPrivacyMode = $0 }
+                    )) {
+                        HStack {
+                            Text("Strict Privacy Mode")
+                                .font(theme.bodyFont)
+                            Spacer()
+                        }
+                    }
+                    .toggleStyle(SwitchToggleStyle(tint: .orange))
+
+                    Text("Never bypass Tor, even during sync. All traffic stays routed through Tor. Sync will be slower but your IP is never exposed to peers.")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(theme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(12)
+                .background(theme.surfaceColor)
+                .overlay(
+                    Rectangle()
+                        .stroke(theme.textPrimary, lineWidth: 1)
+                )
+            }
+
             // Start/Stop button (only for non-disabled modes)
             if TorManager.shared.mode != .disabled {
                 Button(action: {

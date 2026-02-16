@@ -123,6 +123,14 @@ public final class TorManager: ObservableObject {
     /// Cache for SOCKS proxy ready state (prevents repeated connection tests)
     private var socksProxyVerified = false
 
+    /// FIX #1401: Strict privacy mode — NEVER bypass Tor for any operation (slower but fully private).
+    /// When true, bypassTorForMassiveOperation() refuses to bypass, keeping all traffic through Tor.
+    @Published public var strictPrivacyMode: Bool {
+        didSet {
+            UserDefaults.standard.set(strictPrivacyMode, forKey: "torStrictPrivacyMode")
+        }
+    }
+
     // MARK: - Persistent Onion Address (FIX #169)
 
     /// Keychain key for storing the hidden service keypair
@@ -156,6 +164,8 @@ public final class TorManager: ObservableObject {
         } else {
             self.mode = .disabled
         }
+        // FIX #1401: Load strict privacy preference
+        self.strictPrivacyMode = UserDefaults.standard.bool(forKey: "torStrictPrivacyMode")
 
         // Check if Arti is available
         let isAvailable = zipherx_tor_is_available()
@@ -308,12 +318,19 @@ public final class TorManager: ObservableObject {
 
     /// Track if Tor was bypassed for a massive operation
     private var wasTorEnabledBeforeBypass = false
-    private var isBypassActive = false
+    // FIX #1401: Published so BalanceView can show privacy warning during bypass
+    @Published public private(set) var isBypassActive = false
 
     /// Temporarily disable Tor for massive operations (header sync, full rescan)
     /// Returns true if Tor was disabled (caller should call restoreTorAfterBypass when done)
     public func bypassTorForMassiveOperation() async -> Bool {
         guard mode == .enabled && !isBypassActive else {
+            return false
+        }
+
+        // FIX #1401: Strict privacy mode — refuse to bypass Tor
+        if strictPrivacyMode {
+            print("🧅 FIX #1401: Tor bypass REFUSED — strict privacy mode enabled (sync will be slower)")
             return false
         }
 
