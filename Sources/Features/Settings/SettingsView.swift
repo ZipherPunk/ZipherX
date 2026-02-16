@@ -489,14 +489,12 @@ struct SettingsView: View {
             Text("""
 🔐 SECURITY NOTICE
 
-Your private keys remain SECURE in ZipherX's encrypted storage.
+Full Node mode uses the local zclassicd daemon and its wallet.dat for all wallet operations (send, receive, balance).
 
-• ZipherX will NOT use the daemon's wallet.dat
-• Your spending key stays in Secure Enclave / encrypted keychain
-• Send/receive continues through ZipherX wallet
-• Full Node only provides trusted block height & verification
-
-The daemon's wallet is NEVER accessed for signing.
+• Your keys are managed by the daemon's wallet.dat
+• Encrypt wallet.dat with a strong passphrase (recommended)
+• Full blockchain verification — you verify every block independently
+• ZipherX connects to the daemon via local RPC
 
 ⚠️ REQUIREMENTS:
 • ~10 GB disk space for blockchain data
@@ -509,8 +507,6 @@ ZipherX downloads the latest blockchain bootstrap for fast sync:
 https://github.com/VictorLux/zclassic-bootstrap
 
 "By running a full node, you become part of the network's backbone. You verify every transaction independently, trusting no one. This is the cypherpunk way."
-
-Thank you for strengthening the network! 🛡️
 """)
         }
         // Daemon installation choice alert
@@ -1504,7 +1500,7 @@ Both binaries must be installed to /usr/local/bin:
                         Spacer()
                     }
                 }
-                .toggleStyle(SwitchToggleStyle(tint: theme.accentColor))
+                .toggleStyle(SwitchToggleStyle(tint: .green))
 
                 // Mode description
                 Text(TorManager.shared.mode.description)
@@ -1700,7 +1696,7 @@ Both binaries must be installed to /usr/local/bin:
                             Spacer()
                         }
                     }
-                    .toggleStyle(SwitchToggleStyle(tint: Color(red: 0.2, green: 1.0, blue: 0.4)))
+                    .toggleStyle(SwitchToggleStyle(tint: .green))
 
                     // Description
                     Text("When enabled, other peers can connect to you via your unique .onion address. You remain anonymous while being discoverable.")

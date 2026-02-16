@@ -882,6 +882,9 @@ struct ConversationView: View {
         }
         .sheet(isPresented: $showPaymentRequest) {
             PaymentRequestSheet(contact: contact)
+            #if os(macOS)
+                .frame(minWidth: 400, idealWidth: 450, minHeight: 480, idealHeight: 520)
+            #endif
         }
         // FIX #221: Explicitly pass environment objects to prevent blank screen delay
         // SwiftUI sheets don't always inherit environment objects properly
@@ -1597,135 +1600,160 @@ struct AddContactSheet: View {
     private var theme: AppTheme { themeManager.currentTheme }
 
     var body: some View {
-        NavigationView {
-            VStack(spacing: 24) {
-                // macOS: Explicit close button (toolbar doesn't work in sheets)
-                #if os(macOS)
-                HStack {
-                    Spacer()
-                    Button(action: { dismiss() }) {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 20))
-                            .foregroundColor(theme.textPrimary.opacity(0.5))
-                    }
-                    .buttonStyle(.plain)
-                }
-                .padding(.horizontal, 16)
-                .padding(.top, 8)
-                #endif
-
-                // Header icon
-                ZStack {
-                    Circle()
-                        .stroke(theme.accentColor.opacity(0.3), lineWidth: 2)
-                        .frame(width: 80, height: 80)
-
-                    Image(systemName: "person.badge.plus")
-                        .font(.system(size: 36))
-                        .foregroundColor(theme.accentColor)
-                }
-                .padding(.top, 20)
-
-                VStack(spacing: 6) {
-                    Text("Add Contact")
-                        .font(.system(size: 22, weight: .bold, design: .monospaced))
-                        .foregroundColor(theme.textPrimary)
-
-                    Text("Enter their .onion address to connect\nover the Tor network")
-                        .font(.system(size: 13, design: .monospaced))
-                        .foregroundColor(theme.textPrimary.opacity(0.5))
-                        .multilineTextAlignment(.center)
-                }
-
-                // Form
-                VStack(spacing: 18) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Text("ONION ADDRESS")
-                                .font(.system(size: 11, weight: .bold, design: .monospaced))
-                                .foregroundColor(theme.accentColor)
-
-                            Spacer()
-
-                            // FIX #225: QR Scanner button (iOS only)
-                            #if os(iOS)
-                            Button(action: { showQRScanner = true }) {
-                                HStack(spacing: 4) {
-                                    Image(systemName: "qrcode.viewfinder")
-                                        .font(.system(size: 14))
-                                    Text("SCAN")
-                                        .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                }
-                                .foregroundColor(theme.accentColor)
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 6)
-                                .background(theme.accentColor.opacity(0.15))
-                                .cornerRadius(6)
-                            }
-                            .buttonStyle(.plain)
-                            #endif
+        addContactInner
+        // FIX #225: QR Scanner sheet (iOS only)
+        #if os(iOS)
+        .sheet(isPresented: $showQRScanner) {
+            ChatQRScannerSheet { scannedAddress in
+                if let address = scannedAddress {
+                    // FIX #251: Parse new QR format with nickname
+                    if let qrData = ChatQRCodeData.parse(address) {
+                        onionAddress = qrData.onionAddress
+                        if let scannedNickname = qrData.nickname, !scannedNickname.isEmpty {
+                            nickname = generateUniqueNickname(scannedNickname)
                         }
-
-                        // FIX #343: Add visible placeholder styling for iOS
-                        TextField("", text: $onionAddress, prompt: Text("xxxxxxxx...xxxxx.onion")
-                            .font(.system(size: 14, design: .monospaced))
-                            .foregroundColor(.white.opacity(0.5)))
-                            .textFieldStyle(.plain)
-                            .font(.system(size: 14, design: .monospaced))
-                            .foregroundColor(.white)
-                            #if os(iOS)
-                            .autocapitalization(.none)
-                            #endif
-                            .disableAutocorrection(true)
-                            .padding(14)
-                            .background(Color.black.opacity(0.25))
-                            .cornerRadius(10)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 10)
-                                    .stroke(theme.accentColor.opacity(0.3), lineWidth: 1)
-                            )
+                    } else {
+                        errorMessage = "Invalid QR code format"
                     }
+                }
+                showQRScanner = false
+            }
+            .environmentObject(themeManager)
+        }
+        #endif
+    }
 
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("NICKNAME (OPTIONAL)")
+    private var addContactInner: some View {
+        // macOS: No NavigationView — avoids sidebar-split layout in sheets
+        #if os(macOS)
+        addContactForm
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(theme.backgroundColor)
+        #else
+        NavigationView {
+            addContactForm
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(theme.backgroundColor)
+                .navigationTitle("Add Contact")
+                .navigationBarTitleDisplayMode(.inline)
+        }
+        .navigationViewStyle(.stack)
+        #endif
+    }
+
+    private var addContactForm: some View {
+        VStack(spacing: 24) {
+            // macOS: Close button
+            #if os(macOS)
+            HStack {
+                Spacer()
+                Button(action: { dismiss() }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 20))
+                        .foregroundColor(theme.textPrimary.opacity(0.5))
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 8)
+            #endif
+
+            // Header icon
+            ZStack {
+                Circle()
+                    .stroke(theme.accentColor.opacity(0.3), lineWidth: 2)
+                    .frame(width: 80, height: 80)
+                Image(systemName: "person.badge.plus")
+                    .font(.system(size: 36))
+                    .foregroundColor(theme.accentColor)
+            }
+            .padding(.top, 20)
+
+            VStack(spacing: 6) {
+                Text("Add Contact")
+                    .font(.system(size: 22, weight: .bold, design: .monospaced))
+                    .foregroundColor(theme.textPrimary)
+                Text("Enter their .onion address to connect\nover the Tor network")
+                    .font(.system(size: 13, design: .monospaced))
+                    .foregroundColor(theme.textPrimary.opacity(0.5))
+                    .multilineTextAlignment(.center)
+            }
+
+            // Form
+            VStack(spacing: 18) {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("ONION ADDRESS")
                             .font(.system(size: 11, weight: .bold, design: .monospaced))
                             .foregroundColor(theme.accentColor)
-
-                        // FIX #343: Add visible placeholder styling for iOS
-                        TextField("", text: $nickname, prompt: Text("Enter a friendly name")
-                            .font(.system(size: 14, design: .monospaced))
-                            .foregroundColor(.white.opacity(0.5)))
-                            .textFieldStyle(.plain)
-                            .font(.system(size: 14, design: .monospaced))
-                            .foregroundColor(.white)
-                            .padding(14)
-                            .background(Color.black.opacity(0.25))
-                            .cornerRadius(10)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 10)
-                                    .stroke(theme.accentColor.opacity(0.3), lineWidth: 1)
-                            )
+                        Spacer()
+                        #if os(iOS)
+                        Button(action: { showQRScanner = true }) {
+                            HStack(spacing: 4) {
+                                Image(systemName: "qrcode.viewfinder")
+                                    .font(.system(size: 14))
+                                Text("SCAN")
+                                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            }
+                            .foregroundColor(theme.accentColor)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(theme.accentColor.opacity(0.15))
+                            .cornerRadius(6)
+                        }
+                        .buttonStyle(.plain)
+                        #endif
                     }
+                    TextField("", text: $onionAddress, prompt: Text("xxxxxxxx...xxxxx.onion")
+                        .font(.system(size: 14, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.5)))
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 14, design: .monospaced))
+                        .foregroundColor(.white)
+                        #if os(iOS)
+                        .autocapitalization(.none)
+                        #endif
+                        .disableAutocorrection(true)
+                        .padding(14)
+                        .background(Color.black.opacity(0.25))
+                        .cornerRadius(10)
+                        .overlay(RoundedRectangle(cornerRadius: 10).stroke(theme.accentColor.opacity(0.3), lineWidth: 1))
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("NICKNAME (OPTIONAL)")
+                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                        .foregroundColor(theme.accentColor)
+                    TextField("", text: $nickname, prompt: Text("Enter a friendly name")
+                        .font(.system(size: 14, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.5)))
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 14, design: .monospaced))
+                        .foregroundColor(.white)
+                        .padding(14)
+                        .background(Color.black.opacity(0.25))
+                        .cornerRadius(10)
+                        .overlay(RoundedRectangle(cornerRadius: 10).stroke(theme.accentColor.opacity(0.3), lineWidth: 1))
+                }
+            }
+            .padding(.horizontal, 24)
+
+            if let error = errorMessage {
+                HStack {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.red)
+                    Text(error)
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundColor(.red)
                 }
                 .padding(.horizontal, 24)
+            }
 
-                if let error = errorMessage {
-                    HStack {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundColor(.red)
-                        Text(error)
-                            .font(.system(size: 12, design: .monospaced))
-                            .foregroundColor(.red)
-                    }
-                    .padding(.horizontal, 24)
-                }
+            Spacer(minLength: 16)
 
-                Spacer(minLength: 16)
-
-                // Action buttons
-                VStack(spacing: 12) {
-                    // Add button
-                    Button(action: addContact) {
+            // Action buttons
+            VStack(spacing: 12) {
+                Button(action: addContact) {
                     HStack(spacing: 8) {
                         if isAdding {
                             ProgressView()
@@ -1751,76 +1779,27 @@ struct AddContactSheet: View {
                     .cornerRadius(12)
                     .shadow(color: theme.accentColor.opacity(0.3), radius: 8, y: 4)
                 }
-                    .buttonStyle(.plain)
-                    .disabled(onionAddress.isEmpty || isAdding)
-                    .opacity(onionAddress.isEmpty ? 0.6 : 1.0)
+                .buttonStyle(.plain)
+                .disabled(onionAddress.isEmpty || isAdding)
+                .opacity(onionAddress.isEmpty ? 0.6 : 1.0)
 
-                    // Cancel button (explicit for macOS since toolbar doesn't work in sheets)
-                    #if os(macOS)
-                    Button(action: { dismiss() }) {
-                        Text("CANCEL")
-                            .font(.system(size: 14, weight: .medium, design: .monospaced))
-                            .foregroundColor(theme.textPrimary.opacity(0.7))
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 12)
-                            .background(Color.black.opacity(0.2))
-                            .cornerRadius(10)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 10)
-                                    .stroke(theme.textPrimary.opacity(0.2), lineWidth: 1)
-                            )
-                    }
-                    .buttonStyle(.plain)
-                    #endif
+                #if os(macOS)
+                Button(action: { dismiss() }) {
+                    Text("CANCEL")
+                        .font(.system(size: 14, weight: .medium, design: .monospaced))
+                        .foregroundColor(theme.textPrimary.opacity(0.7))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                        .background(Color.black.opacity(0.2))
+                        .cornerRadius(10)
+                        .overlay(RoundedRectangle(cornerRadius: 10).stroke(theme.textPrimary.opacity(0.2), lineWidth: 1))
                 }
-                .padding(.horizontal, 24)
-                .padding(.bottom, 24)
+                .buttonStyle(.plain)
+                #endif
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(theme.backgroundColor)
-            .navigationTitle("Add Contact")
-            #if os(iOS)
-            .navigationBarTitleDisplayMode(.inline)
-            #endif
-            // FIX #270: Hide toolbar buttons on iOS - swipe to dismiss is sufficient
-            #if os(macOS)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { dismiss() }
-                        .foregroundColor(theme.accentColor)
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
-                        .foregroundColor(theme.accentColor)
-                }
-            }
-            // Ensure entire sheet has consistent background on macOS
-            .background(theme.backgroundColor.ignoresSafeArea())
-            #endif
+            .padding(.horizontal, 24)
+            .padding(.bottom, 24)
         }
-        // FIX #225: QR Scanner sheet (iOS only)
-        #if os(iOS)
-        .sheet(isPresented: $showQRScanner) {
-            ChatQRScannerSheet { scannedAddress in
-                if let address = scannedAddress {
-                    // FIX #251: Parse new QR format with nickname
-                    if let qrData = ChatQRCodeData.parse(address) {
-                        onionAddress = qrData.onionAddress
-
-                        // FIX #251: Auto-fill nickname from QR code
-                        if let scannedNickname = qrData.nickname, !scannedNickname.isEmpty {
-                            // Check for duplicate nickname and add random suffix if needed
-                            nickname = generateUniqueNickname(scannedNickname)
-                        }
-                    } else {
-                        errorMessage = "Invalid QR code format"
-                    }
-                }
-                showQRScanner = false
-            }
-            .environmentObject(themeManager)
-        }
-        #endif
     }
 
     /// FIX #251: Generate unique nickname by adding random 5-digit suffix if duplicate exists
@@ -1873,18 +1852,45 @@ struct ChatSettingsSheet: View {
     private var theme: AppTheme { themeManager.currentTheme }
 
     var body: some View {
+        chatSettingsInner
+    }
+
+    private var chatSettingsInner: some View {
+        #if os(macOS)
+        // macOS: No NavigationView — avoids sidebar-split layout in sheets
+        chatSettingsContent
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(theme.backgroundColor)
+            .onAppear {
+                if quote.isEmpty { quote = randomCypherpunkQuote() }
+            }
+        #else
         NavigationView {
-            ScrollView {
-                VStack(spacing: 24) {
-                    // macOS: Explicit close button (toolbar doesn't work in sheets)
-                    #if os(macOS)
-                    HStack {
-                        Spacer()
-                        Button(action: { dismiss() }) {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.system(size: 20))
-                                .foregroundColor(theme.textPrimary.opacity(0.5))
-                        }
+            chatSettingsContent
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(theme.backgroundColor)
+                .navigationTitle("Chat Settings")
+                .navigationBarTitleDisplayMode(.inline)
+                .onAppear {
+                    if quote.isEmpty { quote = randomCypherpunkQuote() }
+                }
+        }
+        .navigationViewStyle(.stack)
+        #endif
+    }
+
+    private var chatSettingsContent: some View {
+        ScrollView {
+            VStack(spacing: 24) {
+                // macOS: Explicit close button
+                #if os(macOS)
+                HStack {
+                    Spacer()
+                    Button(action: { dismiss() }) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 20))
+                            .foregroundColor(theme.textPrimary.opacity(0.5))
+                    }
                         .buttonStyle(.plain)
                     }
                     .padding(.horizontal, 16)
@@ -2072,35 +2078,7 @@ struct ChatSettingsSheet: View {
                 }
                 .padding(24)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(theme.backgroundColor)
-            .navigationTitle("Chat Settings")
-            .onAppear {
-                // Set quote once on appear to prevent loop
-                if quote.isEmpty {
-                    quote = randomCypherpunkQuote()
-                }
-            }
-            #if os(iOS)
-            .navigationBarTitleDisplayMode(.inline)
-            #endif
-            // FIX #270: Hide toolbar buttons on iOS - swipe to dismiss is sufficient
-            #if os(macOS)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Close") { dismiss() }
-                        .foregroundColor(theme.accentColor)
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
-                        .foregroundColor(theme.accentColor)
-                }
-            }
-            // Ensure entire sheet has consistent background on macOS
-            .background(theme.backgroundColor.ignoresSafeArea())
-            #endif
         }
-    }
 
     private func sectionHeader(_ title: String) -> some View {
         Text(title)
@@ -2127,133 +2105,153 @@ struct PaymentRequestSheet: View {
     private var theme: AppTheme { themeManager.currentTheme }
 
     var body: some View {
-        NavigationView {
-            VStack(spacing: 24) {
-                // Header
-                ZStack {
-                    Circle()
-                        .stroke(theme.accentColor.opacity(0.3), lineWidth: 2)
-                        .frame(width: 80, height: 80)
+        paymentRequestContent
+    }
 
-                    Image(systemName: "dollarsign.circle.fill")
-                        .font(.system(size: 40))
-                        .foregroundColor(theme.accentColor)
-                }
-
-                Text("Request Payment")
-                    .font(.system(size: 22, weight: .bold, design: .monospaced))
-                    .foregroundColor(theme.textPrimary)
-
-                Text("from \(contact.displayName)")
-                    .font(.system(size: 14, design: .monospaced))
-                    .foregroundColor(theme.textPrimary.opacity(0.5))
-
-                VStack(spacing: 18) {
-                    // FIX #343: Add visible placeholder styling for iOS
-                    TextField("", text: $amount, prompt: Text("0.00")
-                        .font(.system(size: 36, weight: .bold, design: .monospaced))
-                        .foregroundColor(theme.accentColor.opacity(0.5)))
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 36, weight: .bold, design: .monospaced))
-                        .multilineTextAlignment(.center)
-                        .foregroundColor(theme.accentColor)
-                        #if os(iOS)
-                        .keyboardType(.decimalPad)
-                        #endif
-                        .padding(.vertical, 16)
-                        .background(Color.black.opacity(0.25))
-                        .cornerRadius(12)
-
-                    Text("ZCL")
-                        .font(.system(size: 16, weight: .medium, design: .monospaced))
-                        .foregroundColor(theme.textPrimary.opacity(0.5))
-
-                    // FIX #334: Add foregroundColor to make memo text visible on dark background
-                    // FIX #343: Use prompt parameter with explicit styling for visible placeholder on iOS
-                    TextField("", text: $memo, prompt: Text("Add a memo (optional)")
-                        .font(.system(size: 14, design: .monospaced))
-                        .foregroundColor(theme.textSecondary))
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 14, design: .monospaced))
-                        .foregroundColor(theme.textPrimary)
-                        .padding(14)
-                        .background(Color.black.opacity(0.25))
-                        .cornerRadius(10)
-                        .tint(theme.accentColor)  // Cursor color
-                }
-                .padding(.horizontal, 24)
-
-                // Error message
-                if let error = errorMessage {
-                    HStack(spacing: 8) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundColor(.red)
-                        Text(error)
-                            .font(.system(size: 12, design: .monospaced))
-                            .foregroundColor(.red)
+    private var paymentRequestContent: some View {
+        VStack(spacing: 0) {
+            // Cancel header — pinned at top, never scrolls off
+            HStack {
+                Button(action: { dismiss() }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 11, weight: .bold))
+                        Text("Cancel")
+                            .font(.system(size: 13, weight: .medium, design: .monospaced))
                     }
-                    .padding(.horizontal, 24)
-                    .transition(.opacity)
-                }
-
-                // Success message
-                if showSuccess {
-                    HStack(spacing: 8) {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundColor(theme.accentColor)
-                        Text("Payment request sent!")
-                            .font(.system(size: 14, weight: .medium, design: .monospaced))
-                            .foregroundColor(theme.accentColor)
-                    }
-                    .padding(.horizontal, 24)
-                    .transition(.scale.combined(with: .opacity))
-                }
-
-                Spacer()
-
-                Button(action: sendRequest) {
-                    HStack(spacing: 8) {
-                        if isSending {
-                            ProgressView()
-                                .progressViewStyle(CircularProgressViewStyle(tint: .black))
-                                .scaleEffect(0.8)
-                        } else {
-                            Image(systemName: "paperplane.fill")
-                        }
-                        Text("SEND REQUEST")
-                            .font(.system(size: 14, weight: .bold, design: .monospaced))
-                    }
-                    .foregroundColor(.black)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 14)
-                    .background(
-                        LinearGradient(
-                            colors: [theme.accentColor, theme.accentColor.opacity(0.8)],
-                            startPoint: .leading,
-                            endPoint: .trailing
-                        )
-                    )
-                    .cornerRadius(12)
-                    .shadow(color: theme.accentColor.opacity(0.3), radius: 8, y: 4)
+                    .foregroundColor(theme.accentColor)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(theme.accentColor.opacity(0.15))
+                    .cornerRadius(6)
                 }
                 .buttonStyle(.plain)
-                .disabled(amount.isEmpty || isSending)
-                .opacity(amount.isEmpty ? 0.6 : 1.0)
-                .padding(.horizontal, 24)
-                .padding(.bottom, 24)
+                Spacer()
             }
-            .padding(.top, 24)
-            .background(theme.backgroundColor)
-            // FIX #270: Hide toolbar buttons on iOS - swipe to dismiss is sufficient
-            #if os(macOS)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { dismiss() }
-                        .foregroundColor(theme.accentColor)
+            .padding(.horizontal, 16)
+            .padding(.top, 14)
+            .padding(.bottom, 8)
+
+            // Scrollable content — prevents overflow when error message appears
+            ScrollView {
+                VStack(spacing: 20) {
+                    // Header icon
+                    ZStack {
+                        Circle()
+                            .stroke(theme.accentColor.opacity(0.3), lineWidth: 2)
+                            .frame(width: 70, height: 70)
+
+                        Image(systemName: "dollarsign.circle.fill")
+                            .font(.system(size: 36))
+                            .foregroundColor(theme.accentColor)
+                    }
+
+                    Text("Request Payment")
+                        .font(.system(size: 20, weight: .bold, design: .monospaced))
+                        .foregroundColor(theme.textPrimary)
+
+                    Text("from \(contact.displayName)")
+                        .font(.system(size: 13, design: .monospaced))
+                        .foregroundColor(theme.textPrimary.opacity(0.5))
+
+                    VStack(spacing: 14) {
+                        // FIX #343: Add visible placeholder styling for iOS
+                        TextField("", text: $amount, prompt: Text("0.00")
+                            .font(.system(size: 32, weight: .bold, design: .monospaced))
+                            .foregroundColor(theme.accentColor.opacity(0.5)))
+                            .textFieldStyle(.plain)
+                            .font(.system(size: 32, weight: .bold, design: .monospaced))
+                            .multilineTextAlignment(.center)
+                            .foregroundColor(theme.accentColor)
+                            #if os(iOS)
+                            .keyboardType(.decimalPad)
+                            #endif
+                            .padding(.vertical, 14)
+                            .background(Color.black.opacity(0.25))
+                            .cornerRadius(12)
+
+                        Text("ZCL")
+                            .font(.system(size: 14, weight: .medium, design: .monospaced))
+                            .foregroundColor(theme.textPrimary.opacity(0.5))
+
+                        // FIX #334: Add foregroundColor to make memo text visible on dark background
+                        TextField("", text: $memo, prompt: Text("Add a memo (optional)")
+                            .font(.system(size: 13, design: .monospaced))
+                            .foregroundColor(theme.textSecondary))
+                            .textFieldStyle(.plain)
+                            .font(.system(size: 13, design: .monospaced))
+                            .foregroundColor(theme.textPrimary)
+                            .padding(12)
+                            .background(Color.black.opacity(0.25))
+                            .cornerRadius(10)
+                            .tint(theme.accentColor)
+                    }
+                    .padding(.horizontal, 24)
+
+                    // Error message
+                    if let error = errorMessage {
+                        HStack(spacing: 6) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.system(size: 11))
+                                .foregroundColor(.red)
+                            Text(error)
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundColor(.red)
+                                .lineLimit(3)
+                        }
+                        .padding(.horizontal, 24)
+                        .transition(.opacity)
+                    }
+
+                    // Success message
+                    if showSuccess {
+                        HStack(spacing: 8) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundColor(theme.accentColor)
+                            Text("Payment request sent!")
+                                .font(.system(size: 14, weight: .medium, design: .monospaced))
+                                .foregroundColor(theme.accentColor)
+                        }
+                        .padding(.horizontal, 24)
+                        .transition(.scale.combined(with: .opacity))
+                    }
                 }
+                .padding(.top, 8)
             }
-            #endif
+
+            // Send button — pinned at bottom
+            Button(action: sendRequest) {
+                HStack(spacing: 8) {
+                    if isSending {
+                        ProgressView()
+                            .progressViewStyle(CircularProgressViewStyle(tint: .black))
+                            .scaleEffect(0.8)
+                    } else {
+                        Image(systemName: "paperplane.fill")
+                    }
+                    Text("SEND REQUEST")
+                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                }
+                .foregroundColor(.black)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 14)
+                .background(
+                    LinearGradient(
+                        colors: [theme.accentColor, theme.accentColor.opacity(0.8)],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                )
+                .cornerRadius(12)
+                .shadow(color: theme.accentColor.opacity(0.3), radius: 8, y: 4)
+            }
+            .buttonStyle(.plain)
+            .disabled(amount.isEmpty || isSending)
+            .opacity(amount.isEmpty ? 0.6 : 1.0)
+            .padding(.horizontal, 24)
+            .padding(.vertical, 16)
         }
+        .background(theme.backgroundColor)
     }
 
     private func sendRequest() {

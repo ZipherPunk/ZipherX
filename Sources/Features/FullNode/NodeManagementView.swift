@@ -770,7 +770,7 @@ Continue?
                     Spacer()
 
                     Toggle("", isOn: $viewModel.isListening)
-                        .toggleStyle(SwitchToggleStyle(tint: theme.primaryColor))
+                        .toggleStyle(SwitchToggleStyle(tint: .green))
                         .onChange(of: viewModel.isListening) { newValue in
                             viewModel.setListening(newValue)
                         }
@@ -990,7 +990,7 @@ Continue?
             Spacer()
 
             Toggle("", isOn: isOn)
-                .toggleStyle(SwitchToggleStyle(tint: theme.primaryColor))
+                .toggleStyle(SwitchToggleStyle(tint: .green))
                 .onChange(of: isOn.wrappedValue) { _ in
                     viewModel.markConfigChanged()
                 }

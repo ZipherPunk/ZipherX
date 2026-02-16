@@ -333,14 +333,99 @@ struct AddTrustedPeerSheet: View {
     private var theme: AppTheme { themeManager.currentTheme }
 
     var body: some View {
+        #if os(macOS)
+        VStack(spacing: 0) {
+            // Header bar with Cancel / Title / Add
+            HStack {
+                Button("Cancel") { isPresented = false }
+                    .buttonStyle(.plain)
+                    .foregroundColor(theme.accentColor)
+                Spacer()
+                Text("Add Trusted Peer")
+                    .font(.system(size: 14, weight: .bold, design: .monospaced))
+                    .foregroundColor(theme.textPrimary)
+                Spacer()
+                Button("Add") { addPeer() }
+                    .buttonStyle(.plain)
+                    .foregroundColor(host.isEmpty ? theme.textSecondary : theme.accentColor)
+                    .disabled(host.isEmpty)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 14)
+
+            Divider().background(theme.borderColor)
+
+            // Fields
+            VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("PEER ADDRESS")
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .foregroundColor(theme.textSecondary)
+
+                    TextField("Host (IP or .onion)", text: $host)
+                        .font(.system(size: 13, design: .monospaced))
+                        .textFieldStyle(.plain)
+                        .foregroundColor(theme.textPrimary)
+                        .padding(10)
+                        .background(theme.surfaceColor)
+                        .cornerRadius(8)
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(theme.borderColor, lineWidth: 1))
+                        .disableAutocorrection(true)
+                        .onChange(of: host) { newValue in
+                            isOnion = newValue.hasSuffix(".onion")
+                        }
+
+                    TextField("Port", text: $port)
+                        .font(.system(size: 13, design: .monospaced))
+                        .textFieldStyle(.plain)
+                        .foregroundColor(theme.textPrimary)
+                        .padding(10)
+                        .background(theme.surfaceColor)
+                        .cornerRadius(8)
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(theme.borderColor, lineWidth: 1))
+
+                    TextField("Notes (optional)", text: $notes)
+                        .font(.system(size: 13, design: .monospaced))
+                        .textFieldStyle(.plain)
+                        .foregroundColor(theme.textPrimary)
+                        .padding(10)
+                        .background(theme.surfaceColor)
+                        .cornerRadius(8)
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(theme.borderColor, lineWidth: 1))
+                }
+
+                Text("Add a verified Zclassic node for reliable bootstrap connections.")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(theme.textSecondary)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("EXAMPLES")
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .foregroundColor(theme.textSecondary)
+                    exampleRow("IPv4", example: "140.174.189.17:8033")
+                    exampleRow("IPv6", example: "[2001:db8::1]:8033")
+                    exampleRow(".onion", example: "xyz...abc.onion:8033")
+                }
+
+                Spacer()
+            }
+            .padding(20)
+        }
+        .background(theme.backgroundColor)
+        .frame(minWidth: 400, idealWidth: 440, maxWidth: 520,
+               minHeight: 340, idealHeight: 400, maxHeight: 480)
+        .alert("Error", isPresented: $showError) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text(errorMessage)
+        }
+        #else
         NavigationView {
             Form {
                 Section {
                     TextField("Host (IP or .onion)", text: $host)
                         .font(.system(.body, design: .monospaced))
-                        #if os(iOS)
                         .autocapitalization(.none)
-                        #endif
                         .disableAutocorrection(true)
                         .onChange(of: host) { newValue in
                             isOnion = newValue.hasSuffix(".onion")
@@ -348,9 +433,7 @@ struct AddTrustedPeerSheet: View {
 
                     TextField("Port", text: $port)
                         .font(.system(.body, design: .monospaced))
-                        #if os(iOS)
                         .keyboardType(.numberPad)
-                        #endif
 
                     TextField("Notes (optional)", text: $notes)
                         .font(.system(.body, design: .monospaced))
@@ -372,16 +455,8 @@ struct AddTrustedPeerSheet: View {
                 }
             }
             .navigationTitle("Add Trusted Peer")
-            #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
-            #endif
-            // FIX #270: Hide Cancel on iOS - keep Add button for usability
             .toolbar {
-                #if os(macOS)
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { isPresented = false }
-                }
-                #endif
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Add") { addPeer() }
                         .disabled(host.isEmpty)
@@ -393,9 +468,7 @@ struct AddTrustedPeerSheet: View {
                 Text(errorMessage)
             }
         }
-        #if os(macOS)
-        .frame(minWidth: 550, idealWidth: 650, maxWidth: 750,
-               minHeight: 500, idealHeight: 600, maxHeight: 700)
+        .navigationViewStyle(.stack)
         #endif
     }
 
@@ -452,6 +525,80 @@ struct EditTrustedPeerSheet: View {
     private var theme: AppTheme { themeManager.currentTheme }
 
     var body: some View {
+        #if os(macOS)
+        VStack(spacing: 0) {
+            // Header bar
+            HStack {
+                Button("Cancel") { isPresented = false }
+                    .buttonStyle(.plain)
+                    .foregroundColor(theme.accentColor)
+                Spacer()
+                Text("Edit Peer")
+                    .font(.system(size: 14, weight: .bold, design: .monospaced))
+                    .foregroundColor(theme.textPrimary)
+                Spacer()
+                Button("Save") { savePeer() }
+                    .buttonStyle(.plain)
+                    .foregroundColor(theme.accentColor)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 14)
+
+            Divider().background(theme.borderColor)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    // Peer info
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("PEER INFORMATION")
+                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                            .foregroundColor(theme.textSecondary)
+
+                        infoRow("Host", value: peer.host)
+                        infoRow("Port", value: "\(peer.port)")
+                        infoRow("Type", value: peer.isOnion ? "Tor Hidden Service" : "IPv4/IPv6")
+
+                        TextField("Notes", text: $notes)
+                            .font(.system(size: 13, design: .monospaced))
+                            .textFieldStyle(.plain)
+                            .foregroundColor(theme.textPrimary)
+                            .padding(10)
+                            .background(theme.surfaceColor)
+                            .cornerRadius(8)
+                            .overlay(RoundedRectangle(cornerRadius: 8).stroke(theme.borderColor, lineWidth: 1))
+                    }
+
+                    // Statistics
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("STATISTICS")
+                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                            .foregroundColor(theme.textSecondary)
+
+                        infoRow("Successes", value: "\(peer.successes)", color: .green)
+                        infoRow("Failures", value: "\(peer.failures)", color: peer.failures > 0 ? .orange : theme.textSecondary)
+
+                        if peer.successes > 0 || peer.failures > 0 {
+                            let total = peer.successes + peer.failures
+                            let rate = total > 0 ? Double(peer.successes) / Double(total) * 100 : 0
+                            infoRow("Success Rate", value: "\(Int(rate))%", color: rate > 50 ? .green : .orange)
+                        }
+                    }
+
+                    Spacer()
+                }
+                .padding(20)
+            }
+        }
+        .background(theme.backgroundColor)
+        .frame(minWidth: 400, idealWidth: 440, maxWidth: 520,
+               minHeight: 340, idealHeight: 400, maxHeight: 480)
+        .alert("Error", isPresented: $showError) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text(errorMessage)
+        }
+        .onAppear { notes = peer.notes ?? "" }
+        #else
         NavigationView {
             Form {
                 Section {
@@ -462,7 +609,6 @@ struct EditTrustedPeerSheet: View {
                             .font(.system(.body, design: .monospaced))
                             .foregroundColor(theme.textSecondary)
                     }
-
                     HStack {
                         Text("Port")
                         Spacer()
@@ -470,7 +616,6 @@ struct EditTrustedPeerSheet: View {
                             .font(.system(.body, design: .monospaced))
                             .foregroundColor(theme.textSecondary)
                     }
-
                     TextField("Notes", text: $notes)
                         .font(.system(.body, design: .monospaced))
                 } header: {
@@ -484,21 +629,18 @@ struct EditTrustedPeerSheet: View {
                         Text(peer.isOnion ? "Tor Hidden Service" : "IPv4/IPv6")
                             .foregroundColor(theme.textSecondary)
                     }
-
                     HStack {
                         Text("Successes")
                         Spacer()
                         Text("\(peer.successes)")
                             .foregroundColor(.green)
                     }
-
                     HStack {
                         Text("Failures")
                         Spacer()
                         Text("\(peer.failures)")
                             .foregroundColor(peer.failures > 0 ? .orange : theme.textSecondary)
                     }
-
                     if peer.successes > 0 || peer.failures > 0 {
                         let total = peer.successes + peer.failures
                         let rate = total > 0 ? Double(peer.successes) / Double(total) * 100 : 0
@@ -509,7 +651,6 @@ struct EditTrustedPeerSheet: View {
                                 .foregroundColor(rate > 50 ? .green : .orange)
                         }
                     }
-
                     if let lastConnected = peer.lastConnected {
                         HStack {
                             Text("Last Connected")
@@ -523,16 +664,8 @@ struct EditTrustedPeerSheet: View {
                 }
             }
             .navigationTitle("Edit Peer")
-            #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
-            #endif
-            // FIX #270: Hide Cancel on iOS - keep Save button for usability
             .toolbar {
-                #if os(macOS)
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { isPresented = false }
-                }
-                #endif
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") { savePeer() }
                 }
@@ -542,14 +675,25 @@ struct EditTrustedPeerSheet: View {
             } message: {
                 Text(errorMessage)
             }
-            .onAppear {
-                notes = peer.notes ?? ""
-            }
+            .onAppear { notes = peer.notes ?? "" }
         }
-        #if os(macOS)
-        .frame(minWidth: 550, idealWidth: 650, maxWidth: 750,
-               minHeight: 550, idealHeight: 650, maxHeight: 750)
+        .navigationViewStyle(.stack)
         #endif
+    }
+
+    private func infoRow(_ label: String, value: String, color: Color? = nil) -> some View {
+        HStack {
+            Text(label)
+                .font(.system(size: 13, design: .monospaced))
+                .foregroundColor(theme.textSecondary)
+            Spacer()
+            Text(value)
+                .font(.system(size: 13, design: .monospaced))
+                .foregroundColor(color ?? theme.textPrimary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .padding(.vertical, 4)
     }
 
     private func savePeer() {

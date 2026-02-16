@@ -2498,37 +2498,52 @@ struct CypherpunkMainView: View {
         .background(Color.black.opacity(0.5))
     }
 
+    // FIX #1367: Yellow for self-send transactions
+    private let selfSendYellow = Color(red: 1.0, green: 0.85, blue: 0.0)
+
+    private func txRowColor(_ type: TransactionType) -> Color {
+        switch type {
+        case .received: return receivedGreen
+        case .selfSend: return selfSendYellow
+        default: return Color.red
+        }
+    }
+
     private func transactionRow(_ tx: TransactionHistoryItem) -> some View {
         HStack(spacing: 12) {
-            // Direction icon
-            Image(systemName: tx.type == .received ? "arrow.down.left" : "arrow.up.right")
+            // Direction icon — FIX #1367: Self-send uses circular arrows
+            Image(systemName: tx.type == .selfSend ? "arrow.triangle.2.circlepath" :
+                  (tx.type == .received ? "arrow.down.left" : "arrow.up.right"))
                 .font(.system(size: 14, weight: .medium))
-                // RECEIVED = green (money in), SENT = red (money out)
-                .foregroundColor(tx.type == .received ? receivedGreen : Color.red)
+                .foregroundColor(txRowColor(tx.type))
                 .frame(width: 24)
 
             // Details
             VStack(alignment: .leading, spacing: 2) {
-                Text(tx.type == .received ? "RECEIVED" : "SENT")
+                // FIX #1367: Self-send label
+                Text(tx.type == .selfSend ? "SELF-SEND" : (tx.type == .received ? "RECEIVED" : "SENT"))
                     .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    // RECEIVED = green (money in), SENT = red (money out)
-                    .foregroundColor(tx.type == .received ? receivedGreen : Color.red)
+                    .foregroundColor(txRowColor(tx.type))
 
                 if let date = tx.dateString {
                     Text(date)
                         .font(.system(size: 9, design: .monospaced))
-                        // RECEIVED = green (money in), SENT = red (money out)
-                        .foregroundColor(tx.type == .received ? receivedGreen.opacity(0.8) : Color.red.opacity(0.7))
+                        .foregroundColor(txRowColor(tx.type).opacity(0.7))
                 }
             }
 
             Spacer()
 
-            // Amount
-            Text("\(tx.type == .received ? "+" : "-")\(String(format: "%.8f", tx.valueInZCL))")
-                .font(.system(size: 13, weight: .bold, design: .monospaced))
-                // RECEIVED = green (money in), SENT = red (money out)
-                .foregroundColor(tx.type == .received ? receivedGreen : Color.red)
+            // Amount — FIX #1367: Self-send shows "Fee:" prefix
+            if tx.type == .selfSend {
+                Text("Fee: \(String(format: "%.8f", tx.valueInZCL))")
+                    .font(.system(size: 13, weight: .bold, design: .monospaced))
+                    .foregroundColor(selfSendYellow)
+            } else {
+                Text("\(tx.type == .received ? "+" : "-")\(String(format: "%.8f", tx.valueInZCL))")
+                    .font(.system(size: 13, weight: .bold, design: .monospaced))
+                    .foregroundColor(txRowColor(tx.type))
+            }
 
             // Chevron
             Image(systemName: "chevron.right")
@@ -2537,7 +2552,8 @@ struct CypherpunkMainView: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
-        .background(Color.black.opacity(0.3))
+        // FIX #1367: Subtle yellow tint for self-send rows
+        .background(tx.type == .selfSend ? selfSendYellow.opacity(0.08) : Color.black.opacity(0.3))
         .overlay(
             Rectangle()
                 .fill(matrixGreenDarker.opacity(0.3))
@@ -2718,10 +2734,11 @@ struct CypherpunkMainView: View {
                 let items = try WalletDatabase.shared.getTransactionHistory(limit: 1000)
                 print("📜 TXHIST [S7]: getTransactionHistory returned \(items.count) items")
 
-                // Debug: count sent vs received
+                // Debug: count sent vs received vs selfSend
                 let sentCount = items.filter { $0.type == .sent }.count
                 let receivedCount = items.filter { $0.type == .received }.count
-                print("📜 TXHIST [S7]: sent=\(sentCount), received=\(receivedCount)")
+                let selfSendCount = items.filter { $0.type == .selfSend }.count
+                print("📜 TXHIST [S7]: sent=\(sentCount), received=\(receivedCount), selfSend=\(selfSendCount)")
 
                 DispatchQueue.main.async {
                     self.transactions = items

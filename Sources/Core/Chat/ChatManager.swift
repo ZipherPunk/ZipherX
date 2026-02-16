@@ -410,7 +410,7 @@ final class ChatManager: ObservableObject {
                 if !hasResumed {
                     hasResumed = true
                     connection.cancel()
-                    continuation.resume(throwing: ChatError.connectionFailed("SOCKS5 proxy connection timeout"))
+                    continuation.resume(throwing: ChatError.connectionFailed("Connection timed out. Tor may still be establishing circuits."))
                 }
             }
         }
@@ -517,29 +517,29 @@ final class ChatManager: ObservableObject {
             throw ChatError.connectionFailed("Invalid SOCKS5 connect response")
         }
 
-        // Check reply code
+        // Check reply code — user-friendly messages
         let replyCode = header[1]
         switch replyCode {
         case 0x00:
             break // Success — continue parsing
         case 0x01:
-            throw ChatError.connectionFailed("SOCKS5: General failure")
+            throw ChatError.connectionFailed("Unable to reach contact. Please try again later.")
         case 0x02:
-            throw ChatError.connectionFailed("SOCKS5: Connection not allowed")
+            throw ChatError.connectionFailed("Connection blocked by network. Please try again later.")
         case 0x03:
-            throw ChatError.connectionFailed("SOCKS5: Network unreachable")
+            throw ChatError.connectionFailed("Contact unreachable. They may be offline.")
         case 0x04:
-            throw ChatError.connectionFailed("SOCKS5: Host unreachable")
+            throw ChatError.connectionFailed("Contact unreachable. They may be offline.")
         case 0x05:
-            throw ChatError.connectionFailed("SOCKS5: Connection refused")
+            throw ChatError.connectionFailed("Contact is offline or not accepting connections.")
         case 0x06:
-            throw ChatError.connectionFailed("SOCKS5: TTL expired")
+            throw ChatError.connectionFailed("Connection timed out. Contact may be offline.")
         case 0x07:
-            throw ChatError.connectionFailed("SOCKS5: Command not supported")
+            throw ChatError.connectionFailed("Connection method not supported.")
         case 0x08:
-            throw ChatError.connectionFailed("SOCKS5: Address type not supported")
+            throw ChatError.connectionFailed("Unable to resolve contact address.")
         default:
-            throw ChatError.connectionFailed("SOCKS5: Unknown error \(replyCode)")
+            throw ChatError.connectionFailed("Connection failed (code \(replyCode)). Please try again.")
         }
 
         // FIX #1368: Parse ATYP to determine remaining bytes — drain them all from TCP buffer
@@ -1368,6 +1368,15 @@ final class ChatManager: ObservableObject {
 
     private func loadPersistentData() async {
         contacts = database.loadContacts()
+
+        // FIX #1369: Reset all contacts to offline on startup — no connections exist yet.
+        // isOnline was persisted to disk from the previous session but is stale.
+        for i in contacts.indices {
+            if contacts[i].isOnline {
+                contacts[i].isOnline = false
+                database.saveContact(contacts[i])
+            }
+        }
 
         for contact in contacts {
             var conversation = ChatConversation(contact: contact)

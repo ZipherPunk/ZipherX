@@ -1631,6 +1631,8 @@ final class WalletManager: ObservableObject {
             let corrected = try WalletDatabase.shared.correctMiscomputedSentAmounts()
             if corrected > 0 {
                 print("🔧 FIX #1367: Corrected \(corrected) sent transaction(s) with wrong amounts")
+                // FIX #1367: Notify UI to reload with updated self-send types
+                NotificationCenter.default.post(name: Notification.Name("transactionHistoryUpdated"), object: nil)
             }
         } catch {
             print("⚠️ FIX #1367: Failed to correct sent amounts: \(error)")
@@ -6184,7 +6186,14 @@ final class WalletManager: ObservableObject {
                         combinedCMUData.append(boostCMUData.suffix(from: 8))
                         for cmu in localDeltaCMUs { combinedCMUData.append(cmu) }
 
-                        print("🔧 FIX #1361: Creating \(targetCMUs.count) fresh witnesses via batch (boost:\(boostCMUCount) + delta:\(localDeltaCMUs.count) = \(totalCount) CMUs)...")
+                        let estimatedSeconds = targetCMUs.count  // ~1s per witness
+                        print("🔧 FIX #1361: Creating \(targetCMUs.count) fresh witnesses via batch (boost:\(boostCMUCount) + delta:\(localDeltaCMUs.count) = \(totalCount) CMUs, ~\(estimatedSeconds)s)...")
+
+                        // FIX #1370: Show progress with estimated time during witness rebuild
+                        await MainActor.run {
+                            self.syncStatus = "Rebuilding \(targetCMUs.count) witnesses (~\(estimatedSeconds)s)..."
+                            self.updateSyncTask(id: "witness_sync", status: .inProgress, detail: "Rebuilding \(targetCMUs.count) witnesses (~\(estimatedSeconds)s)...", progress: 0.1)
+                        }
 
                         let batchResults = ZipherXFFI.treeCreateWitnessesBatch(cmuData: combinedCMUData, targetCMUs: targetCMUs)
 
@@ -6224,6 +6233,12 @@ final class WalletManager: ObservableObject {
                         witnessIndices = updatedIndices
                         let batchElapsed = CFAbsoluteTimeGetCurrent() - batchStart
                         print("✅ FIX #1361: Created \(freshCount)/\(witnessIndices.count) fresh witnesses (\(String(format: "%.1f", batchElapsed))s)")
+
+                        // FIX #1370: Update status after completion
+                        await MainActor.run {
+                            self.syncStatus = "Witnesses rebuilt (\(freshCount)/\(witnessIndices.count))"
+                            self.updateSyncTask(id: "witness_sync", status: .completed, detail: "Rebuilt \(freshCount) witnesses in \(String(format: "%.0f", batchElapsed))s")
+                        }
                     } else {
                         print("⚠️ FIX #1361: No boost CMU cache available — witnesses will be rebuilt by FIX #1280")
                     }

@@ -739,12 +739,20 @@ struct BalanceView: View {
                     if tx.isPending { return false }
                     return true
                 }
-                // FIX #961: Removed per-render debug logging
-                // Show up to 5 recent transactions (excluding change)
+                // Show up to 10 recent transactions (excluding change)
+                // FIX #1367: Increased from 5 to 10 so self-sends are more likely visible
+                let displayed = Array(visibleTransactions.prefix(10))
+                let _ = {
+                    // FIX #1367 DEBUG: Log what's actually displayed
+                    let types = displayed.map { "\($0.type.rawValue)@\($0.height)" }
+                    print("📜 FIX #1367 DISPLAY: \(displayed.count) items: \(types)")
+                }()
                 VStack(spacing: 0) {
-                    ForEach(visibleTransactions.prefix(5), id: \.uniqueId) { tx in
+                    ForEach(displayed, id: \.uniqueId) { tx in
                         VStack(spacing: 0) {
                             transactionRow(tx)
+                                // FIX #1367: Orange tinted background for self-send rows
+                                .background(tx.type == .selfSend ? Color.yellow.opacity(0.12) : Color.clear)
                             // Separator line between rows
                             Rectangle()
                                 .fill(theme.borderColor)
@@ -826,70 +834,76 @@ struct BalanceView: View {
         return nil
     }
 
+    // FIX #1367: Bright yellow color for self-send — explicit RGB, not system Color.yellow
+    private let selfSendColor = Color(red: 1.0, green: 0.85, blue: 0.0)
+
     private func transactionRow(_ tx: TransactionHistoryItem) -> some View {
-        Button(action: {
-            selectedTransaction = tx
-            showTransactionDetail = true
-        }) {
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 8) {
-                    // Type icon with pending indicator
-                    ZStack {
-                        Image(systemName: txIcon(for: tx.type))
-                            .font(.system(size: 10))
-                            .foregroundColor(tx.isPending ? theme.warningColor : txColor(for: tx.type))
-                            .frame(width: 16)
+        // FIX #1367: Use plain view + onTapGesture instead of Button (macOS Button can tint colors)
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 8) {
+                // Type icon with pending indicator
+                ZStack {
+                    Image(systemName: txIcon(for: tx.type))
+                        .font(.system(size: 10))
+                        .foregroundColor(tx.isPending ? theme.warningColor : (tx.type == .selfSend ? selfSendColor : txColor(for: tx.type)))
+                        .frame(width: 16)
 
-                        // Pulsing dot for pending transactions
-                        if tx.isPending {
-                            Circle()
-                                .fill(theme.warningColor)
-                                .frame(width: 6, height: 6)
-                                .offset(x: 6, y: -4)
-                        }
+                    // Pulsing dot for pending transactions
+                    if tx.isPending {
+                        Circle()
+                            .fill(theme.warningColor)
+                            .frame(width: 6, height: 6)
+                            .offset(x: 6, y: -4)
                     }
+                }
 
-                    // Amount — FIX #1367: Self-sends show "Fee:" prefix in orange
-                    Text(tx.type == .selfSend ? "Fee: \(String(format: "%.8f", tx.valueInZCL))" :
-                         "\(tx.type == .sent ? "-" : "+")\(String(format: "%.8f", tx.valueInZCL))")
+                // Amount — FIX #1367: Self-sends show "Self-Send (Fee)" label in yellow
+                if tx.type == .selfSend {
+                    Text("Self-Send (Fee: \(String(format: "%.8f", tx.valueInZCL)))")
+                        .font(theme.monoFont)
+                        .foregroundColor(selfSendColor)
+                } else {
+                    Text("\(tx.type == .sent ? "-" : "+")\(String(format: "%.8f", tx.valueInZCL))")
                         .font(theme.monoFont)
                         .foregroundColor(tx.isPending ? theme.warningColor : txColor(for: tx.type))
-
-                    Spacer()
-
-                    // Status or Date/Time
-                    if tx.isPending {
-                        Text(tx.statusString)
-                            .font(theme.captionFont)
-                            .foregroundColor(theme.warningColor)
-                    } else {
-                        Text(tx.dateString ?? realBlockDateString(for: tx.height))
-                            .font(theme.captionFont)
-                            // Red for sent, green for received
-                            .foregroundColor(txColor(for: tx.type))
-                    }
                 }
 
-                // Txid preview (truncated) with confirmations
-                HStack {
-                    Text(truncatedTxid(tx.txidString))
-                        .font(.system(size: 8, design: .monospaced))
-                        .foregroundColor(theme.textSecondary)
+                Spacer()
 
-                    if tx.status == .confirmed && tx.confirmations > 0 {
-                        Text("(\(tx.confirmations) conf.)")
-                            .font(.system(size: 7, design: .monospaced))
-                            .foregroundColor(theme.textSecondary.opacity(0.7))
-                    }
+                // Status or Date/Time
+                if tx.isPending {
+                    Text(tx.statusString)
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.warningColor)
+                } else {
+                    Text(tx.dateString ?? realBlockDateString(for: tx.height))
+                        .font(theme.captionFont)
+                        .foregroundColor(tx.type == .selfSend ? selfSendColor : txColor(for: tx.type))
                 }
-                .padding(.leading, 24)
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(tx.isPending ? theme.warningColor.opacity(0.1) : theme.surfaceColor)
-            .contentShape(Rectangle())
+
+            // Txid preview (truncated) with confirmations
+            HStack {
+                Text(truncatedTxid(tx.txidString))
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundColor(theme.textSecondary)
+
+                if tx.status == .confirmed && tx.confirmations > 0 {
+                    Text("(\(tx.confirmations) conf.)")
+                        .font(.system(size: 7, design: .monospaced))
+                        .foregroundColor(theme.textSecondary.opacity(0.7))
+                }
+            }
+            .padding(.leading, 24)
         }
-        .buttonStyle(PlainButtonStyle())
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(tx.type == .selfSend ? selfSendColor.opacity(0.12) : (tx.isPending ? theme.warningColor.opacity(0.1) : theme.surfaceColor))
+        .contentShape(Rectangle())
+        .onTapGesture {
+            selectedTransaction = tx
+            showTransactionDetail = true
+        }
     }
 
     /// Truncate txid for display: first 8 + ... + last 8 characters
@@ -1733,7 +1747,7 @@ struct BalanceView: View {
         case .change:
             return theme.textSecondary
         case .selfSend:
-            return theme.warningColor
+            return .yellow  // FIX #1367: Yellow — matches fee display color, clearly distinct from red/green
         }
     }
 

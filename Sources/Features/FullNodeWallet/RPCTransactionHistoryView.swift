@@ -320,7 +320,7 @@ struct RPCTransactionHistoryView: View {
         // are Color.black in System 7 theme, making the arrow backgrounds grey.
         let txGreen = Color(red: 0.1, green: 0.7, blue: 0.2)
         let txRed = Color(red: 0.85, green: 0.15, blue: 0.15)
-        let txOrange = Color.orange  // FIX #1367: Self-send color
+        let txOrange = Color.yellow  // FIX #1367: Self-send color (yellow — distinct from red/green)
 
         // FIX #1367: Detect self-sends (address == "self")
         let isSelfSend = tx.type == .sent && tx.address == "self"
@@ -448,7 +448,7 @@ struct RPCTransactionHistoryView: View {
                     let detailGreen = Color(red: 0.1, green: 0.7, blue: 0.2)
                     let detailRed = Color(red: 0.85, green: 0.15, blue: 0.15)
                     let detailIsSelfSend = tx.type == .sent && tx.address == "self"
-                    let detailColor = detailIsSelfSend ? Color.orange : (tx.type == .received ? detailGreen : detailRed)
+                    let detailColor = detailIsSelfSend ? Color.yellow : (tx.type == .received ? detailGreen : detailRed)
                     VStack(spacing: 4) {
                         Text(detailIsSelfSend ? "Fee: \(formatBalance(tx.amount))" :
                              "\(tx.type == .received ? "+" : "-")\(formatBalance(tx.amount))")

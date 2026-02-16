@@ -283,21 +283,99 @@ struct AddNodeSheet: View {
     private var theme: AppTheme { themeManager.currentTheme }
 
     var body: some View {
+        #if os(macOS)
+        VStack(spacing: 0) {
+            HStack {
+                Button("Cancel") { isPresented = false }
+                    .buttonStyle(.plain)
+                    .foregroundColor(theme.accentColor)
+                Spacer()
+                Text("Add Node")
+                    .font(.system(size: 14, weight: .bold, design: .monospaced))
+                    .foregroundColor(theme.textPrimary)
+                Spacer()
+                Button("Add") { addNode() }
+                    .buttonStyle(.plain)
+                    .foregroundColor(host.isEmpty ? theme.textSecondary : theme.accentColor)
+                    .disabled(host.isEmpty)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 14)
+
+            Divider().background(theme.borderColor)
+
+            VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("NODE ADDRESS")
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .foregroundColor(theme.textSecondary)
+
+                    TextField("Address (IP or .onion)", text: $host)
+                        .font(.system(size: 13, design: .monospaced))
+                        .textFieldStyle(.plain)
+                        .foregroundColor(theme.textPrimary)
+                        .padding(10)
+                        .background(theme.surfaceColor)
+                        .cornerRadius(8)
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(theme.borderColor, lineWidth: 1))
+                        .disableAutocorrection(true)
+
+                    TextField("Port", text: $port)
+                        .font(.system(size: 13, design: .monospaced))
+                        .textFieldStyle(.plain)
+                        .foregroundColor(theme.textPrimary)
+                        .padding(10)
+                        .background(theme.surfaceColor)
+                        .cornerRadius(8)
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(theme.borderColor, lineWidth: 1))
+
+                    TextField("Label (optional)", text: $label)
+                        .font(.system(size: 13, design: .monospaced))
+                        .textFieldStyle(.plain)
+                        .foregroundColor(theme.textPrimary)
+                        .padding(10)
+                        .background(theme.surfaceColor)
+                        .cornerRadius(8)
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(theme.borderColor, lineWidth: 1))
+                }
+
+                Text("Supports IPv4, IPv6, or Tor v3 onion addresses.")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(theme.textSecondary)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("EXAMPLES")
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .foregroundColor(theme.textSecondary)
+                    exampleRow("IPv4", example: "185.205.246.161")
+                    exampleRow("IPv6", example: "2001:db8::1")
+                    exampleRow(".onion", example: "xyz...abc.onion")
+                }
+
+                Spacer()
+            }
+            .padding(20)
+        }
+        .background(theme.backgroundColor)
+        .frame(minWidth: 400, idealWidth: 440, maxWidth: 520,
+               minHeight: 340, idealHeight: 400, maxHeight: 480)
+        .alert("Error", isPresented: $showError) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text(errorMessage)
+        }
+        #else
         NavigationView {
             Form {
                 Section {
                     TextField("Address (IP or .onion)", text: $host)
                         .font(.system(.body, design: .monospaced))
-                        #if os(iOS)
                         .autocapitalization(.none)
-                        #endif
                         .disableAutocorrection(true)
 
                     TextField("Port", text: $port)
                         .font(.system(.body, design: .monospaced))
-                        #if os(iOS)
                         .keyboardType(.numberPad)
-                        #endif
 
                     TextField("Label (optional)", text: $label)
                         .font(.system(.body, design: .monospaced))
@@ -319,16 +397,8 @@ struct AddNodeSheet: View {
                 }
             }
             .navigationTitle("Add Node")
-            #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
-            #endif
-            // FIX #270: Hide Cancel on iOS - keep Add button for usability
             .toolbar {
-                #if os(macOS)
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { isPresented = false }
-                }
-                #endif
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Add") { addNode() }
                         .disabled(host.isEmpty)
@@ -340,9 +410,7 @@ struct AddNodeSheet: View {
                 Text(errorMessage)
             }
         }
-        #if os(macOS)
-        .frame(minWidth: 550, idealWidth: 650, maxWidth: 750,
-               minHeight: 500, idealHeight: 600, maxHeight: 700)
+        .navigationViewStyle(.stack)
         #endif
     }
 
@@ -388,21 +456,105 @@ struct EditNodeSheet: View {
     private var theme: AppTheme { themeManager.currentTheme }
 
     var body: some View {
+        #if os(macOS)
+        VStack(spacing: 0) {
+            HStack {
+                Button("Cancel") { isPresented = false }
+                    .buttonStyle(.plain)
+                    .foregroundColor(theme.accentColor)
+                Spacer()
+                Text("Edit Node")
+                    .font(.system(size: 14, weight: .bold, design: .monospaced))
+                    .foregroundColor(theme.textPrimary)
+                Spacer()
+                Button("Save") { saveNode() }
+                    .buttonStyle(.plain)
+                    .foregroundColor(theme.accentColor)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 14)
+
+            Divider().background(theme.borderColor)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("NODE ADDRESS")
+                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                            .foregroundColor(theme.textSecondary)
+
+                        TextField("Address", text: $host)
+                            .font(.system(size: 13, design: .monospaced))
+                            .textFieldStyle(.plain)
+                            .foregroundColor(theme.textPrimary)
+                            .padding(10)
+                            .background(theme.surfaceColor)
+                            .cornerRadius(8)
+                            .overlay(RoundedRectangle(cornerRadius: 8).stroke(theme.borderColor, lineWidth: 1))
+                            .disableAutocorrection(true)
+
+                        TextField("Port", text: $port)
+                            .font(.system(size: 13, design: .monospaced))
+                            .textFieldStyle(.plain)
+                            .foregroundColor(theme.textPrimary)
+                            .padding(10)
+                            .background(theme.surfaceColor)
+                            .cornerRadius(8)
+                            .overlay(RoundedRectangle(cornerRadius: 8).stroke(theme.borderColor, lineWidth: 1))
+
+                        TextField("Label", text: $label)
+                            .font(.system(size: 13, design: .monospaced))
+                            .textFieldStyle(.plain)
+                            .foregroundColor(theme.textPrimary)
+                            .padding(10)
+                            .background(theme.surfaceColor)
+                            .cornerRadius(8)
+                            .overlay(RoundedRectangle(cornerRadius: 8).stroke(theme.borderColor, lineWidth: 1))
+                    }
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("STATISTICS")
+                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                            .foregroundColor(theme.textSecondary)
+
+                        editInfoRow("Type", value: node.addressType.rawValue)
+
+                        if node.connectionAttempts > 0 {
+                            editInfoRow("Success Rate", value: "\(Int(node.successRate))%", color: node.successRate > 50 ? .green : .orange)
+                            editInfoRow("Attempts", value: "\(node.connectionAttempts)")
+                        }
+                    }
+
+                    Spacer()
+                }
+                .padding(20)
+            }
+        }
+        .background(theme.backgroundColor)
+        .frame(minWidth: 400, idealWidth: 440, maxWidth: 520,
+               minHeight: 340, idealHeight: 400, maxHeight: 480)
+        .alert("Error", isPresented: $showError) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text(errorMessage)
+        }
+        .onAppear {
+            host = node.host
+            port = String(node.port)
+            label = node.label
+        }
+        #else
         NavigationView {
             Form {
                 Section {
                     TextField("Address", text: $host)
                         .font(.system(.body, design: .monospaced))
-                        #if os(iOS)
                         .autocapitalization(.none)
-                        #endif
                         .disableAutocorrection(true)
 
                     TextField("Port", text: $port)
                         .font(.system(.body, design: .monospaced))
-                        #if os(iOS)
                         .keyboardType(.numberPad)
-                        #endif
 
                     TextField("Label", text: $label)
                         .font(.system(.body, design: .monospaced))
@@ -417,14 +569,6 @@ struct EditNodeSheet: View {
                         Text(node.addressType.rawValue)
                             .foregroundColor(theme.textSecondary)
                     }
-
-                    HStack {
-                        Text("Added")
-                        Spacer()
-                        Text(node.addedDate, style: .date)
-                            .foregroundColor(theme.textSecondary)
-                    }
-
                     if node.connectionAttempts > 0 {
                         HStack {
                             Text("Success Rate")
@@ -432,7 +576,6 @@ struct EditNodeSheet: View {
                             Text("\(Int(node.successRate))%")
                                 .foregroundColor(node.successRate > 50 ? .green : .orange)
                         }
-
                         HStack {
                             Text("Attempts")
                             Spacer()
@@ -440,7 +583,6 @@ struct EditNodeSheet: View {
                                 .foregroundColor(theme.textSecondary)
                         }
                     }
-
                     if let lastConnected = node.lastConnected {
                         HStack {
                             Text("Last Connected")
@@ -454,16 +596,8 @@ struct EditNodeSheet: View {
                 }
             }
             .navigationTitle("Edit Node")
-            #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
-            #endif
-            // FIX #270: Hide Cancel on iOS - keep Save button for usability
             .toolbar {
-                #if os(macOS)
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { isPresented = false }
-                }
-                #endif
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") { saveNode() }
                 }
@@ -479,10 +613,21 @@ struct EditNodeSheet: View {
                 label = node.label
             }
         }
-        #if os(macOS)
-        .frame(minWidth: 550, idealWidth: 650, maxWidth: 750,
-               minHeight: 550, idealHeight: 650, maxHeight: 750)
+        .navigationViewStyle(.stack)
         #endif
+    }
+
+    private func editInfoRow(_ label: String, value: String, color: Color? = nil) -> some View {
+        HStack {
+            Text(label)
+                .font(.system(size: 13, design: .monospaced))
+                .foregroundColor(theme.textSecondary)
+            Spacer()
+            Text(value)
+                .font(.system(size: 13, design: .monospaced))
+                .foregroundColor(color ?? theme.textPrimary)
+        }
+        .padding(.vertical, 4)
     }
 
     private func saveNode() {

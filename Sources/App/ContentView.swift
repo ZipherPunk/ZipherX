@@ -3002,6 +3002,10 @@ struct ContentView: View {
             if modeManager.walletSource == .walletDat {
                 FullNodeWalletView()
                     .environmentObject(themeManager)
+                    // FIX #1372: Track user activity in Full Node mode for inactivity lock
+                    .contentShape(Rectangle())
+                    .onTapGesture { recordUserActivity() }
+                    .gesture(DragGesture(minimumDistance: 0).onChanged { _ in recordUserActivity() })
             } else if isCypherpunkTheme {
                 // Cypherpunk theme: Single-screen layout with balance, buttons, history
                 cypherpunkWalletView

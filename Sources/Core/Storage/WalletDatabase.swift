@@ -5046,8 +5046,48 @@ final class WalletDatabase {
             let confirmations = Int(sqlite3_column_int(stmt, 9))
 
             let txidData = Data(bytes: txidPtr, count: Int(txidLen))
-            // FIX #1367: Detect self-send entries (to_address='self' marker)
-            let resolvedType: TransactionType = (txType == .sent && toAddress == "self") ? .selfSend : txType
+            // FIX #1367: Detect self-send — check to_address marker OR compute from notes in real-time
+            // This catches both: (1) entries corrected at startup, (2) new sends during current session
+            var resolvedType: TransactionType = txType
+            if txType == .sent {
+                if toAddress == "self" {
+                    resolvedType = .selfSend
+                } else if height > 0 {
+                    // Real-time self-send detection: check if all outputs are change
+                    // total_input - total_change_at_height <= fee + buffer → self-send
+                    let selfSendCheckSql = """
+                        SELECT
+                            COALESCE((SELECT SUM(value) FROM notes WHERE is_spent = 1 AND (spent_in_tx = ? OR spent_in_tx = ? OR spent_height = ?)), 0) as total_input,
+                            COALESCE((SELECT SUM(value) FROM notes WHERE is_spent = 0 AND received_height = ?), 0) as total_change
+                    """
+                    var checkStmt: OpaquePointer?
+                    if sqlite3_prepare_v2(db, selfSendCheckSql, -1, &checkStmt, nil) == SQLITE_OK {
+                        let SQLITE_TRANSIENT_LOCAL = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+                        // Bind txid (original byte order)
+                        _ = txidData.withUnsafeBytes { ptr in
+                            sqlite3_bind_blob(checkStmt, 1, ptr.baseAddress, Int32(txidData.count), SQLITE_TRANSIENT_LOCAL)
+                        }
+                        // Bind txid (reversed byte order)
+                        let reversedTxid = Data(txidData.reversed())
+                        _ = reversedTxid.withUnsafeBytes { ptr in
+                            sqlite3_bind_blob(checkStmt, 2, ptr.baseAddress, Int32(reversedTxid.count), SQLITE_TRANSIENT_LOCAL)
+                        }
+                        sqlite3_bind_int64(checkStmt, 3, Int64(height))
+                        sqlite3_bind_int64(checkStmt, 4, Int64(height))
+                        if sqlite3_step(checkStmt) == SQLITE_ROW {
+                            let totalInput = UInt64(sqlite3_column_int64(checkStmt, 0))
+                            let totalChange = UInt64(sqlite3_column_int64(checkStmt, 1))
+                            if totalInput > 0 && totalChange > 0 {
+                                let netSent = totalInput > (totalChange + 10000) ? totalInput - totalChange - 10000 : 0
+                                if netSent <= 1000 {
+                                    resolvedType = .selfSend
+                                }
+                            }
+                        }
+                        sqlite3_finalize(checkStmt)
+                    }
+                }
+            }
             let item = TransactionHistoryItem(
                 txid: txidData,
                 height: height,
@@ -6506,9 +6546,9 @@ final class WalletDatabase {
             guard correctSent != entry.storedValue else { continue }
 
             if correctSent <= 1000 {
-                // FIX #1367: Self-send — mark with to_address='self' and value=fee for orange display
+                // FIX #1367: Self-send — mark with to_address='self', value=fee, clear memo
                 // All outputs are change, only the network fee was spent
-                let updateSql = "UPDATE transaction_history SET value = ?, to_address = 'self' WHERE rowid = ?;"
+                let updateSql = "UPDATE transaction_history SET value = ?, to_address = 'self', memo = NULL WHERE rowid = ?;"
                 var updateStmt: OpaquePointer?
                 if sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK {
                     sqlite3_bind_int64(updateStmt, 1, Int64(fee))
@@ -6540,6 +6580,16 @@ final class WalletDatabase {
 
         if correctedCount > 0 {
             print("✅ FIX #1367: Corrected \(correctedCount) sent transaction(s) with miscomputed amounts")
+        }
+
+        // FIX #1367: Clean up FIX #843 internal memos — they're debug artifacts, not user-facing
+        let cleanupSql = "UPDATE transaction_history SET memo = NULL WHERE memo LIKE '%FIX #843%';"
+        if sqlite3_exec(db, cleanupSql, nil, nil, nil) == SQLITE_OK {
+            let cleaned = sqlite3_changes(db)
+            if cleaned > 0 {
+                print("🔧 FIX #1367: Cleaned \(cleaned) internal FIX #843 memo(s)")
+                correctedCount += Int(cleaned)
+            }
         }
 
         return correctedCount

@@ -71,7 +71,7 @@ public class RPCClient: ObservableObject {
 
     @Published public private(set) var isConnected = false
     @Published public private(set) var blockHeight: UInt64 = 0
-    @Published public private(set) var peerCount: Int = 0
+    @Published public var peerCount: Int = 0  // FIX #1373: Writable so main view can sync value
     @Published public private(set) var version: String = ""
 
     private var config: RPCConfig?
@@ -206,6 +206,26 @@ public class RPCClient: ObservableObject {
             throw RPCError.invalidResponse
         }
         return dict
+    }
+
+    /// FIX #1371: Get peer info to determine onion vs clearnet connections
+    public func getPeerInfo() async throws -> [[String: Any]] {
+        let result = try await call(method: "getpeerinfo", params: [])
+        guard let peers = result as? [[String: Any]] else {
+            throw RPCError.invalidResponse
+        }
+        return peers
+    }
+
+    /// FIX #1371: Count onion peers from getpeerinfo
+    public func getOnionPeerCount() async -> Int {
+        guard let peers = try? await getPeerInfo() else { return 0 }
+        return peers.filter { peer in
+            if let addr = peer["addr"] as? String {
+                return addr.contains(".onion")
+            }
+            return false
+        }.count
     }
 
     /// Get network info (connections, version, etc.)
@@ -743,6 +763,7 @@ public class RPCClient: ObservableObject {
         public let rescanProgress: Double // Rescan progress if rescanning
         public let rescanBlock: Int      // Current rescan block
         public let connections: Int      // Number of peer connections
+        public let onionPeers: Int      // FIX #1371: Number of .onion peer connections
         public let statusMessage: String // Human-readable status
     }
 
@@ -757,9 +778,12 @@ public class RPCClient: ObservableObject {
 
         // Get network info for connections
         var connections = 0
+        var onionPeers = 0
         if let networkInfo = try? await getNetworkInfo() {
             connections = networkInfo["connections"] as? Int ?? 0
         }
+        // FIX #1371: Count onion peers
+        onionPeers = await getOnionPeerCount()
 
         // Check for wallet rescan status
         var isRescanning = false
@@ -802,6 +826,7 @@ public class RPCClient: ObservableObject {
             rescanProgress: rescanProgress,
             rescanBlock: rescanBlock,
             connections: connections,
+            onionPeers: onionPeers,
             statusMessage: statusMessage
         )
     }

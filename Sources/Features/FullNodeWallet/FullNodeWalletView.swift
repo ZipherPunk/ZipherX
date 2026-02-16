@@ -104,6 +104,11 @@ struct FullNodeWalletView: View {
             return "Daemon Busy..."
         }
 
+        // FIX #1373: Daemon offline — RPC failed multiple times, detailedSync cleared
+        if detailedSync == nil && rpcUnavailableCount >= 2 {
+            return "Daemon Offline"
+        }
+
         if externalRescanDetected {
             return "Rescanning..."
         } else if isImporting && importRescan {
@@ -129,6 +134,11 @@ struct FullNodeWalletView: View {
             return statusBlue
         }
 
+        // FIX #1373: Daemon offline
+        if detailedSync == nil && rpcUnavailableCount >= 2 {
+            return .red
+        }
+
         if externalRescanDetected || (isImporting && importRescan) {
             return statusBlue
         } else if isImporting {
@@ -147,6 +157,10 @@ struct FullNodeWalletView: View {
         // FIX #286 v14: Daemon busy
         if daemonBusyDetected {
             return statusBlue
+        }
+        // FIX #1373: Daemon offline
+        if detailedSync == nil && rpcUnavailableCount >= 2 {
+            return .red
         }
         if isImporting || externalRescanDetected || !syncStatus.synced {
             return statusBlue
@@ -349,6 +363,29 @@ struct FullNodeWalletView: View {
                         Text("Block \(syncStatus.height)")
                             .font(theme.monoFont)
                             .foregroundColor(theme.textSecondary)
+                    }
+                    // FIX #1371: Show connected peers with onion indicator
+                    if let sync = detailedSync {
+                        HStack(spacing: 4) {
+                            Image(systemName: "network")
+                                .font(.system(size: 10))
+                            let peerWord = sync.connections == 1 ? "peer" : "peers"
+                            Text("\(sync.connections) \(peerWord)")
+                                .font(.system(size: 10, design: .monospaced))
+                            if sync.onionPeers > 0 {
+                                Text("(\(sync.onionPeers) \u{1F9C5})")
+                                    .font(.system(size: 10, design: .monospaced))
+                            }
+                        }
+                        .foregroundColor(sync.connections > 0 ? theme.textSecondary : theme.errorColor)
+                    } else {
+                        HStack(spacing: 4) {
+                            Image(systemName: "network")
+                                .font(.system(size: 10))
+                            Text("\(RPCClient.shared.peerCount) peers")
+                                .font(.system(size: 10, design: .monospaced))
+                        }
+                        .foregroundColor(RPCClient.shared.peerCount > 0 ? theme.textSecondary : theme.errorColor)
                     }
                 }
 
@@ -1600,12 +1637,16 @@ struct FullNodeWalletView: View {
 
                 Spacer()
 
-                // Connections indicator
+                // FIX #1371: Connections indicator with onion count
                 HStack(spacing: 4) {
                     Image(systemName: "network")
                         .font(.system(size: 10))
                     Text("\(sync.connections) peers")
                         .font(.system(size: 10))
+                    if sync.onionPeers > 0 {
+                        Text("(\(sync.onionPeers) \u{1F9C5})")
+                            .font(.system(size: 10))
+                    }
                 }
                 .foregroundColor(sync.connections > 0 ? theme.textSecondary : theme.errorColor)
             }
@@ -2069,6 +2110,10 @@ struct FullNodeWalletView: View {
             let status = try await RPCClient.shared.getDetailedSyncStatus()
             await MainActor.run {
                 detailedSync = status
+                // FIX #1373: Keep main page block height in sync with RPC
+                syncStatus = (height: UInt64(status.blocks), synced: !status.isSyncing && !status.isRescanning)
+                // FIX #1373: Keep RPCClient.peerCount in sync so Settings shows same value
+                RPCClient.shared.peerCount = status.connections
                 rpcUnavailableCount = 0  // Reset on success
                 daemonBusyDetected = false
             }
@@ -2084,6 +2129,16 @@ struct FullNodeWalletView: View {
                         print("📊 FIX #286 v14: Daemon busy detected after \(rpcUnavailableCount) HTTP 500 errors - likely rescanning")
                         // FIX #286 v15: Try to get real progress from debug.log
                         parseDebugLogForRescanProgress()
+                    }
+                }
+            } else {
+                // FIX #1373: Connection refused / daemon offline — clear stale status
+                await MainActor.run {
+                    rpcUnavailableCount += 1
+                    if rpcUnavailableCount >= 2 {
+                        detailedSync = nil
+                        syncStatus = (height: syncStatus.height, synced: false)
+                        RPCClient.shared.peerCount = 0
                     }
                 }
             }

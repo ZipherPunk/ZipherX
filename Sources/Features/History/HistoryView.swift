@@ -102,6 +102,8 @@ struct HistoryView: View {
                             .fill(theme.borderColor)
                             .frame(height: 1)
                     }
+                    // FIX #1367: Distinct orange background tint for self-send rows
+                    .background(transaction.type == .selfSend ? Color.yellow.opacity(0.10) : Color.clear)
                     .onTapGesture {
                         selectedTransaction = transaction
                     }
@@ -109,13 +111,22 @@ struct HistoryView: View {
             }
         }
         .background(theme.backgroundColor)
+        .onAppear {
+            // FIX #1367 DEBUG: Log self-send items in the list
+            let selfSends = transactions.filter { $0.type == .selfSend }
+            if !selfSends.isEmpty {
+                print("📜 FIX #1367: HistoryView has \(selfSends.count) self-send item(s): \(selfSends.map { "h=\($0.height)" })")
+            } else {
+                print("📜 FIX #1367: HistoryView has 0 self-send items! Types: \(Set(transactions.map { $0.type.rawValue }))")
+            }
+        }
     }
 
     // FIX #1367: Color for transaction type (green=received, red=sent, orange=self-send)
     private func txColor(_ type: TransactionType) -> Color {
         switch type {
         case .received: return theme.successColor
-        case .selfSend: return theme.warningColor
+        case .selfSend: return .yellow  // FIX #1367: Yellow — matches fee display, distinct from red/green
         default: return theme.errorColor
         }
     }
@@ -393,7 +404,7 @@ struct TransactionDetailView: View {
     private func txColor(_ type: TransactionType) -> Color {
         switch type {
         case .received: return theme.successColor
-        case .selfSend: return theme.warningColor
+        case .selfSend: return .yellow  // FIX #1367: Yellow — matches fee display, distinct from red/green
         default: return theme.errorColor
         }
     }
