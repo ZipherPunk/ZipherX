@@ -67,9 +67,15 @@ class AppUpdateChecker: ObservableObject {
                 }
 
                 guard httpResponse.statusCode == 200 else {
-                    print("⏭️ FIX #1383: GitHub API returned HTTP \(httpResponse.statusCode)")
-                    await MainActor.run {
-                        self.checkFailed = "Version check failed: GitHub returned HTTP \(httpResponse.statusCode)"
+                    if httpResponse.statusCode == 404 {
+                        // 404 = no releases published yet — this is normal, not an error
+                        print("✅ FIX #1383: No releases published yet on GitHub (404) — skipping update check")
+                        await MainActor.run { self.checkCompleted = true }
+                    } else {
+                        print("⚠️ FIX #1383: GitHub API returned HTTP \(httpResponse.statusCode)")
+                        await MainActor.run {
+                            self.checkFailed = "Version check failed: GitHub returned HTTP \(httpResponse.statusCode)"
+                        }
                     }
                     return
                 }
