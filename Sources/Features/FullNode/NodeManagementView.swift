@@ -573,6 +573,7 @@ struct NodeManagementView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
 
                 HStack(spacing: 12) {
+                    // FIX #1379: Disable bootstrap when daemon is running OR starting
                     Button(action: { viewModel.showBootstrapConfirm = true }) {
                         HStack {
                             Image(systemName: "arrow.down.doc.fill")
@@ -582,14 +583,14 @@ struct NodeManagementView: View {
                         .foregroundColor(.white)
                         .padding(.horizontal, 16)
                         .padding(.vertical, 8)
-                        .background(theme.primaryColor)
+                        .background(isDaemonRunning || isDaemonBusy ? Color.gray : theme.primaryColor)
                         .cornerRadius(theme.cornerRadius)
                     }
                     .buttonStyle(PlainButtonStyle())
-                    .disabled(viewModel.isDaemonRunning)
+                    .disabled(isDaemonRunning || isDaemonBusy)
 
-                    if viewModel.isDaemonRunning {
-                        Text("⚠️ Stop daemon first")
+                    if isDaemonRunning || isDaemonBusy {
+                        Text("Stop daemon first — wallet.dat cannot be backed up while running")
                             .font(theme.captionFont)
                             .foregroundColor(.orange)
                     }
@@ -1895,6 +1896,13 @@ class NodeManagementViewModel: ObservableObject {
     }
 
     func installBootstrapWithBackup() {
+        // FIX #1379: Refuse bootstrap install while daemon is running or starting
+        // wallet.dat backup requires daemon to be stopped
+        if isDaemonRunning || FullNodeManager.shared.daemonStatus == .starting {
+            recentErrors.insert("Cannot install bootstrap while daemon is running. Stop the daemon first.", at: 0)
+            return
+        }
+
         isOperationInProgress = true
         operationStatus = "Preparing bootstrap installation..."
 
