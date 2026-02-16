@@ -30,12 +30,10 @@ struct ChatView: View {
 
     private var theme: AppTheme { themeManager.currentTheme }
 
-    // FIX #243: Minimum peers required for stable chat
-    private let minimumPeersForChat = 3
-
-    /// Check if we have enough peers for stable chat
-    private var hasEnoughPeers: Bool {
-        networkManager.connectedPeers >= minimumPeersForChat
+    // FIX #1389: Chat uses Tor/onion, NOT P2P peers — peer count is irrelevant
+    // Chat is stable when Tor is running and chat service is available
+    private var isChatStable: Bool {
+        chatManager.isAvailable
     }
 
     /// FIX #244: Check if Tor is enabled (required for chat)
@@ -406,13 +404,13 @@ struct ChatView: View {
 
     private var statusBar: some View {
         VStack(spacing: 0) {
-            // FIX #243: Warning when not enough peers for stable chat
-            if !hasEnoughPeers {
+            // FIX #1389: Warning when chat service is not available (Tor not running)
+            if !isChatStable {
                 HStack(spacing: 6) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.system(size: 10))
                         .foregroundColor(.orange)
-                    Text("Unstable: Need \(minimumPeersForChat) peers, have \(networkManager.connectedPeers)")
+                    Text("Chat unavailable: Tor service not running")
                         .font(.system(size: 10, weight: .medium, design: .monospaced))
                         .foregroundColor(.orange)
                     Spacer()
@@ -430,7 +428,7 @@ struct ChatView: View {
                             .fill(chatStatusColor)
                             .frame(width: 10, height: 10)
 
-                        if chatManager.isAvailable && hasEnoughPeers {
+                        if chatManager.isAvailable && isChatStable {
                             Circle()
                                 .stroke(theme.accentColor, lineWidth: 2)
                                 .frame(width: 16, height: 16)
@@ -467,7 +465,7 @@ struct ChatView: View {
                 // Peer count
                 Text("\(networkManager.connectedPeers) peers")
                     .font(.system(size: 10, design: .monospaced))
-                    .foregroundColor(hasEnoughPeers ? theme.textPrimary.opacity(0.4) : .orange)
+                    .foregroundColor(isChatStable ? theme.textPrimary.opacity(0.4) : .orange)
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
@@ -475,23 +473,19 @@ struct ChatView: View {
         }
     }
 
-    // FIX #243: Chat status color based on peers and availability
+    // FIX #1389: Chat status color — based on Tor/chat availability, not P2P peers
     private var chatStatusColor: Color {
         if !chatManager.isAvailable {
             return Color.red
-        } else if !hasEnoughPeers {
-            return Color.orange
         } else {
             return theme.accentColor
         }
     }
 
-    // FIX #243: Chat status text based on peers and availability
+    // FIX #1389: Chat status text — based on Tor/chat availability, not P2P peers
     private var chatStatusText: String {
         if !chatManager.isAvailable {
             return "OFFLINE"
-        } else if !hasEnoughPeers {
-            return "UNSTABLE"
         } else {
             return "ONLINE"
         }
@@ -789,8 +783,8 @@ struct ConversationView: View {
     private var theme: AppTheme { themeManager.currentTheme }
 
     // FIX #243: Minimum peers required for stable chat
-    private let minimumPeersForChat = 3
-    private var hasEnoughPeers: Bool { networkManager.connectedPeers >= minimumPeersForChat }
+    // FIX #1389: Chat uses Tor/onion, NOT P2P peers
+    private var isChatStable: Bool { chatManager.isAvailable }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -841,6 +835,12 @@ struct ConversationView: View {
                     .padding(.horizontal, 12)
                     .padding(.vertical, 16)
                 }
+                .onAppear {
+                    // FIX #1388: Scroll to latest message when opening chat
+                    if let lastMessage = chatManager.conversations[contact.onionAddress]?.messages.last {
+                        proxy.scrollTo(lastMessage.id, anchor: .bottom)
+                    }
+                }
                 .onChange(of: chatManager.conversations[contact.onionAddress]?.messages.count) { _ in
                     if let lastMessage = chatManager.conversations[contact.onionAddress]?.messages.last {
                         withAnimation(.easeOut(duration: 0.3)) {
@@ -866,7 +866,15 @@ struct ConversationView: View {
         }
         .background(theme.backgroundColor)
         .onAppear {
+            // FIX #1387: Set selectedConversation so new messages don't increment unread badge
+            chatManager.selectedConversation = contact.onionAddress
             chatManager.markAsRead(contact: contact)
+        }
+        .onDisappear {
+            // FIX #1387: Clear selectedConversation when leaving chat
+            if chatManager.selectedConversation == contact.onionAddress {
+                chatManager.selectedConversation = nil
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .chatTypingIndicator)) { notification in
             if let onion = notification.userInfo?["onion"] as? String, onion == contact.onionAddress {
@@ -1010,13 +1018,13 @@ struct ConversationView: View {
                 .background(Color.red.opacity(0.1))
             }
 
-            // FIX #243: Warning when not enough peers for stable chat
-            if !hasEnoughPeers && !networkManager.isFeatureBlocked(.chat) {
+            // FIX #1389: Warning when chat service is not available (Tor not running)
+            if !isChatStable && !networkManager.isFeatureBlocked(.chat) {
                 HStack(spacing: 6) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.system(size: 10))
                         .foregroundColor(.orange)
-                    Text("Chat unstable: Need \(minimumPeersForChat) peers (\(networkManager.connectedPeers) connected)")
+                    Text("Chat unavailable: Tor service not running")
                         .font(.system(size: 10, weight: .medium, design: .monospaced))
                         .foregroundColor(.orange)
                     Spacer()
@@ -1093,7 +1101,7 @@ struct ConversationView: View {
     // FIX #243: Can send message only if text is not empty AND enough peers connected
     // FIX #410: Also check if chat is blocked by health check
     private var canSendMessage: Bool {
-        !messageText.isEmpty && hasEnoughPeers && !networkManager.isFeatureBlocked(.chat)
+        !messageText.isEmpty && isChatStable && !networkManager.isFeatureBlocked(.chat)
     }
 
     private func sendMessage() {
@@ -2258,7 +2266,9 @@ struct PaymentRequestSheet: View {
         // FIX #236: Handle both '.' and ',' decimal separators (locale-independent)
         let normalizedAmount = amount.replacingOccurrences(of: ",", with: ".")
         guard let amountDouble = Double(normalizedAmount) else { return }
-        let zatoshis = UInt64(amountDouble * 100_000_000)
+        // FIX #1385: Use round() to avoid floating point truncation
+        // e.g. 0.0012 * 100_000_000 = 119999.99999999999 → UInt64 truncates to 119999
+        let zatoshis = UInt64(round(amountDouble * 100_000_000))
 
         isSending = true
         errorMessage = nil
@@ -2675,7 +2685,8 @@ struct SendViewForPayment: View {
 
     private func sendPayment() {
         guard let amount = Double(prefilledAmount) else { return }
-        let amountZatoshis = UInt64(amount * 100_000_000)
+        // FIX #1385: Use round() to avoid floating point truncation
+        let amountZatoshis = UInt64(round(amount * 100_000_000))
 
         isSending = true
         sendProgress = [

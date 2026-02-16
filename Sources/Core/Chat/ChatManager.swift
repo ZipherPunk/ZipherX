@@ -1062,6 +1062,25 @@ final class ChatManager: ObservableObject {
             addMessageToConversation(message)
             database.saveMessage(message, ourOnionAddress: ourOnionAddress)
 
+            // FIX #1386: Bridge chat payment confirmations to balance view + system notifications
+            // When we receive paymentSent (someone paid our request) or paymentReceived,
+            // trigger a balance view refresh and send a payment notification
+            if message.type == .paymentSent || message.type == .paymentReceived {
+                let amount = message.paymentAmount ?? 0
+                let senderName = message.nickname ?? contacts.first(where: { $0.onionAddress == message.fromOnion })?.displayName ?? String(message.fromOnion.prefix(8)) + "..."
+
+                // Post notification to refresh balance view and transaction history
+                NotificationCenter.default.post(name: Notification.Name("transactionHistoryUpdated"), object: nil)
+                print("📜 FIX #1386: Posted transactionHistoryUpdated after chat payment confirmation from \(senderName)")
+
+                // Send system notification for incoming payment
+                if amount > 0 {
+                    let txid = message.content.replacingOccurrences(of: "Payment sent: ", with: "")
+                    NotificationManager.shared.notifyReceived(amount: amount, txid: txid)
+                    print("🔔 FIX #1386: System notification sent for chat payment of \(amount) zatoshis from \(senderName)")
+                }
+            }
+
             // Update unread count
             if selectedConversation != message.fromOnion {
                 incrementUnreadCount(for: message.fromOnion)
