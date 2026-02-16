@@ -7,6 +7,7 @@ struct FullNodeWalletView: View {
     @EnvironmentObject var themeManager: ThemeManager
     @StateObject private var rpcWallet = RPCWalletOperations.shared
     @ObservedObject private var fullNodeManager = FullNodeManager.shared  // FIX #1380: Observe daemon status
+    @ObservedObject private var appUpdateChecker = AppUpdateChecker.shared  // FIX #1383
 
     @State private var selectedTab: WalletTab = .addresses
     @State private var isLoading = true
@@ -48,6 +49,10 @@ struct FullNodeWalletView: View {
     // FIX #305: Prerequisites check state
     @State private var prerequisitesMissing = false
     @State private var prerequisitesMessage = ""
+
+    // FIX #1382: Daemon version and path display
+    @State private var daemonVersion: String?
+    @State private var daemonPath: String = FullNodeManager.daemonPath.path
 
     private var theme: AppTheme { themeManager.currentTheme }
 
@@ -267,6 +272,12 @@ struct FullNodeWalletView: View {
                 prerequisitesMessage = prereqCheck.message
             }
 
+            // FIX #1382: Load daemon version (first line only)
+            if let version = await FullNodeManager.shared.getDaemonVersion() {
+                let firstLine = version.components(separatedBy: .newlines).first ?? version
+                await MainActor.run { daemonVersion = firstLine }
+            }
+
             // Only load wallet data if prerequisites are met
             if !prereqCheck.missing {
                 await loadWalletData()
@@ -330,6 +341,36 @@ struct FullNodeWalletView: View {
         .sheet(isPresented: $showingSettings) {
             FullNodeSettingsView()
                 .environmentObject(themeManager)
+        }
+        // FIX #1383: Prompt user when newer app version is available on GitHub
+        .alert("Update Available", isPresented: Binding(
+            get: { appUpdateChecker.updateAvailable != nil },
+            set: { if !$0 { appUpdateChecker.updateAvailable = nil } }
+        )) {
+            Button("View on GitHub") {
+                appUpdateChecker.openReleaseURL()
+                appUpdateChecker.updateAvailable = nil
+            }
+            Button("Later", role: .cancel) {
+                appUpdateChecker.updateAvailable = nil
+            }
+        } message: {
+            if let info = appUpdateChecker.updateAvailable {
+                Text("ZipherX \(info.latest) is available (you have \(info.current)). Visit GitHub to download the latest version.")
+            }
+        }
+        // FIX #1383: Warn user when version check failed (no GitHub access, network issues)
+        .alert("Version Check Failed", isPresented: Binding(
+            get: { appUpdateChecker.checkFailed != nil },
+            set: { if !$0 { appUpdateChecker.dismissFailure() } }
+        )) {
+            Button("OK", role: .cancel) {
+                appUpdateChecker.dismissFailure()
+            }
+        } message: {
+            if let reason = appUpdateChecker.checkFailed {
+                Text("\(reason)\n\nThe app cannot verify if you are running the latest version. Check your internet connection or visit GitHub manually.")
+            }
         }
     }
 
@@ -435,6 +476,9 @@ struct FullNodeWalletView: View {
             .background(theme.surfaceColor)
             .cornerRadius(theme.cornerRadius)
 
+            // FIX #1382: Daemon version and path info
+            daemonInfoRow
+
             // FIX #286 v12: Rescan progress banner (local import or external rescan)
             if isRescanActive {
                 rescanProgressBanner
@@ -459,6 +503,29 @@ struct FullNodeWalletView: View {
         }
         .padding()
         .background(theme.backgroundColor)
+    }
+
+    // FIX #1382: Daemon version and path display
+    private var daemonInfoRow: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "server.rack")
+                .font(.system(size: 10))
+                .foregroundColor(theme.textSecondary)
+            if let version = daemonVersion {
+                Text(version)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(theme.textSecondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            Text(daemonPath)
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundColor(theme.textSecondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 4)
     }
 
     // FIX #305: Prerequisites warning banner

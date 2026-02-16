@@ -59,6 +59,9 @@ struct ZipherXApp: App {
             // Fetch tree info from GitHub (lightweight ~1KB manifest)
             await CommitmentTreeUpdater.shared.fetchAndUpdateTreeInfo()
 
+            // FIX #1383: Check for app updates on GitHub
+            AppUpdateChecker.shared.checkForUpdate()
+
             // Auto-start Tor if mode is enabled (for maximum privacy)
             await TorManager.shared.start()
         }

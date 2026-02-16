@@ -49,6 +49,16 @@ struct FullNodeSettingsView: View {
         }
     }
 
+    // FIX #1379: Daemon active = running, syncing, OR starting — backup not safe in any of these states
+    private var isDaemonActive: Bool {
+        switch fullNodeManager.daemonStatus {
+        case .running, .syncing, .starting:
+            return true
+        default:
+            return false
+        }
+    }
+
     private var isDaemonBusy: Bool {
         switch fullNodeManager.daemonStatus {
         case .starting, .syncing:
@@ -311,7 +321,14 @@ struct FullNodeSettingsView: View {
                 .background(Color.blue.opacity(0.1))
                 .cornerRadius(6)
                 .foregroundColor(.blue)
-                .disabled(isCreatingBackup)
+                .disabled(isCreatingBackup || isDaemonActive)
+
+                // FIX #1379: Warn user backup requires daemon to be stopped
+                if isDaemonActive {
+                    Text("(Stop daemon first)")
+                        .font(theme.captionFont)
+                        .foregroundColor(.orange)
+                }
 
                 if let success = backupSuccess {
                     Text(success)
@@ -798,6 +815,12 @@ struct FullNodeSettingsView: View {
     }
 
     private func backupWalletDat() {
+        // FIX #1379: Safety check — never backup while daemon is running or starting
+        if isDaemonActive {
+            operationError = "Cannot backup wallet.dat while daemon is running. Stop the daemon first."
+            return
+        }
+
         isCreatingBackup = true
         backupSuccess = nil
 

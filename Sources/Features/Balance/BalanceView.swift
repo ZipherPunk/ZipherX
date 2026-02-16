@@ -13,6 +13,7 @@ struct BalanceView: View {
     @EnvironmentObject var networkManager: NetworkManager
     @EnvironmentObject var themeManager: ThemeManager
     @ObservedObject private var torManager = TorManager.shared
+    @ObservedObject private var appUpdateChecker = AppUpdateChecker.shared  // FIX #1383
     #if os(macOS)
     @ObservedObject private var fullNodeManager = FullNodeManager.shared
     #endif
@@ -78,6 +79,36 @@ struct BalanceView: View {
             } message: {
                 if let info = walletManager.newerBoostAvailable {
                     Text("A newer boost file is available (height \(info.remoteHeight) vs \(info.cachedHeight)). Download for faster sync operations?")
+                }
+            }
+            // FIX #1383: Prompt user when newer app version is available on GitHub
+            .alert("Update Available", isPresented: Binding(
+                get: { appUpdateChecker.updateAvailable != nil },
+                set: { if !$0 { appUpdateChecker.updateAvailable = nil } }
+            )) {
+                Button("View on GitHub") {
+                    appUpdateChecker.openReleaseURL()
+                    appUpdateChecker.updateAvailable = nil
+                }
+                Button("Later", role: .cancel) {
+                    appUpdateChecker.updateAvailable = nil
+                }
+            } message: {
+                if let info = appUpdateChecker.updateAvailable {
+                    Text("ZipherX \(info.latest) is available (you have \(info.current)). Visit GitHub to download the latest version.")
+                }
+            }
+            // FIX #1383: Warn user when version check failed (no GitHub access, network issues)
+            .alert("Version Check Failed", isPresented: Binding(
+                get: { appUpdateChecker.checkFailed != nil },
+                set: { if !$0 { appUpdateChecker.dismissFailure() } }
+            )) {
+                Button("OK", role: .cancel) {
+                    appUpdateChecker.dismissFailure()
+                }
+            } message: {
+                if let reason = appUpdateChecker.checkFailed {
+                    Text("\(reason)\n\nThe app cannot verify if you are running the latest version. Check your internet connection or visit GitHub manually.")
                 }
             }
             .sheet(isPresented: $showTransactionDetail) {

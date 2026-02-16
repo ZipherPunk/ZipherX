@@ -2566,7 +2566,7 @@ struct CypherpunkMainView: View {
 
     private var networkStatusBar: some View {
         HStack(spacing: 8) {
-            // FIX #270: Zclassic version (left)
+            // FIX #270: Zclassic protocol version (left)
             HStack(spacing: 2) {
                 Text("ZCL")
                     .font(.system(size: 9, weight: .bold, design: .monospaced))
@@ -2574,6 +2574,11 @@ struct CypherpunkMainView: View {
                     .font(.system(size: 8, design: .monospaced))
             }
             .foregroundColor(matrixGreenDark)
+
+            // FIX #1383: ZipherX app version (dynamic from Bundle)
+            Text("ZipherX v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")")
+                .font(.system(size: 8, design: .monospaced))
+                .foregroundColor(matrixGreenDark.opacity(0.7))
 
             Spacer()
 
