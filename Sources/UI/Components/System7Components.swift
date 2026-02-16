@@ -1979,7 +1979,7 @@ struct CypherpunkMainView: View {
                 clearingTime = mempool.clearingTime
                 clearingIsOutgoing = false
                 withAnimation { showClearingCelebration = true }
-                print("🏦 FIX #1337 (onAppear): Incoming \(clearingTxAmount) ZCL")
+                print("🏦 FIX #1337 (onAppear): Incoming \(LogRedaction.redactAmount(UInt64(clearingTxAmount * 100_000_000)))")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                     networkManager.justDetectedIncomingMempool = nil
                 }
@@ -1991,7 +1991,7 @@ struct CypherpunkMainView: View {
                 clearingTime = cleared.clearingTime
                 clearingIsOutgoing = true
                 withAnimation { showClearingCelebration = true }
-                print("🏦 FIX #1337 (onAppear): Sent \(clearingTxAmount) ZCL (fee: \(clearingTxFee))")
+                print("🏦 FIX #1337 (onAppear): Sent \(LogRedaction.redactAmount(UInt64(clearingTxAmount * 100_000_000))) (fee: \(LogRedaction.redactAmount(UInt64(clearingTxFee * 100_000_000))))")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                     networkManager.justClearedOutgoing = nil
                 }
@@ -2004,7 +2004,7 @@ struct CypherpunkMainView: View {
                 settlementClearingTime = confirmed.clearingTime
                 settlementTime = confirmed.settlementTime
                 withAnimation { showSettlementCelebration = true }
-                print("⛏️ FIX #1337 (onAppear): \(settlementIsOutgoing ? "Sent" : "Received") \(settlementTxAmount) ZCL (fee: \(settlementTxFee))")
+                print("⛏️ FIX #1337 (onAppear): \(settlementIsOutgoing ? "Sent" : "Received") \(LogRedaction.redactAmount(UInt64(settlementTxAmount * 100_000_000))) (fee: \(LogRedaction.redactAmount(UInt64(settlementTxFee * 100_000_000))))")
                 if confirmed.isOutgoing { walletManager.clearBalanceBeforeLastSend() }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                     networkManager.justConfirmedTx = nil
@@ -2031,7 +2031,7 @@ struct CypherpunkMainView: View {
                 // Balance fluctuates during initial sync as notes are discovered/verified
                 // This is NOT a real incoming transaction - just sync progress
                 if walletManager.isSyncing || FilterScanner.isScanInProgress {
-                    print("💰 FIX #1106: Balance increased by \(Double(increase) / 100_000_000.0) ZCL during sync - suppressing fireworks")
+                    print("💰 FIX #1106: Balance increased by \(LogRedaction.redactAmount(increase)) during sync - suppressing fireworks")
                     previousBalance = newValue
                     return
                 }
@@ -2058,7 +2058,7 @@ struct CypherpunkMainView: View {
                 if !isLikelyChangeOutput, let balanceBeforeSend = walletManager.balanceBeforeLastSend {
                     if newValue <= balanceBeforeSend {
                         isLikelyChangeOutput = true
-                        print("💰 Change detection (balance): newBalance=\(newValue) <= balanceBeforeSend=\(balanceBeforeSend)")
+                        print("💰 Change detection (balance): newBalance=\(LogRedaction.redactAmount(newValue)) <= balanceBeforeSend=\(LogRedaction.redactAmount(balanceBeforeSend))")
                     }
                 }
 
@@ -2067,11 +2067,11 @@ struct CypherpunkMainView: View {
                     withAnimation {
                         showFireworks = true
                     }
-                    print("🎆 FIREWORKS! Received \(fireworksAmount) ZCL!")
+                    print("🎆 FIREWORKS! Received \(LogRedaction.redactAmount(increase))")
                     // Clear tracking after real incoming is processed
                     walletManager.clearBalanceBeforeLastSend()
                 } else {
-                    print("💰 Balance increased by \(Double(increase) / 100_000_000.0) ZCL (change output - no fireworks)")
+                    print("💰 Balance increased by \(LogRedaction.redactAmount(increase)) (change output - no fireworks)")
                     // Change output detected means our tx was mined!
                     // Clear tracking after a brief delay to ensure UI is stable
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
@@ -2116,7 +2116,7 @@ struct CypherpunkMainView: View {
                 withAnimation {
                     showClearingCelebration = true
                 }
-                print("🏦 FIX #1337: CLEARING! Incoming \(clearingTxAmount) ZCL in tx \(mempool.txid.prefix(12))...")
+                print("🏦 FIX #1337: CLEARING! Incoming \(LogRedaction.redactAmount(UInt64(clearingTxAmount * 100_000_000))) in tx \(mempool.txid.prefix(12))...")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                     networkManager.justDetectedIncomingMempool = nil
                 }
@@ -2132,7 +2132,7 @@ struct CypherpunkMainView: View {
                 withAnimation {
                     showClearingCelebration = true
                 }
-                print("🏦 FIX #1337: CLEARING! Sent \(clearingTxAmount) ZCL (fee: \(clearingTxFee)) in \(String(format: "%.1f", cleared.clearingTime))s")
+                print("🏦 FIX #1337: CLEARING! Sent \(LogRedaction.redactAmount(UInt64(clearingTxAmount * 100_000_000))) (fee: \(LogRedaction.redactAmount(UInt64(clearingTxFee * 100_000_000)))) in \(String(format: "%.1f", cleared.clearingTime))s")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                     networkManager.justClearedOutgoing = nil
                 }
@@ -2149,7 +2149,7 @@ struct CypherpunkMainView: View {
                 withAnimation {
                     showSettlementCelebration = true
                 }
-                print("⛏️ FIX #1337: SETTLEMENT! \(settlementIsOutgoing ? "Sent" : "Received") \(settlementTxAmount) ZCL (fee: \(settlementTxFee))")
+                print("⛏️ FIX #1337: SETTLEMENT! \(settlementIsOutgoing ? "Sent" : "Received") \(LogRedaction.redactAmount(UInt64(settlementTxAmount * 100_000_000))) (fee: \(LogRedaction.redactAmount(UInt64(settlementTxFee * 100_000_000))))")
                 if confirmed.isOutgoing {
                     walletManager.clearBalanceBeforeLastSend()
                 }

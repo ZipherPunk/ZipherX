@@ -1253,6 +1253,125 @@ final class WalletDatabase {
                 print("🔐 Migration 17: Backfilled encrypted shadow columns for \(backfillCount) notes (TASK 16)")
             }
         }
+
+        // PRIVACY: P-DB-001 — Migration 18: Diversified address tracking for address rotation
+        let divAddrColumns = getTableColumns("diversified_addresses")
+        if divAddrColumns.isEmpty {
+            let createTableSql = """
+                CREATE TABLE IF NOT EXISTS diversified_addresses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER NOT NULL,
+                    diversifier_index INTEGER NOT NULL,
+                    address TEXT NOT NULL,
+                    label TEXT,
+                    is_current INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                    UNIQUE(account_id, diversifier_index),
+                    FOREIGN KEY (account_id) REFERENCES accounts(id)
+                );
+            """
+            if sqlite3_exec(db, createTableSql, nil, nil, nil) == SQLITE_OK {
+                // Create index for current address lookup
+                let indexSql = """
+                    CREATE INDEX IF NOT EXISTS idx_div_addr_current
+                    ON diversified_addresses(account_id, is_current);
+                """
+                sqlite3_exec(db, indexSql, nil, nil, nil)
+
+                // Seed with existing default address (index 0) for backward compatibility
+                if let account = try? getAccount(index: 0) {
+                    let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+                    let seedSql = "INSERT OR IGNORE INTO diversified_addresses (account_id, diversifier_index, address, is_current, label) VALUES (?, 0, ?, 1, 'Default');"
+                    var seedStmt: OpaquePointer?
+                    if sqlite3_prepare_v2(db, seedSql, -1, &seedStmt, nil) == SQLITE_OK {
+                        sqlite3_bind_int64(seedStmt, 1, account.accountId)
+                        sqlite3_bind_text(seedStmt, 2, account.address, -1, SQLITE_TRANSIENT)
+                        sqlite3_step(seedStmt)
+                        sqlite3_finalize(seedStmt)
+                    }
+                }
+                print("✅ P-DB-001: Created diversified_addresses table")
+            } else {
+                print("⚠️ P-DB-001: Migration error (non-fatal): \(String(cString: sqlite3_errmsg(db)))")
+            }
+        }
+    }
+
+    // MARK: - Privacy: Diversified Address Helpers
+
+    /// PRIVACY: P-DB-001 — Insert a new diversified address
+    func insertDiversifiedAddress(accountId: Int64, diversifierIndex: UInt64, address: String, label: String? = nil) throws {
+        try executeInTransaction {
+            let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+            let sql = "INSERT OR IGNORE INTO diversified_addresses (account_id, diversifier_index, address, label, is_current) VALUES (?, ?, ?, ?, 0);"
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+            }
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_bind_int64(stmt, 1, accountId)
+            sqlite3_bind_int64(stmt, 2, Int64(bitPattern: diversifierIndex))
+            sqlite3_bind_text(stmt, 3, address, -1, SQLITE_TRANSIENT)
+            if let label = label {
+                sqlite3_bind_text(stmt, 4, label, -1, SQLITE_TRANSIENT)
+            } else {
+                sqlite3_bind_null(stmt, 4)
+            }
+            guard sqlite3_step(stmt) == SQLITE_DONE else {
+                throw DatabaseError.insertFailed(String(cString: sqlite3_errmsg(db)))
+            }
+        }
+    }
+
+    /// PRIVACY: P-DB-001 — Set the current diversified address for an account
+    func setCurrentDiversifiedAddress(accountId: Int64, diversifierIndex: UInt64) throws {
+        try executeInTransaction {
+            // Clear current flag on all addresses for this account
+            let clearSql = "UPDATE diversified_addresses SET is_current = 0 WHERE account_id = ?;"
+            var clearStmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, clearSql, -1, &clearStmt, nil) == SQLITE_OK {
+                sqlite3_bind_int64(clearStmt, 1, accountId)
+                sqlite3_step(clearStmt)
+                sqlite3_finalize(clearStmt)
+            }
+
+            // Set new current
+            let setSql = "UPDATE diversified_addresses SET is_current = 1 WHERE account_id = ? AND diversifier_index = ?;"
+            var setStmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, setSql, -1, &setStmt, nil) == SQLITE_OK {
+                sqlite3_bind_int64(setStmt, 1, accountId)
+                sqlite3_bind_int64(setStmt, 2, Int64(bitPattern: diversifierIndex))
+                sqlite3_step(setStmt)
+                sqlite3_finalize(setStmt)
+            }
+        }
+    }
+
+    /// PRIVACY: P-DB-001 — Get the current diversifier index for an account
+    func getCurrentDiversifierIndex(accountId: Int64) -> UInt64 {
+        let sql = "SELECT diversifier_index FROM diversified_addresses WHERE account_id = ? AND is_current = 1 LIMIT 1;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return 0 }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, accountId)
+        if sqlite3_step(stmt) == SQLITE_ROW {
+            return UInt64(bitPattern: sqlite3_column_int64(stmt, 0))
+        }
+        return 0
+    }
+
+    /// PRIVACY: P-DB-001 — Get the highest diversifier index for an account
+    func getHighestDiversifierIndex(accountId: Int64) -> UInt64 {
+        let sql = "SELECT MAX(diversifier_index) FROM diversified_addresses WHERE account_id = ?;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return 0 }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, accountId)
+        if sqlite3_step(stmt) == SQLITE_ROW {
+            let val = sqlite3_column_int64(stmt, 0)
+            return val > 0 ? UInt64(bitPattern: val) : 0
+        }
+        return 0
     }
 
     // MARK: - Account Operations
@@ -1638,7 +1757,7 @@ final class WalletDatabase {
             let spentStatus = isSpent == 1 ? "SPENT" : "UNSPENT"
             let witnessStatus = hasWitness ? "✅" : "❌"
 
-            print("📝 Note \(id): value=\(value) zatoshis (\(Double(value)/100000000.0) ZCL), height=\(height), \(spentStatus), witness=\(witnessStatus)")
+            print("📝 Note \(id): value=\(LogRedaction.redactAmount(UInt64(value))), height=\(height), \(spentStatus), witness=\(witnessStatus)")
             print("   diversifier: \(divHex.prefix(22))...")
 
             if isSpent == 1 {
@@ -1651,9 +1770,9 @@ final class WalletDatabase {
         }
 
         print("📊 ===== SUMMARY =====")
-        print("📊 Unspent notes: \(unspentCount), Total: \(totalUnspent) zatoshis (\(Double(totalUnspent)/100000000.0) ZCL)")
-        print("📊 Spent notes: \(spentCount), Total: \(totalSpent) zatoshis (\(Double(totalSpent)/100000000.0) ZCL)")
-        print("📊 Grand total: \(totalUnspent + totalSpent) zatoshis (\(Double(totalUnspent + totalSpent)/100000000.0) ZCL)")
+        print("📊 Unspent notes: \(unspentCount), Total: \(LogRedaction.redactAmount(UInt64(totalUnspent)))")
+        print("📊 Spent notes: \(spentCount), Total: \(LogRedaction.redactAmount(UInt64(totalSpent)))")
+        print("📊 Grand total: \(LogRedaction.redactAmount(UInt64(totalUnspent + totalSpent)))")
         print("📊 ================================")
     }
 
@@ -4181,7 +4300,7 @@ final class WalletDatabase {
 
         for note in affectedNotes {
             let valueZCL = Double(note.value) / 100_000_000.0
-            print("✅ FIX #1168: Restored note #\(note.id) (\(String(format: "%.8f", valueZCL)) ZCL) - TX was rejected by network")
+            print("✅ FIX #1168: Restored note #\(note.id) (\(LogRedaction.redactAmount(note.value))) - TX was rejected by network")
         }
 
         return (count: updated, totalValue: totalValue)
@@ -4277,7 +4396,7 @@ final class WalletDatabase {
         }
 
         let updated = Int(sqlite3_changes(db))
-        print("🔧 FIX #360: Unmarked \(updated) notes with boost placeholder txids (total value: \(Double(totalValue) / 100_000_000) ZCL)")
+        print("🔧 FIX #360: Unmarked \(updated) notes with boost placeholder txids (total value: \(LogRedaction.redactAmount(UInt64(totalValue))))")
 
         return (updated, totalValue)
     }
@@ -6858,7 +6977,7 @@ final class WalletDatabase {
                     if deleted > 0 {
                         let txidHex = tx.txid.map { String(format: "%02x", $0) }.joined()
                         let changeZCL = Double(tx.changeAmount) / 100_000_000.0
-                        print("🧹 FIX #852: Deleted mislabeled 'received' entry: \(txidHex.prefix(16))... (\(changeZCL) ZCL was change)")
+                        print("🧹 FIX #852: Deleted mislabeled 'received' entry: \(txidHex.prefix(16))... (\(LogRedaction.redactAmount(UInt64(max(0, tx.changeAmount)))) was change)")
                         cleanedCount += deleted
                     }
                 }
@@ -6938,7 +7057,7 @@ final class WalletDatabase {
                             let displayTxid = Data(tx.spentTxid.reversed())
                             let txidHex = displayTxid.map { String(format: "%02x", $0) }.joined()
                             let sentZCL = Double(sentAmount) / 100_000_000.0
-                            print("📤 FIX #852: Created missing 'sent' entry: \(txidHex.prefix(16))... (\(sentZCL) ZCL)")
+                            print("📤 FIX #852: Created missing 'sent' entry: \(txidHex.prefix(16))... (\(LogRedaction.redactAmount(UInt64(max(0, sentAmount)))))")
                         }
                         sqlite3_finalize(insertStmt)
                     }
@@ -7060,7 +7179,7 @@ final class WalletDatabase {
                     sqlite3_bind_int64(updateStmt, 2, entry.rowid)
                     if sqlite3_step(updateStmt) == SQLITE_DONE && sqlite3_changes(db) > 0 {
                         let oldZCL = String(format: "%.8f", Double(entry.storedValue) / 100_000_000.0)
-                        print("🔧 FIX #1367: Marked self-send α entry at h=\(entry.blockHeight): was \(oldZCL) ZCL → fee only (all outputs are change)")
+                        print("🔧 FIX #1367: Marked self-send α entry at h=\(entry.blockHeight): was \(LogRedaction.redactAmount(UInt64(entry.storedValue))) → fee only (all outputs are change)")
                         correctedCount += 1
                     }
                     sqlite3_finalize(updateStmt)
@@ -7075,7 +7194,7 @@ final class WalletDatabase {
                     if sqlite3_step(updateStmt) == SQLITE_DONE && sqlite3_changes(db) > 0 {
                         let oldZCL = String(format: "%.8f", Double(entry.storedValue) / 100_000_000.0)
                         let newZCL = String(format: "%.8f", Double(correctSent) / 100_000_000.0)
-                        print("🔧 FIX #1367: Corrected sent amount at h=\(entry.blockHeight): \(oldZCL) → \(newZCL) ZCL (was missing \(totalChange) zatoshis change)")
+                        print("🔧 FIX #1367: Corrected sent amount at h=\(entry.blockHeight): \(LogRedaction.redactAmount(UInt64(entry.storedValue))) → \(LogRedaction.redactAmount(correctSent)) (was missing \(totalChange) zatoshis change)")
                         correctedCount += 1
                     }
                     sqlite3_finalize(updateStmt)
@@ -7285,9 +7404,9 @@ final class WalletDatabase {
                 let sentZCL = Double(sentAmount) / 100_000_000.0
 
                 print("🔍 FIX #1084 v2: Detected mislabeled change at height \(rx.blockHeight):")
-                print("   Input note #\(inputNoteId) at height \(inputHeight): \(inputZCL) ZCL (marked unspent but likely spent)")
-                print("   Change note #\(rx.noteId) at height \(rx.blockHeight): \(changeZCL) ZCL (recorded as 'received')")
-                print("   Implied sent amount: \(sentZCL) ZCL + 0.0001 fee")
+                print("   Input note #\(inputNoteId) at height \(inputHeight): \(LogRedaction.redactAmount(UInt64(max(0, inputValue)))) (marked unspent but likely spent)")
+                print("   Change note #\(rx.noteId) at height \(rx.blockHeight): \(LogRedaction.redactAmount(UInt64(max(0, rx.value)))) (recorded as 'received')")
+                print("   Implied sent amount: \(LogRedaction.redactAmount(UInt64(max(0, sentAmount)))) + 0.0001 fee")
 
                 // Fix: Mark input note as spent, delete "received" entry, add "sent" entry
                 // Step 2a: Mark input note as spent

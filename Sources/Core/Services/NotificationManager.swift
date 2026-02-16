@@ -90,7 +90,7 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         guard !shouldSuppressNotifications else { return }
 
         let zcl = Double(amount) / 100_000_000.0
-        print("🔔 Notification: +\(zcl) ZCL incoming (mempool)")
+        print("🔔 Notification: +\(amount.redactedAmount) incoming (mempool)")
 
         let content = UNMutableNotificationContent()
         content.title = "Incoming ZCL"
@@ -125,7 +125,7 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         guard !shouldSuppressNotifications else { return }
 
         let zcl = Double(amount) / 100_000_000.0
-        print("🔔 Notification: +\(zcl) ZCL confirmed")
+        print("🔔 Notification: +\(amount.redactedAmount) confirmed")
 
         // Remove the pending "Incoming" notification for this txid
         // This replaces the "Awaiting confirmation" message with "Received"
@@ -165,7 +165,7 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         guard !shouldSuppressNotifications else { return }
 
         let zcl = Double(amount) / 100_000_000.0
-        print("🔔 Notification: -\(zcl) ZCL confirmed")
+        print("🔔 Notification: -\(amount.redactedAmount) confirmed")
 
         let content = UNMutableNotificationContent()
         content.title = "⛏️ Transaction Mined"
@@ -194,9 +194,10 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
 
         let zcl = Double(amount) / 100_000_000.0
         print("🔔 NOTIFICATION: notifySent called")
-        print("   amount=\(amount) (\(zcl) ZCL)")
+        print("   amount=\(amount.redactedAmount)")
         print("   txid=\(txid.prefix(16))...")
-        print("   memo=\(memo ?? "nil")")
+        // PRIVACY: P-META-003 — Redact memo content from logs
+        print("   memo=\(LogRedaction.redactMemo(memo))")
         print("   >>> Sending SENT notification (tx broadcast)")
 
         let content = UNMutableNotificationContent()
@@ -230,7 +231,7 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
     func notifyExternalWalletSpend(amount: UInt64, txid: String) {
         let zcl = Double(amount) / 100_000_000.0
         print("🚨 NOTIFICATION: notifyExternalWalletSpend called")
-        print("   amount=\(amount) (\(zcl) ZCL)")
+        print("   amount=\(amount.redactedAmount)")
         print("   txid=\(txid.prefix(16))...")
         print("   >>> ALERT: External wallet spent our funds!")
 

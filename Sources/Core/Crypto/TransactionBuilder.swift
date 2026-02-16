@@ -206,7 +206,17 @@ final class TransactionBuilder {
         // CURRENT LIMITATION: Single-note transactions only
         // Find the largest note that can cover the amount + fee
         let requiredAmount = amount + DEFAULT_FEE
-        let sortedNotes = notes.sorted { $0.value > $1.value }
+        // PRIVACY: P-TX-001 — Randomized note selection to prevent UTXO fingerprinting
+        let shuffledNotes = notes.shuffled()
+        let sortedNotes: [SpendableNote]
+        if let exactFit = shuffledNotes.first(where: { $0.value >= requiredAmount && $0.value <= requiredAmount * 2 }) {
+            sortedNotes = [exactFit] + shuffledNotes.filter { $0.position != exactFit.position }
+        } else {
+            sortedNotes = shuffledNotes.sorted { a, b in
+                if Bool.random() && Bool.random() { return a.value < b.value }
+                return a.value > b.value
+            }
+        }
 
         // Find a single note large enough for the transaction
         guard let note = sortedNotes.first(where: { $0.value >= requiredAmount }) else {
@@ -216,16 +226,16 @@ final class TransactionBuilder {
             let totalBalance = notes.reduce(0) { $0 + $1.value }
 
             print("❌ No single note large enough for this transaction")
-            print("   Required: \(requiredAmount) zatoshis (amount: \(amount) + fee: \(DEFAULT_FEE))")
-            print("   Largest note: \(largestNote) zatoshis")
-            print("   Max sendable: \(maxSendable) zatoshis (\(Double(maxSendable) / 100_000_000) ZCL)")
-            print("   Total balance: \(totalBalance) zatoshis across \(notes.count) notes")
+            print("   Required: \(requiredAmount.redactedAmount) (amount: \(amount.redactedAmount) + fee: \(DEFAULT_FEE.redactedAmount))")
+            print("   Largest note: \(largestNote.redactedAmount)")
+            print("   Max sendable: \(maxSendable.redactedAmount)")
+            print("   Total balance: \(totalBalance.redactedAmount) across \(notes.count) notes")
             print("   NOTE: Multi-input transactions not yet supported - must use single note")
 
             throw TransactionError.noteLargeEnough(largestNote: largestNote, required: requiredAmount)
         }
 
-        print("📝 Selected note: \(note.value) zatoshis at height \(note.height)")
+        print("📝 Selected note: \(note.value.redactedAmount) at height \(note.height)") // PRIVACY: Intentionally unredacted for critical diagnostics
 
         // Prepare memo (512 bytes)
         var memoData = Data(repeating: 0, count: 512)
@@ -397,7 +407,7 @@ final class TransactionBuilder {
         print("🔍 FIX #982: Note components being sent to Rust FFI:")
         print("   Diversifier: \(note.diversifier.map { String(format: "%02x", $0) }.joined())")
         print("   RCM: \(note.rcm.prefix(8).map { String(format: "%02x", $0) }.joined())...")
-        print("   Value: \(note.value) zatoshis")
+        print("   Value: \(note.value.redactedAmount)")
         if let cmu = noteCMU {
             print("   Stored CMU: \(cmu.prefix(8).map { String(format: "%02x", $0) }.joined())...")
             // Also print reversed CMU for comparison with Rust logs
@@ -672,12 +682,22 @@ final class TransactionBuilder {
 
         // Note selection - prefer single note, fall back to multi-input
         let requiredAmount = amount + DEFAULT_FEE
-        let sortedNotes = notes.sorted { $0.value > $1.value }
+        // PRIVACY: P-TX-001 — Randomized note selection to prevent UTXO fingerprinting
+        let shuffledNotes = notes.shuffled()
+        let sortedNotes: [SpendableNote]
+        if let exactFit = shuffledNotes.first(where: { $0.value >= requiredAmount && $0.value <= requiredAmount * 2 }) {
+            sortedNotes = [exactFit] + shuffledNotes.filter { $0.position != exactFit.position }
+        } else {
+            sortedNotes = shuffledNotes.sorted { a, b in
+                if Bool.random() && Bool.random() { return a.value < b.value }
+                return a.value > b.value
+            }
+        }
         let totalBalance = notes.reduce(0) { $0 + $1.value }
 
         // Check if we have enough total balance
         guard totalBalance >= requiredAmount else {
-            print("❌ Insufficient total balance: have \(totalBalance), need \(requiredAmount)")
+            print("❌ Insufficient total balance: have \(totalBalance.redactedAmount), need \(requiredAmount.redactedAmount)")
             throw TransactionError.insufficientFunds
         }
 
@@ -685,7 +705,7 @@ final class TransactionBuilder {
         var selectedNotes: [SpendableNote] = []
         if let singleNote = sortedNotes.first(where: { $0.value >= requiredAmount }) {
             selectedNotes = [singleNote]
-            print("📝 Single note selected: \(singleNote.value) zatoshis at height \(singleNote.height)")
+            print("📝 Single note selected: \(singleNote.value.redactedAmount) at height \(singleNote.height)")
         } else {
             // Multi-input mode: select notes until we have enough
             print("📝 No single note large enough, using multi-input mode...")
@@ -693,7 +713,7 @@ final class TransactionBuilder {
             for note in sortedNotes {
                 selectedNotes.append(note)
                 accumulated += note.value
-                print("   + Note: \(note.value) zatoshis (running total: \(accumulated))")
+                print("   + Note: \(note.value.redactedAmount) (running total: \(accumulated.redactedAmount))")
                 if accumulated >= requiredAmount {
                     break
                 }
@@ -1540,11 +1560,20 @@ final class TransactionBuilder {
     }
 
     private func selectNotes(_ notes: [SpendableNote], targetAmount: UInt64) throws -> ([SpendableNote], UInt64) {
-        // Simple greedy selection
+        // PRIVACY: P-TX-001 — Randomized note selection to prevent UTXO fingerprinting
         var selected: [SpendableNote] = []
         var total: UInt64 = 0
 
-        let sortedNotes = notes.sorted { $0.value > $1.value }
+        let shuffledNotes = notes.shuffled()
+        let sortedNotes: [SpendableNote]
+        if let exactFit = shuffledNotes.first(where: { $0.value >= targetAmount && $0.value <= targetAmount * 2 }) {
+            sortedNotes = [exactFit] + shuffledNotes.filter { $0.position != exactFit.position }
+        } else {
+            sortedNotes = shuffledNotes.sorted { a, b in
+                if Bool.random() && Bool.random() { return a.value < b.value }
+                return a.value > b.value
+            }
+        }
 
         for note in sortedNotes {
             selected.append(note)

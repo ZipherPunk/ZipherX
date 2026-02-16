@@ -972,29 +972,26 @@ private class CertificatePinningDelegate: NSObject, URLSessionDelegate {
             }
         }
 
-        // Always allow the connection (TLS is still valid)
         let credential = URLCredential(trust: serverTrust)
 
         if foundMatch {
             // Pin matched - all good
             completionHandler(.useCredential, credential)
         } else {
-            // Pin mismatch - WARN but allow (certificate might have rotated)
+            // PRIVACY: P-META-002 — Pin mismatch = potential MITM, BLOCK connection
             if !hasShownWarning {
                 hasShownWarning = true
-                print("⚠️ [TLS Pinning] Certificate pin mismatch for \(host)")
-                print("⚠️ [TLS Pinning] Current leaf hash: \(leafHash)")
-                print("⚠️ [TLS Pinning] This may indicate certificate rotation or MITM attack")
-                print("⚠️ [TLS Pinning] Connection allowed but verify you're on a trusted network")
+                print("🚨 [TLS Pinning] Certificate pin mismatch for \(host) — connection BLOCKED")
+                print("🚨 [TLS Pinning] Leaf hash: \(leafHash)")
+                print("🚨 [TLS Pinning] This may indicate certificate rotation or MITM attack")
 
-                // Notify the app to show a warning to the user
                 DispatchQueue.main.async {
                     self.onCertificateWarning?(leafHash)
                 }
             }
 
-            // Allow connection - TLS is still valid, just pin mismatch
-            completionHandler(.useCredential, credential)
+            // BLOCK connection on pin mismatch (fail secure)
+            completionHandler(.cancelAuthenticationChallenge, nil)
         }
     }
 

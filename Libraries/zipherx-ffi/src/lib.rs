@@ -66,7 +66,7 @@ use zcash_primitives::{
         Rseed,
         note_encryption::{try_sapling_note_decryption, try_sapling_output_recovery, PreparedIncomingViewingKey, SaplingDomain},
     },
-    zip32::{ChildIndex, sapling::ExtendedSpendingKey},
+    zip32::{ChildIndex, DiversifierIndex, sapling::ExtendedSpendingKey},
     transaction::{
         builder::Builder,
         components::Amount,
@@ -473,14 +473,22 @@ pub unsafe extern "C" fn zipherx_derive_address(
         Err(_) => return false,
     };
 
-    // Get default address (uses diversifier index 0 by default)
-    // or find address at specific index
+    // PRIVACY: P-ADDR-003 — Support diversified address derivation
+    let dfvk = account_key.to_diversifiable_full_viewing_key();
     let (_, addr) = if diversifier_index == 0 {
-        account_key.default_address()
+        dfvk.default_address()
     } else {
-        // For non-zero index, we need to use the diversifier key
-        // For now, just use default
-        account_key.default_address()
+        let j = DiversifierIndex::from(diversifier_index);
+        match dfvk.find_address(j) {
+            Some((_, address)) => {
+                // find_address returns the next VALID diversifier >= j
+                (j, address)
+            }
+            None => {
+                debug_log!("zipherx_derive_address: no valid diversifier at index {}", diversifier_index);
+                return false;
+            }
+        }
     };
 
     // Serialize address: diversifier (11) + pk_d (32) = 43 bytes
@@ -2107,8 +2115,20 @@ pub unsafe extern "C" fn zipherx_build_transaction(
                 return false;
             }
         };
-        // Send change back to sender's default address
-        let (_, change_addr) = extsk.default_address();
+        // PRIVACY: P-ADDR-002 — Use diversified change address (external scope, high index)
+        // MUST stay in external scope so IVK-based scanning can discover change notes.
+        // Uses index range >= 1_000_000_000 to separate from receive addresses (0..999_999_999).
+        let dfvk_change = extsk.to_diversifiable_full_viewing_key();
+        let change_diversifier_base: u64 = 1_000_000_000;
+        let change_index = change_diversifier_base + (change as u64 % 1_000_000);
+        let change_j = DiversifierIndex::from(change_index);
+        let (_, change_addr) = match dfvk_change.find_address(change_j) {
+            Some(result) => result,
+            None => {
+                debug_log!("P-ADDR-002: find_address failed at index {}, using default", change_index);
+                dfvk_change.default_address()
+            }
+        };
         if let Err(e) = builder.add_sapling_output(
             Some(extsk.expsk.ovk),
             change_addr,
@@ -2529,7 +2549,18 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi(
                 return false;
             }
         };
-        let (_, change_addr) = extsk.default_address();
+        // PRIVACY: P-ADDR-002 — Use diversified change address (external scope, high index)
+        let dfvk_change = extsk.to_diversifiable_full_viewing_key();
+        let change_diversifier_base: u64 = 1_000_000_000;
+        let change_index = change_diversifier_base + (change as u64 % 1_000_000);
+        let change_j = DiversifierIndex::from(change_index);
+        let (_, change_addr) = match dfvk_change.find_address(change_j) {
+            Some(result) => result,
+            None => {
+                debug_log!("P-ADDR-002: find_address failed at index {}, using default", change_index);
+                dfvk_change.default_address()
+            }
+        };
         if let Err(e) = builder.add_sapling_output(
             Some(extsk.expsk.ovk),
             change_addr,
@@ -6896,7 +6927,18 @@ pub unsafe extern "C" fn zipherx_build_transaction_encrypted(
                 return false;
             }
         };
-        let (_, change_addr) = extsk.default_address();
+        // PRIVACY: P-ADDR-002 — Use diversified change address (external scope, high index)
+        let dfvk_change = extsk.to_diversifiable_full_viewing_key();
+        let change_diversifier_base: u64 = 1_000_000_000;
+        let change_index = change_diversifier_base + (change as u64 % 1_000_000);
+        let change_j = DiversifierIndex::from(change_index);
+        let (_, change_addr) = match dfvk_change.find_address(change_j) {
+            Some(result) => result,
+            None => {
+                debug_log!("P-ADDR-002: find_address failed at index {}, using default", change_index);
+                dfvk_change.default_address()
+            }
+        };
         if let Err(e) = builder.add_sapling_output(
             Some(extsk.expsk.ovk),
             change_addr,
@@ -7370,7 +7412,18 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi_encrypted(
                 return false;
             }
         };
-        let (_, change_addr) = extsk.default_address();
+        // PRIVACY: P-ADDR-002 — Use diversified change address (external scope, high index)
+        let dfvk_change = extsk.to_diversifiable_full_viewing_key();
+        let change_diversifier_base: u64 = 1_000_000_000;
+        let change_index = change_diversifier_base + (change as u64 % 1_000_000);
+        let change_j = DiversifierIndex::from(change_index);
+        let (_, change_addr) = match dfvk_change.find_address(change_j) {
+            Some(result) => result,
+            None => {
+                debug_log!("P-ADDR-002: find_address failed at index {}, using default", change_index);
+                dfvk_change.default_address()
+            }
+        };
         if let Err(e) = builder.add_sapling_output(
             Some(extsk.expsk.ovk),
             change_addr,

@@ -826,7 +826,7 @@ final class FilterScanner {
                         // FIX #469: Pass custom detail to preserve the descriptive message
                         self.reportPhase1Progress(subProgress, height: self.currentChainHeight, maxHeight: targetHeight, customDetail: detail)
                     }
-                    print("🦀 Rust scan complete: \(result.notesFound) notes, \(result.notesSpent) spent, balance: \(Double(result.balance) / 100_000_000) ZCL")
+                    print("🦀 Rust scan complete: \(result.notesFound) notes, \(result.notesSpent) spent, balance: \(result.balance.redactedAmount)")
                     usedRustBoostScan = true
 
                     // Skip to PHASE 2 since boost file covers everything up to phase1EndHeight
@@ -2497,7 +2497,7 @@ final class FilterScanner {
                 print("✅ FIX #1082: All notes have valid witnesses")
             } else {
                 let valueZCL = Double(missingValue) / 100_000_000.0
-                print("⚠️ FIX #1082: \(missingCount) notes still without witnesses (\(String(format: "%.8f", valueZCL)) ZCL)")
+                print("⚠️ FIX #1082: \(missingCount) notes still without witnesses (\(missingValue.redactedAmount))")
                 print("   📍 Min note height: \(minHeight)")
                 print("   🔧 FIX #1082: Triggering post-scan witness rebuild...")
 

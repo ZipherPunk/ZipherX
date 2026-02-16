@@ -12,6 +12,7 @@ struct ReceiveView: View {
     @EnvironmentObject var walletManager: WalletManager
     @EnvironmentObject var themeManager: ThemeManager
     @State private var showCopied = false
+    @State private var isGenerating = false
 
     // Theme shortcut
     private var theme: AppTheme { themeManager.currentTheme }
@@ -28,6 +29,23 @@ struct ReceiveView: View {
                 // Copy button
                 System7Button(title: "Copy Address") {
                     copyAddress()
+                }
+
+                // PRIVACY: P-ADDR-004 — Address rotation for privacy
+                System7Button(title: isGenerating ? "Generating..." : "New Address") {
+                    guard !isGenerating else { return }
+                    isGenerating = true
+                    Task {
+                        do {
+                            let (_, index) = try await walletManager.generateNextDiversifiedAddress()
+                            print("🔄 ReceiveView: New address generated at index \(index)")
+                        } catch {
+                            print("⚠️ ReceiveView: Address generation failed: \(error)")
+                        }
+                        await MainActor.run {
+                            isGenerating = false
+                        }
+                    }
                 }
 
                 // Privacy notice

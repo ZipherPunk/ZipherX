@@ -111,7 +111,7 @@ final class WalletHealthCheck {
         // Also set FIX #1104 timestamp for backward compatibility
         defaults.set(Date().timeIntervalSince1970, forKey: "FIX1104_BalanceVerifiedTimestamp")
 
-        print("✅ FIX #1126: Saved verified state - tree=\(treeSize), witnesses=\(witnessCount), balance=\(Double(balance)/100_000_000.0) ZCL")
+        print("✅ FIX #1126: Saved verified state - tree=\(treeSize), witnesses=\(witnessCount), balance=\(LogRedaction.redactAmount(balance)) ZCL")
     }
 
     /// Invalidate verified state (call when database is modified)
@@ -1777,7 +1777,7 @@ final class WalletHealthCheck {
             let valueZCL = Double(totalValue) / 100_000_000.0
 
             print("🚨 FIX #876: CRITICAL - \(count) notes without witnesses!")
-            print("   💰 Total value affected: \(String(format: "%.8f", valueZCL)) ZCL")
+            print("   💰 Total value affected: \(LogRedaction.redactAmount(totalValue)) ZCL")
             print("   📍 Min note height: \(minHeight) (boost file ends at \(boostFileEndHeight))")
 
             // FIX #1082: Check if notes are ONLY in boost range (can rebuild instantly)
