@@ -54,6 +54,10 @@ struct FullNodeWalletView: View {
     @State private var daemonVersion: String?
     @State private var daemonPath: String = FullNodeManager.daemonPath.path
 
+    // FIX #1384: Prevent double-load when switching modes
+    // Track whether .task initial load is done so onChange doesn't redundantly reload
+    @State private var hasLoadedOnce = false
+
     private var theme: AppTheme { themeManager.currentTheme }
 
     // FIX #305: Check if Full Node prerequisites are met
@@ -281,6 +285,7 @@ struct FullNodeWalletView: View {
             // Only load wallet data if prerequisites are met
             if !prereqCheck.missing {
                 await loadWalletData()
+                await MainActor.run { hasLoadedOnce = true }  // FIX #1384
                 // FIX #286 v12: Check for external rescan on startup
                 await checkExternalRescanStatus()
                 // FIX #1273: Start polling AFTER auth + data load (onAppear skips when not authenticated)
@@ -317,7 +322,9 @@ struct FullNodeWalletView: View {
         }
         .onChange(of: fullNodeManager.daemonStatus.isRunning) { isRunning in
             // FIX #1380: Auto-reload wallet data when daemon transitions to running
-            // Only reload if NOT currently loading (prevents double-load on initial appear)
+            // FIX #1384: onChange fires on first observation when daemon is already running,
+            // causing a redundant reload after .task already loaded data. Skip the first fire.
+            guard hasLoadedOnce else { return }
             if isRunning && !isLoading {
                 Task {
                     await loadWalletData()
