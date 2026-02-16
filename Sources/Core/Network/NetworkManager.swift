@@ -4606,8 +4606,7 @@ public final class NetworkManager: ObservableObject {
             // Track as pending outgoing so BalanceView shows "awaiting confirmation"
             await MainActor.run {
                 self.mempoolOutgoing = sentAmount + fee
-                WalletManager.shared.balanceBeforeLastSend = WalletManager.shared.shieldedBalance
-                WalletManager.shared.lastSendTimestamp = Date()
+                WalletManager.shared.recordBalanceBeforeExternalSpend()
             }
             // Track TX for confirmation monitoring
             _ = await txTrackingState.trackOutgoingSimple(txid: txidDisplayHex, amount: sentAmount)

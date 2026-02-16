@@ -408,6 +408,14 @@ final class WalletManager: ObservableObject {
         lastSendTimestamp = Date()
     }
 
+    /// FIX #1398: Record balance snapshot before an external spend is detected
+    /// Called by NetworkManager when another wallet spends our notes
+    @MainActor
+    func recordBalanceBeforeExternalSpend() {
+        balanceBeforeLastSend = shieldedBalance
+        lastSendTimestamp = Date()
+    }
+
     /// Increment the transaction history version to trigger UI updates
     @MainActor
     func incrementHistoryVersion() {
@@ -2214,8 +2222,7 @@ final class WalletManager: ObservableObject {
                 // The note must be restored to unspent since the TX was rejected by the network
                 if let (restoredCount, restoredValue) = try? WalletDatabase.shared.restoreNotesSpentByPhantomTx(txid: txidWireFormat),
                    restoredCount > 0 {
-                    let restoredZCL = Double(restoredValue) / 100_000_000.0
-                    print("✅ FIX #1168: Restored \(restoredCount) note(s) totaling \(String(format: "%.8f", restoredZCL)) ZCL from phantom TX")
+                    print("✅ FIX #1168: Restored \(restoredCount) note(s) totaling \(restoredValue.redactedAmount) from phantom TX")
                 }
 
                 // Delete from transaction_history database (if it exists there)
@@ -2403,8 +2410,7 @@ final class WalletManager: ObservableObject {
                         // FIX #1168: FIRST restore notes spent by this phantom TX
                         if let (restoredCount, restoredValue) = try? WalletDatabase.shared.restoreNotesSpentByPhantomTx(txid: tx.txid),
                            restoredCount > 0 {
-                            let restoredZCL = Double(restoredValue) / 100_000_000.0
-                            print("✅ FIX #1168: Restored \(restoredCount) note(s) totaling \(String(format: "%.8f", restoredZCL)) ZCL")
+                            print("✅ FIX #1168: Restored \(restoredCount) note(s) totaling \(restoredValue.redactedAmount)")
                         }
                         if let deletedValue = try? WalletDatabase.shared.deletePhantomTransaction(txid: tx.txid) {
                             print("🗑️ FIX #975: Deleted phantom TX (value: \(deletedValue) zatoshis)")
@@ -2472,8 +2478,7 @@ final class WalletManager: ObservableObject {
                     // FIX #1168: FIRST restore notes spent by this phantom TX
                     if let (restoredCount, restoredValue) = try? WalletDatabase.shared.restoreNotesSpentByPhantomTx(txid: tx.txid),
                        restoredCount > 0 {
-                        let restoredZCL = Double(restoredValue) / 100_000_000.0
-                        print("✅ FIX #1221: Restored \(restoredCount) note(s) totaling \(String(format: "%.8f", restoredZCL)) ZCL from phantom TX")
+                        print("✅ FIX #1221: Restored \(restoredCount) note(s) totaling \(restoredValue.redactedAmount) from phantom TX")
                     }
 
                     // Delete the phantom TX from transaction_history
@@ -4288,12 +4293,11 @@ final class WalletManager: ObservableObject {
                         // Refresh shieldedBalance and notify UI so user sees correct balance.
                         if postVerifyBalance != preVerifyBalance {
                             let restoredDiff = Int64(postVerifyBalance) - Int64(preVerifyBalance)
-                            let diffZCL = Double(restoredDiff) / 100_000_000.0
-                            print("💰 FIX #1245: Balance changed during verification: \(String(format: "%+.8f", diffZCL)) ZCL (restored phantom/orphan notes)")
+                            print("💰 FIX #1245: Balance changed during verification: \(UInt64(abs(restoredDiff)).redactedAmount) (restored phantom/orphan notes)")
                             await MainActor.run {
                                 WalletManager.shared.shieldedBalance = postVerifyBalance
                                 NotificationCenter.default.post(name: Notification.Name("transactionHistoryUpdated"), object: nil)
-                                print("✅ FIX #1245: UI balance refreshed to \(postVerifyBalance) zatoshis")
+                                print("✅ FIX #1245: UI balance refreshed to \(postVerifyBalance.redactedAmount)")
                             }
                         }
 
@@ -8927,7 +8931,7 @@ final class WalletManager: ObservableObject {
                 self.balanceIntegrityMessage = "Full Rescan found 0 notes - data may be corrupted"
             } else if finalNoteCount > 0 && finalBalance >= 0 {
                 // Balance looks valid
-                print("✅ FIX #1098: Balance verification PASSED - \(finalNoteCount) notes, \(Double(finalBalance) / 100_000_000.0) ZCL")
+                print("✅ FIX #1098: Balance verification PASSED - \(finalNoteCount) notes, \(finalBalance.redactedAmount)")
                 self.balanceIntegrityIssue = false
                 self.balanceIntegrityMessage = nil
 
@@ -10575,9 +10579,9 @@ final class WalletManager: ObservableObject {
 
         // Read balance on main thread to avoid stale value
         let currentBalance = await MainActor.run { shieldedBalance }
-        print("📤 Send check: amount=\(amount), fee=\(fee), total=\(totalRequired), balance=\(currentBalance)")
+        print("📤 Send check: amount=\(amount), fee=\(fee), total=\(totalRequired), balance=\(currentBalance)") // PRIVACY: Intentionally unredacted for critical diagnostics
         guard totalRequired <= currentBalance else {
-            print("❌ Insufficient funds: need \(totalRequired) zatoshis (amount: \(amount) + fee: \(fee)), have \(currentBalance)")
+            print("❌ Insufficient funds: need \(totalRequired) zatoshis (amount: \(amount) + fee: \(fee)), have \(currentBalance)") // PRIVACY: Intentionally unredacted for critical diagnostics
             throw WalletError.insufficientFunds
         }
         print("✅ Balance check passed")
@@ -10900,6 +10904,43 @@ final class WalletManager: ObservableObject {
         let fvk = try RustBridge.shared.deriveFullViewingKey(from: saplingSpendingKey)
         let address = try RustBridge.shared.derivePaymentAddress(from: fvk)
         return address
+    }
+
+    // PRIVACY: P-ADDR-001 — Diversified address rotation
+
+    /// Generate the next diversified receive address
+    /// Returns the new address string and its diversifier index
+    func generateNextDiversifiedAddress(label: String? = nil) async throws -> (String, UInt64) {
+        let db = WalletDatabase.shared
+
+        // Get highest used index
+        let highestIndex = db.getHighestDiversifierIndex(accountId: 1)
+        let nextIndex = highestIndex + 1
+
+        // Derive address at next index via FFI
+        let spendingKey = try secureStorage.retrieveSpendingKey()
+        let saplingKey = SaplingSpendingKey(data: spendingKey)
+        let fvk = try RustBridge.shared.deriveFullViewingKey(from: saplingKey)
+        let newAddress = try RustBridge.shared.derivePaymentAddress(from: fvk, diversifierIndex: nextIndex)
+
+        // Store in database
+        try db.insertDiversifiedAddress(
+            accountId: 1,
+            diversifierIndex: nextIndex,
+            address: newAddress,
+            label: label
+        )
+        try db.setCurrentDiversifiedAddress(accountId: 1, diversifierIndex: nextIndex)
+
+        // Update published property on main thread
+        await MainActor.run {
+            self.zAddress = newAddress
+            // Persist to UserDefaults for quick startup
+            UserDefaults.standard.set(newAddress, forKey: "z_address")
+        }
+
+        print("🔄 P-ADDR-001: Rotated to address at diversifier index \(nextIndex)")
+        return (newAddress, nextIndex)
     }
 
     // MARK: - Persistence
@@ -12361,8 +12402,7 @@ final class WalletManager: ObservableObject {
             }
         }
 
-        let totalZCL = Double(totalValue) / 100_000_000.0
-        print("📊 FIX #563 v19: Checked \(spentNotes.count) spent notes (\(String(format: "%.8f", totalZCL)) ZCL)")
+        print("📊 FIX #563 v19: Checked \(spentNotes.count) spent notes (\(totalValue.redactedAmount))")
 
         if unmarkedCount > 0 {
             print("✅ FIX #563 v19: UNMARKED \(unmarkedCount) incorrectly marked notes!")
@@ -13129,7 +13169,7 @@ final class WalletManager: ObservableObject {
                 print("🔧 FIX #1090: Note \(note.id) at height \(note.height) has WRONG nullifier!")
                 print("   Old (wrong): \(oldPrefix)... (position was placeholder)")
                 print("   New (correct): \(newPrefix)... (position=\(note.witnessIndex))")
-                print("   Value: \(Double(note.value) / 100_000_000.0) ZCL")
+                print("   Value: \(note.value.redactedAmount)")
 
                 // Update the database with correct nullifier
                 // Note: updateNoteNullifier takes RAW nullifier and hashes it internally
