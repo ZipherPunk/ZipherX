@@ -16,6 +16,7 @@ struct NodeManagementView: View {
 
     /// Check if daemon is in a startup/syncing state (prevents duplicate starts)
     /// FIX #316: Also check if bootstrap is starting/syncing the daemon
+    /// FIX #1378: Also check if ViewModel has an operation in progress
     private var isDaemonBusy: Bool {
         // Check FullNodeManager status
         switch fullNodeManager.daemonStatus {
@@ -33,10 +34,12 @@ struct NodeManagementView: View {
             break
         }
 
+        // FIX #1378: Check ViewModel's operation-in-progress flag
         return viewModel.isOperationInProgress
     }
 
     /// FIX #316: Check if daemon is actually running (from any source)
+    /// FIX #1378: Also check ViewModel's isDaemonRunning (set by pgrep process check on refresh)
     private var isDaemonRunning: Bool {
         // Check FullNodeManager
         if fullNodeManager.daemonStatus.isRunning {
@@ -48,8 +51,13 @@ struct NodeManagementView: View {
         case .complete, .syncingBlocks:
             return true
         default:
-            return false
+            break
         }
+
+        // FIX #1378: Check ViewModel's pgrep-based daemon detection
+        // This catches the case where daemon was started, user closed settings, and reopened
+        // before RPC connects — FullNodeManager status is still .unknown but process IS running
+        return viewModel.isDaemonRunning
     }
 
     /// FIX #316: Get status text when daemon is busy
@@ -635,31 +643,45 @@ Continue?
 
             VStack(spacing: 12) {
                 // wallet.dat backup
-                HStack {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("wallet.dat")
-                            .font(theme.bodyFont)
-                            .foregroundColor(theme.textPrimary)
-                        Text(viewModel.walletDatExists ? "File exists" : "Not found")
-                            .font(theme.captionFont)
-                            .foregroundColor(viewModel.walletDatExists ? .green : .orange)
-                    }
-
-                    Spacer()
-
-                    Button(action: { viewModel.backupWalletDat() }) {
-                        HStack {
-                            Image(systemName: "square.and.arrow.down")
-                            Text("Backup")
+                // FIX #1379: Backup only available when daemon is stopped (file locked while running)
+                VStack(spacing: 6) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("wallet.dat")
+                                .font(theme.bodyFont)
+                                .foregroundColor(theme.textPrimary)
+                            Text(viewModel.walletDatExists ? "File exists" : "Not found")
+                                .font(theme.captionFont)
+                                .foregroundColor(viewModel.walletDatExists ? .green : .orange)
                         }
-                        .font(theme.captionFont)
-                        .foregroundColor(theme.primaryColor)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-                        .overlay(Rectangle().stroke(theme.primaryColor, lineWidth: 1))
+
+                        Spacer()
+
+                        Button(action: { viewModel.backupWalletDat() }) {
+                            HStack {
+                                Image(systemName: "square.and.arrow.down")
+                                Text("Backup")
+                            }
+                            .font(theme.captionFont)
+                            .foregroundColor(isDaemonRunning ? theme.textSecondary : theme.primaryColor)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .overlay(Rectangle().stroke(isDaemonRunning ? theme.textSecondary : theme.primaryColor, lineWidth: 1))
+                        }
+                        .buttonStyle(PlainButtonStyle())
+                        .disabled(!viewModel.walletDatExists || isDaemonRunning)
                     }
-                    .buttonStyle(PlainButtonStyle())
-                    .disabled(!viewModel.walletDatExists)
+
+                    // FIX #1379: Show warning when daemon is running
+                    if isDaemonRunning && viewModel.walletDatExists {
+                        HStack(spacing: 4) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.system(size: 10))
+                            Text("Stop the daemon before backing up wallet.dat")
+                                .font(.system(size: 10))
+                        }
+                        .foregroundColor(.orange)
+                    }
                 }
 
                 Divider()
@@ -1579,6 +1601,9 @@ class NodeManagementViewModel: ObservableObject {
         isOperationInProgress = true
         operationProgress = 0.0
         operationStatus = "Initializing..."
+
+        // FIX #1378: Mark daemon as starting in FullNodeManager so state persists across view recreations
+        FullNodeManager.shared.markDaemonStarting()
 
         Task {
             do {

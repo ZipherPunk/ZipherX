@@ -6,6 +6,7 @@ import SwiftUI
 struct FullNodeWalletView: View {
     @EnvironmentObject var themeManager: ThemeManager
     @StateObject private var rpcWallet = RPCWalletOperations.shared
+    @ObservedObject private var fullNodeManager = FullNodeManager.shared  // FIX #1380: Observe daemon status
 
     @State private var selectedTab: WalletTab = .addresses
     @State private var isLoading = true
@@ -104,6 +105,11 @@ struct FullNodeWalletView: View {
             return "Daemon Busy..."
         }
 
+        // FIX #1380: Daemon starting — show "Starting..." instead of "Offline" while RPC not yet available
+        if case .starting = fullNodeManager.daemonStatus {
+            return "Daemon Starting..."
+        }
+
         // FIX #1373: Daemon offline — RPC failed multiple times, detailedSync cleared
         if detailedSync == nil && rpcUnavailableCount >= 2 {
             return "Daemon Offline"
@@ -134,6 +140,11 @@ struct FullNodeWalletView: View {
             return statusBlue
         }
 
+        // FIX #1380: Daemon starting — use blue (in progress), not red (error)
+        if case .starting = fullNodeManager.daemonStatus {
+            return statusBlue
+        }
+
         // FIX #1373: Daemon offline
         if detailedSync == nil && rpcUnavailableCount >= 2 {
             return .red
@@ -156,6 +167,10 @@ struct FullNodeWalletView: View {
         }
         // FIX #286 v14: Daemon busy
         if daemonBusyDetected {
+            return statusBlue
+        }
+        // FIX #1380: Daemon starting
+        if case .starting = fullNodeManager.daemonStatus {
             return statusBlue
         }
         // FIX #1373: Daemon offline
@@ -289,6 +304,14 @@ struct FullNodeWalletView: View {
             // FIX #286 v17: Stop pending TX monitoring
             stopPendingTxMonitoring()
         }
+        .onChange(of: fullNodeManager.daemonStatus.isRunning) { isRunning in
+            // FIX #1380: Auto-reload wallet data when daemon transitions to running
+            if isRunning {
+                Task {
+                    await loadWalletData()
+                }
+            }
+        }
         .sheet(isPresented: $showingSendSheet) {
             RPCSendView(addresses: zAddresses + tAddresses, onSendSuccess: {
                 // FIX #286 v17: Refresh wallet data after successful send
@@ -320,9 +343,18 @@ struct FullNodeWalletView: View {
                         .font(theme.captionFont)
                         .foregroundColor(theme.textSecondary)
 
+                    // FIX #1380: Show loading state while gathering wallet data
+                    if isLoading {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                                .scaleEffect(0.8)
+                            Text("Loading wallet data...")
+                                .font(.system(size: 18, weight: .medium, design: .monospaced))
+                                .foregroundColor(theme.textSecondary)
+                        }
                     // FIX #1272: During pending z_sendmany, z_getbalance excludes locked notes
                     // making balance appear dramatically lower. Show message instead of wrong number.
-                    if hasPendingTransactions {
+                    } else if hasPendingTransactions {
                         Text("Pending confirmation...")
                             .font(.system(size: 22, weight: .semibold, design: .monospaced))
                             .foregroundColor(statusBlue)
@@ -734,21 +766,38 @@ struct FullNodeWalletView: View {
     private var addressListContent: some View {
         ScrollView {
             VStack(spacing: 16) {
-                // Toggle for showing empty addresses
-                HStack {
-                    Spacer()
-                    Toggle("Show empty addresses", isOn: $showEmptyAddresses)
-                        .font(theme.captionFont)
-                        .toggleStyle(.checkbox)
+                // FIX #1380: Show loading placeholder while gathering wallet data
+                if isLoading {
+                    VStack(spacing: 16) {
+                        Spacer().frame(height: 40)
+                        ProgressView()
+                            .scaleEffect(1.2)
+                        Text("Connecting to daemon and loading addresses...")
+                            .font(theme.bodyFont)
+                            .foregroundColor(theme.textSecondary)
+                        Text("This may take a few seconds")
+                            .font(theme.captionFont)
+                            .foregroundColor(theme.textSecondary.opacity(0.7))
+                        Spacer()
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    // Toggle for showing empty addresses
+                    HStack {
+                        Spacer()
+                        Toggle("Show empty addresses", isOn: $showEmptyAddresses)
+                            .font(theme.captionFont)
+                            .toggleStyle(.checkbox)
+                    }
+
+                    // Z-Addresses section (filtered)
+                    let filteredZ = showEmptyAddresses ? zAddresses : zAddresses.filter { $0.balance > 0 }
+                    addressSection(title: "Shielded Addresses (Z)", addresses: filteredZ, isShielded: true, totalCount: zAddresses.count)
+
+                    // T-Addresses section (filtered)
+                    let filteredT = showEmptyAddresses ? tAddresses : tAddresses.filter { $0.balance > 0 }
+                    addressSection(title: "Transparent Addresses (T)", addresses: filteredT, isShielded: false, totalCount: tAddresses.count)
                 }
-
-                // Z-Addresses section (filtered)
-                let filteredZ = showEmptyAddresses ? zAddresses : zAddresses.filter { $0.balance > 0 }
-                addressSection(title: "Shielded Addresses (Z)", addresses: filteredZ, isShielded: true, totalCount: zAddresses.count)
-
-                // T-Addresses section (filtered)
-                let filteredT = showEmptyAddresses ? tAddresses : tAddresses.filter { $0.balance > 0 }
-                addressSection(title: "Transparent Addresses (T)", addresses: filteredT, isShielded: false, totalCount: tAddresses.count)
             }
             .padding()
         }
@@ -1572,16 +1621,25 @@ struct FullNodeWalletView: View {
                 daemonBusyStatusBar
             } else if actionsDisabled && !isLoading {
                 // Fallback to simple message if detailed sync not available
+                // FIX #1375: Red for daemon offline, blue for syncing/starting
+                let isDaemonStarting: Bool = { if case .starting = fullNodeManager.daemonStatus { return true }; return false }()
+                let isDaemonOffline = !isDaemonStarting && detailedSync == nil && rpcUnavailableCount >= 2
+                let bannerColor = isDaemonOffline ? Color.red : statusBlue
+                let bannerIcon = isDaemonOffline ? "bolt.slash.fill" : (isDaemonStarting ? "hourglass" : "exclamationmark.triangle.fill")
                 HStack(spacing: 6) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundColor(statusBlue)
+                    if isDaemonStarting {
+                        ProgressView()
+                            .scaleEffect(0.6)
+                    }
+                    Image(systemName: bannerIcon)
+                        .foregroundColor(bannerColor)
                     Text(actionsDisabledReason)
                         .font(.system(size: 10))
-                        .foregroundColor(statusBlue)
+                        .foregroundColor(bannerColor)
                 }
                 .padding(.vertical, 6)
                 .frame(maxWidth: .infinity)
-                .background(statusBlue.opacity(0.1))
+                .background(bannerColor.opacity(0.1))
             }
 
             HStack(spacing: 16) {
@@ -1893,6 +1951,16 @@ struct FullNodeWalletView: View {
             return "Daemon busy (likely rescanning) - RPC unavailable"
         }
 
+        // FIX #1380: Daemon starting — show "starting" message, not "not running"
+        if case .starting = fullNodeManager.daemonStatus {
+            return "Daemon is starting - please wait..."
+        }
+
+        // FIX #1375: Daemon offline — don't say "syncing" when daemon is stopped
+        if detailedSync == nil && rpcUnavailableCount >= 2 {
+            return "Daemon is not running - start it from Settings"
+        }
+
         if externalRescanDetected {
             return "External rescan in progress - please wait (\(Int(externalRescanProgress * 100))%)"
         } else if isImporting && importRescan {
@@ -1999,6 +2067,9 @@ struct FullNodeWalletView: View {
             await MainActor.run {
                 errorMessage = error.localizedDescription
                 isLoading = false
+                // FIX #1375: If initial load fails, daemon is likely offline — set count so
+                // status immediately shows "Daemon is not running" instead of "Wallet syncing"
+                rpcUnavailableCount = 2
             }
         }
     }
@@ -2108,6 +2179,7 @@ struct FullNodeWalletView: View {
     private func updateDetailedSyncStatus() async {
         do {
             let status = try await RPCClient.shared.getDetailedSyncStatus()
+            let wasOffline = await MainActor.run { rpcUnavailableCount >= 2 }
             await MainActor.run {
                 detailedSync = status
                 // FIX #1373: Keep main page block height in sync with RPC
@@ -2116,6 +2188,11 @@ struct FullNodeWalletView: View {
                 RPCClient.shared.peerCount = status.connections
                 rpcUnavailableCount = 0  // Reset on success
                 daemonBusyDetected = false
+            }
+            // FIX #1380: Auto-reload wallet data when daemon comes back online
+            if wasOffline {
+                print("📊 FIX #1380: Daemon came online — reloading wallet data")
+                await loadWalletData()
             }
         } catch {
             // FIX #286 v14: Track consecutive HTTP 500 errors - likely daemon rescanning

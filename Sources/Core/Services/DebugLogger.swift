@@ -88,11 +88,11 @@ final class DebugLogger {
         return AppDirectories.logs
     }
 
-    /// Check if debug logging is enabled (always true now - FIX #763)
+    /// FIX #1376: Debug logging can be disabled by the user from Settings.
+    /// When disabled, log file writes are suppressed (console output still works).
     var isEnabled: Bool {
-        get { true }  // FIX #763: Always enabled
+        get { UserDefaults.standard.object(forKey: "debugLoggingEnabled") == nil ? true : UserDefaults.standard.bool(forKey: "debugLoggingEnabled") }
         set {
-            // Kept for backward compatibility with Settings UI
             UserDefaults.standard.set(newValue, forKey: "debugLoggingEnabled")
         }
     }
@@ -212,10 +212,10 @@ final class DebugLogger {
     // MARK: - File Writing (Thread-Safe)
 
     /// Write directly to log file (called by global print override)
-    /// This is the core method that ensures all output goes to file
+    /// FIX #1376: Respects isEnabled — when disabled, file writes are suppressed
     func writeToFile(_ message: String) {
         queue.async { [weak self] in
-            guard let self = self else { return }
+            guard let self = self, self.isEnabled else { return }
 
             let logMessage = message.hasSuffix("\n") ? message : message + "\n"
             guard let data = logMessage.data(using: .utf8) else { return }
@@ -314,15 +314,15 @@ final class DebugLogger {
         }
     }
 
-    /// Clear the current log file (starts fresh within same session)
+    /// Clear the current log file
+    /// FIX #1376: Just clears the file. Does NOT restart session header (that would write to a "cleared" file).
     func clearLog() {
         queue.async { [weak self] in
             guard let self = self else { return }
             try? "".write(to: self.logFileURL, atomically: true, encoding: .utf8)
         }
         // Use Swift.print to avoid recursion
-        Swift.print("[FIX #763] 🗑️ Debug log cleared")
-        logSessionStart()
+        Swift.print("[FIX #1376] 🗑️ Debug log cleared")
     }
 
     /// Add system info header to log (legacy method - now called automatically)

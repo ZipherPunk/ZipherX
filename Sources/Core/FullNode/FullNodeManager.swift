@@ -34,6 +34,9 @@ public class FullNodeManager: ObservableObject {
     /// Set to false when daemon is restarted (in startDaemon)
     @Published public private(set) var needsTorRestart: Bool = false
 
+    /// FIX #1378: Timestamp when daemon was marked as starting (for timeout)
+    private var startingTimestamp: Date?
+
     // MARK: - Daemon Status
 
     public enum DaemonStatus: Equatable {
@@ -291,9 +294,20 @@ public class FullNodeManager: ObservableObject {
             return
         }
 
-        // Binary exists but daemon not running
-        // FIX #1052: Suppress routine "not running" logs (called every 5s)
-        daemonStatus = hasBlockchain ? .installed : .notInstalled
+        // Binary exists but daemon not running via RPC
+        // FIX #1378: Don't override .starting status — daemon may be loading block index
+        // before RPC is available. Only reset when we're sure it's not starting.
+        if case .starting = daemonStatus {
+            // Timeout after 2 minutes — if daemon hasn't connected by then, it failed
+            if let ts = startingTimestamp, Date().timeIntervalSince(ts) > 120 {
+                startingTimestamp = nil
+                daemonStatus = hasBlockchain ? .installed : .notInstalled
+            }
+            // Otherwise keep .starting — RPC not yet available but daemon may still be launching
+        } else {
+            // FIX #1052: Suppress routine "not running" logs (called every 5s)
+            daemonStatus = hasBlockchain ? .installed : .notInstalled
+        }
     }
 
     /// Check blockchain sync status and get block height
@@ -378,6 +392,17 @@ public class FullNodeManager: ObservableObject {
 
     // MARK: - Daemon Control
 
+    /// FIX #1378: Allow external callers to mark daemon as starting
+    /// Used by NodeManagementViewModel when it launches the daemon directly
+    public func markDaemonStarting() {
+        Task { @MainActor in
+            if !daemonStatus.isRunning {
+                daemonStatus = .starting
+                startingTimestamp = Date()
+            }
+        }
+    }
+
     /// Start the daemon (if not already running)
     /// IMPORTANT: Never stops an already running daemon!
     public func startDaemon() async throws {
@@ -393,6 +418,7 @@ public class FullNodeManager: ObservableObject {
 
         await MainActor.run {
             daemonStatus = .starting
+            startingTimestamp = Date()
         }
 
         // Ensure config exists

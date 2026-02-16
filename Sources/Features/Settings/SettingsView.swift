@@ -2035,8 +2035,10 @@ Both binaries must be installed to /usr/local/bin:
                     )
                 }
 
-                // Clear button
+                // Clear button — also disables debug logging
                 Button(action: {
+                    DebugLogger.shared.isEnabled = false
+                    debugLoggingEnabled = false
                     DebugLogger.shared.clearLog()
                     updateDebugLogSize()
                 }) {

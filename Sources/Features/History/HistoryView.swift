@@ -499,7 +499,7 @@ struct TransactionDetailView: View {
             detailRow("Amount (zatoshis)", "\(transaction.value)")
 
             // Fee (if sent or self-send)
-            if transaction.type == .sent, let fee = transaction.feeInZCL {
+            if (transaction.type == .sent || transaction.type == .selfSend), let fee = transaction.feeInZCL {
                 detailRow("Fee", "\(String(format: "%.8f", fee)) ZCL")
             }
 

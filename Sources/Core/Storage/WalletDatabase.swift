@@ -5088,12 +5088,17 @@ final class WalletDatabase {
                     }
                 }
             }
+            // FIX #1377: Self-sends must display the fee as the value, not the uncorrected DB amount
+            // Real-time detection at line 5083 correctly sets resolvedType = .selfSend, but `value`
+            // still holds the raw DB value (which may be the change amount if correctMiscomputedSentAmounts
+            // didn't run or failed for this TX). Override to fee for correct "Fee:" display in all UIs.
+            let resolvedValue = resolvedType == .selfSend ? (fee ?? 10000) : value
             let item = TransactionHistoryItem(
                 txid: txidData,
                 height: height,
                 blockTime: blockTime,
                 type: resolvedType,
-                value: value,
+                value: resolvedValue,
                 fee: fee,
                 toAddress: toAddress,
                 memo: memo,
