@@ -229,7 +229,7 @@ final class BiometricAuthManager: ObservableObject {
         let zcl = Double(amount) / 100_000_000.0
         let reason = String(format: "Authenticate to send %.8f ZCL", zcl)
 
-        print("🔐 authenticateForSend: amount=\(amount) zatoshis (\(String(format: "%.8f", zcl)) ZCL)")
+        print("🔐 authenticateForSend: amount=\(amount.redactedAmount)")
 
         #if DEBUG
         // UAT mode: bypass send auth for test amounts (<= 0.0019 ZCL = 190000 zatoshis)
@@ -239,7 +239,7 @@ final class BiometricAuthManager: ObservableObject {
             print("🔐 WARNING: UAT mode is ENABLED (uatModeEnabled=true)")
         }
         if uatEnabled && amount <= 190000 {
-            print("🧪 [UAT] Send auth bypassed for \(amount) zatoshis (\(String(format: "%.4f", zcl)) ZCL)")
+            print("🧪 [UAT] Send auth bypassed for \(amount.redactedAmount)")
             completion(true, nil)
             return
         }
@@ -442,15 +442,22 @@ final class BiometricAuthManager: ObservableObject {
         // FIX #1273: Use authenticateForSensitiveOperation instead of authenticate()
         // authenticate() auto-passes when biometric is disabled — wrong for app unlock.
         // App unlock must ALWAYS require auth (biometric or passcode).
+        // FIX #1400: LAContext callback fires on arbitrary background thread.
+        // @Published and @State mutations MUST happen on main thread.
+        // Previously only isAuthInProgress was dispatched to main — unlockApp(),
+        // hasAuthenticatedThisSession, and the completion callback (which sets
+        // @State isAuthenticating in LockScreenView) ran on background thread.
+        // Under heavy concurrency load (45+ Tor SOCKS waiters), the SwiftUI
+        // state updates never propagated → UI stuck on "Authenticating..." forever.
         authenticateForSensitiveOperation(reason: "Unlock ZipherX Wallet") { [weak self] success, error in
             DispatchQueue.main.async {
                 self?.isAuthInProgress = false
+                if success {
+                    self?.unlockApp()
+                    self?.hasAuthenticatedThisSession = true
+                }
+                completion(success, error)
             }
-            if success {
-                self?.unlockApp()
-                self?.hasAuthenticatedThisSession = true
-            }
-            completion(success, error)
         }
     }
 
