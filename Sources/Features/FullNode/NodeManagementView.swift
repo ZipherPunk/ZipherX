@@ -663,17 +663,17 @@ Continue?
                                 Text("Backup")
                             }
                             .font(theme.captionFont)
-                            .foregroundColor(isDaemonRunning ? theme.textSecondary : theme.primaryColor)
+                            .foregroundColor(isDaemonRunning || isDaemonBusy ? theme.textSecondary : theme.primaryColor)
                             .padding(.horizontal, 12)
                             .padding(.vertical, 6)
-                            .overlay(Rectangle().stroke(isDaemonRunning ? theme.textSecondary : theme.primaryColor, lineWidth: 1))
+                            .overlay(Rectangle().stroke(isDaemonRunning || isDaemonBusy ? theme.textSecondary : theme.primaryColor, lineWidth: 1))
                         }
                         .buttonStyle(PlainButtonStyle())
-                        .disabled(!viewModel.walletDatExists || isDaemonRunning)
+                        .disabled(!viewModel.walletDatExists || isDaemonRunning || isDaemonBusy)
                     }
 
-                    // FIX #1379: Show warning when daemon is running
-                    if isDaemonRunning && viewModel.walletDatExists {
+                    // FIX #1379: Show warning when daemon is running or starting
+                    if (isDaemonRunning || isDaemonBusy) && viewModel.walletDatExists {
                         HStack(spacing: 4) {
                             Image(systemName: "exclamationmark.triangle.fill")
                                 .font(.system(size: 10))
@@ -1134,19 +1134,20 @@ Continue?
                         .buttonStyle(PlainButtonStyle())
                     }
 
+                    // FIX #1379: Backup only when daemon is stopped
                     Button(action: { viewModel.backupWalletDat() }) {
                         HStack {
                             Image(systemName: "square.and.arrow.down")
                             Text("Backup Now")
                         }
                         .font(theme.captionFont)
-                        .foregroundColor(theme.primaryColor)
+                        .foregroundColor(isDaemonRunning || isDaemonBusy ? theme.textSecondary : theme.primaryColor)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 6)
-                        .overlay(Rectangle().stroke(theme.primaryColor, lineWidth: 1))
+                        .overlay(Rectangle().stroke(isDaemonRunning || isDaemonBusy ? theme.textSecondary : theme.primaryColor, lineWidth: 1))
                     }
                     .buttonStyle(PlainButtonStyle())
-                    .disabled(!viewModel.walletDatExists)
+                    .disabled(!viewModel.walletDatExists || isDaemonRunning || isDaemonBusy)
 
                     Spacer()
 
@@ -1159,6 +1160,17 @@ Continue?
                         .foregroundColor(theme.textSecondary)
                     }
                     .buttonStyle(PlainButtonStyle())
+                }
+
+                // FIX #1379: Warn when backup is blocked by running daemon
+                if (isDaemonRunning || isDaemonBusy) && viewModel.walletDatExists {
+                    HStack(spacing: 4) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 10))
+                        Text("Stop the daemon before backing up wallet.dat")
+                            .font(.system(size: 10))
+                    }
+                    .foregroundColor(.orange)
                 }
             }
             .padding(12)
@@ -1836,6 +1848,12 @@ class NodeManagementViewModel: ObservableObject {
     }
 
     func backupWalletDat() {
+        // FIX #1379: Safety check — refuse backup while daemon is running or starting
+        if isDaemonRunning || FullNodeManager.shared.daemonStatus == .starting {
+            recentErrors.insert("Cannot backup wallet.dat while daemon is running. Stop the daemon first.", at: 0)
+            return
+        }
+
         let backupDir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("ZipherX_Backups")
 

@@ -166,12 +166,17 @@ final class BiometricAuthManager: ObservableObject {
                         self?.hasAuthenticatedThisSession = true  // FIX #1253
                         self?.consecutiveFailures = 0  // FIX #1253: Reset on success
                         self?.lastFailureTime = nil
+                        completion(true, nil)
+                    } else if let laError = authError as? LAError, laError.code == .userFallback {
+                        // FIX #1381: User clicked "Use Passcode" — fall back to device passcode
+                        print("🔐 authenticate: user chose passcode fallback")
+                        self?.evaluatePasscodeFallback(reason: reason, completion: completion)
                     } else {
                         // FIX #1253: Track failure for retry delay
                         self?.consecutiveFailures += 1
                         self?.lastFailureTime = Date()
+                        completion(false, authError)
                     }
-                    completion(success, authError)
                 }
             }
         }
@@ -256,6 +261,39 @@ final class BiometricAuthManager: ObservableObject {
         }
     }
 
+    /// FIX #1381: Evaluate device passcode after user clicks "Use Passcode" on biometric prompt
+    /// Uses a NEW LAContext (the biometric one is consumed after evaluation)
+    private func evaluatePasscodeFallback(reason: String, completion: @escaping (Bool, Error?) -> Void) {
+        let passcodeContext = LAContext()
+        passcodeContext.localizedFallbackTitle = ""  // No further fallback needed
+        passcodeContext.localizedCancelTitle = "Cancel"
+
+        var error: NSError?
+        if passcodeContext.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) {
+            print("🔐 FIX #1381: Showing passcode prompt after user fallback")
+            passcodeContext.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { [weak self] success, authError in
+                DispatchQueue.main.async {
+                    print("🔐 FIX #1381: passcode fallback result — success=\(success), error=\(authError?.localizedDescription ?? "none")")
+                    if success {
+                        self?.lastAuthTime = Date()
+                        self?.lastActivityTime = Date()
+                        self?.isLocked = false
+                        self?.hasAuthenticatedThisSession = true
+                        self?.consecutiveFailures = 0
+                        self?.lastFailureTime = nil
+                    } else {
+                        self?.consecutiveFailures += 1
+                        self?.lastFailureTime = Date()
+                    }
+                    completion(success, authError)
+                }
+            }
+        } else {
+            print("🔐 FIX #1381: Device passcode not available")
+            completion(false, error)
+        }
+    }
+
     /// Authenticate using device passcode only (no biometrics)
     /// SECURITY: Required when biometric auth is disabled to ensure transactions are authorized
     private func authenticateWithPasscode(reason: String, completion: @escaping (Bool, Error?) -> Void) {
@@ -315,8 +353,14 @@ final class BiometricAuthManager: ObservableObject {
                         self?.lastAuthTime = Date()
                         self?.lastActivityTime = Date()
                         self?.isLocked = false
+                        completion(true, nil)
+                    } else if let laError = authError as? LAError, laError.code == .userFallback {
+                        // FIX #1381: User clicked "Use Passcode" — fall back to device passcode
+                        print("🔐 authenticateFresh: user chose passcode fallback")
+                        self?.evaluatePasscodeFallback(reason: reason, completion: completion)
+                    } else {
+                        completion(false, authError)
                     }
-                    completion(success, authError)
                 }
             }
         }

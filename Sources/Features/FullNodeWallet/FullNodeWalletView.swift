@@ -306,7 +306,8 @@ struct FullNodeWalletView: View {
         }
         .onChange(of: fullNodeManager.daemonStatus.isRunning) { isRunning in
             // FIX #1380: Auto-reload wallet data when daemon transitions to running
-            if isRunning {
+            // Only reload if NOT currently loading (prevents double-load on initial appear)
+            if isRunning && !isLoading {
                 Task {
                     await loadWalletData()
                 }
