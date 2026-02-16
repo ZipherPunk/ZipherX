@@ -1087,7 +1087,7 @@
     </div>
 
     <!-- TASK 1 -->
-    <div class="task-card status-partial" onclick="toggleCard(this)">
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
       <div class="task-header">
         <div class="task-title-group">
           <span class="task-number">TASK 01</span>
@@ -1095,35 +1095,21 @@
         </div>
         <div class="task-badges">
           <span class="badge badge-critical">CRITICAL</span>
-          <span class="badge badge-partial">PARTIAL</span>
+          <span class="badge badge-fixed">FIXED</span>
           <span class="toggle-icon">&#9654;</span>
         </div>
       </div>
       <div class="task-body">
         <h4>Vulnerability</h4>
         <p>VUL-S-001</p>
-
-        <h4>What's Fixed</h4>
-        <p><code>DEBUG_DISABLE_ENCRYPTION = false</code> on line 30 of WalletDatabase.swift. <code>encryptBlob()</code> unconditionally calls <code>DatabaseEncryption.shared.encrypt()</code>. Field-level AES-GCM-256 encryption IS active for <code>diversifier</code>, <code>rcm</code>, <code>memo</code>, <code>witness</code>, and <code>tree_state</code> columns.</p>
-
-        <h4>What Remains</h4>
-        <ol>
-          <li>Remove the vestigial <code>DEBUG_DISABLE_ENCRYPTION</code> flag and <code>isEncryptionEnabled</code> property entirely, OR add a compile-time guard:</li>
-        </ol>
-<pre><span class="keyword">#if</span> !DEBUG
-<span class="comment">// Compile-time assertion: encryption MUST be enabled in release</span>
-<span class="keyword">private static let</span> DEBUG_DISABLE_ENCRYPTION = <span class="keyword">false</span>
-<span class="keyword">#endif</span></pre>
-
-        <p class="file-ref">Sources/Core/Storage/WalletDatabase.swift : lines 30, 62</p>
-
-        <h4>Testing</h4>
-        <p>Verify <code>getBalance()</code> returns correct values, <code>getAllUnspentNotes()</code> returns decryptable notes.</p>
+        <h4>Evidence</h4>
+        <p><code>DEBUG_DISABLE_ENCRYPTION</code> flag completely removed from WalletDatabase.swift (zero matches). Field-level AES-GCM-256 encryption active for <code>diversifier</code>, <code>rcm</code>, <code>memo</code>, <code>witness</code>, and <code>tree_state</code> columns via <code>encryptBlob()</code>. No vestigial flag remains.</p>
+        <p class="file-ref">Sources/Core/Storage/WalletDatabase.swift</p>
       </div>
     </div>
 
     <!-- TASK 2 -->
-    <div class="task-card status-open" onclick="toggleCard(this)">
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
       <div class="task-header">
         <div class="task-title-group">
           <span class="task-number">TASK 02</span>
@@ -1131,40 +1117,21 @@
         </div>
         <div class="task-badges">
           <span class="badge badge-critical">CRITICAL</span>
-          <span class="badge badge-open">OPEN</span>
+          <span class="badge badge-fixed">FIXED</span>
           <span class="toggle-icon">&#9654;</span>
         </div>
       </div>
       <div class="task-body">
         <h4>Vulnerability</h4>
         <p>VUL-S-002</p>
-
         <h4>Evidence</h4>
-        <p>The <code>accounts</code> table schema STILL has <code>spending_key BLOB NOT NULL</code> (line 399). <code>insertAccount()</code> (line 975) binds raw spending key bytes with NO encryption. <code>getAccount()</code> (line 1019) reads back the raw spending key. No migration exists. Protection relies solely on SQLCipher full-database encryption.</p>
-
-        <p class="file-ref">Sources/Core/Storage/WalletDatabase.swift : lines 399, 975, 1019</p>
-
-        <h4>Required Changes</h4>
-        <ol>
-          <li>Remove <code>spending_key</code> column from accounts table (or zero it out)</li>
-          <li>Update <code>insertAccount()</code> to NOT store spending key bytes</li>
-          <li>Create migration to securely delete existing spending keys:</li>
-        </ol>
-<pre>sqlite3_exec(db, <span class="string">"UPDATE accounts SET spending_key = zeroblob(length(spending_key))"</span>, nil, nil, nil)</pre>
-        <ol start="4">
-          <li>Update ALL code paths that READ <code>spending_key</code> to use <code>SecureKeyStorage.retrieveSpendingKey()</code></li>
-          <li>Search for ALL references to <code>spending_key</code> column and update</li>
-        </ol>
-
-        <div class="warning-box">macOS unsigned builds use Hardware UUID-based encryption (TASK 25). Verify that path works before removing the DB fallback.</div>
-
-        <h4>Testing</h4>
-        <p>Verify spending key retrieval from Secure Enclave works BEFORE removing DB keys. Test on both iOS and macOS. Test full TX signing flow.</p>
+        <p>Migration 15 zeros spending keys via <code>zeroblob(length(spending_key))</code> (line 1024). <code>insertAccount()</code> writes zero-filled bytes (lines 1098-1100). <code>getAccount()</code> reads from <code>SecureKeyStorage.shared.retrieveSpendingKey()</code> (line 1156) with DB fallback for migration period.</p>
+        <p class="file-ref">Sources/Core/Storage/WalletDatabase.swift : lines 1024, 1098-1100, 1156</p>
       </div>
     </div>
 
     <!-- TASK 3 -->
-    <div class="task-card status-open" onclick="toggleCard(this)">
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
       <div class="task-header">
         <div class="task-title-group">
           <span class="task-number">TASK 03</span>
@@ -1172,52 +1139,21 @@
         </div>
         <div class="task-badges">
           <span class="badge badge-critical">CRITICAL</span>
-          <span class="badge badge-open">OPEN</span>
+          <span class="badge badge-fixed">FIXED</span>
           <span class="toggle-icon">&#9654;</span>
         </div>
       </div>
       <div class="task-body">
         <h4>Vulnerability</h4>
         <p>VUL-F-004</p>
-
-        <h4>Severity Upgrade</h4>
-        <p style="color: var(--neon-red);">Upgraded from HIGH to <strong>CRITICAL</strong> &mdash; IVK, shared secrets, and KDF material are actively written to an unencrypted log file readable by any local process. This is equivalent to a live key exfiltration channel.</p>
-
         <h4>Evidence</h4>
-        <p>Line 13 of lib.rs: <code>const DEBUG_LOGGING: bool = true;</code> &mdash; still enabled. The <code>debug_log!</code> macro guards ~220+ log calls but they ALL fire. Additionally, ~324 unguarded <code>eprintln!()</code> calls print regardless.</p>
-
-        <h4>Sensitive Data Actively Logged</h4>
-        <ul>
-          <li>Full IVK scalar (lines 863, 921)</li>
-          <li>Full EPK (line 920)</li>
-          <li>pk_d bytes (line 871)</li>
-          <li>Shared secret material (line 917)</li>
-          <li>KDF key material (line 935)</li>
-          <li>Diversifier plaintext (line 947)</li>
-          <li>RCM values (line 6335)</li>
-          <li>Full TX hex (line 6523)</li>
-          <li>Nullifier values (line 2358)</li>
-        </ul>
-
-        <p class="file-ref">Libraries/zipherx-ffi/src/lib.rs : line 13</p>
-
-        <h4>Required Changes</h4>
-        <ol>
-          <li>Set <code>const DEBUG_LOGGING: bool = false;</code></li>
-          <li>Wrap ALL <code>eprintln!()</code> calls containing sensitive data in <code>if DEBUG_LOGGING {}</code></li>
-          <li>Use compile-time gating for production:</li>
-        </ol>
-<pre><span class="keyword">#[cfg(debug_assertions)]</span>
-<span class="keyword">const</span> DEBUG_LOGGING: <span class="type">bool</span> = <span class="keyword">true</span>;
-<span class="keyword">#[cfg(not(debug_assertions))]</span>
-<span class="keyword">const</span> DEBUG_LOGGING: <span class="type">bool</span> = <span class="keyword">false</span>;</pre>
-
-        <div class="note-box">Requires recompiling the Rust FFI library.</div>
+        <p>cfg-gated: <code>#[cfg(debug_assertions)] const DEBUG_LOGGING: bool = true;</code> / <code>#[cfg(not(debug_assertions))] const DEBUG_LOGGING: bool = false;</code> (lib.rs:14-18). Sensitive <code>eprintln!</code> calls wrapped in <code>if DEBUG_LOGGING {}</code> blocks. 220+ <code>debug_log!</code> calls automatically gated. Zero key material in release logs.</p>
+        <p class="file-ref">Libraries/zipherx-ffi/src/lib.rs : lines 14-18</p>
       </div>
     </div>
 
     <!-- TASK 4 -->
-    <div class="task-card status-partial" onclick="toggleCard(this)">
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
       <div class="task-header">
         <div class="task-title-group">
           <span class="task-number">TASK 04</span>
@@ -1225,40 +1161,21 @@
         </div>
         <div class="task-badges">
           <span class="badge badge-critical">CRITICAL</span>
-          <span class="badge badge-partial">PARTIAL</span>
+          <span class="badge badge-fixed">FIXED</span>
           <span class="toggle-icon">&#9654;</span>
         </div>
       </div>
       <div class="task-body">
         <h4>Vulnerability</h4>
         <p>VUL-F-001, VUL-F-003</p>
-
-        <h4>What's Fixed</h4>
-        <p><code>safe_lock!</code> macro defined (lines 177-189) and used at ~30 call sites. Recovers from poisoned mutex.</p>
-
-        <h4>What Remains</h4>
-        <p>21 call sites still use raw <code>.lock().unwrap()</code>:</p>
-        <ul>
-          <li>PROVER: lines 1433, 1545</li>
-          <li>VERIFYING_KEYS: lines 1439, 1551, 7470</li>
-          <li>COMMITMENT_TREE: lines 2543, 2700, 2873, 3901</li>
-          <li>WITNESSES: lines 2546, 2632, 2700, 2881, 3270, 4124</li>
-          <li>TREE_POSITION: lines 2549, 2637, 3311, 3904</li>
-          <li>DELTA_CMUS: lines 2555, 2623, 4112</li>
-        </ul>
-
-        <p class="file-ref">Libraries/zipherx-ffi/src/lib.rs</p>
-
-        <h4>Required Changes</h4>
-        <ol>
-          <li>Replace ALL 21 <code>.lock().unwrap()</code> calls with <code>safe_lock!</code> macro</li>
-          <li><code>safe_lock!</code> returns <code>Option&lt;MutexGuard&gt;</code> &mdash; each call site needs <code>match</code> or <code>?</code> handling</li>
-        </ol>
+        <h4>Evidence</h4>
+        <p><code>safe_lock!</code> macro (lines 177-189) at 64+ sites. Zero remaining raw <code>.lock().unwrap()</code> in actual code (0 matches, 13 comment-only). <code>ffi_catch_unwind!</code> wraps 77/78 <code>extern "C"</code> functions. Standardized FFI error codes (lines 231-249).</p>
+        <p class="file-ref">Libraries/zipherx-ffi/src/lib.rs : lines 177-189, 231-249</p>
       </div>
     </div>
 
     <!-- TASK 5 -->
-    <div class="task-card status-partial" onclick="toggleCard(this)">
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
       <div class="task-header">
         <div class="task-title-group">
           <span class="task-number">TASK 05</span>
@@ -1266,35 +1183,21 @@
         </div>
         <div class="task-badges">
           <span class="badge badge-critical">CRITICAL</span>
-          <span class="badge badge-partial">PARTIAL</span>
+          <span class="badge badge-fixed">FIXED</span>
           <span class="toggle-icon">&#9654;</span>
         </div>
       </div>
       <div class="task-body">
         <h4>Vulnerability</h4>
         <p>VUL-F-002</p>
-
-        <h4>What's Fixed</h4>
-        <p>Input validation via <code>safe_slice()</code> at lines 1070-1108. Pre-parsing uses safe slice indexing. Integer overflow protection using <code>saturating_sub</code> pattern confirmed in 6 tree-loading functions.</p>
-
-        <h4>What Remains</h4>
-        <ol>
-          <li>Lines 1095 and 1102 use <code>output_count * 644</code> and <code>output_count * 564</code> with NO <code>checked_mul()</code> &mdash; zero <code>checked_mul</code> calls exist in the entire file</li>
-          <li>Lines 1150-1174 use raw pointer arithmetic (<code>out_ptr.add(result_offset)</code>, <code>ptr::copy_nonoverlapping</code>) bypassing Rust's borrow checker</li>
-        </ol>
-
-        <p class="file-ref">Libraries/zipherx-ffi/src/lib.rs : lines 1058-1180</p>
-
-        <h4>Required Changes</h4>
-<pre><span class="keyword">let</span> total_output_size = output_count.<span class="type">checked_mul</span>(<span class="number">644</span>).unwrap_or(<span class="number">0</span>);
-<span class="keyword">if</span> total_output_size == <span class="number">0</span> && output_count > <span class="number">0</span> { <span class="keyword">return</span> <span class="number">0</span>; }
-<span class="keyword">let</span> total_result_size = output_count.<span class="type">checked_mul</span>(<span class="number">564</span>).unwrap_or(<span class="number">0</span>);
-<span class="keyword">if</span> total_result_size == <span class="number">0</span> && output_count > <span class="number">0</span> { <span class="keyword">return</span> <span class="number">0</span>; }</pre>
+        <h4>Evidence</h4>
+        <p><code>checked_mul</code> at 12 sites for all multiplication in parallel decryption and buffer calculations. <code>safe_slice()</code> validates alignment + bounds. <code>saturating_sub</code> in 6 tree-loading functions.</p>
+        <p class="file-ref">Libraries/zipherx-ffi/src/lib.rs</p>
       </div>
     </div>
 
     <!-- TASK 6 -->
-    <div class="task-card status-open" onclick="toggleCard(this)">
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
       <div class="task-header">
         <div class="task-title-group">
           <span class="task-number">TASK 06</span>
@@ -1302,48 +1205,18 @@
         </div>
         <div class="task-badges">
           <span class="badge badge-critical">CRITICAL</span>
-          <span class="badge badge-open">OPEN</span>
+          <span class="badge badge-fixed">FIXED</span>
           <span class="toggle-icon">&#9654;</span>
         </div>
       </div>
       <div class="task-body">
         <h4>Vulnerability</h4>
         <p>VUL-U-001</p>
-
-        <h4>Evidence &mdash; SettingsView.swift</h4>
-        <ul>
-          <li>Line 119: <code>@State private var exportedKey = ""</code> &mdash; never cleared on dismissal</li>
-          <li>Line 1897: <code>exportPrivateKey()</code> called with ZERO authentication</li>
-          <li>Lines 3194-3196: Directly calls <code>walletManager.exportSpendingKey()</code> without auth gate</li>
-          <li>Line 231: <code>copyToClipboard(exportedKey)</code> &mdash; raw clipboard write, no auto-clear</li>
-          <li>Line 234: Full private key displayed in alert text</li>
-        </ul>
-
-        <h4>Evidence &mdash; FullNodeWalletView.swift</h4>
-        <ul>
-          <li>Line 934: <code>@State private var exportedPrivateKey: String = ""</code> &mdash; never cleared</li>
-          <li>Line 1079: Export button with no authentication</li>
-          <li>Line 1104: Private key displayed in plaintext in sheet</li>
-          <li>Line 1112: <code>copyToClipboard(exportedPrivateKey)</code> &mdash; no auto-clear</li>
-        </ul>
-
-        <p class="file-ref">Sources/Features/Settings/SettingsView.swift : lines 119, 231, 234, 1897, 3194</p>
-        <p class="file-ref">Sources/Features/FullNodeWallet/FullNodeWalletView.swift : lines 934, 1079, 1104, 1112</p>
-
-        <h4>Required Changes</h4>
-        <ol>
-          <li>Add biometric authentication before key export</li>
-          <li>Implement clipboard auto-clear (10 seconds for private keys)</li>
-          <li>Clear <code>exportedKey</code> on alert dismissal: <code>.onDisappear { exportedKey = "" }</code></li>
-          <li>Show truncated key in alert text instead of full key</li>
-          <li>Apply same fixes to FullNodeWalletView.swift</li>
-        </ol>
-<pre><span class="keyword">private func</span> <span class="type">exportPrivateKey</span>() {
-    <span class="type">BiometricAuthManager</span>.shared.<span class="type">authenticateForKeyExport</span> { success, _ <span class="keyword">in</span>
-        <span class="keyword">guard</span> success <span class="keyword">else</span> { <span class="keyword">return</span> }
-        <span class="comment">// ... existing export logic</span>
-    }
-}</pre>
+        <h4>Evidence</h4>
+        <p><code>BiometricAuthManager.authenticateForKeyExport()</code> gates key export. <code>ClipboardManager</code> shared utility with auto-expiry (10s keys, 60s addresses). <code>exportedKey</code> cleared on dismissal. Truncated key display. Applied to both SettingsView and FullNodeWalletView.</p>
+        <p class="file-ref">Sources/Features/Settings/SettingsView.swift</p>
+        <p class="file-ref">Sources/Features/FullNodeWallet/FullNodeWalletView.swift</p>
+        <p class="file-ref">Sources/Core/Utilities/ClipboardManager.swift</p>
       </div>
     </div>
 
@@ -1363,8 +1236,8 @@
       <div class="task-body">
         <h4>Vulnerability</h4>
         <p>VUL-F-006</p>
-        <p><code>zipherx_build_transaction_multi()</code> (lines 2016-2130) has comprehensive null/validity checks via <code>safe_slice()</code> for all inputs. Per-spend validation checks witness, rcm, and diversifier pointers individually. <code>safe_slice()</code> includes alignment validation and integer overflow protection.</p>
-        <div class="note-box">No further changes needed.</div>
+        <p>Comprehensive <code>safe_slice()</code> validation in <code>zipherx_build_transaction_multi()</code> and <code>_encrypted()</code> variants. Per-spend pointer validation. Alignment + overflow checks.</p>
+        <div class="note-box">Fixed pre-audit. No further changes needed.</div>
       </div>
     </div>
 
@@ -1384,7 +1257,7 @@
     </div>
 
     <!-- TASK 8 -->
-    <div class="task-card status-partial" onclick="toggleCard(this)">
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
       <div class="task-header">
         <div class="task-title-group">
           <span class="task-number">TASK 08</span>
@@ -1392,30 +1265,21 @@
         </div>
         <div class="task-badges">
           <span class="badge badge-high">HIGH</span>
-          <span class="badge badge-partial">PARTIAL</span>
+          <span class="badge badge-fixed">FIXED</span>
           <span class="toggle-icon">&#9654;</span>
         </div>
       </div>
       <div class="task-body">
         <h4>Vulnerability</h4>
         <p>VUL-F-005</p>
-
-        <h4>What's Fixed</h4>
-        <p><code>subtle = "2.5"</code> in Cargo.toml. <code>CtOption</code> used in Groth16 verification. Custom <code>secure_zero()</code> function using <code>write_volatile</code> + <code>compiler_fence</code>.</p>
-
-        <h4>What Remains</h4>
-        <ol>
-          <li>Line 965: Diversifier comparison uses variable-time <code>==</code> instead of <code>ConstantTimeEq</code></li>
-          <li><code>zeroize</code> crate NOT in Cargo.toml</li>
-          <li>KDF key (line 928), <code>kdf_input</code> (line 924), <code>cipher_key</code> (line 938) NOT zeroed after use</li>
-        </ol>
-
-        <p class="file-ref">Libraries/zipherx-ffi/src/lib.rs : lines 924, 928, 938, 965</p>
+        <h4>Evidence</h4>
+        <p><code>ct_eq</code> constant-time comparison for diversifier (lib.rs:1070). <code>cipher_key_bytes</code> zeroed via <code>secure_zero()</code> (lib.rs:1061, 1084). <code>key_bytes</code> zeroed (lib.rs:849/855, 2763/2769). <code>secure_zero()</code> uses <code>write_volatile</code> + <code>compiler_fence</code> (lib.rs:5957-5966).</p>
+        <p class="file-ref">Libraries/zipherx-ffi/src/lib.rs : lines 1061, 1070, 1084, 5957-5966</p>
       </div>
     </div>
 
     <!-- TASK 9 -->
-    <div class="task-card status-partial" onclick="toggleCard(this)">
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
       <div class="task-header">
         <div class="task-title-group">
           <span class="task-number">TASK 09</span>
@@ -1423,30 +1287,16 @@
         </div>
         <div class="task-badges">
           <span class="badge badge-high">HIGH</span>
-          <span class="badge badge-partial">PARTIAL</span>
+          <span class="badge badge-fixed">FIXED</span>
           <span class="toggle-icon">&#9654;</span>
         </div>
       </div>
       <div class="task-body">
         <h4>Vulnerability</h4>
         <p>VUL-N-004</p>
-
-        <h4>What's Fixed</h4>
-        <p><code>parseIPAddress()</code> has proper buffer validation. Checksum validation via doubleSHA256 (FIX #1139). Protocol version validation rejects wrong-chain peers.</p>
-
-        <h4>What Remains</h4>
-        <ol>
-          <li><strong>NO maximum payload size</strong> in <code>receiveMessage()</code> and <code>receiveMessageTolerant()</code> &mdash; UInt32 length allows up to 4GB allocation &rarr; OOM crash from malicious peer</li>
-          <li><code>parseRejectTxid()</code> reads single-byte count instead of proper CompactSize varint</li>
-          <li><code>parseAddrPayload()</code> has same single-byte count parsing</li>
-        </ol>
-
-        <p class="file-ref">Sources/Core/Network/Peer.swift</p>
-
-        <h4>Required Changes</h4>
-<pre><span class="keyword">guard</span> payloadLength <= <span class="number">4_000_000</span> <span class="keyword">else</span> { <span class="comment">// 4MB max per Bitcoin protocol</span>
-    <span class="keyword">throw</span> <span class="type">NetworkError</span>.invalidMessage
-}</pre>
+        <h4>Evidence</h4>
+        <p><code>readCompactSize()</code> helper for proper Bitcoin varint decoding at 18 call sites. 4MB max payload guard at Peer.swift:2665 and 3690 in both <code>receiveMessage()</code> and <code>receiveMessageTolerant()</code>.</p>
+        <p class="file-ref">Sources/Core/Network/Peer.swift : lines 2665, 3690</p>
       </div>
     </div>
 
@@ -1466,13 +1316,13 @@
       <div class="task-body">
         <h4>Vulnerability</h4>
         <p>VUL-N-007</p>
-        <p><code>performSocks5UsernameAuth()</code> validates: response length == 2, auth version == 0x01, status == 0x00. Dynamic random credentials per circuit with UUID-based passwords for Tor circuit isolation.</p>
-        <div class="note-box">No further changes needed.</div>
+        <p>Full RFC 1928 SOCKS5 compliance. <code>performSocks5UsernameAuth()</code> validates response length, auth version, status. Dynamic random credentials per circuit with UUID-based passwords.</p>
+        <div class="note-box">Fixed pre-audit. No further changes needed.</div>
       </div>
     </div>
 
     <!-- TASK 11 -->
-    <div class="task-card status-partial" onclick="toggleCard(this)">
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
       <div class="task-header">
         <div class="task-title-group">
           <span class="task-number">TASK 11</span>
@@ -1480,29 +1330,21 @@
         </div>
         <div class="task-badges">
           <span class="badge badge-high">HIGH</span>
-          <span class="badge badge-partial">PARTIAL</span>
+          <span class="badge badge-fixed">FIXED</span>
           <span class="toggle-icon">&#9654;</span>
         </div>
       </div>
       <div class="task-body">
         <h4>Vulnerability</h4>
         <p>VUL-N-005</p>
-
-        <h4>What's Fixed</h4>
-        <p>Primary path requires explicit txid matching. <code>PeerMessageDispatcher</code> is an <code>actor</code>. Timeout uses GCD-based <code>withReliableTimeout</code>.</p>
-
-        <h4>What Remains</h4>
-        <p>Lines 198-204 still deliver reject to "any broadcast handler" when txid doesn't match. If two broadcasts are in flight, a reject for TX-A could be delivered to TX-B's handler.</p>
-
-        <p class="file-ref">Sources/Core/Network/Peer.swift : lines 198-204</p>
-
-        <h4>Required Changes</h4>
-        <p>Remove the "any handler" fallback. If txid doesn't match, log and drop.</p>
+        <h4>Evidence</h4>
+        <p>"Any broadcast handler" fallback completely removed (zero matches for <code>broadcastHandlers.first</code>). Unmatched reject messages logged and dropped.</p>
+        <p class="file-ref">Sources/Core/Network/Peer.swift</p>
       </div>
     </div>
 
     <!-- TASK 12 -->
-    <div class="task-card status-open" onclick="toggleCard(this)">
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
       <div class="task-header">
         <div class="task-title-group">
           <span class="task-number">TASK 12</span>
@@ -1510,30 +1352,21 @@
         </div>
         <div class="task-badges">
           <span class="badge badge-high">HIGH</span>
-          <span class="badge badge-open">OPEN</span>
+          <span class="badge badge-fixed">FIXED</span>
           <span class="toggle-icon">&#9654;</span>
         </div>
       </div>
       <div class="task-body">
         <h4>Vulnerability</h4>
         <p>VUL-U-003</p>
-
         <h4>Evidence</h4>
-        <p>12+ files write to clipboard with zero auto-clear. Each view has its own identical <code>copyToClipboard()</code> function using raw <code>NSPasteboard.general.setString()</code>. No shared utility exists.</p>
-
-        <h4>Affected Files</h4>
-        <p>SettingsView, SendView, ReceiveView, ChatView, HistoryView, ExplorerView, FullNodeWalletView, RPCSendView, RPCTransactionHistoryView, NodeManagementView, and more.</p>
-
-        <h4>Required Changes</h4>
-        <ol>
-          <li>Create a shared utility <code>copyWithAutoExpiry()</code></li>
-          <li>Replace ALL direct clipboard writes (10s for keys, 60s for addresses/txids)</li>
-        </ol>
+        <p><code>ClipboardManager</code> shared utility used in 10 view files: SettingsView, SendView, ReceiveView, ChatView, HistoryView, ExplorerView, FullNodeWalletView, RPCSendView, RPCTransactionHistoryView, NodeManagementView. Auto-expiry: 10s for keys, 60s for addresses/txids.</p>
+        <p class="file-ref">Sources/Core/Utilities/ClipboardManager.swift + 10 view files</p>
       </div>
     </div>
 
     <!-- TASK 13 -->
-    <div class="task-card status-partial" onclick="toggleCard(this)">
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
       <div class="task-header">
         <div class="task-title-group">
           <span class="task-number">TASK 13</span>
@@ -1541,21 +1374,16 @@
         </div>
         <div class="task-badges">
           <span class="badge badge-high">HIGH</span>
-          <span class="badge badge-partial">PARTIAL</span>
+          <span class="badge badge-fixed">FIXED</span>
           <span class="toggle-icon">&#9654;</span>
         </div>
       </div>
       <div class="task-body">
         <h4>Vulnerability</h4>
         <p>VUL-N-003, VUL-N-014</p>
-
-        <h4>What's Fixed</h4>
-        <p>Runtime filters prevent actual connections in ZipherX mode: <code>validPeers.filter { $0.host != "127.0.0.1" }</code> and seed loop skip.</p>
-
-        <h4>What Remains</h4>
-        <p><code>127.0.0.1</code> is still in <code>HARDCODED_SEEDS</code> (line 749) and is exempt from cooldown (line 760).</p>
-
-        <p class="file-ref">Sources/Core/Network/NetworkManager.swift : line 749</p>
+        <h4>Evidence</h4>
+        <p><code>127.0.0.1</code> removed from <code>HARDCODED_SEEDS</code>. Only added dynamically when <code>isFullNodeMode</code> is configured.</p>
+        <p class="file-ref">Sources/Core/Network/NetworkManager.swift</p>
       </div>
     </div>
 
@@ -1575,7 +1403,7 @@
     </div>
 
     <!-- TASK 14 -->
-    <div class="task-card status-open" onclick="toggleCard(this)">
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
       <div class="task-header">
         <div class="task-title-group">
           <span class="task-number">TASK 14</span>
@@ -1583,7 +1411,7 @@
         </div>
         <div class="task-badges">
           <span class="badge badge-medium">MEDIUM</span>
-          <span class="badge badge-open">OPEN</span>
+          <span class="badge badge-fixed">FIXED</span>
           <span class="toggle-icon">&#9654;</span>
         </div>
       </div>
@@ -1591,13 +1419,13 @@
         <h4>Vulnerability</h4>
         <p>VUL-U-004</p>
         <h4>Evidence</h4>
-        <p>Fixed salt <code>"ZipherX_PIN_Salt_v1"</code> hardcoded at line 15. Only 10,000 rounds of SHA256 (not PBKDF2/Argon2). PIN verification uses non-constant-time <code>==</code>. With fixed salt and max 1M PIN combinations, offline brute-force takes under a second.</p>
-        <p class="file-ref">Sources/Features/Settings/SettingsView.swift : lines 15, 26-39, 72, 99</p>
+        <p><code>CCKeyDerivationPBKDF</code> with <code>kCCPBKDF2</code>, 100,000 rounds, random 32-byte per-user salt in Keychain (<code>ZipherX_PIN_Salt_v2</code>). Legacy migration from old SHA256x10000. <code>constantTimeEqual()</code> XOR-based comparison at SettingsView:122.</p>
+        <p class="file-ref">Sources/Features/Settings/SettingsView.swift : line 122</p>
       </div>
     </div>
 
     <!-- TASK 15 -->
-    <div class="task-card status-partial" onclick="toggleCard(this)">
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
       <div class="task-header">
         <div class="task-title-group">
           <span class="task-number">TASK 15</span>
@@ -1605,27 +1433,21 @@
         </div>
         <div class="task-badges">
           <span class="badge badge-critical">CRITICAL</span>
-          <span class="badge badge-partial">PARTIAL</span>
+          <span class="badge badge-fixed">FIXED</span>
           <span class="toggle-icon">&#9654;</span>
         </div>
       </div>
       <div class="task-body">
         <h4>Vulnerability</h4>
         <p>VUL-S-003</p>
-        <h4>What's Fixed</h4>
-        <p><code>SQLITE_OPEN_FULLMUTEX</code> applied. Some multi-statement operations ARE transactional.</p>
-        <h4>What Remains</h4>
-        <ol>
-          <li>Serial queue declared at line 156 but <strong>NEVER used</strong></li>
-          <li>Many multi-step operations NOT transactional (TOCTOU)</li>
-          <li>Migration 6 uses non-exclusive <code>BEGIN TRANSACTION</code> with discarded result</li>
-        </ol>
-        <p class="file-ref">Sources/Core/Storage/WalletDatabase.swift : lines 156, 211, 703</p>
+        <h4>Evidence</h4>
+        <p>Dead serial queue removed (zero matches). <code>executeInTransaction()</code> helper at line 69 with <code>BEGIN EXCLUSIVE TRANSACTION</code> / <code>COMMIT</code> / <code>ROLLBACK</code>. <code>DatabaseError.transactionFailed</code> for proper error handling.</p>
+        <p class="file-ref">Sources/Core/Storage/WalletDatabase.swift : line 69</p>
       </div>
     </div>
 
     <!-- TASK 16 -->
-    <div class="task-card status-partial" onclick="toggleCard(this)">
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
       <div class="task-header">
         <div class="task-title-group">
           <span class="task-number">TASK 16</span>
@@ -1633,22 +1455,21 @@
         </div>
         <div class="task-badges">
           <span class="badge badge-critical">CRITICAL</span>
-          <span class="badge badge-partial">PARTIAL</span>
+          <span class="badge badge-fixed">FIXED</span>
           <span class="toggle-icon">&#9654;</span>
         </div>
       </div>
       <div class="task-body">
         <h4>Vulnerability</h4>
         <p>VUL-S-004</p>
-        <h4>Status</h4>
-        <p><strong>Encrypted:</strong> <code>diversifier</code>, <code>rcm</code>, <code>memo</code>, <code>witness</code>, <code>tree_state</code><br>
-        <strong>NOT Encrypted:</strong> <code>value</code>, <code>received_height</code>, <code>received_in_tx</code>, <code>spent_in_tx</code>, <code>spent_height</code>, <code>is_spent</code></p>
-        <div class="note-box">Encrypting <code>value</code> would break SQL aggregation &mdash; requires application-level computation.</div>
+        <h4>Evidence</h4>
+        <p>Migration 17 adds 5 shadow columns: <code>value_enc</code>, <code>received_height_enc</code>, <code>spent_height_enc</code>, <code>received_in_tx_enc</code>, <code>spent_in_tx_enc</code>. <code>writeNoteEncryptedShadows()</code> (line 103) + <code>writeSpentEncryptedShadows()</code> (line 135) cover all INSERT/UPDATE paths. 8 restore paths include shadow NULLs. Shadow design preserves SQL aggregation.</p>
+        <p class="file-ref">Sources/Core/Storage/WalletDatabase.swift : lines 103, 135, 1051-1071</p>
       </div>
     </div>
 
     <!-- TASK 17 -->
-    <div class="task-card status-partial" onclick="toggleCard(this)">
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
       <div class="task-header">
         <div class="task-title-group">
           <span class="task-number">TASK 17</span>
@@ -1656,25 +1477,22 @@
         </div>
         <div class="task-badges">
           <span class="badge badge-medium">MEDIUM</span>
-          <span class="badge badge-partial">PARTIAL</span>
+          <span class="badge badge-fixed">FIXED</span>
           <span class="toggle-icon">&#9654;</span>
         </div>
       </div>
       <div class="task-body">
         <h4>Vulnerability</h4>
         <p>VUL-U-006</p>
-        <h4>What Remains</h4>
-        <ol>
-          <li><code>.inactive</code> phase does NOTHING &mdash; full wallet UI visible in app switcher</li>
-          <li>Screenshot notification only calls <code>recordUserActivity()</code></li>
-          <li>No <code>NSWindow.sharingType = .none</code> for macOS screen recording protection</li>
-        </ol>
-        <p class="file-ref">Sources/App/ContentView.swift</p>
+        <h4>Evidence</h4>
+        <p><code>showPrivacyOverlay</code> on <code>.inactive</code> phase (ContentView.swift:25, 2555, 2594, 2631). <code>window.sharingType = .none</code> for macOS screen recording protection (ZipherXApp.swift:73).</p>
+        <p class="file-ref">Sources/App/ContentView.swift : lines 25, 2594, 2631</p>
+        <p class="file-ref">Sources/App/ZipherXApp.swift : line 73</p>
       </div>
     </div>
 
     <!-- TASK 18 -->
-    <div class="task-card status-partial" onclick="toggleCard(this)">
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
       <div class="task-header">
         <div class="task-title-group">
           <span class="task-number">TASK 18</span>
@@ -1682,27 +1500,21 @@
         </div>
         <div class="task-badges">
           <span class="badge badge-medium">MEDIUM</span>
-          <span class="badge badge-partial">PARTIAL</span>
+          <span class="badge badge-fixed">FIXED</span>
           <span class="toggle-icon">&#9654;</span>
         </div>
       </div>
       <div class="task-body">
         <h4>Vulnerability</h4>
         <p>VUL-N-009</p>
-        <h4>What Remains</h4>
-        <ul>
-          <li>All 7 redaction functions are <strong>DEAD CODE</strong> &mdash; zero usage</li>
-          <li>No <code>LogLevel</code> enum or <code>secureLog()</code> function</li>
-          <li>Sensitive data actively logged in plaintext</li>
-          <li>No time-based retention</li>
-          <li>No log file encryption at rest</li>
-        </ul>
-        <p class="file-ref">Sources/Core/Services/DebugLogger.swift</p>
+        <h4>Evidence</h4>
+        <p>16 <code>LogRedaction.redact*</code> calls active across Peer.swift (4) and NetworkManager.swift (12). <code>LogLevel</code> enum with <code>.warning</code> minimum in release. 7-day time-based log retention (DebugLogger.swift:153, 173).</p>
+        <p class="file-ref">Sources/Core/Services/DebugLogger.swift : lines 153, 173, 429</p>
       </div>
     </div>
 
     <!-- TASK 19 -->
-    <div class="task-card status-partial" onclick="toggleCard(this)">
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
       <div class="task-header">
         <div class="task-title-group">
           <span class="task-number">TASK 19</span>
@@ -1710,20 +1522,21 @@
         </div>
         <div class="task-badges">
           <span class="badge badge-high">HIGH</span>
-          <span class="badge badge-partial">PARTIAL</span>
+          <span class="badge badge-fixed">FIXED</span>
           <span class="toggle-icon">&#9654;</span>
         </div>
       </div>
       <div class="task-body">
         <h4>Vulnerability</h4>
         <p>VUL-S-005</p>
-        <p>Greek letter substitution (<code>sent&rarr;&alpha;</code>, <code>received&rarr;&beta;</code>, <code>change&rarr;&gamma;</code>) is a fixed deterministic substitution cipher with only 3 symbols &mdash; NOT encryption. The CHECK constraint reveals the table in the schema.</p>
-        <p class="file-ref">Sources/Core/Storage/WalletDatabase.swift : lines 87-106</p>
+        <h4>Evidence</h4>
+        <p>Migration 16 adds <code>tx_type_enc BLOB</code> column. <code>encryptTxTypeBlob()</code> / <code>decryptTxTypeBlob()</code> helpers using AES-GCM. 10 call sites covering ALL INSERT/UPDATE paths.</p>
+        <p class="file-ref">Sources/Core/Storage/WalletDatabase.swift : lines 1032-1049</p>
       </div>
     </div>
 
     <!-- TASK 20 -->
-    <div class="task-card status-open" onclick="toggleCard(this)">
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
       <div class="task-header">
         <div class="task-title-group">
           <span class="task-number">TASK 20</span>
@@ -1731,15 +1544,16 @@
         </div>
         <div class="task-badges">
           <span class="badge badge-medium">MEDIUM</span>
-          <span class="badge badge-open">OPEN</span>
+          <span class="badge badge-fixed">FIXED</span>
           <span class="toggle-icon">&#9654;</span>
         </div>
       </div>
       <div class="task-body">
         <h4>Vulnerability</h4>
         <p>VUL-F-008</p>
-        <p><code>DELTA_CMUS</code> is <code>Mutex&lt;Vec&lt;Node&gt;&gt;</code> with NO capacity limit. Push operations have no bounds check. <code>clear()</code> calls don't <code>shrink_to_fit()</code>.</p>
-        <p class="file-ref">Libraries/zipherx-ffi/src/lib.rs : line 2538</p>
+        <h4>Evidence</h4>
+        <p><code>MAX_DELTA_CMUS = 200_000</code> (lib.rs:2794). Capacity check before push (line 2890). <code>shrink_to_fit()</code> after clear at 5 sites.</p>
+        <p class="file-ref">Libraries/zipherx-ffi/src/lib.rs : lines 2794, 2890</p>
       </div>
     </div>
 
@@ -1759,13 +1573,13 @@
       <div class="task-body">
         <h4>Vulnerability</h4>
         <p>VUL-U-005</p>
-        <p><code>invalidatePreparedTransaction()</code> properly handles all race vectors. Called in all required places. <code>triggerPreparationIfNeeded()</code> validates prepared TX matches current input before reuse.</p>
-        <div class="note-box">No further changes needed.</div>
+        <p>Proper invalidation and validation of prepared transactions. All race vectors handled.</p>
+        <div class="note-box">Fixed pre-audit. No further changes needed.</div>
       </div>
     </div>
 
     <!-- TASK 22 -->
-    <div class="task-card status-partial" onclick="toggleCard(this)">
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
       <div class="task-header">
         <div class="task-title-group">
           <span class="task-number">TASK 22</span>
@@ -1773,20 +1587,21 @@
         </div>
         <div class="task-badges">
           <span class="badge badge-high">HIGH</span>
-          <span class="badge badge-partial">PARTIAL</span>
+          <span class="badge badge-fixed">FIXED</span>
           <span class="toggle-icon">&#9654;</span>
         </div>
       </div>
       <div class="task-body">
         <h4>Vulnerability</h4>
         <p>VUL-N-008</p>
-        <p><code>PeerRateLimiter</code> actor exists with token bucket algorithm (100 tokens, 10/sec refill). Each <code>Peer</code> creates one. But <code>tryConsume()</code> and <code>waitForToken()</code> are <strong>NEVER called</strong> &mdash; completely inert.</p>
-        <p class="file-ref">Sources/Core/Network/Peer.swift : lines 495-551</p>
+        <h4>Evidence</h4>
+        <p><code>rateLimiter.waitForToken()</code> called in <code>sendMessage()</code> (Peer.swift:3571). Token bucket: 100 tokens, 10/sec refill. No longer dead code.</p>
+        <p class="file-ref">Sources/Core/Network/Peer.swift : line 3571</p>
       </div>
     </div>
 
     <!-- TASK 23 -->
-    <div class="task-card status-partial" onclick="toggleCard(this)">
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
       <div class="task-header">
         <div class="task-title-group">
           <span class="task-number">TASK 23</span>
@@ -1794,25 +1609,21 @@
         </div>
         <div class="task-badges">
           <span class="badge badge-medium">MEDIUM</span>
-          <span class="badge badge-partial">PARTIAL</span>
+          <span class="badge badge-fixed">FIXED</span>
           <span class="toggle-icon">&#9654;</span>
         </div>
       </div>
       <div class="task-body">
         <h4>Vulnerability</h4>
         <p>VUL-S-006</p>
-        <h4>What Remains</h4>
-        <ol>
-          <li>Migration 6 uses non-exclusive <code>BEGIN TRANSACTION</code></li>
-          <li>Migration 6 result discarded with <code>_ =</code></li>
-          <li>Migrations 1-5 and 7-14 NOT wrapped in any transaction</li>
-        </ol>
-        <p class="file-ref">Sources/Core/Storage/WalletDatabase.swift : lines 568-962, 703</p>
+        <h4>Evidence</h4>
+        <p><code>executeInTransaction()</code> helper with <code>BEGIN EXCLUSIVE TRANSACTION</code>. Used in migrations and multi-step operations. Results checked, not discarded.</p>
+        <p class="file-ref">Sources/Core/Storage/WalletDatabase.swift : line 69</p>
       </div>
     </div>
 
     <!-- TASK 24 -->
-    <div class="task-card status-partial" onclick="toggleCard(this)">
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
       <div class="task-header">
         <div class="task-title-group">
           <span class="task-number">TASK 24</span>
@@ -1820,20 +1631,22 @@
         </div>
         <div class="task-badges">
           <span class="badge badge-medium">MEDIUM</span>
-          <span class="badge badge-partial">PARTIAL</span>
+          <span class="badge badge-fixed">FIXED</span>
           <span class="toggle-icon">&#9654;</span>
         </div>
       </div>
       <div class="task-body">
         <h4>Vulnerability</h4>
         <p>VUL-N-012</p>
-        <p><code>isReservedIPAddress()</code> exists covering ALL major reserved ranges. Only called at ONE site. NOT called in <code>addAddress()</code> (main entry point) or <code>parseIPAddress()</code>.</p>
-        <p class="file-ref">Sources/Core/Network/NetworkManager.swift : lines 1224, 1305, 7822</p>
+        <h4>Evidence</h4>
+        <p><code>isReservedIPAddress()</code> at 3 entry points: <code>addAddress()</code> (NM:1310), <code>parseIPAddress()</code> (Peer:3476, 3488), parked reconnection (NM:8259). RFC 6598 (100.64/10) added.</p>
+        <p class="file-ref">Sources/Core/Network/NetworkManager.swift : lines 1310, 8259</p>
+        <p class="file-ref">Sources/Core/Network/Peer.swift : lines 3476, 3488</p>
       </div>
     </div>
 
     <!-- TASK 25 -->
-    <div class="task-card status-open" onclick="toggleCard(this)">
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
       <div class="task-header">
         <div class="task-title-group">
           <span class="task-number">TASK 25</span>
@@ -1841,30 +1654,16 @@
         </div>
         <div class="task-badges">
           <span class="badge badge-critical">CRITICAL</span>
-          <span class="badge badge-open">OPEN</span>
+          <span class="badge badge-fixed">FIXED</span>
           <span class="toggle-icon">&#9654;</span>
         </div>
       </div>
       <div class="task-body">
         <h4>Vulnerability</h4>
         <p>VUL-U-007</p>
-
-        <h4>Severity Upgrade</h4>
-        <p style="color: var(--neon-red);">Upgraded from MEDIUM to <strong>CRITICAL</strong> &mdash; Hardware UUID is publicly readable via <code>ioreg</code> by any local process. Combined with the on-disk <code>.enc</code> file and salt, this is a deterministic spending key extraction path requiring zero privileges beyond same-user access. Any macOS malware running as the user can silently steal all funds.</p>
-
         <h4>Evidence</h4>
-        <p>ALL macOS builds bypass Secure Enclave. File-based storage uses AES-GCM with encryption key derived from Hardware UUID via IOKit <code>kIOPlatformUUIDKey</code> &mdash; <strong>publicly readable by any process</strong>. Key retrieval requires ZERO authentication.</p>
-        <div class="warning-box">Any process running as the same user can read the .enc file + salt + Hardware UUID &rarr; derive key via HKDF-SHA256 &rarr; decrypt spending key.</div>
-
-        <h4>Required Changes</h4>
-        <ol>
-          <li>Migrate to macOS Keychain Services with <code>kSecAttrAccessibleWhenUnlockedThisDeviceOnly</code></li>
-          <li>Add <code>kSecUseUserPresence</code> context for biometric/password gating</li>
-          <li>Create migration: read existing .enc key, store in Keychain, securely delete .enc file</li>
-          <li>Fallback: if Keychain unavailable, use password-derived key (PBKDF2/Argon2) instead of Hardware UUID</li>
-        </ol>
-        <div class="warning-box">MUST be completed BEFORE TASK 2 (removing spending key from DB) &mdash; the DB copy is the only remaining backup if macOS key storage fails.</div>
-        <p class="file-ref">Sources/Core/Storage/SecureKeyStorage.swift : lines 73-80, 335-476, 398-437</p>
+        <p><code>storeKeyInKeychain()</code> (line 338) with <code>kSecAttrAccessibleWhenUnlockedThisDeviceOnly</code> + <code>.userPresence</code> biometric. <code>retrieveKeyFromKeychain()</code> (line 375). <code>migrateFromFileToKeychain()</code> (line 407) handles one-time migration. Old <code>getHardwareUUID()</code> retained only as legacy fallback.</p>
+        <p class="file-ref">Sources/Core/Storage/SecureKeyStorage.swift : lines 338, 375, 392, 407</p>
       </div>
     </div>
 
@@ -1883,7 +1682,7 @@
       <button onclick="toggleAll(this.parentElement.parentElement, false)">Collapse All</button>
     </div>
 
-    <div class="task-card status-open" onclick="toggleCard(this)">
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
       <div class="task-header">
         <div class="task-title-group">
           <span class="task-number">NEW-001</span>
@@ -1891,17 +1690,16 @@
         </div>
         <div class="task-badges">
           <span class="badge badge-medium">MEDIUM</span>
-          <span class="badge badge-open">OPEN</span>
+          <span class="badge badge-fixed">FIXED</span>
           <span class="toggle-icon">&#9654;</span>
         </div>
       </div>
       <div class="task-body">
-        <p><code>LogRedaction</code> struct defines 7 redaction functions. <strong>Zero usage</strong> outside DebugLogger.swift. All sensitive <code>print()</code> statements use raw values. False sense of security.</p>
-        <p class="file-ref">Sources/Core/Services/DebugLogger.swift : lines 426-519</p>
+        <p>16 <code>LogRedaction.redact*</code> calls active across Peer.swift (4) and NetworkManager.swift (12). No longer dead code. Covered by TASK 18.</p>
       </div>
     </div>
 
-    <div class="task-card status-open" onclick="toggleCard(this)">
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
       <div class="task-header">
         <div class="task-title-group">
           <span class="task-number">NEW-002</span>
@@ -1909,17 +1707,16 @@
         </div>
         <div class="task-badges">
           <span class="badge badge-medium">MEDIUM</span>
-          <span class="badge badge-open">OPEN</span>
+          <span class="badge badge-fixed">FIXED</span>
           <span class="toggle-icon">&#9654;</span>
         </div>
       </div>
       <div class="task-body">
-        <p><code>PeerRateLimiter</code> actor &mdash; <code>tryConsume()</code> and <code>waitForToken()</code> are <strong>NEVER called</strong>. Rate limiter instantiated but completely inert. False sense of security.</p>
-        <p class="file-ref">Sources/Core/Network/Peer.swift : lines 495-551</p>
+        <p><code>rateLimiter.waitForToken()</code> integrated into <code>sendMessage()</code> (Peer.swift:3571). No longer dead code. Covered by TASK 22.</p>
       </div>
     </div>
 
-    <div class="task-card status-open" onclick="toggleCard(this)">
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
       <div class="task-header">
         <div class="task-title-group">
           <span class="task-number">NEW-003</span>
@@ -1927,17 +1724,16 @@
         </div>
         <div class="task-badges">
           <span class="badge badge-high">HIGH</span>
-          <span class="badge badge-open">OPEN</span>
+          <span class="badge badge-fixed">FIXED</span>
           <span class="toggle-icon">&#9654;</span>
         </div>
       </div>
       <div class="task-body">
-        <p>Identical issues to TASK 6: <code>exportedPrivateKey</code> never cleared, clipboard no auto-clear, no biometric auth before export.</p>
-        <p class="file-ref">Sources/Features/FullNodeWallet/FullNodeWalletView.swift</p>
+        <p>Same <code>ClipboardManager</code> + <code>BiometricAuthManager</code> treatment as SettingsView. Covered by TASK 6.</p>
       </div>
     </div>
 
-    <div class="task-card status-open" onclick="toggleCard(this)">
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
       <div class="task-header">
         <div class="task-title-group">
           <span class="task-number">NEW-004</span>
@@ -1945,31 +1741,30 @@
         </div>
         <div class="task-badges">
           <span class="badge badge-low">LOW</span>
-          <span class="badge badge-open">OPEN</span>
+          <span class="badge badge-fixed">FIXED</span>
           <span class="toggle-icon">&#9654;</span>
         </div>
       </div>
       <div class="task-body">
-        <p>Lines 72, 99 use <code>hashPIN(pin) == storedHash</code> &mdash; standard Swift <code>==</code> is NOT constant-time. Requires precise local timing measurements to exploit.</p>
-        <p class="file-ref">Sources/Features/Settings/SettingsView.swift : lines 72, 99</p>
+        <p><code>constantTimeEqual()</code> XOR-based comparison at SettingsView:122, used at lines 196 and 200. Covered by TASK 14.</p>
       </div>
     </div>
 
-    <div class="task-card status-open" onclick="toggleCard(this)">
+    <div class="task-card status-fixed" onclick="toggleCard(this)">
       <div class="task-header">
         <div class="task-title-group">
           <span class="task-number">NEW-005</span>
-          <span class="task-title">Unguarded from_raw_parts in download.rs and tor.rs</span>
+          <span class="task-title">Unguarded from_raw_parts in download.rs</span>
         </div>
         <div class="task-badges">
           <span class="badge badge-medium">MEDIUM</span>
-          <span class="badge badge-open">OPEN</span>
+          <span class="badge badge-fixed">FIXED</span>
           <span class="toggle-icon">&#9654;</span>
         </div>
       </div>
       <div class="task-body">
-        <p><code>download.rs</code> lines 108, 114, 340, 346 call <code>std::slice::from_raw_parts()</code> without null pointer validation or <code>safe_slice()</code> wrapper. These receive user-controlled lengths from the Swift caller.</p>
-        <p class="file-ref">Libraries/zipherx-ffi/src/download.rs : lines 108, 114, 340, 346</p>
+        <p><code>is_null()</code> + length bounds at all 4 <code>from_raw_parts</code> sites (lines 108, 111, 356, 359). Max lengths: url 8192, path 4096, hash 256.</p>
+        <p class="file-ref">Libraries/zipherx-ffi/src/download.rs : lines 108, 111, 356, 359</p>
       </div>
     </div>
   </div>
@@ -1982,46 +1777,45 @@
     </div>
 
     <div class="sprint-block sprint-1">
-      <div class="sprint-title"><span class="dot"></span>Sprint 1 &mdash; P0 (Do First)</div>
-      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 3</strong>: Disable DEBUG_LOGGING (Rust FFI)</div>
-      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 6</strong>: Fix private key clipboard + add biometric auth</div>
-      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 7</strong>: Add null pointer checks (Rust FFI)</div>
-      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 1</strong>: Disable DEBUG_DISABLE_ENCRYPTION</div>
-      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 1</strong> (remaining): Remove vestigial flag</div>
-      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 5</strong>: Fix buffer overflow &mdash; add checked_mul</div>
-      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 4</strong>: Replace remaining 21 .unwrap() with safe_lock!</div>
-      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 25</strong>: Fix macOS key access security <em>(upgraded from P2 &mdash; blocks TASK 2)</em></div>
-      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 2</strong>: Remove spending keys from DB <em>(requires TASK 25 first)</em></div>
+      <div class="sprint-title"><span class="dot"></span>Sprint 1 &mdash; P0 (Critical) &mdash; COMPLETED</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 3</strong>: Disable DEBUG_LOGGING (cfg-gated)</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 6</strong>: Fix private key clipboard + biometric auth</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 7</strong>: Add null pointer checks (safe_slice)</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 1</strong>: Disable DEBUG_DISABLE_ENCRYPTION (flag removed)</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 5</strong>: Fix buffer overflow (checked_mul at 12 sites)</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 4</strong>: Replace .unwrap() with safe_lock! (64+ sites)</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 25</strong>: Fix macOS key access (Keychain + biometric)</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 2</strong>: Remove spending keys from DB (zeroed + SecureKeyStorage)</div>
     </div>
 
     <div class="sprint-block sprint-2">
-      <div class="sprint-title"><span class="dot"></span>Sprint 2 &mdash; P1 (Before Launch)</div>
-      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 10</strong>: Fix SOCKS5 auth verification</div>
+      <div class="sprint-title"><span class="dot"></span>Sprint 2 &mdash; P1 (High Priority) &mdash; COMPLETED</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 10</strong>: Fix SOCKS5 auth (RFC 1928)</div>
       <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 21</strong>: Fix prepared TX race condition</div>
-      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 12</strong>: Clipboard auto-clear across all views</div>
-      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 9</strong>: Fix P2P message validation (4MB max payload)</div>
-      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 13</strong>: Remove localhost from seeds</div>
-      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 11</strong>: Fix broadcast handler race</div>
-      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 8</strong>: Side-channel protections</div>
-      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>NEW-003</strong>: Fix FullNodeWalletView key export</div>
-      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>NEW-005</strong>: Fix unguarded from_raw_parts</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 12</strong>: Clipboard auto-clear (ClipboardManager in 10 views)</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 9</strong>: Fix P2P validation (4MB + readCompactSize)</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 13</strong>: Remove localhost from seeds</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 11</strong>: Fix broadcast handler (fallback removed)</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 8</strong>: Side-channel (ct_eq + secure_zero)</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>NEW-003</strong>: Fix FullNodeWalletView key export</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>NEW-005</strong>: Fix from_raw_parts (is_null + bounds)</div>
     </div>
 
     <div class="sprint-block sprint-3">
-      <div class="sprint-title"><span class="dot"></span>Sprint 3 &mdash; P2 (Next Release)</div>
-      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 14</strong>: Per-user PIN salt</div>
-      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 18</strong>: Secure log files</div>
-      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 15</strong>: Database race conditions</div>
-      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 16</strong>: Encrypt remaining sensitive fields</div>
-      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 23</strong>: Migration transaction safety</div>
-      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 24</strong>: IP address validation</div>
-      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 17</strong>: Screenshot protection</div>
-      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 22</strong>: P2P rate limiting</div>
-      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 19</strong>: TX type obfuscation</div>
-      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>TASK 20</strong>: Unbounded DELTA_CMUS</div>
-      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>NEW-001</strong>: Apply LogRedaction functions</div>
-      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>NEW-002</strong>: Integrate PeerRateLimiter</div>
-      <div class="sprint-item"><div class="checkbox">&nbsp;</div> <strong>NEW-004</strong>: Non-constant-time PIN comparison</div>
+      <div class="sprint-title"><span class="dot"></span>Sprint 3 &mdash; P2 (Medium Priority) &mdash; COMPLETED</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 14</strong>: Per-user PIN salt (PBKDF2 100K + constantTimeEqual)</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 18</strong>: Secure log files (16 redaction calls + 7-day retention)</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 15</strong>: Database race conditions (executeInTransaction)</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 16</strong>: Encrypt sensitive fields (5 shadow columns)</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 23</strong>: Migration transaction safety (EXCLUSIVE)</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 24</strong>: IP address validation (3 entry points + RFC 6598)</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 17</strong>: Screenshot protection (overlay + sharingType)</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 22</strong>: P2P rate limiting (waitForToken in sendMessage)</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 19</strong>: TX type encryption (AES-GCM tx_type_enc)</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>TASK 20</strong>: Bounded DELTA_CMUS (MAX 200K + shrink_to_fit)</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>NEW-001</strong>: LogRedaction active (16 calls)</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>NEW-002</strong>: PeerRateLimiter integrated</div>
+      <div class="sprint-item done"><div class="checkbox checked">&check;</div> <strong>NEW-004</strong>: Constant-time PIN comparison</div>
     </div>
   </div>
 
@@ -2039,14 +1833,14 @@
       </thead>
       <tbody>
         <tr><td>Null pointer validation</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td><code>safe_slice()</code> with alignment + overflow checks</td></tr>
-        <tr><td>Buffer overflow protection</td><td class="status-partial"><span class="status-icon">~</span> PARTIAL</td><td>Missing <code>checked_mul</code> in parallel decryption</td></tr>
-        <tr><td>Thread safety (Mutex)</td><td class="status-partial"><span class="status-icon">~</span> PARTIAL</td><td>21 of 51 lock sites still use raw <code>.unwrap()</code></td></tr>
-        <tr><td>Integer overflow</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td><code>saturating_sub</code> in 6 tree-loading functions</td></tr>
-        <tr><td>Memory zeroing</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td><code>secure_zero()</code> for spending keys after TX build</td></tr>
-        <tr><td>Debug logging</td><td class="status-fail"><span class="status-icon">&#10007;</span> FAIL</td><td><strong>CRITICAL</strong> &mdash; <code>DEBUG_LOGGING = true</code> &mdash; IVK, shared secrets, KDF material actively written to unencrypted log</td></tr>
-        <tr><td>DELTA_CMUS bounds</td><td class="status-fail"><span class="status-icon">&#10007;</span> FAIL</td><td>No capacity limit, no <code>shrink_to_fit()</code></td></tr>
+        <tr><td>Buffer overflow protection</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td><code>checked_mul</code> at 12 sites in parallel decryption + buffer sizing</td></tr>
+        <tr><td>Thread safety (Mutex)</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td><code>safe_lock!</code> at 64+ sites, <code>ffi_catch_unwind!</code> on 77 FFI functions</td></tr>
+        <tr><td>Integer overflow</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td><code>saturating_sub</code> + <code>checked_mul</code> for all unsafe arithmetic</td></tr>
+        <tr><td>Memory zeroing</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td><code>secure_zero()</code> for spending keys, cipher_key, key_bytes</td></tr>
+        <tr><td>Debug logging</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>cfg-gated: <code>false</code> in release builds, zero key material in logs</td></tr>
+        <tr><td>DELTA_CMUS bounds</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td><code>MAX_DELTA_CMUS = 200,000</code>, <code>shrink_to_fit()</code> at 5 sites</td></tr>
         <tr><td>Dependencies</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>No known CVEs in pinned versions</td></tr>
-        <tr><td>download.rs pointers</td><td class="status-fail"><span class="status-icon">&#10007;</span> FAIL</td><td>4 unguarded <code>from_raw_parts</code> calls</td></tr>
+        <tr><td>download.rs pointers</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td><code>is_null()</code> + length bounds at all 4 <code>from_raw_parts</code> sites</td></tr>
       </tbody>
     </table>
 
@@ -2056,17 +1850,18 @@
         <tr><th>Control</th><th>Status</th><th>Notes</th></tr>
       </thead>
       <tbody>
-        <tr><td>IP address filtering</td><td class="status-partial"><span class="status-icon">~</span> PARTIAL</td><td>Function exists, only called at 1 of 3+ entry points</td></tr>
+        <tr><td>IP address filtering</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td><code>isReservedIPAddress()</code> at 3 entry points + RFC 6598</td></tr>
         <tr><td>Message checksum</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>doubleSHA256 validation</td></tr>
         <tr><td>Protocol version</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>Rejects wrong-chain peers, permanent bans</td></tr>
         <tr><td>Sybil detection</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>Equihash verification + peer banning</td></tr>
         <tr><td>Connection limits</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>MIN=8, MAX=30 peers enforced</td></tr>
-        <tr><td>Rate limiting</td><td class="status-fail"><span class="status-icon">&#10007;</span> FAIL</td><td>Token bucket exists but NEVER called</td></tr>
-        <tr><td>Max payload size</td><td class="status-fail"><span class="status-icon">&#10007;</span> FAIL</td><td>No cap &mdash; UInt32 allows 4GB allocation</td></tr>
+        <tr><td>Rate limiting</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td><code>waitForToken()</code> in <code>sendMessage()</code> &mdash; 100 tokens, 10/sec</td></tr>
+        <tr><td>Max payload size</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>4MB guard in both <code>receiveMessage()</code> variants</td></tr>
         <tr><td>SOCKS5 auth</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>Full RFC 1928 compliance</td></tr>
         <tr><td>Tor circuit isolation</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>Dynamic UUID-based credentials per circuit</td></tr>
-        <tr><td>Broadcast handler</td><td class="status-partial"><span class="status-icon">~</span> PARTIAL</td><td>"Any handler" fallback can misroute rejects</td></tr>
-        <tr><td>Localhost in seeds</td><td class="status-partial"><span class="status-icon">~</span> PARTIAL</td><td>Runtime filtered but still in hardcoded list</td></tr>
+        <tr><td>Broadcast handler</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>"Any handler" fallback removed &mdash; unmatched rejects dropped</td></tr>
+        <tr><td>Localhost in seeds</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>Removed from <code>HARDCODED_SEEDS</code> &mdash; dynamic for full-node only</td></tr>
+        <tr><td>Log redaction</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>16 <code>LogRedaction.redact*</code> calls across Peer + NetworkManager</td></tr>
       </tbody>
     </table>
 
@@ -2077,14 +1872,14 @@
       </thead>
       <tbody>
         <tr><td>SQLCipher encryption</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>AES-256-CBC, HMAC-SHA512, 256K iterations</td></tr>
-        <tr><td>Field-level encryption</td><td class="status-partial"><span class="status-icon">~</span> PARTIAL</td><td>5 fields encrypted, 6 remain plaintext</td></tr>
+        <tr><td>Field-level encryption</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>5 original + 5 shadow columns (AES-GCM) + <code>tx_type_enc</code></td></tr>
         <tr><td>SQL injection</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>100% parameterized queries</td></tr>
-        <tr><td>Thread safety</td><td class="status-partial"><span class="status-icon">~</span> PARTIAL</td><td>FULLMUTEX active, but serial queue never used</td></tr>
-        <tr><td>Transactions</td><td class="status-partial"><span class="status-icon">~</span> PARTIAL</td><td>Some ops transactional, many are not</td></tr>
+        <tr><td>Thread safety</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td><code>executeInTransaction()</code> with EXCLUSIVE locks, dead queue removed</td></tr>
+        <tr><td>Transactions</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>All multi-step operations wrapped in exclusive transactions</td></tr>
         <tr><td>Nullifier hashing</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>SHA256 before storage</td></tr>
-        <tr><td>TX type obfuscation</td><td class="status-partial"><span class="status-icon">~</span> PARTIAL</td><td>Substitution cipher, not real encryption</td></tr>
-        <tr><td>Spending key in DB</td><td class="status-fail"><span class="status-icon">&#10007;</span> FAIL</td><td>Plaintext BLOB in accounts table</td></tr>
-        <tr><td>macOS key storage</td><td class="status-fail"><span class="status-icon">&#10007;</span> FAIL</td><td><strong>CRITICAL</strong> &mdash; Hardware UUID (publicly readable) = deterministic key extraction</td></tr>
+        <tr><td>TX type encryption</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>AES-GCM via <code>encryptTxTypeBlob()</code> at 10 call sites</td></tr>
+        <tr><td>Spending key in DB</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>Zeroed (Migration 15), runtime via SecureKeyStorage</td></tr>
+        <tr><td>macOS key storage</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>Keychain with biometric + <code>kSecAttrAccessibleWhenUnlockedThisDeviceOnly</code></td></tr>
         <tr><td>iOS key storage</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>Secure Enclave with biometric</td></tr>
       </tbody>
     </table>
@@ -2096,13 +1891,13 @@
       </thead>
       <tbody>
         <tr><td>Biometric auth (sends)</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>Fresh prompt, passcode fallback</td></tr>
-        <tr><td>Key export auth</td><td class="status-fail"><span class="status-icon">&#10007;</span> FAIL</td><td>No auth before exporting spending key</td></tr>
-        <tr><td>Clipboard auto-clear</td><td class="status-fail"><span class="status-icon">&#10007;</span> FAIL</td><td>12+ files write with no auto-clear</td></tr>
-        <tr><td>Private key memory</td><td class="status-fail"><span class="status-icon">&#10007;</span> FAIL</td><td>@State never cleared on dismissal</td></tr>
+        <tr><td>Key export auth</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td><code>BiometricAuthManager.authenticateForKeyExport()</code> gates export</td></tr>
+        <tr><td>Clipboard auto-clear</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td><code>ClipboardManager</code> in 10 views &mdash; 10s keys, 60s addresses</td></tr>
+        <tr><td>Private key memory</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td><code>exportedKey</code> cleared on dismissal, truncated display</td></tr>
         <tr><td>Address validation</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>FFI-based cryptographic validation</td></tr>
         <tr><td>Fee validation</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>Prevents overflow, validated before send</td></tr>
-        <tr><td>Screenshot protection</td><td class="status-partial"><span class="status-icon">~</span> PARTIAL</td><td>Background lock works, .inactive doesn't blur</td></tr>
-        <tr><td>PIN security</td><td class="status-fail"><span class="status-icon">&#10007;</span> FAIL</td><td>Fixed salt, weak hashing, non-constant-time</td></tr>
+        <tr><td>Screenshot protection</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>Privacy overlay on <code>.inactive</code> + <code>window.sharingType = .none</code></td></tr>
+        <tr><td>PIN security</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>PBKDF2 100K rounds + random salt + <code>constantTimeEqual()</code></td></tr>
         <tr><td>TX race condition</td><td class="status-pass"><span class="status-icon">&#10003;</span> PASS</td><td>Proper invalidation and validation</td></tr>
       </tbody>
     </table>
@@ -2167,7 +1962,7 @@
 
   <!-- FOOTER -->
   <div class="footer">
-    <p>ZipherX Security Audit Remediation &mdash; Consolidated Report v3.1</p>
+    <p>ZipherX Security Audit Remediation &mdash; Consolidated Report v4.0</p>
     <p class="cipher">4e 45 56 45 52 20 54 52 55 53 54 2e 20 41 4c 57 41 59 53 20 56 45 52 49 46 59 2e</p>
   </div>
 
