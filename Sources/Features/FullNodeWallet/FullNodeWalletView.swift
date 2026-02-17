@@ -41,6 +41,13 @@ struct FullNodeWalletView: View {
     @State private var recentlyConfirmedTxid: String? = nil
     // FIX #1399: Track gap between z_sendmany completion and block mining
     @State private var awaitingBlockConfirmation: Bool = false
+    // FIX #1399 v2: Timestamp for timeout — auto-clear after 10 minutes
+    @State private var awaitingBlockConfirmationSince: Date? = nil
+    // FIX #1399 v2: Snapshot balance when flag is set — compare against THIS, not totalBalance
+    // (totalBalance gets updated by loadWalletData() before balance check runs, masking the change)
+    @State private var awaitingBlockBalanceSnapshot: UInt64? = nil
+    // FIX #1408: Separate private balance snapshot for accurate pending delta display
+    @State private var awaitingBlockPrivateSnapshot: UInt64? = nil
     @State private var lastKnownTxids: Set<String> = []
     @State private var pendingTxMonitorTask: Task<Void, Never>? = nil
 
@@ -59,6 +66,9 @@ struct FullNodeWalletView: View {
     // FIX #1384: Prevent double-load when switching modes
     // Track whether .task initial load is done so onChange doesn't redundantly reload
     @State private var hasLoadedOnce = false
+
+    // Privacy warning dismissal (persists across sessions)
+    @AppStorage("fullnode_privacy_warning_dismissed") private var privacyWarningDismissed = false
 
     private var theme: AppTheme { themeManager.currentTheme }
 
@@ -231,6 +241,11 @@ struct FullNodeWalletView: View {
                 prerequisitesWarningBanner
             }
 
+            // Privacy warning banner
+            if !privacyWarningDismissed && !prerequisitesMissing {
+                fullNodePrivacyWarningBanner
+            }
+
             // Main content
             VStack(spacing: 0) {
                 // Balance header
@@ -339,7 +354,12 @@ struct FullNodeWalletView: View {
                 Task {
                     print("📊 FIX #286 v17: Transaction sent - refreshing wallet data")
                     // FIX #1399: Immediately show "awaiting block confirmation" banner
-                    await MainActor.run { awaitingBlockConfirmation = true }
+                    await MainActor.run {
+                        awaitingBlockConfirmation = true
+                        awaitingBlockConfirmationSince = Date()
+                        awaitingBlockBalanceSnapshot = totalBalance.total
+                        awaitingBlockPrivateSnapshot = totalBalance.private  // FIX #1408
+                    }
                     await loadWalletData()
                 }
             })
@@ -589,6 +609,46 @@ struct FullNodeWalletView: View {
         .padding()
     }
 
+    // Privacy warning: Full Node mode has reduced privacy vs ZipherX P2P mode
+    private var fullNodePrivacyWarningBanner: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 12) {
+                Image(systemName: "eye.trianglebadge.exclamationmark")
+                    .font(.system(size: 28))
+                    .foregroundColor(.yellow)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Reduced Privacy Mode")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundColor(.yellow)
+
+                    Text("Full Node mode uses the daemon for TX construction. Privacy features like randomized change addresses, note selection shuffling, and broadcast jitter are only available in ZipherX P2P mode.")
+                        .font(.system(size: 11))
+                        .foregroundColor(theme.textPrimary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer()
+
+                Button(action: { privacyWarningDismissed = true }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 18))
+                        .foregroundColor(theme.textSecondary)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(12)
+        .background(Color.yellow.opacity(0.1))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.yellow.opacity(0.4), lineWidth: 1)
+        )
+        .cornerRadius(8)
+        .padding(.horizontal)
+        .padding(.top, 8)
+    }
+
     // FIX #286 v12: Rescan progress banner for main view (local or external)
     private var rescanProgressBanner: some View {
         let progress = activeRescanProgress
@@ -711,12 +771,30 @@ struct FullNodeWalletView: View {
                 Spacer()
 
                 // Show pending balance change
+                // FIX #1408: During a z-to-z send, getUnconfirmedBalance returns the CHANGE
+                // amount (positive) instead of the sent amount (negative). When we have a
+                // pre-send balance snapshot, calculate the net delta instead.
                 VStack(alignment: .trailing, spacing: 2) {
                     if pendingUnconfirmedBalance.private_ != 0 {
-                        let sign = pendingUnconfirmedBalance.private_ > 0 ? "+" : ""
-                        Text("\(sign)\(String(format: "%.8f", pendingUnconfirmedBalance.private_)) ZCL")
+                        let pendingDisplay: Double = {
+                            if awaitingBlockConfirmation,
+                               let snapshot = awaitingBlockPrivateSnapshot,
+                               pendingUnconfirmedBalance.private_ > 0 {
+                                // FIX #1408: Net delta = (confirmed + unconfirmed) - preSendPrivateBalance
+                                // During a z-send: confirmed = 0 (input spent), unconfirmed = change
+                                // So delta = change - preSendBalance = negative (= -(sent + fee))
+                                let currentTotal = Double(totalBalance.private) / 100_000_000.0 + pendingUnconfirmedBalance.private_
+                                let preSend = Double(snapshot) / 100_000_000.0
+                                let delta = currentTotal - preSend
+                                print("📊 FIX #1408: Pending display delta: current=\(String(format: "%.8f", currentTotal)), preSend=\(String(format: "%.8f", preSend)), delta=\(String(format: "%.8f", delta))")
+                                return delta
+                            }
+                            return pendingUnconfirmedBalance.private_
+                        }()
+                        let sign = pendingDisplay > 0 ? "+" : ""
+                        Text("\(sign)\(String(format: "%.8f", pendingDisplay)) ZCL")
                             .font(.system(size: 12, weight: .bold, design: .monospaced))
-                            .foregroundColor(pendingUnconfirmedBalance.private_ > 0 ? theme.successColor : theme.errorColor)
+                            .foregroundColor(pendingDisplay > 0 ? theme.successColor : theme.errorColor)
                     }
                     if pendingUnconfirmedBalance.transparent != 0 {
                         let sign = pendingUnconfirmedBalance.transparent > 0 ? "+" : ""
@@ -2160,6 +2238,23 @@ struct FullNodeWalletView: View {
         }
     }
 
+    /// FIX #1405: Lightweight balance-only refresh — no address listing.
+    /// Avoids daemon keypool reserve/return spam from listaddressgroupings/getaddressesbyaccount.
+    /// Use this in monitor/poll paths; use loadWalletData() only for startup and address creation.
+    private func refreshBalanceOnly() async {
+        do {
+            async let balance = rpcWallet.getTotalBalance()
+            async let status = rpcWallet.getSyncStatus()
+            let (balanceResult, statusResult) = try await (balance, status)
+            await MainActor.run {
+                totalBalance = balanceResult
+                syncStatus = statusResult
+            }
+        } catch {
+            // Silently ignore — monitor will retry
+        }
+    }
+
     private func createAddress(shielded: Bool) async {
         do {
             if shielded {
@@ -2433,6 +2528,13 @@ struct FullNodeWalletView: View {
                     if let txid = completedOp.txid {
                         print("📊 FIX #1399: Operation completed — txid: \(txid.prefix(16))... — awaiting block confirmation")
                         awaitingBlockConfirmation = true
+                        awaitingBlockConfirmationSince = Date()
+                        awaitingBlockBalanceSnapshot = totalBalance.total
+                        // FIX #1408: Only set private snapshot if not already captured by onSendSuccess
+                        // (at this point totalBalance may already be post-send = 0)
+                        if awaitingBlockPrivateSnapshot == nil {
+                            awaitingBlockPrivateSnapshot = totalBalance.private
+                        }
                     }
                 }
             }
@@ -2443,8 +2545,23 @@ struct FullNodeWalletView: View {
             let hasPendingNow = !trulyPendingNow.isEmpty || unconfirmed.transparent != 0 || unconfirmed.private_ != 0
 
             if hadRawPendingBefore && !hasPendingNow {
-                print("📊 FIX #1272: Pending→confirmed transition detected — refreshing all wallet data")
-                await loadWalletData()
+                print("📊 FIX #1272: Pending→confirmed transition detected — refreshing balance")
+                await refreshBalanceOnly()  // FIX #1405: No address listing needed here
+            }
+
+            // FIX #1399 v2: Timeout — auto-clear awaitingBlockConfirmation after 10 minutes
+            // This prevents the banner from being stuck forever if both clear paths fail
+            if awaitingBlockConfirmation, let since = awaitingBlockConfirmationSince {
+                let elapsed = Date().timeIntervalSince(since)
+                if elapsed > 600 {  // 10 minutes
+                    print("📊 FIX #1399 v2: Clearing awaitingBlockConfirmation after \(Int(elapsed))s timeout (TX likely confirmed)")
+                    await MainActor.run {
+                        awaitingBlockConfirmation = false
+                        awaitingBlockConfirmationSince = nil
+                        awaitingBlockPrivateSnapshot = nil  // FIX #1408
+                    }
+                    await refreshBalanceOnly()  // FIX #1405
+                }
             }
 
             // FIX #1272: Always refresh balance during monitoring when no pending ops.
@@ -2463,8 +2580,27 @@ struct FullNodeWalletView: View {
                     if total != current.total || transparent != current.transparent || privateBalance != current.private {
                         print("📊 FIX #1272: Balance changed \(formatBalance(current.total)) → \(formatBalance(total)) — refreshing all wallet data")
                         // FIX #1399: Block confirmed — balance changed, clear awaiting state
-                        await MainActor.run { awaitingBlockConfirmation = false }
-                        await loadWalletData()
+                        await MainActor.run {
+                            awaitingBlockConfirmation = false
+                            awaitingBlockConfirmationSince = nil
+                            awaitingBlockBalanceSnapshot = nil
+                            awaitingBlockPrivateSnapshot = nil  // FIX #1408
+                        }
+                        await refreshBalanceOnly()  // FIX #1405
+                    }
+
+                    // FIX #1399 v2: Compare against SNAPSHOT balance (set when flag was enabled)
+                    // loadWalletData() updates totalBalance before this check runs, masking the change.
+                    // The snapshot preserves the pre-send balance for reliable comparison.
+                    if awaitingBlockConfirmation, let snapshot = awaitingBlockBalanceSnapshot, total != snapshot {
+                        print("📊 FIX #1399 v2: Balance changed from snapshot \(formatBalance(snapshot)) → \(formatBalance(total)) — TX confirmed!")
+                        await MainActor.run {
+                            awaitingBlockConfirmation = false
+                            awaitingBlockConfirmationSince = nil
+                            awaitingBlockBalanceSnapshot = nil
+                            awaitingBlockPrivateSnapshot = nil  // FIX #1408
+                        }
+                        await refreshBalanceOnly()  // FIX #1405
                     }
                 }
             }
@@ -2499,10 +2635,13 @@ struct FullNodeWalletView: View {
                             if awaitingBlockConfirmation {
                                 print("📊 FIX #1399: TX \(newTxid.prefix(16))... confirmed in block — clearing awaiting state")
                                 awaitingBlockConfirmation = false
+                                awaitingBlockConfirmationSince = nil
+                                awaitingBlockBalanceSnapshot = nil
+                                awaitingBlockPrivateSnapshot = nil  // FIX #1408
                             }
                         }
-                        // Refresh wallet data to update balance
-                        await loadWalletData()
+                        // Refresh balance (no address listing needed)
+                        await refreshBalanceOnly()  // FIX #1405
                         break
                     }
                 }

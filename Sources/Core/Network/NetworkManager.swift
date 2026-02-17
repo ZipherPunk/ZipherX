@@ -169,7 +169,9 @@ public final class NetworkManager: ObservableObject {
     private let QUERY_TIMEOUT: TimeInterval = 10
     private let BAN_DURATION: TimeInterval = 604800 // VUL-010: 7 days for stronger Sybil protection
     private let MAX_KNOWN_ADDRESSES = 1000
+    private let MAX_ADDRESSES_PER_PEER = 100  // NET-005: Limit addresses accepted from a single peer per cycle
     private let GETADDR_INTERVAL: TimeInterval = 30 // Request addresses every 30 seconds
+    private var addressSourceCounts: [String: Int] = [:]  // NET-005: Track total addresses contributed by each source
 
     // FIX #849: UserDefaults key for persisting pending outgoing txids across app restart
     private let PENDING_TXIDS_KEY = "ZipherX_PendingOutgoingTxids"
@@ -1177,7 +1179,7 @@ public final class NetworkManager: ObservableObject {
                 print("⚠️ FIX #847: Found \(pendingSent.count) unconfirmed sent transaction(s) - blocking new sends")
                 for tx in pendingSent {
                     let txidHex = tx.txid.map { String(format: "%02x", $0) }.joined()
-                    print("  📤 Pending TX: \(txidHex.prefix(16))... status=\(tx.status.rawValue) value=\(tx.value) zatoshis")
+                    print("  📤 Pending TX: \(txidHex.prefix(16))... status=\(tx.status.rawValue) value=\(tx.value.redactedAmount)")
 
                     // Add to tracking state (for consistency with runtime tracking)
                     pendingOutgoingLock.lock()
@@ -1345,6 +1347,13 @@ public final class NetworkManager: ObservableObject {
         if knownAddresses[key] != nil {
             // Update last seen time
             knownAddresses[key]?.lastSeen = Date()
+            return
+        }
+
+        // NET-005: Reject addresses from sources that have contributed too many (Sybil indicator)
+        let sourceTotal = addressSourceCounts[source] ?? 0
+        if sourceTotal > 200 {
+            // Source has contributed 200+ addresses across all cycles — suspicious
             return
         }
 
@@ -1816,13 +1825,22 @@ public final class NetworkManager: ObservableObject {
         for peer in peers {
             do {
                 let addresses = try await peer.getAddresses()
+                var peerAccepted = 0
                 for addr in addresses {
+                    // NET-005: Per-peer quota per discovery cycle
+                    guard peerAccepted < MAX_ADDRESSES_PER_PEER else {
+                        print("🛡️ NET-005: Capped \(peer.host) at \(MAX_ADDRESSES_PER_PEER) addresses (sent \(addresses.count))")
+                        break
+                    }
                     addAddress(addr, source: peer.host)
+                    peerAccepted += 1
                     discoveredCount += 1
                     if addr.host.hasSuffix(".onion") {
                         onionDiscoveredCount += 1
                     }
                 }
+                // NET-005: Track cumulative source contributions
+                addressSourceCounts[peer.host, default: 0] += peerAccepted
                 peer.recordSuccess()
             } catch {
                 peer.recordFailure()
@@ -3587,7 +3605,7 @@ public final class NetworkManager: ObservableObject {
         await MainActor.run {
             self.mempoolOutgoing = result.total
             self.mempoolOutgoingTxCount = result.count
-            print("📤 FIX #350: Tracking pending outgoing (deferred DB write): \(pendingTx.txid.prefix(12))... = \(pendingTx.amount + pendingTx.fee) zatoshis (total: \(result.total))")
+            print("📤 FIX #350: Tracking pending outgoing (deferred DB write): \(pendingTx.txid.prefix(12))... = \(LogRedaction.redactAmount(pendingTx.amount + pendingTx.fee)) (total: \(result.total.redactedAmount))")
         }
     }
 
@@ -3605,7 +3623,7 @@ public final class NetworkManager: ObservableObject {
         await MainActor.run {
             self.mempoolOutgoing = result.total
             self.mempoolOutgoingTxCount = result.count
-            print("📤 Tracking pending outgoing (legacy): \(txid.prefix(12))... = \(amount) zatoshis (total: \(result.total))")
+            print("📤 Tracking pending outgoing (legacy): \(txid.prefix(12))... = \(amount.redactedAmount) (total: \(result.total.redactedAmount))")
         }
     }
 
@@ -3619,12 +3637,19 @@ public final class NetworkManager: ObservableObject {
     /// FIX #350: NOW writes to database - this is the ONLY place where sent TX is recorded!
     /// This is now async and awaitable to ensure proper completion ordering
     func confirmOutgoingTx(txid: String, blockHeight: UInt64 = 0) async {
-        print("📤 confirmOutgoingTx called for: \(txid.prefix(16))... (blockHeight: \(blockHeight))")
-
-        // Remove from sync-accessible set
+        // FIX #1403: Atomic check-and-remove to deduplicate concurrent calls.
+        // A TX spending N notes triggers N nullifier matches in the block scanner,
+        // each calling confirmOutgoingTx. Only the first call should proceed.
         pendingOutgoingLock.lock()
-        pendingOutgoingTxidSet.remove(txid)
+        let wasPresent = pendingOutgoingTxidSet.remove(txid) != nil
         pendingOutgoingLock.unlock()
+
+        guard wasPresent else {
+            // Already confirmed by a prior call (same TX, different nullifier match)
+            return
+        }
+
+        print("📤 confirmOutgoingTx called for: \(txid.prefix(16))... (blockHeight: \(blockHeight))")
 
         // FIX #849: Remove from UserDefaults persistence
         await MainActor.run { removePendingTxidFromPersistence(txid) }
@@ -3748,7 +3773,7 @@ public final class NetworkManager: ObservableObject {
     /// Track a pending incoming transaction found during block scan (0 confirmations)
     /// This will trigger the Settlement celebration once it has 1+ confirmations
     func trackPendingIncoming(txid: String, amount: UInt64) async {
-        print("📥 trackPendingIncoming: txid=\(txid.prefix(16))... amount=\(amount)")
+        print("📥 trackPendingIncoming: txid=\(txid.prefix(16))... amount=\(amount.redactedAmount)")
         await txTrackingState.trackIncoming(txid: txid, amount: amount)
         await MainActor.run {
             // Update mempoolIncoming to show pending indicator
@@ -4360,7 +4385,7 @@ public final class NetworkManager: ObservableObject {
                         if !isOurPending && !isOurRecorded {
                             // EXTERNAL WALLET SPEND DETECTED - store for now, finalize after output parsing
                             print("🚨🚨🚨 [EXTERNAL SPEND] TX \(txHashHex.prefix(12))... is spending our note!")
-                            print("🚨 [EXTERNAL SPEND] Input note value: \(noteInfo.value) zatoshis")
+                            print("🚨 [EXTERNAL SPEND] Input note value: \(noteInfo.value.redactedAmount)")
                             pendingExternalSpend = (txid: txHashHex, inputValue: noteInfo.value, nullifier: nullifier)
                         } else if isOurRecorded && !isOurPending {
                             print("🔮 MEMPOOL: Skipping tx \(txHashHex.prefix(12))... (our recorded sent tx still in mempool)")
@@ -4371,6 +4396,8 @@ public final class NetworkManager: ObservableObject {
 
             // FIX #301: Declare outside block so it's accessible for external spend calculation
             var txIncomingAmount: UInt64 = 0
+            // FIX #1403: Track individual output values for same-key external spend detection
+            var decryptedOutputValues: [UInt64] = []
 
             // Parse transaction for shielded outputs
             if let outputs = parseShieldedOutputs(from: rawTx) {
@@ -4387,7 +4414,8 @@ public final class NetworkManager: ObservableObject {
                             let valueBytes = Data(decrypted[11..<19])
                             let value = valueBytes.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
                             txIncomingAmount += value
-                            print("🔮 MEMPOOL: Found incoming \(value) zatoshis in tx \(txHashHex.prefix(12))...")
+                            decryptedOutputValues.append(value)
+                            print("🔮 MEMPOOL: Found incoming \(value.redactedAmount) in tx \(txHashHex.prefix(12))...")
                         }
                     }
                 }
@@ -4429,7 +4457,7 @@ public final class NetworkManager: ObservableObject {
 
                     if isChangeOutput {
                         // Change outputs are NOT counted in mempoolIncoming
-                        print("🔔 MEMPOOL: Excluding change output \(txIncomingAmount) zatoshis from tx \(txHashHex.prefix(12))...")
+                        print("🔔 MEMPOOL: Excluding change output \(txIncomingAmount.redactedAmount) from tx \(txHashHex.prefix(12))...")
                     } else {
                         // CRITICAL: Check if this tx has already been confirmed
                         // This prevents the race condition where mempool scan runs
@@ -4463,11 +4491,24 @@ public final class NetworkManager: ObservableObject {
             if let extSpend = pendingExternalSpend {
                 let changeBack = txIncomingAmount
                 let estimatedFee: UInt64 = 10_000  // Standard fee
-                let actualSent = extSpend.inputValue > (changeBack + estimatedFee)
+                var actualSent = extSpend.inputValue > (changeBack + estimatedFee)
                     ? extSpend.inputValue - changeBack - estimatedFee
-                    : extSpend.inputValue  // Fallback if no change
+                    : UInt64(0)
 
-                print("🚨 [EXTERNAL SPEND] Calculated: input=\(extSpend.inputValue), change=\(changeBack), fee=\(estimatedFee), actual sent=\(actualSent)")
+                // FIX #1403: Same-key scenario — when ALL outputs are decryptable (same IVK controls
+                // both destination and change), actualSent computes to 0. The smallest output
+                // is the actual sent amount (the larger one is change back to us).
+                if actualSent == 0 && decryptedOutputValues.count >= 2 {
+                    let sorted = decryptedOutputValues.sorted()
+                    actualSent = sorted[0]  // Smallest output = destination amount
+                    print("🚨 FIX #1403: Same-key external spend — all outputs decryptable. Using smallest output (\(actualSent.redactedAmount)) as sent amount")
+                } else if actualSent == 0 && decryptedOutputValues.count == 1 {
+                    // Only one output decryptable and it equals the input minus fee = self-transfer
+                    actualSent = estimatedFee  // Just the fee was spent
+                    print("🚨 FIX #1403: Self-transfer detected — only fee was spent")
+                }
+
+                print("🚨 [EXTERNAL SPEND] Calculated: input=\(extSpend.inputValue.redactedAmount), change=\(changeBack.redactedAmount), fee=\(estimatedFee.redactedAmount), actual sent=\(actualSent.redactedAmount)")
                 print("🚨 [EXTERNAL SPEND] This transaction was NOT sent by ZipherX - another wallet with the same key sent it!")
 
                 // Track external spend (for mempool confirmation checking)
@@ -4488,7 +4529,7 @@ public final class NetworkManager: ObservableObject {
 
         // Send notifications for NEW incoming transactions (already filtered for change)
         for (txid, amount) in newIncomingTxs {
-            print("🔔 MEMPOOL NOTIFICATION: New incoming \(amount) zatoshis in tx \(txid.prefix(12))...")
+            print("🔔 MEMPOOL NOTIFICATION: New incoming \(amount.redactedAmount) in tx \(txid.prefix(12))...")
             NotificationManager.shared.notifyReceived(amount: amount, txid: txid)
 
             // Track this incoming tx so we can celebrate when it's confirmed
@@ -4507,7 +4548,7 @@ public final class NetworkManager: ObservableObject {
             self.mempoolIncoming = incomingAmount
             self.mempoolTxCount = incomingCount
             if incomingAmount > 0 {
-                print("🔮 Mempool incoming: \(incomingAmount) zatoshis (\(incomingCount) tx)")
+                print("🔮 Mempool incoming: \(incomingAmount.redactedAmount) (\(incomingCount) tx)")
             }
         }
     }
@@ -4575,6 +4616,8 @@ public final class NetworkManager: ObservableObject {
         let outputs = parseShieldedOutputs(from: rawTx)
 
         var txIncomingAmount: UInt64 = 0
+        // FIX #1403: Track individual output values for same-key external spend detection
+        var decryptedOutputValues: [UInt64] = []
         if let outputs = outputs {
             for output in outputs {
                 if let decrypted = ZipherXFFI.tryDecryptNoteWithSK(
@@ -4587,9 +4630,10 @@ public final class NetworkManager: ObservableObject {
                         let valueBytes = Data(decrypted[11..<19])
                         let value = valueBytes.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
                         txIncomingAmount += value
+                        decryptedOutputValues.append(value)
                         if externalSpendTotal == 0 {
                             // Only log as "incoming" if NOT an external spend
-                            print("🔮 FIX #1333: 💰 INSTANT DETECT — incoming \(value) zatoshis in TX \(txidDisplayHex.prefix(12))... from [\(fromPeer)]")
+                            print("🔮 FIX #1333: 💰 INSTANT DETECT — incoming \(value.redactedAmount) in TX \(txidDisplayHex.prefix(12))... from [\(fromPeer)]")
                         }
                     }
                 }
@@ -4600,13 +4644,37 @@ public final class NetworkManager: ObservableObject {
         if externalSpendTotal > 0 {
             let fee: UInt64 = 10_000
             let changeAmount = txIncomingAmount  // Our decryptable outputs = change back to us
-            let sentAmount = externalSpendTotal > (changeAmount + fee) ? externalSpendTotal - changeAmount - fee : 0
-            print("🔮 FIX #1398: EXTERNAL SPEND in TX \(txidDisplayHex.prefix(12))... — input: \(externalSpendTotal), change: \(changeAmount), sent: \(sentAmount), fee: \(fee) zat")
+            var sentAmount = externalSpendTotal > (changeAmount + fee) ? externalSpendTotal - changeAmount - fee : 0
 
-            // Track as pending outgoing so BalanceView shows "awaiting confirmation"
+            // FIX #1403: Same-key scenario — when ALL outputs are decryptable (same IVK controls
+            // both destination and change), sentAmount computes to 0. In this case, the smallest
+            // decrypted output is the actual sent amount (the larger one is change).
+            if sentAmount == 0 && decryptedOutputValues.count >= 2 {
+                let sorted = decryptedOutputValues.sorted()
+                sentAmount = sorted[0]  // Smallest output = destination amount
+                print("🔮 FIX #1403: Same-key external spend — all outputs decryptable. Using smallest output (\(sentAmount.redactedAmount)) as sent amount")
+            }
+
+            print("🔮 FIX #1398: EXTERNAL SPEND in TX \(txidDisplayHex.prefix(12))... — input: \(externalSpendTotal.redactedAmount), change: \(changeAmount.redactedAmount), sent: \(sentAmount.redactedAmount), fee: \(fee.redactedAmount)")
+
+            // FIX #1406: Add to pendingOutgoingTxidSet so FIX #859 block scanner can confirm
+            // AND prevent mempool scan from re-detecting as external spend
+            pendingOutgoingLock.lock()
+            pendingOutgoingTxidSet.insert(txidDisplayHex)
+            pendingOutgoingLock.unlock()
+
+            // FIX #1407: Set pendingBroadcastAmount for correct display in BalanceView.
+            // The pendingBroadcastAmount path shows the sent amount directly (no fee subtraction)
+            // and displays "awaiting confirmation" text. The mempoolOutgoing path would subtract
+            // 10000 for display, which only works if fee IS included — but that's confusing.
             await MainActor.run {
-                self.mempoolOutgoing = sentAmount + fee
+                self.pendingBroadcastAmount = sentAmount  // Sent amount without fee — shown directly
+                self.pendingBroadcastFee = fee             // Fee tracked separately
+                self.pendingBroadcastTxid = txidDisplayHex
+                self.mempoolOutgoing = sentAmount + fee    // Total deduction for effectiveDisplayBalance
                 WalletManager.shared.recordBalanceBeforeExternalSpend()
+                // FIX #1406: Persist for cross-restart tracking
+                self.persistPendingTxid(txidDisplayHex)
             }
             // Track TX for confirmation monitoring
             _ = await txTrackingState.trackOutgoingSimple(txid: txidDisplayHex, amount: sentAmount)
@@ -4634,7 +4702,7 @@ public final class NetworkManager: ObservableObject {
         }
 
         // NEW incoming TX — send notification and celebrate!
-        print("🔔 FIX #1333: 🎉 INSTANT MEMPOOL NOTIFICATION — \(txIncomingAmount) zatoshis in TX \(txidDisplayHex.prefix(12))... (event-driven, no polling!)")
+        print("🔔 FIX #1333: 🎉 INSTANT MEMPOOL NOTIFICATION — \(txIncomingAmount.redactedAmount) in TX \(txidDisplayHex.prefix(12))... (event-driven, no polling!)")
         NotificationManager.shared.notifyReceived(amount: txIncomingAmount, txid: txidDisplayHex)
 
         // Track incoming TX

@@ -273,9 +273,9 @@ final class FilterScanner {
     ///   - accountId: Account to scan for
     ///   - viewingKey: Spending key (used as viewing key)
     ///   - fromHeight: Optional custom start height (for quick scan)
-    func startScan(for accountId: Int64, viewingKey: Data, fromHeight customStartHeight: UInt64? = nil) async throws {
+    func startScan(for accountId: Int64, viewingKey: Data, fromHeight customStartHeight: UInt64? = nil, expectedBlockCount: UInt64 = 0) async throws {
         // FIX #1097: Log entry into startScan for debugging
-        print("🔍 FIX #1097: startScan called - isScanning=\(isScanning), isScanInProgress=\(FilterScanner.isScanInProgress)")
+        print("🔍 FIX #1097: startScan called - isScanning=\(isScanning), isScanInProgress=\(FilterScanner.isScanInProgress), expectedBlocks=\(expectedBlockCount)")
 
         // SECURITY: Thread-safe check and acquisition of global lock
         guard !isScanning && !FilterScanner.isScanInProgress else {
@@ -294,28 +294,38 @@ final class FilterScanner {
         )
         defer { ProcessInfo.processInfo.endActivity(activity) }
 
-        // FIX #907: Block all block listeners during the entire scan operation
-        // Block listeners can only run when app is idle on main screen
-        await PeerManager.shared.stopAllBlockListeners(timeout: 3.0)
-        PeerManager.shared.setBlockListenersBlocked(true)
+        // FIX #1410: For small background syncs (≤ 10 blocks), DON'T stop block listeners.
+        // Stopping listeners cancels ALL NWConnections (especially Tor SOCKS5), causing peers
+        // to drop to 0 for 5-10 seconds during reconnection. For 1-2 block syncs this is
+        // extremely disruptive and unnecessary — the dispatcher handles block fetches fine
+        // while listeners are running.
+        let isLightweightScan = expectedBlockCount > 0 && expectedBlockCount <= 10
+        if isLightweightScan {
+            print("🔍 FIX #1410: Lightweight scan (\(expectedBlockCount) blocks) — keeping block listeners active")
+        } else {
+            // FIX #907: Block all block listeners during the entire scan operation
+            // Block listeners can only run when app is idle on main screen
+            await PeerManager.shared.stopAllBlockListeners(timeout: 3.0)
+            PeerManager.shared.setBlockListenersBlocked(true)
 
-        // FIX #1228: Reconnect peers with dead connections after stopping block listeners.
-        // FIX #1184b kills NWConnections → peers have handshake=true but connection=nil.
-        // Without this, FilterScanner can't fetch blocks or chain height → scan fails.
-        let deadPeersScan = await MainActor.run {
-            networkManager.peers.filter { $0.isHandshakeComplete && !$0.isConnectionReady }
-        }
-        if !deadPeersScan.isEmpty {
-            print("🔄 FIX #1228: Reconnecting \(deadPeersScan.count) peers with dead connections (FilterScanner start)...")
-            var reconnectedScan = Set<String>()  // FIX #1235
-            for peer in deadPeersScan {
-                if reconnectedScan.contains(peer.host) { print("⏭️ FIX #1235: [\(peer.host)] Already reconnected - skipping"); continue }
-                do {
-                    try await peer.ensureConnected()
-                    reconnectedScan.insert(peer.host)  // FIX #1235
-                    print("✅ FIX #1228: [\(peer.host)] Reconnected for FilterScanner")
-                } catch {
-                    print("⚠️ FIX #1228: [\(peer.host)] Reconnect failed: \(error.localizedDescription)")
+            // FIX #1228: Reconnect peers with dead connections after stopping block listeners.
+            // FIX #1184b kills NWConnections → peers have handshake=true but connection=nil.
+            // Without this, FilterScanner can't fetch blocks or chain height → scan fails.
+            let deadPeersScan = await MainActor.run {
+                networkManager.peers.filter { $0.isHandshakeComplete && !$0.isConnectionReady }
+            }
+            if !deadPeersScan.isEmpty {
+                print("🔄 FIX #1228: Reconnecting \(deadPeersScan.count) peers with dead connections (FilterScanner start)...")
+                var reconnectedScan = Set<String>()  // FIX #1235
+                for peer in deadPeersScan {
+                    if reconnectedScan.contains(peer.host) { print("⏭️ FIX #1235: [\(peer.host)] Already reconnected - skipping"); continue }
+                    do {
+                        try await peer.ensureConnected()
+                        reconnectedScan.insert(peer.host)  // FIX #1235
+                        print("✅ FIX #1228: [\(peer.host)] Reconnected for FilterScanner")
+                    } catch {
+                        print("⚠️ FIX #1228: [\(peer.host)] Reconnect failed: \(error.localizedDescription)")
+                    }
                 }
             }
         }
@@ -324,7 +334,9 @@ final class FilterScanner {
             isScanning = false
             FilterScanner.setScanInProgress(false)
             // FIX #907: Unblock block listeners when scan completes
-            PeerManager.shared.setBlockListenersBlocked(false)
+            if !isLightweightScan {
+                PeerManager.shared.setBlockListenersBlocked(false)
+            }
         }
 
         // Get current chain height
@@ -3431,6 +3443,8 @@ final class FilterScanner {
 
         // FIX #288: Check for spent notes (nullifier detection) FIRST
         // FIX #1050: Suppress verbose per-TX spend processing log (routine during sync)
+        // FIX #1403: Track if we already confirmed this txid (a TX with N spends triggers N matches)
+        var didConfirmOutgoingTx = false
         if let spends = spends, !spends.isEmpty {
             // FIX #1289 v3: Collect nullifiers for delta bundle (enables local spend detection in Phase 1b)
             if deltaCollectionEnabled, let txidData = Data(hexString: txid) {
@@ -3528,14 +3542,16 @@ final class FilterScanner {
                     } else {
                         txidDisplayFormat = txid  // Fallback if parsing fails
                     }
-                    if NetworkManager.shared.isPendingOutgoingTx(txidDisplayFormat) {
+                    // FIX #1403: Only confirm once per txid (first nullifier match wins)
+                    if !didConfirmOutgoingTx && NetworkManager.shared.isPendingOutgoingTx(txidDisplayFormat) {
+                        didConfirmOutgoingTx = true
                         if verbose {
                             print("📤 FIX #859: Pending TX \(txidDisplayFormat.prefix(16))... confirmed in block \(height)")
                         }
                         Task {
                             await NetworkManager.shared.confirmOutgoingTx(txid: txidDisplayFormat, blockHeight: height)
                         }
-                    } else {
+                    } else if !didConfirmOutgoingTx {
                         // FIX #843: External spend or app-restart case
                         // We detected our nullifier but TX wasn't in pending list
                         // This happens when:
@@ -3550,7 +3566,7 @@ final class FilterScanner {
                                     if verbose {
                                         print("💸 FIX #843: External/restart spend detected")
                                         print("   TX: \(txid.prefix(16))... at height \(height)")
-                                        print("   Note value: \(spentNote.value) zatoshis")
+                                        print("   Note value: \(spentNote.value.redactedAmount)")
                                     }
                                     // Track this TX for reconciliation when we find the change output
                                     externalSpendTxids.insert(txid)
@@ -3709,7 +3725,7 @@ final class FilterScanner {
             if verbose {
                 let nfShort = nullifier.prefix(8).map { String(format: "%02x", $0) }.joined()
                 print("🔑 FIX #953: Adding nullifier to knownNullifiers at height \(height)")
-                print("   Position: \(treePosition), Value: \(value) zatoshis")
+                print("   Position: \(treePosition), Value: \(value.redactedAmount)")
                 print("   Nullifier (wire): \(nfShort)...")
                 let hashedNfShort = hashedNf.prefix(8).map { String(format: "%02x", $0) }.joined()
                 print("   Hashed nullifier: \(hashedNfShort)...")
@@ -3820,10 +3836,10 @@ final class FilterScanner {
 
                 if verbose {
                     print("💸 FIX #843: Recording external spend as SENT transaction")
-                    print("   Input note: \(externalSpendNoteValue) zatoshis")
-                    print("   Change output: \(changeValue) zatoshis")
-                    print("   Sent amount: \(sentAmount) zatoshis")
-                    print("   Fee: \(fee) zatoshis")
+                    print("   Input note: \(externalSpendNoteValue.redactedAmount)")
+                    print("   Change output: \(changeValue.redactedAmount)")
+                    print("   Sent amount: \(sentAmount.redactedAmount)")
+                    print("   Fee: \(fee.redactedAmount)")
                 }
 
                 _ = try database.recordSentTransactionAtomic(
@@ -3874,7 +3890,7 @@ final class FilterScanner {
 
                 // Send system notification so user sees incoming TX even if app is in background
                 NotificationManager.shared.notifyReceived(amount: blockValue, txid: blockTxid)
-                print("🔔 FIX #1332: System notification sent for incoming \(blockValue) zatoshis in block \(height)")
+                print("🔔 FIX #1332: System notification sent for incoming \(blockValue.redactedAmount) in block \(height)")
             }
 
             pendingWitnesses.append((noteId: noteId, witnessIndex: witnessIndex))
@@ -3891,8 +3907,8 @@ final class FilterScanner {
                     if verbose {
                         print("💸 FIX #843: Recording external spend (no change) as SENT transaction")
                         print("   TX: \(externalTxid.prefix(16))...")
-                        print("   Input note: \(externalSpendNoteValue) zatoshis")
-                        print("   Sent amount: \(sentAmount) zatoshis (no change output)")
+                        print("   Input note: \(externalSpendNoteValue.redactedAmount)")
+                        print("   Sent amount: \(sentAmount.redactedAmount) (no change output)")
                     }
 
                     _ = try database.recordSentTransactionAtomic(
@@ -4351,6 +4367,8 @@ final class FilterScanner {
         // CRITICAL: Check for spent notes (nullifier detection) FIRST
         // This must be done before processing outputs so we can catch spends
         // of notes we already know about
+        // FIX #1403: Track if we already confirmed this txid (a TX with N spends triggers N matches)
+        var didConfirmOutgoingTx = false
         if let spends = spends {
             // Convert txid from hex string to Data for database storage
             let txidData = Data(hexString: txid)
@@ -4375,18 +4393,22 @@ final class FilterScanner {
 
                     // FIX #396: Confirm pending outgoing TX when nullifier found in block
                     // FIX #859: txid parameter is in wire format, but pending set uses display format
-                    let txidDisplayFormat: String
-                    if let txidData = Data(hexString: txid) {
-                        txidDisplayFormat = txidData.reversed().map { String(format: "%02x", $0) }.joined()
-                    } else {
-                        txidDisplayFormat = txid  // Fallback
-                    }
-                    if NetworkManager.shared.isPendingOutgoingSync(txid: txidDisplayFormat) {
-                        if verbose {
-                            print("📤 FIX #859: Pending TX \(txidDisplayFormat.prefix(16))... confirmed in block \(height)")
+                    // FIX #1403: Only confirm once per txid (first nullifier match wins)
+                    if !didConfirmOutgoingTx {
+                        let txidDisplayFormat: String
+                        if let txidData = Data(hexString: txid) {
+                            txidDisplayFormat = txidData.reversed().map { String(format: "%02x", $0) }.joined()
+                        } else {
+                            txidDisplayFormat = txid  // Fallback
                         }
-                        Task {
-                            await NetworkManager.shared.confirmOutgoingTx(txid: txidDisplayFormat, blockHeight: height)
+                        if NetworkManager.shared.isPendingOutgoingSync(txid: txidDisplayFormat) {
+                            didConfirmOutgoingTx = true
+                            if verbose {
+                                print("📤 FIX #859: Pending TX \(txidDisplayFormat.prefix(16))... confirmed in block \(height)")
+                            }
+                            Task {
+                                await NetworkManager.shared.confirmOutgoingTx(txid: txidDisplayFormat, blockHeight: height)
+                            }
                         }
                     }
                 }

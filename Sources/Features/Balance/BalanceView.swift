@@ -1105,7 +1105,10 @@ struct BalanceView: View {
                             .font(theme.captionFont)
                             .foregroundColor(theme.textSecondary)
                     }
-                } else if !networkManager.isConnected {
+                } else if !networkManager.isConnected || networkManager.connectedPeers == 0 {
+                    // FIX #1409: Check BOTH isConnected AND connectedPeers.
+                    // On iOS network path changes, peers drop to 0 but cached heights
+                    // still satisfy "Synced" condition — must show "Disconnected" instead.
                     Image(systemName: "xmark.circle.fill")
                         .foregroundColor(theme.errorColor)
                         .font(.system(size: 10))
@@ -1307,8 +1310,8 @@ struct BalanceView: View {
                 // Initial sync in progress
                 Text("⏳")
                     .font(.system(size: 14))
-            } else if !networkManager.isConnected {
-                // Not connected - warning
+            } else if !networkManager.isConnected || networkManager.connectedPeers == 0 {
+                // FIX #1409: Not connected OR no peers — warning
                 Text("⚠️")
                     .font(.system(size: 14))
             } else if networkManager.chainHeight > 0 && networkManager.walletHeight > 0 &&

@@ -1893,8 +1893,8 @@ final class WalletManager: ObservableObject {
 
         if dbValues != p2pValues {
             print("❌ FIX #1085: Height \(height) - Value mismatch!")
-            print("   Database values: \(dbValues.map { Double($0) / 100_000_000.0 })")
-            print("   P2P values: \(p2pValues.map { Double($0) / 100_000_000.0 })")
+            print("   Database values: \(dbValues.map { LogRedaction.redactAmount(UInt64(abs($0))) })")
+            print("   P2P values: \(p2pValues.map { LogRedaction.redactAmount(UInt64(abs($0))) })")
             return true
         }
 
@@ -2227,7 +2227,7 @@ final class WalletManager: ObservableObject {
 
                 // Delete from transaction_history database (if it exists there)
                 if let deletedValue = try? WalletDatabase.shared.deletePhantomTransaction(txid: txidWireFormat) {
-                    print("🗑️ FIX #970: Deleted phantom TX from history (value: \(deletedValue) zatoshis)")
+                    print("🗑️ FIX #970: Deleted phantom TX from history (value: \(deletedValue.redactedAmount))")
                 }
 
                 // Remove from UserDefaults persistence
@@ -2371,7 +2371,7 @@ final class WalletManager: ObservableObject {
                 case .some(false):
                     print("🧹 FIX #970 v3: Phantom pending TX: \(txidDisplay.prefix(16))...")
                     if let deletedValue = try? WalletDatabase.shared.deletePhantomTransaction(txid: tx.txid) {
-                        print("🗑️ FIX #970 v3: Deleted (value: \(deletedValue) zatoshis)")
+                        print("🗑️ FIX #970 v3: Deleted (value: \(deletedValue.redactedAmount))")
                         cleanedCount += 1
                     }
 
@@ -2413,7 +2413,7 @@ final class WalletManager: ObservableObject {
                             print("✅ FIX #1168: Restored \(restoredCount) note(s) totaling \(restoredValue.redactedAmount)")
                         }
                         if let deletedValue = try? WalletDatabase.shared.deletePhantomTransaction(txid: tx.txid) {
-                            print("🗑️ FIX #975: Deleted phantom TX (value: \(deletedValue) zatoshis)")
+                            print("🗑️ FIX #975: Deleted phantom TX (value: \(deletedValue.redactedAmount))")
                             cleanedCount += 1
                         }
                     case .none:
@@ -2483,7 +2483,7 @@ final class WalletManager: ObservableObject {
 
                     // Delete the phantom TX from transaction_history
                     if let deletedValue = try? WalletDatabase.shared.deletePhantomTransaction(txid: tx.txid) {
-                        print("🗑️ FIX #1221: Deleted phantom TX (value: \(deletedValue) zatoshis)")
+                        print("🗑️ FIX #1221: Deleted phantom TX (value: \(deletedValue.redactedAmount))")
                         cleanedCount += 1
                     }
 
@@ -4209,10 +4209,13 @@ final class WalletManager: ObservableObject {
             }
 
             // Scan just the new blocks
+            // FIX #1410: Pass expected block count so FilterScanner can skip stopping
+            // block listeners for small syncs (prevents peer drop to 0 on iOS)
             try await scanner.startScan(
                 for: account.accountId,
                 viewingKey: spendingKey,
-                fromHeight: currentHeight + 1
+                fromHeight: currentHeight + 1,
+                expectedBlockCount: blocksToSync
             )
 
             // FIX #398: CRITICAL - Do NOT update lastScannedHeight to targetHeight!
@@ -4337,7 +4340,7 @@ final class WalletManager: ObservableObject {
             await MainActor.run {
                 self.shieldedBalance = confirmedBalance
                 self.pendingBalance = pendingBal
-                print("💰 Background sync balance: \(confirmedBalance) zatoshis (\(pendingBal) pending)")
+                print("💰 Background sync balance: \(confirmedBalance.redactedAmount) (\(pendingBal.redactedAmount) pending)")
             }
 
             // Update wallet height in NetworkManager for UI display
@@ -4448,7 +4451,7 @@ final class WalletManager: ObservableObject {
             do {
                 let refreshedBalance = try WalletDatabase.shared.getTotalUnspentBalance(accountId: account.accountId)
                 if refreshedBalance != confirmedBalance {
-                    print("💰 FIX #300: Balance updated after witness rebuild: \(confirmedBalance) → \(refreshedBalance) zatoshis")
+                    print("💰 FIX #300: Balance updated after witness rebuild: \(confirmedBalance.redactedAmount) → \(refreshedBalance.redactedAmount)")
                     await MainActor.run {
                         self.shieldedBalance = refreshedBalance
                     }
@@ -4457,7 +4460,7 @@ final class WalletManager: ObservableObject {
                 // Check if any notes still need witnesses (couldn't be rebuilt)
                 let (needCount, needValue) = try WalletDatabase.shared.getNotesNeedingWitness(accountId: account.accountId)
                 if needCount > 0 {
-                    print("⚠️ FIX #300: \(needCount) note(s) worth \(Double(needValue) / 100_000_000.0) ZCL still need witness rebuild")
+                    print("⚠️ FIX #300: \(needCount) note(s) worth \(needValue.redactedAmount) still need witness rebuild")
                     // Trigger automatic repair if significant amount is affected
                     if needValue > 10_000 { // More than 0.0001 ZCL
                         print("🔧 FIX #300: Auto-triggering witness repair for unspendable notes...")
@@ -6974,6 +6977,12 @@ final class WalletManager: ObservableObject {
         treeLoadProgress = 0.0
         treeLoadStatus = ""
 
+        // FIX #1402 (NEW-001): Recover diversified addresses from UserDefaults
+        // (UserDefaults persists across DB deletion — it remembers the highest index)
+        Task {
+            await self.recoverDiversifiedAddressesIfNeeded()
+        }
+
         // Update state - restored wallet (may have historical notes)
         DispatchQueue.main.async {
             self.zAddress = address
@@ -7706,7 +7715,7 @@ final class WalletManager: ObservableObject {
             self.shieldedBalance = totalBalance
             self.pendingBalance = pendingBalance
             self.syncProgress = 1.0
-            print("💰 Balance updated: \(totalBalance) zatoshis (\(pendingBalance) pending)")
+            print("💰 Balance updated: \(totalBalance.redactedAmount) (\(pendingBalance.redactedAmount) pending)")
         }
 
         // Update wallet height in NetworkManager for UI display
@@ -10236,7 +10245,7 @@ final class WalletManager: ObservableObject {
             throw WalletError.transactionFailed("""
                 ⚠️ NOTE ALREADY SPENT
 
-                One of your notes (value: \(Double(spentNote.value) / 100_000_000.0) ZCL) was already spent in another transaction.
+                One of your notes (value: \(spentNote.value.redactedAmount)) was already spent in another transaction.
 
                 This can happen if you:
                 • Sent from this wallet on another device
@@ -10579,9 +10588,9 @@ final class WalletManager: ObservableObject {
 
         // Read balance on main thread to avoid stale value
         let currentBalance = await MainActor.run { shieldedBalance }
-        print("📤 Send check: amount=\(amount), fee=\(fee), total=\(totalRequired), balance=\(currentBalance)") // PRIVACY: Intentionally unredacted for critical diagnostics
+        print("📤 Send check: amount=\(amount.redactedAmount), fee=\(fee.redactedAmount), total=\(totalRequired.redactedAmount), balance=\(currentBalance.redactedAmount)")
         guard totalRequired <= currentBalance else {
-            print("❌ Insufficient funds: need \(totalRequired) zatoshis (amount: \(amount) + fee: \(fee)), have \(currentBalance)") // PRIVACY: Intentionally unredacted for critical diagnostics
+            print("❌ Insufficient funds: need \(totalRequired.redactedAmount) (amount: \(amount.redactedAmount) + fee: \(fee.redactedAmount)), have \(currentBalance.redactedAmount)")
             throw WalletError.insufficientFunds
         }
         print("✅ Balance check passed")
@@ -10600,7 +10609,7 @@ final class WalletManager: ObservableObject {
             throw WalletError.transactionFailed("""
                 ⚠️ NOTE ALREADY SPENT
 
-                One of your notes (value: \(Double(spentNote.value) / 100_000_000.0) ZCL) was already spent on-chain.
+                One of your notes (value: \(spentNote.value.redactedAmount)) was already spent on-chain.
 
                 This can happen if:
                 • You sent from another wallet instance
@@ -10902,7 +10911,7 @@ final class WalletManager: ObservableObject {
         // Use RustBridge to derive address via FFI
         let saplingSpendingKey = SaplingSpendingKey(data: spendingKey)
         let fvk = try RustBridge.shared.deriveFullViewingKey(from: saplingSpendingKey)
-        let address = try RustBridge.shared.derivePaymentAddress(from: fvk)
+        let (address, _) = try RustBridge.shared.derivePaymentAddress(from: fvk)
         return address
     }
 
@@ -10913,34 +10922,126 @@ final class WalletManager: ObservableObject {
     func generateNextDiversifiedAddress(label: String? = nil) async throws -> (String, UInt64) {
         let db = WalletDatabase.shared
 
-        // Get highest used index
+        // Get highest used index — use the ACTUAL valid index stored, not just sequential
         let highestIndex = db.getHighestDiversifierIndex(accountId: 1)
-        let nextIndex = highestIndex + 1
+        var requestIndex = highestIndex + 1
+
+        // FIX #1402 (NEW-003): Bounds check — receive addresses must stay below change range (1 billion)
+        guard requestIndex < 1_000_000_000 else {
+            print("⚠️ FIX #1402 (NEW-003): Diversifier index \(requestIndex) exceeds receive address range (max 999,999,999)")
+            throw WalletError.addressGenerationFailed
+        }
 
         // Derive address at next index via FFI
         let spendingKey = try secureStorage.retrieveSpendingKey()
         let saplingKey = SaplingSpendingKey(data: spendingKey)
         let fvk = try RustBridge.shared.deriveFullViewingKey(from: saplingKey)
-        let newAddress = try RustBridge.shared.derivePaymentAddress(from: fvk, diversifierIndex: nextIndex)
+
+        // FIX: find_address returns the next VALID diversifier >= requested index.
+        // Multiple requested indices can resolve to the same valid diversifier (producing the same address).
+        // Loop until we get a truly DIFFERENT address from the current one.
+        let currentAddress = await MainActor.run { self.zAddress }
+        var newAddress: String
+        var actualIndex: UInt64
+
+        repeat {
+            guard requestIndex < 1_000_000_000 else {
+                throw WalletError.addressGenerationFailed
+            }
+            (newAddress, actualIndex) = try RustBridge.shared.derivePaymentAddress(from: fvk, diversifierIndex: requestIndex)
+            if newAddress == currentAddress {
+                // This index resolved to the same valid diversifier — skip past it
+                requestIndex = actualIndex + 1
+            }
+        } while newAddress == currentAddress
+
+        // Use the ACTUAL valid index for storage (not the requested one)
+        let storedIndex = actualIndex
 
         // Store in database
         try db.insertDiversifiedAddress(
             accountId: 1,
-            diversifierIndex: nextIndex,
+            diversifierIndex: storedIndex,
             address: newAddress,
             label: label
         )
-        try db.setCurrentDiversifiedAddress(accountId: 1, diversifierIndex: nextIndex)
+        try db.setCurrentDiversifiedAddress(accountId: 1, diversifierIndex: storedIndex)
 
         // Update published property on main thread
         await MainActor.run {
             self.zAddress = newAddress
             // Persist to UserDefaults for quick startup
             UserDefaults.standard.set(newAddress, forKey: "z_address")
+            // FIX #1402 (NEW-001): Persist highest diversifier index for wallet restore recovery
+            UserDefaults.standard.set(Int(storedIndex), forKey: "z_address_highest_diversifier_index")
         }
 
-        print("🔄 P-ADDR-001: Rotated to address at diversifier index \(nextIndex)")
-        return (newAddress, nextIndex)
+        print("🔄 P-ADDR-001: Rotated to address at diversifier index \(storedIndex) (requested \(highestIndex + 1))")
+        return (newAddress, storedIndex)
+    }
+
+    /// FIX #1402 (NEW-001): Recover diversified addresses after wallet restore
+    /// Regenerates addresses 0..highestKnownIndex from UserDefaults
+    /// Funds are always safe (IVK decrypts all diversifiers), this restores address history
+    private func recoverDiversifiedAddressesIfNeeded() async {
+        let defaults = UserDefaults.standard
+        let highestStoredIndex = defaults.integer(forKey: "z_address_highest_diversifier_index")
+
+        guard highestStoredIndex > 0 else {
+            // No diversified addresses were ever generated, nothing to recover
+            return
+        }
+
+        let db = WalletDatabase.shared
+        let currentHighest = db.getHighestDiversifierIndex(accountId: 1)
+
+        guard currentHighest < UInt64(highestStoredIndex) else {
+            // Already recovered or DB has more addresses than UserDefaults
+            return
+        }
+
+        print("🔄 FIX #1402 (NEW-001): Recovering diversified addresses (0..\(highestStoredIndex))...")
+
+        do {
+            let spendingKey = try secureStorage.retrieveSpendingKey()
+            let saplingKey = SaplingSpendingKey(data: spendingKey)
+            let fvk = try RustBridge.shared.deriveFullViewingKey(from: saplingKey)
+
+            for index in 0...UInt64(highestStoredIndex) {
+                // Skip if already in DB
+                let existing = db.getHighestDiversifierIndex(accountId: 1)
+                if index <= existing && index > 0 { continue }
+
+                do {
+                    let (address, _) = try RustBridge.shared.derivePaymentAddress(from: fvk, diversifierIndex: index)
+                    try db.insertDiversifiedAddress(
+                        accountId: 1,
+                        diversifierIndex: index,
+                        address: address,
+                        label: index == 0 ? "Default" : "Recovered #\(index)"
+                    )
+                } catch {
+                    // Some diversifier indices are invalid — skip silently
+                    continue
+                }
+            }
+
+            // Set the highest as current
+            if let highestIndex = UInt64(exactly: highestStoredIndex) {
+                try? db.setCurrentDiversifiedAddress(accountId: 1, diversifierIndex: highestIndex)
+                let currentAddress = try? RustBridge.shared.derivePaymentAddress(from: fvk, diversifierIndex: highestIndex)
+                if let (addr, _) = currentAddress {
+                    await MainActor.run {
+                        self.zAddress = addr
+                        UserDefaults.standard.set(addr, forKey: "z_address")
+                    }
+                }
+            }
+
+            print("✅ FIX #1402 (NEW-001): Recovered diversified addresses up to index \(highestStoredIndex)")
+        } catch {
+            print("⚠️ FIX #1402 (NEW-001): Address recovery failed (funds are safe): \(error)")
+        }
     }
 
     // MARK: - Persistence
@@ -11042,7 +11143,7 @@ final class WalletManager: ObservableObject {
             await MainActor.run {
                 self.shieldedBalance = confirmedBalance
                 self.pendingBalance = 0
-                print("💰 Loaded balance from database: \(confirmedBalance) zatoshis (0 pending)")
+                print("💰 Loaded balance from database: \(confirmedBalance.redactedAmount) (0 pending)")
             }
         } catch {
             print("⚠️ Failed to load balance from database: \(error.localizedDescription)")
@@ -11380,6 +11481,12 @@ final class WalletManager: ObservableObject {
         treeLoadProgress = 0.0
         treeLoadStatus = ""
 
+        // FIX #1402 (NEW-001): Recover diversified addresses from UserDefaults after PK import
+        // UserDefaults persists across DB deletion — it remembers the highest diversifier index
+        Task {
+            await self.recoverDiversifiedAddressesIfNeeded()
+        }
+
         // FIX #500: Don't update state here - let importSpendingKeyAsync handle it
         // The DispatchQueue.main.async was causing a race condition where ContentView
         // wouldn't see the state changes until after the function returned
@@ -11628,15 +11735,17 @@ final class WalletManager: ObservableObject {
                 blocksToScan = blocksSinceCheckpoint
                 print("🔍 FIX #595: Quick check from checkpoint \(checkpointHeight) - scanning \(blocksToScan) blocks")
             } else {
-                // Checkpoint too old - just check last 100 blocks
-                startHeight = chainHeight > 100 ? chainHeight - 100 : 0
-                blocksToScan = min(100, chainHeight)
+                // Checkpoint too old - TX-004: Randomize scan depth to obscure note creation time
+                let scanDepth = UInt64(Int.random(in: 100...500))
+                startHeight = chainHeight > scanDepth ? chainHeight - scanDepth : 0
+                blocksToScan = min(scanDepth, chainHeight)
                 print("🔍 FIX #595: Checkpoint old (\(blocksSinceCheckpoint) blocks behind) - scanning last \(blocksToScan) blocks")
             }
         } else {
-            // No checkpoint - scan last 100 blocks
-            startHeight = chainHeight > 100 ? chainHeight - 100 : 0
-            blocksToScan = min(100, chainHeight)
+            // No checkpoint - TX-004: Randomize scan depth to obscure note creation time
+            let scanDepth = UInt64(Int.random(in: 100...500))
+            startHeight = chainHeight > scanDepth ? chainHeight - scanDepth : 0
+            blocksToScan = min(scanDepth, chainHeight)
             print("🔍 FIX #595: No checkpoint - scanning last \(blocksToScan) blocks")
         }
 
@@ -12242,7 +12351,7 @@ final class WalletManager: ObservableObject {
 
                             // Check if this matches any of our unspent notes
                             if let note = nullifierToNote[spendHashed] {
-                                print("💸 FIX #1093: Found spent note at height \(height): \(note.value) zatoshis")
+                                print("💸 FIX #1093: Found spent note at height \(height): \(note.value.redactedAmount)")
                                 try database.markNoteSpentByHashedNullifier(hashedNullifier: note.nullifier, spentHeight: height)
                                 nullifierToNote.removeValue(forKey: spendHashed)
                                 spentCount += 1
@@ -12383,22 +12492,22 @@ final class WalletManager: ObservableObject {
             if let spentResult = isSpentOnChain {
                 if !spentResult {
                     // Note is marked as SPENT in DB but NOT spent on-chain - UNMARK IT!
-                    print("💰 FIX #563 v19: Found incorrectly marked note: \(value) zatoshis at height \(height)")
+                    print("💰 FIX #563 v19: Found incorrectly marked note: \(value.redactedAmount) at height \(height)")
                     print("💰 FIX #563 v19: Note marked SPENT but NOT spent on-chain - UNMARKING!")
 
                     do {
                         try database.unmarkNoteAsSpent(nullifier: note.nullifier)
                         unmarkedCount += 1
-                        print("✅ FIX #563 v19: UNMARKED note (restored \(value) zatoshis)")
+                        print("✅ FIX #563 v19: UNMARKED note (restored \(value.redactedAmount))")
                     } catch {
                         print("❌ FIX #563 v19: Failed to unmark note: \(error)")
                     }
                 } else {
-                    print("✅ FIX #563 v19: Note \(value) zatoshis is actually spent on-chain - correct")
+                    print("✅ FIX #563 v19: Note \(value.redactedAmount) is actually spent on-chain - correct")
                 }
             } else {
                 // FIX #563 v40: Verification failed - don't unmark, keep as spent
-                print("⚠️ FIX #563 v40: Could not verify note \(value) zatoshis at height \(height) - keeping marked as spent")
+                print("⚠️ FIX #563 v40: Could not verify note \(value.redactedAmount) at height \(height) - keeping marked as spent")
             }
         }
 
@@ -12583,14 +12692,15 @@ final class WalletManager: ObservableObject {
             return 0
         }
 
+        // TX-004: Randomize scan depth to obscure note creation time
+        let scanDepth = UInt64(Int.random(in: 100...500))
         var startHeight: UInt64
         if fromCheckpoint {
             // Scan from checkpoint (should be recent)
             let checkpoint = try database.getVerifiedCheckpointHeight()
-            startHeight = checkpoint > 0 ? checkpoint : (chainHeight > 100 ? chainHeight - 100 : 0)
+            startHeight = checkpoint > 0 ? checkpoint : (chainHeight > scanDepth ? chainHeight - scanDepth : 0)
         } else {
-            // Scan last 100 blocks
-            startHeight = chainHeight > 100 ? chainHeight - 100 : 0
+            startHeight = chainHeight > scanDepth ? chainHeight - scanDepth : 0
         }
 
         let blocksToScan = chainHeight > startHeight ? Int(chainHeight - startHeight) : 0
@@ -12686,7 +12796,7 @@ final class WalletManager: ObservableObject {
                             if let matchedNote = ourNullifiers[hashedNullifier] {
                                 // Found! This note was spent on-chain but not recorded
                                 print("🚨 FIX #212: Found unrecorded spend!")
-                                print("   Note value: \(matchedNote.value) zatoshis")
+                                print("   Note value: \(matchedNote.value.redactedAmount)")
                                 print("   Spent in TX: \(txidHex.prefix(16))...")
                                 print("   Spent at height: \(height)")
 
@@ -13346,8 +13456,7 @@ final class WalletManager: ObservableObject {
             ourNullifiers[note.nullifier] = note
             totalValue += note.value
         }
-        let totalZCL = Double(totalValue) / 100_000_000.0
-        print("🔍 FIX #303: Checking \(unspentNotes.count) unspent notes (\(String(format: "%.8f", totalZCL)) ZCL)")
+        print("🔍 FIX #303: Checking \(unspentNotes.count) unspent notes (\(totalValue.redactedAmount))")
         print("🔍 FIX #1089: Starting verification from height \(checkpointHeight)")
 
         // FIX #367: ALWAYS get fresh chain height from peers, not cached value
@@ -13605,7 +13714,7 @@ final class WalletManager: ObservableObject {
                                 do {
                                     // Found! This note was spent on-chain - EXTERNAL SPEND!
                                     print("🚨 FIX #303: EXTERNAL SPEND DETECTED!")
-                                    print("   Note value: \(matchedNote.value) zatoshis (\(Double(matchedNote.value) / 100_000_000.0) ZCL)")
+                                    print("   Note value: \(matchedNote.value.redactedAmount)")
                                     print("   Spent in TX: \(txidHex.prefix(16))...")
                                     print("   Spent at height: \(height)")
                                     print("   Note created at height: \(matchedNote.height)")
@@ -13745,12 +13854,11 @@ final class WalletManager: ObservableObject {
 
             // FIX #303: Calculate total amount corrected and show alert
             let correctedAmount = totalValue - unspentNotes.filter { ourNullifiers[$0.nullifier] != nil }.reduce(0) { $0 + $1.value }
-            let correctedZCL = Double(correctedAmount) / 100_000_000.0
             await MainActor.run {
                 self.databaseCorrectionAlert = DatabaseCorrectionInfo(
                     externalSpendsDetected: externalSpendsFound,
                     amountCorrected: correctedAmount,
-                    message: "Detected \(externalSpendsFound) transaction(s) from another wallet totaling \(String(format: "%.8f", correctedZCL)) ZCL. Your balance has been corrected."
+                    message: "Detected \(externalSpendsFound) transaction(s) from another wallet totaling \(correctedAmount.redactedAmount). Your balance has been corrected."
                 )
             }
         } else if failedBatches > 0 || scanTimedOut || coveragePercent < 95 {
@@ -14363,7 +14471,7 @@ final class WalletManager: ObservableObject {
                     continue
                 }
 
-                print("💰 FIX #680: Found note worth \(noteValue) zatoshis (id=\(noteId))")
+                print("💰 FIX #680: Found note worth \(noteValue.redactedAmount) (id=\(noteId))")
                 totalSpent += noteValue
 
                 // Step 4: Mark note as spent using recordSentTransactionAtomic
@@ -14616,7 +14724,7 @@ final class WalletManager: ObservableObject {
 
                 // Check if this is our nullifier
                 if let (noteId, noteValue) = try? database.getNoteByNullifier(nullifier: hashedNullifier) {
-                    print("💰 FIX #689: Found our note worth \(noteValue) zatoshis (id=\(noteId))")
+                    print("💰 FIX #689: Found our note worth \(noteValue.redactedAmount) (id=\(noteId))")
                     totalSpent += noteValue
                     foundOurSpend = true
 
@@ -15022,6 +15130,7 @@ enum WalletError: LocalizedError {
     case transactionFailed(String)
     case networkError(String)
     case secureEnclaveError(String)
+    case addressGenerationFailed  // FIX #1402 (NEW-003): Diversifier index exceeds receive range
 
     var errorDescription: String? {
         switch self {
@@ -15041,6 +15150,8 @@ enum WalletError: LocalizedError {
             return "Network error: \(message)"
         case .secureEnclaveError(let message):
             return "Secure Enclave error: \(message)"
+        case .addressGenerationFailed:
+            return "Address generation failed: diversifier index limit reached"
         }
     }
 }
