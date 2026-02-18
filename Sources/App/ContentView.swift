@@ -3423,11 +3423,22 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showCypherpunkChat) {
             // FIX #252: Pass callback to navigate to main app settings when Tor is disabled
-            ChatView(onShowAppSettings: {
-                showCypherpunkChat = false
-                showCypherpunkSettings = true
-            })
-            .background(Color.black)
+            ZStack(alignment: .topTrailing) {
+                ChatView(onShowAppSettings: {
+                    showCypherpunkChat = false
+                    showCypherpunkSettings = true
+                })
+                .background(Color.black)
+
+                // Close button for the chat window
+                Button(action: { showCypherpunkChat = false }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 20))
+                        .foregroundColor(.gray.opacity(0.7))
+                        .padding(12)
+                }
+                .buttonStyle(.plain)
+            }
             #if os(macOS)
             // FIX #257: Use min/ideal/max constraints for better macOS window sizing
             .frame(minWidth: 650, idealWidth: 750, maxWidth: 900,

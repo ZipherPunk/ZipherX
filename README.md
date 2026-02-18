@@ -18,6 +18,8 @@
 >
 > **BETA SOFTWARE.** This software is under active development and may contain bugs, errors, or incomplete features. Do not use this software with funds you cannot afford to lose.
 >
+> **BACKUP YOUR WALLET BEFORE INSTALLATION.** If you are running an existing Zclassic full node or any other wallet software, you MUST back up your wallet files, private keys, and spending keys BEFORE installing or using ZipherX. ZipherX's Full Node mode connects to your local node and software bugs could potentially overwrite, corrupt, or delete existing wallet data. The developers accept NO responsibility for loss of funds or data resulting from failure to back up. This applies to both P2P mode and Full Node mode. **Always maintain independent, offline backups of your keys and wallet files.**
+>
 > By downloading, installing, or using ZipherX, you acknowledge that you have read, understood, and agree to this disclaimer in its entirety. If you do not agree, do not use this software.
 
 ---
@@ -184,14 +186,75 @@ ZipherX includes peer-to-peer encrypted messaging over Tor:
 6. **Profile Picture** — Set in Chat Settings (iOS: from Photos, macOS: from file)
 7. **Block Contacts** — Right-click (macOS) or long-press (iOS) a contact to block
 
-### Full Node Mode
+### Full Node Mode (macOS only)
 
-For users running their own Zclassic full node:
+ZipherX can connect to a local Zclassic full node for enhanced security, full transaction history, and transparent address support. **This mode requires running your own `zclassicd` daemon.**
 
-1. Go to **Settings > Full Node**
-2. Enter your node's RPC host, port, username, and password
-3. Toggle **Full Node Mode** on
-4. The app connects to your node for enhanced security and faster queries
+> **WARNING**: Back up your existing `wallet.dat` and private keys BEFORE enabling Full Node mode. See Section "Backup Your Wallet Before Installation" in the disclaimer above.
+
+#### Prerequisites
+
+| Requirement | Details |
+|-------------|---------|
+| **zclassicd** | Daemon binary at `/usr/local/bin/zclassicd` |
+| **zclassic-cli** | CLI tool at `/usr/local/bin/zclassic-cli` |
+| **Blockchain data** | `~/Library/Application Support/Zclassic/blocks/` (~5 GB) |
+| **zclassic.conf** | Configuration file (auto-generated if missing) |
+| **zstd** | Required for bootstrap extraction (`brew install zstd`) |
+
+#### Required `zclassic.conf` Settings
+
+```ini
+server=1
+rpcuser=<your_username>
+rpcpassword=<your_password>
+rpcport=8023
+rpcallowip=127.0.0.1
+txindex=1
+daemon=1
+```
+
+ZipherX auto-generates RPC credentials on first setup if no config file exists.
+
+#### Setup
+
+1. **Install the daemon** — Build from source or use the bootstrap installer in **Settings > Full Node > Bootstrap**
+2. **Bootstrap the blockchain** — Download via ZipherX (Settings > Full Node > Download Bootstrap) or sync from scratch
+3. **Start the daemon** — ZipherX can auto-start `zclassicd`, or start it manually
+4. **Select Full Node mode** — On launch, ZipherX detects the running daemon and offers to switch modes
+
+#### Wallet Sources
+
+Full Node mode supports two wallet sources:
+
+| Source | Description |
+|--------|-------------|
+| **ZipherX Wallet** (recommended) | Keys stay in Secure Enclave. Uses RPC for blockchain queries only. Single shielded address. |
+| **wallet.dat** | Uses the daemon's built-in wallet. Supports multiple z-addresses and transparent (t-) addresses. Full RPC wallet operations. |
+
+#### Full Node Features
+
+- **Shielded transactions** — Send/receive via `z_sendmany` with memo support
+- **Transparent addresses** — Full t-address support (send, receive, shield coinbase)
+- **Shield coinbase** — Convert mining rewards from transparent to shielded (`z_shieldcoinbase`)
+- **Multiple addresses** — Create and manage multiple z-addresses and t-addresses
+- **Transaction history** — Complete paginated history with filtering (All / Shielded / Transparent)
+- **Key management** — Export/import z-keys and t-keys with optional rescan
+- **Wallet encryption** — Password-protect `wallet.dat` via daemon
+- **Daemon management** — Start, stop, and monitor the daemon from the UI
+- **Blockchain explorer** — View block headers, transaction details, network hashrate
+- **Tor integration** — Configure SOCKS5 proxy for private peer connections
+- **Debug logging** — Toggle debug categories (Network, Mempool, RPC, Tor)
+- **Wallet backup** — Create timestamped backups of `wallet.dat` from the UI
+
+#### Network & RPC
+
+| Parameter | Value |
+|-----------|-------|
+| RPC Port | 8023 (default) |
+| RPC Access | localhost only (127.0.0.1) |
+| P2P Port | 8033 |
+| Sapling Activation | Block 476,969 |
 
 ### Security Settings
 

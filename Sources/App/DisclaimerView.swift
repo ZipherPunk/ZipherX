@@ -249,6 +249,23 @@ struct DisclaimerView: View {
                 """
             )
 
+            // Section 13: Backup Warning
+            sectionView(
+                title: "13. BACKUP WARNING",
+                icon: "externaldrive.fill.badge.exclamationmark",
+                content: """
+                YOU MUST BACK UP YOUR WALLET BEFORE INSTALLING OR USING ZIPHERX. \
+                If you are running an existing Zclassic full node or any other wallet software, \
+                back up ALL wallet files, private keys, and spending keys BEFORE proceeding. \
+                ZipherX's Full Node mode connects to your local node — software bugs could potentially \
+                overwrite, corrupt, or delete existing wallet data. This applies to both P2P mode and \
+                Full Node mode. The developer(s) accept NO responsibility for loss of funds or data \
+                resulting from failure to maintain adequate backups. \
+                ALWAYS maintain independent, offline backups of your keys and wallet files. \
+                Never rely solely on any single piece of software to protect your funds.
+                """
+            )
+
             // Cypherpunk quote
             quoteView
 
@@ -313,13 +330,14 @@ struct DisclaimerView: View {
                 .foregroundColor(.white)
 
             VStack(alignment: .leading, spacing: 8) {
-                acknowledgmentItem("You have read and understood all 12 sections of this disclaimer")
+                acknowledgmentItem("You have read and understood all 13 sections of this disclaimer")
                 acknowledgmentItem("You are at least 18 years of age or the age of majority in your jurisdiction")
                 acknowledgmentItem("You accept full responsibility for your use of this software")
                 acknowledgmentItem("You will comply with all applicable laws in your jurisdiction")
                 acknowledgmentItem("You understand the risks of using cryptocurrency and beta software")
                 acknowledgmentItem("You agree to the indemnification terms in Section 11")
                 acknowledgmentItem("You understand that third-party networks are outside the developer's control")
+                acknowledgmentItem("You have backed up all existing wallet files and keys before using this software")
             }
         }
         .padding(16)
