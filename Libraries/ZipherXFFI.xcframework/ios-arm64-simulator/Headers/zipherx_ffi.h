@@ -212,6 +212,9 @@ size_t zipherx_try_decrypt_notes_parallel(
 // Get the number of CPU threads Rayon will use for parallel decryption
 size_t zipherx_get_rayon_threads(void);
 
+// FIX #1402 (NEW-004): Get the last change diversifier index used in TX construction
+uint64_t zipherx_get_last_change_diversifier_index(void);
+
 // =============================================================================
 // Equihash Proof-of-Work Verification (for trustless header validation)
 // =============================================================================

@@ -73,200 +73,34 @@ final class HeaderSyncManager {
             Self.syncLock.unlock()
         }
 
-        // FIX #1243: Skip block listener stop if caller already stopped them.
-        // FilterScanner PHASE 2 (line 1226) stops listeners, sets headerSyncInProgress=true,
-        // then calls this function. HeaderSyncManager was stopping AGAIN (double-stop pattern).
-        // Result: Redundant stop/verify/reconnect cycles (2-5s overhead), peer state confusion.
-        // Solution: Check if PeerManager already has headerSyncInProgress=true. If so, skip
-        // the stop/verify/reconnect logic entirely (caller already did it).
-        let alreadyInHeaderSync = PeerManager.shared.isHeaderSyncInProgress()
+        // FIX #1418: Header sync now routes through the dispatcher (sendAndWaitViaDispatcher).
+        // Block listeners receive "headers" responses and dispatch them to our waiting handler.
+        // This eliminates the need to stop/restart block listeners, which was the #1 cause of
+        // peer drops (stopping kills NWConnections → connection nil → reconnection overhead).
+        //
+        // Old flow: stop listeners → verify stopped (30s) → reconnect dead peers → wait for .ready
+        //           → sync headers via direct reads → restart listeners. Total overhead: 5-35s.
+        // New flow: send getheaders → dispatcher routes response → done. Zero connection disruption.
+        //
+        // FIX #811/900/904/1010/1206/1227/1235/1243/1244 stop/verify/reconnect logic REMOVED.
+        // sendAndWaitViaDispatcher handles all cases:
+        //   - Dispatcher active → routes through block listener (zero overhead)
+        //   - Dispatcher inactive → starts block listener automatically (2s startup)
 
-        var hadListenersBefore = false  // Declare outside if block so it's available later
-
-        if !alreadyInHeaderSync {
-            // FIX #811: CRITICAL - Stop block listeners BEFORE header sync!
-            // Block listeners consume `headers` response messages, causing sync to hang forever.
-            // This is the REAL fix for FIX #383 (was documented but never properly implemented)
-            // Block listeners are on ALL peers and call receiveMessage() in a loop.
-            // When we send `getheaders`, the block listener receives the response first!
-            // FIX #874: stopAllBlockListeners now has early return if no listeners running (fast path)
-            print("⏸️ FIX #811: Stopping block listeners before header sync...")
-            // FIX #877: Check for active block listeners before stopping
-            // FIX #904: Check BOTH PeerManager.peers AND networkManager.peers (they can differ!)
-            let peerManagerListeners = await PeerManager.shared.hasActiveBlockListeners()
-            let networkManagerListeners = await MainActor.run {
-                networkManager.peers.filter { $0.isListening }.count
-            }
-            hadListenersBefore = peerManagerListeners || networkManagerListeners > 0
-            if verbose {
-                print("📊 FIX #904: Block listeners before stop - PeerManager: \(peerManagerListeners), NetworkManager: \(networkManagerListeners)")
-            }
-            await networkManager.stopAllBlockListeners()
-            // FIX #900: CRITICAL - Verify block listeners are ACTUALLY stopped before proceeding!
-        // Problem: stopAllBlockListeners() has a 5s timeout and "proceeds anyway" if not done
-        // But block listeners keep running in background, holding peer locks for 20+ more seconds
-        // Result: Parallel header sync starts, all peer lock acquisitions timeout → sync hangs
-        // Solution: Wait until ALL listeners are verified stopped (up to 30s)
-        // FIX #904: ALWAYS run verification to catch any listeners we might have missed
-        // FIX #1010: PERFORMANCE - Skip verification loop when NO listeners were running!
-        //   Problem: FIX #904's `if true` always runs the 30s verification loop
-        //   Even when hadListenersBefore=false (no listeners running), we still:
-        //   - Print "Verifying all block listeners are stopped..."
-        //   - Loop at least once checking stillListening == 0
-        //   - Wait 200ms for "in-flight receives" that don't exist
-        //   This adds ~500ms+ unnecessary delay on EVERY header sync startup!
-        //   Solution: Only verify/wait when listeners were actually running
-        if hadListenersBefore {  // FIX #1010: Only verify when there were actually listeners to stop
-            if verbose {
-                print("⏳ FIX #900: Verifying all block listeners are stopped...")
-            }
-            let verifyStartTime = Date()
-            let maxVerifyWait: Double = 30.0  // 30 seconds max wait
-            var lastListeningCount = 0
-
-            while true {
-                let elapsed = Date().timeIntervalSince(verifyStartTime)
-                if elapsed > maxVerifyWait {
-                    print("⚠️ FIX #900: Block listener verification timed out after \(Int(elapsed))s - proceeding anyway")
-                    break
-                }
-
-                // Check how many listeners are still running
-                let stillListening = await MainActor.run {
-                    networkManager.peers.filter { $0.isListening }.count
-                }
-                let peerManagerListening = await PeerManager.shared.hasActiveBlockListeners()
-
-                if stillListening == 0 && !peerManagerListening {
-                    if verbose {
-                        print("✅ FIX #900: All block listeners stopped after \(String(format: "%.1f", elapsed))s")
-                    }
-                    break
-                }
-
-                // Log progress every time count changes
-                if stillListening != lastListeningCount {
-                    if verbose {
-                        print("⏳ FIX #900: Still waiting for \(stillListening) block listeners to stop...")
-                    }
-                    lastListeningCount = stillListening
-                }
-
-                // Wait 500ms between checks
-                try? await Task.sleep(nanoseconds: 500_000_000)
-            }
-
-            // FIX #813: Additional 200ms for any in-flight receives
-            if verbose {
-                print("⏳ FIX #813: Waiting 200ms for in-flight receives to complete...")
-            }
-            try? await Task.sleep(nanoseconds: 200_000_000)
-        } else {
-            // FIX #1010: No listeners were running - skip verification entirely
-            if verbose {
-                print("⚡ FIX #1010: No block listeners were running - skipping verification (FAST PATH)")
-            }
-        }
-
-            // FIX #1206: Reconnect peers whose connections were killed by FIX #1184b.
-        // FIX #1227: Reconnect REGARDLESS of hadListenersBefore - connections may have been killed
-        // by a PREVIOUS operation (FilterScanner, earlier header sync). FilterScanner stops listeners
-        // before header sync runs → hadListenersBefore=false but connections already dead.
-        // Stopping block listeners kills NWConnections (orphan prevention), leaving peers
-        // with handshake=true but connection=nil. Header sync needs working connections.
+        // FIX #1227: Still reconnect dead peers — connections may be dead from OTHER operations
         let deadPeers = await MainActor.run {
             networkManager.peers.filter { $0.isHandshakeComplete && !$0.isConnectionReady }
         }
         if !deadPeers.isEmpty {
-            if verbose {
-                print("🔄 FIX #1227: Reconnecting \(deadPeers.count) peers with dead connections...")
-            }
-            // FIX #1235: Track reconnected peers to prevent duplicate reconnections in same batch.
-            // isConnectionReady is a computed property checking connection?.state == .ready.
-            // NWConnection state transitions asynchronously (connecting→ready takes time).
-            // Without tracking, the SAME peer appears in deadPeers multiple times because
-            // connection state hasn't transitioned to .ready yet → duplicate reconnections
-            // → disconnect() kills just-established connection → remote peer confused → TCP desync.
-            var reconnectedHosts = Set<String>()
+            print("🔄 FIX #1418: Reconnecting \(deadPeers.count) dead peers before header sync...")
+            var reconnectedHosts = Set<String>()  // FIX #1235
             for peer in deadPeers {
-                // Skip if we already reconnected this peer in this batch
-                if reconnectedHosts.contains(peer.host) {
-                    if verbose {
-                        print("⏭️ FIX #1235: [\(peer.host)] Already reconnected in this batch - skipping")
-                    }
-                    continue
-                }
+                if reconnectedHosts.contains(peer.host) { continue }
                 do {
                     try await peer.ensureConnected()
                     reconnectedHosts.insert(peer.host)
-                    if verbose {
-                        print("✅ FIX #1227: [\(peer.host)] Reconnected for header sync")
-                    }
                 } catch {
-                    print("⚠️ FIX #1227: [\(peer.host)] Reconnect failed: \(error.localizedDescription)")
-                }
-            }
-        } else {
-            if verbose {
-                print("✅ FIX #1227: No dead connections found - all peers ready")
-            }
-        }
-
-        // FIX #1244: Wait for NWConnection states to become .ready after peer reconnection.
-        // FIX #1242 checked networkManager.isConnected (boolean flag based on peer count),
-        // but this flag is true immediately after reconnection even though NWConnection
-        // state transitions (connecting → preparing → ready) take 500ms-2s.
-        // ensureConnected() at line 181 initiates connections, but getChainHeight() at
-        // line 238 requires peer.isConnectionReady (checks connection?.state == .ready).
-        // Log evidence: [01:10:59.181] header sync starts 3ms after reconnection →
-        // [01:10:59.354] "Not connected to network" 173ms later.
-        // Solution: Check actual peer.isConnectionReady states, not the boolean flag.
-        let readyPeers = await MainActor.run {
-            networkManager.peers.filter { $0.isConnectionReady }
-        }
-        if readyPeers.count < minPeers {
-            if verbose {
-                print("⏳ FIX #1244: Waiting for \(minPeers) peers to reach .ready state (currently \(readyPeers.count))...")
-            }
-            for waitStep in 1...10 {  // Up to 5s (10 × 500ms)
-                try? await Task.sleep(nanoseconds: 500_000_000)
-                let currentReady = await MainActor.run {
-                    networkManager.peers.filter { $0.isConnectionReady }.count
-                }
-                if currentReady >= minPeers {
-                    if verbose {
-                        print("✅ FIX #1244: \(currentReady) peers reached .ready state after \(waitStep * 500)ms")
-                    }
-                    break
-                }
-                if waitStep == 10 {
-                    print("⚠️ FIX #1244: Only \(currentReady) peers ready after 5s (need \(minPeers)) — proceeding (may fail)")
-                }
-            }
-        } else {
-            if verbose {
-                print("✅ FIX #1244: \(readyPeers.count) peers already in .ready state - no wait needed")
-            }
-        }
-        } else {
-            // FIX #1243: Caller already stopped listeners + verified + reconnected
-            if verbose {
-                print("⚡ FIX #1243: Block listeners already stopped by caller - skipping redundant stop/verify/reconnect (FAST PATH)")
-            }
-        }
-
-        defer {
-            // FIX #811 + FIX #907: Resume block listeners ONLY if not blocked by operations
-            Task {
-                if PeerManager.shared.areBlockListenersBlocked() {
-                    if verbose {
-                        print("🛑 FIX #907: Block listeners still BLOCKED - skipping FIX #811 resume")
-                    }
-                } else {
-                    if verbose {
-                        print("▶️ FIX #811: Resuming block listeners after header sync...")
-                    }
-                    await networkManager.startBlockListenersOnMainScreen()
+                    print("⚠️ FIX #1418: [\(peer.host)] Reconnect failed: \(error.localizedDescription)")
                 }
             }
         }
@@ -471,146 +305,24 @@ final class HeaderSyncManager {
             print("⚠️ FIX #1251: Quick gap check failed: \(error.localizedDescription) - proceeding with full sync")
         }
 
-        // FIX #898: Stop block listeners before gap filling (same pattern as syncHeaders)
-        // Block listeners hold peer locks, preventing header fetch from acquiring them
-        // Without this, syncHeadersSimple times out on lock acquisition → sync hangs
-        // FIX #904: Check BOTH PeerManager.peers AND networkManager.peers (they can differ!)
-        let peerManagerListeners = await PeerManager.shared.hasActiveBlockListeners()
-        let networkManagerListeners = await MainActor.run {
-            networkManager.peers.filter { $0.isListening }.count
-        }
-        let hadListenersBefore = peerManagerListeners || networkManagerListeners > 0
-        if verbose {
-            print("📊 FIX #904: Block listeners before gap fill - PeerManager: \(peerManagerListeners), NetworkManager: \(networkManagerListeners)")
-        }
+        // FIX #1418: Gap filling now uses dispatcher-based header sync (sendAndWaitViaDispatcher).
+        // No need to stop/restart block listeners — dispatcher routes "headers" responses.
+        // See syncHeaders() for full explanation.
 
-        // FIX #904: ALWAYS stop and verify - stopAllBlockListeners is fast if no listeners
-        if verbose {
-            print("⏸️ FIX #898: Stopping block listeners before gap filling...")
-        }
-        await networkManager.stopAllBlockListeners()
-
-        // FIX #902: CRITICAL - Verify block listeners are ACTUALLY stopped before proceeding!
-        // FIX #904: ALWAYS run verification to catch any listeners we might have missed
-        if true { // Always verify
-            // FIX #898's 200ms wait was not enough - block listeners can take 20+ seconds to stop
-            // Without verification, syncHeadersSimple times out on lock acquisition
-            if verbose {
-                print("⏳ FIX #902: Verifying all block listeners are stopped...")
-            }
-            let verifyStartTime = Date()
-            let maxVerifyWait: Double = 30.0  // 30 seconds max wait
-            var lastListeningCount = 0
-
-            while true {
-                let elapsed = Date().timeIntervalSince(verifyStartTime)
-                if elapsed > maxVerifyWait {
-                    print("⚠️ FIX #902: Block listener verification timed out after \(Int(elapsed))s - proceeding anyway")
-                    break
-                }
-
-                let stillListening = await MainActor.run {
-                    networkManager.peers.filter { $0.isListening }.count
-                }
-                let peerManagerListening = await PeerManager.shared.hasActiveBlockListeners()
-
-                if stillListening == 0 && !peerManagerListening {
-                    if verbose {
-                        print("✅ FIX #902: All block listeners stopped after \(String(format: "%.1f", elapsed))s")
-                    }
-                    break
-                }
-
-                if stillListening != lastListeningCount {
-                    if verbose {
-                        print("⏳ FIX #902: Still waiting for \(stillListening) block listeners to stop...")
-                    }
-                    lastListeningCount = stillListening
-                }
-
-                try? await Task.sleep(nanoseconds: 500_000_000)  // Check every 500ms
-            }
-
-            if verbose {
-                print("⏳ FIX #902: Waiting 200ms for in-flight receives to complete...")
-            }
-            try? await Task.sleep(nanoseconds: 200_000_000)
-        }
-
-        // FIX #1206: Reconnect peers whose connections were killed by FIX #1184b.
-        // FIX #1227: Reconnect REGARDLESS of hadListenersBefore (same as syncHeaders path).
+        // FIX #1227: Still reconnect dead peers — connections may be dead from other operations
         let deadPeersGapFill = await MainActor.run {
             networkManager.peers.filter { $0.isHandshakeComplete && !$0.isConnectionReady }
         }
         if !deadPeersGapFill.isEmpty {
-            if verbose {
-                print("🔄 FIX #1227: Reconnecting \(deadPeersGapFill.count) peers with dead connections (gap fill)...")
-            }
-            // FIX #1235: Track reconnected peers (same pattern as header sync path above)
-            var reconnectedHostsGapFill = Set<String>()
+            print("🔄 FIX #1418: Reconnecting \(deadPeersGapFill.count) dead peers before gap fill...")
+            var reconnectedHostsGapFill = Set<String>()  // FIX #1235
             for peer in deadPeersGapFill {
-                if reconnectedHostsGapFill.contains(peer.host) {
-                    if verbose {
-                        print("⏭️ FIX #1235: [\(peer.host)] Already reconnected in this batch - skipping")
-                    }
-                    continue
-                }
+                if reconnectedHostsGapFill.contains(peer.host) { continue }
                 do {
                     try await peer.ensureConnected()
                     reconnectedHostsGapFill.insert(peer.host)
-                    if verbose {
-                        print("✅ FIX #1227: [\(peer.host)] Reconnected for gap fill")
-                    }
                 } catch {
-                    print("⚠️ FIX #1227: [\(peer.host)] Reconnect failed: \(error.localizedDescription)")
-                }
-            }
-        } else {
-            if verbose {
-                print("✅ FIX #1227: No dead connections found - all peers ready (gap fill)")
-            }
-        }
-
-        // FIX #1244: Wait for NWConnection states to become .ready (same fix as syncHeaders path).
-        // FIX #1242 checked networkManager.isConnected (boolean flag), but this is true
-        // immediately after reconnection even though NWConnection state transitions take time.
-        // Solution: Check actual peer.isConnectionReady states, not the boolean flag.
-        let readyPeersGapFill = await MainActor.run {
-            networkManager.peers.filter { $0.isConnectionReady }
-        }
-        if readyPeersGapFill.count < minPeers {
-            if verbose {
-                print("⏳ FIX #1244: Waiting for \(minPeers) peers to reach .ready state (gap fill, currently \(readyPeersGapFill.count))...")
-            }
-            for waitStep in 1...10 {
-                try? await Task.sleep(nanoseconds: 500_000_000)
-                let currentReady = await MainActor.run {
-                    networkManager.peers.filter { $0.isConnectionReady }.count
-                }
-                if currentReady >= minPeers {
-                    if verbose {
-                        print("✅ FIX #1244: \(currentReady) peers reached .ready state after \(waitStep * 500)ms (gap fill)")
-                    }
-                    break
-                }
-                if waitStep == 10 {
-                    print("⚠️ FIX #1244: Only \(currentReady) peers ready after 5s (gap fill, need \(minPeers)) — proceeding")
-                }
-            }
-        } else {
-            if verbose {
-                print("✅ FIX #1244: \(readyPeersGapFill.count) peers already in .ready state (gap fill) - no wait needed")
-            }
-        }
-
-        defer {
-            // FIX #898: Resume block listeners after gap filling completes (or fails)
-            if hadListenersBefore {
-                Task {
-                    if verbose {
-                        print("▶️ FIX #898: Resuming block listeners after gap filling...")
-                    }
-                    await networkManager.startBlockListenersOnMainScreen()
+                    print("⚠️ FIX #1418: [\(peer.host)] Reconnect failed: \(error.localizedDescription)")
                 }
             }
         }
@@ -877,32 +589,18 @@ final class HeaderSyncManager {
             let headersStartHeight = actualLocatorHeight + 1
 
             do {
-                // FIX #501: Very aggressive timeout - 5 seconds per peer, then switch
-                let headers: [ZclassicBlockHeader] = try await peer.withExclusiveAccessTimeout(seconds: 5.0) {
-                    try await peer.sendMessage(command: "getheaders", payload: payload)
-
-                    var receivedHeaders: [ZclassicBlockHeader]?
-                    var attempts = 0
-
-                    // FIX #925: Loop up to 5 times to skip non-header messages (inv, ping, addr, etc.)
-                    // Peer might send other messages before the headers response
-                    // FIX #1236: Use 0.5s timeout (not 3s) for fast draining of unsolicited messages
-                    while receivedHeaders == nil && attempts < 5 {
-                        attempts += 1
-                        let (command, response) = try await peer.receiveMessageWithTimeout(seconds: 0.5)
-                        if command == "headers" {
-                            // FIX #133: Use correct starting height from actual locator
-                            receivedHeaders = try self.parseHeadersPayload(response, startingAt: headersStartHeight, fromPeer: peer.host)
-                        } else {
-                            // FIX #925: Log non-header messages for debugging
-                            if verbose {
-                                print("🔍 FIX #925: [\(peer.host)] Got '\(command)' (\(response.count) bytes) instead of headers, attempt \(attempts)/5")
-                            }
-                        }
-                    }
-
-                    return receivedHeaders ?? []
-                }
+                // FIX #1418: Route header sync through the dispatcher instead of direct reads.
+                // Old approach: stop block listeners → acquire messageLock → direct read → restart.
+                // This killed NWConnections (peer drops from 9 to 3), required 2-3s reconnection per peer.
+                // New approach: send getheaders, block listener receives "headers" response,
+                // dispatcher routes it to us. No listener stop/start, connections preserved.
+                let (_, responsePayload) = try await peer.sendAndWaitViaDispatcher(
+                    command: "getheaders",
+                    payload: payload,
+                    expectedResponse: "headers",
+                    timeoutSeconds: 5.0
+                )
+                let headers: [ZclassicBlockHeader] = try self.parseHeadersPayload(responsePayload, startingAt: headersStartHeight, fromPeer: peer.host)
 
                 guard !headers.isEmpty else {
                     print("⚠️ FIX #502: Peer \(peer.host) returned no headers, trying next peer...")
@@ -1133,29 +831,14 @@ final class HeaderSyncManager {
             for (_, peer) in currentPeers.enumerated() {
                 // FIX #707: Removed per-peer "trying" log (too spammy)
                 do {
-                    let result: [ZclassicBlockHeader] = try await peer.withExclusiveAccessTimeout(seconds: perPeerTimeout) {
-                        try await peer.sendMessage(command: "getheaders", payload: payload)
-
-                        // FIX #1236: Retry up to 5 times with 0.5s timeout to drain unsolicited messages
-                        var receivedHeaders: [ZclassicBlockHeader]?
-                        var attempts = 0
-
-                        while receivedHeaders == nil && attempts < 5 {
-                            attempts += 1
-                            let (command, response) = try await peer.receiveMessageWithTimeout(seconds: 0.5)
-
-                            if command == "headers" {
-                                receivedHeaders = try self.parseHeadersPayload(response, startingAt: headersStartHeight, fromPeer: peer.host)
-                            } else if attempts < 5 {
-                                // Log non-headers message and continue retry
-                                if verbose {
-                                    print("🔍 FIX #1236: [\(peer.host)] Got '\(command)' instead of headers, attempt \(attempts)/5")
-                                }
-                            }
-                        }
-
-                        return receivedHeaders ?? []
-                    }
+                    // FIX #1418: Route through dispatcher — no direct reads, no listener stop needed.
+                    let (_, responsePayload) = try await peer.sendAndWaitViaDispatcher(
+                        command: "getheaders",
+                        payload: payload,
+                        expectedResponse: "headers",
+                        timeoutSeconds: perPeerTimeout
+                    )
+                    let result: [ZclassicBlockHeader] = try self.parseHeadersPayload(responsePayload, startingAt: headersStartHeight, fromPeer: peer.host)
 
                     if !result.isEmpty {
                         // Success!
@@ -1322,26 +1005,14 @@ final class HeaderSyncManager {
             // Headers will start at actualLocatorHeight + 1 (P2P returns headers AFTER locator)
             let headersStartHeight = actualLocatorHeight + 1
 
-            let headers: [ZclassicBlockHeader] = try await peer.withExclusiveAccess {
-                try await peer.sendMessage(command: "getheaders", payload: payload)
-
-                var receivedHeaders: [ZclassicBlockHeader]?
-                var attempts = 0
-
-                // FIX #1236: Use 0.5s timeout for draining unsolicited messages (was 5s)
-                while receivedHeaders == nil && attempts < 5 {
-                    attempts += 1
-                    let (command, response) = try await peer.receiveMessageWithTimeout(seconds: 0.5)
-                    if command == "headers" {
-                        // FIX #133: Use correct starting height from actual locator
-                        receivedHeaders = try self.parseHeadersPayload(response, startingAt: headersStartHeight, fromPeer: peer.host)
-                    } else if attempts < 5 {
-                        print("🔍 FIX #1236: Gap-fill got '\(command)' instead of headers, attempt \(attempts)/5")
-                    }
-                }
-
-                return receivedHeaders ?? []
-            }
+            // FIX #1418: Route through dispatcher — no direct reads needed.
+            let (_, responsePayload) = try await peer.sendAndWaitViaDispatcher(
+                command: "getheaders",
+                payload: payload,
+                expectedResponse: "headers",
+                timeoutSeconds: 5.0
+            )
+            let headers: [ZclassicBlockHeader] = try self.parseHeadersPayload(responsePayload, startingAt: headersStartHeight, fromPeer: peer.host)
 
             guard !headers.isEmpty else { break }
 
@@ -1636,43 +1307,15 @@ final class HeaderSyncManager {
         // Headers will start at actualLocatorHeight + 1 (P2P returns headers AFTER locator)
         let headersStartHeight = actualLocatorHeight + 1
 
-        // CRITICAL FIX: Wrap entire send+receive sequence in withExclusiveAccess
-        // This prevents block listener from reading our response while we're waiting for it
-        let headers = try await peer.withExclusiveAccess {
-            // Send getheaders message
-            try await peer.sendMessage(command: "getheaders", payload: payload)
-
-            // Loop until we receive headers response (peers may send inv/addr/ping first)
-            // FIX #1236: Use 0.5s timeout for draining unsolicited messages (was 30s)
-            var receivedHeaders: [ZclassicBlockHeader]?
-            let maxAttempts = 10
-            var attempts = 0
-
-            while receivedHeaders == nil && attempts < maxAttempts {
-                attempts += 1
-                // FIX #120: Use timeout to prevent infinite blocking on unresponsive peers
-                let (command, response) = try await peer.receiveMessageWithTimeout(seconds: 0.5)
-
-                if command == "headers" {
-                    // FIX #133: Use correct starting height from actual locator
-                    receivedHeaders = try self.parseHeadersPayload(response, startingAt: headersStartHeight, fromPeer: peer.host)
-                    if verbose {
-                        print("✅ Received \(receivedHeaders?.count ?? 0) headers from \(peer.host) (starting at height \(headersStartHeight))")
-                    }
-                } else {
-                    // Ignore other messages (inv, addr, ping, etc.)
-                    if verbose {
-                        print("📭 FIX #1236: Peer sent '\(command)' message, waiting for headers (attempt \(attempts)/\(maxAttempts))...")
-                    }
-                }
-            }
-
-            guard let headers = receivedHeaders else {
-                throw SyncError.unexpectedMessage(expected: "headers", got: "timeout after \(maxAttempts) messages")
-            }
-
-            return headers
-        }
+        // FIX #1418: Route through dispatcher — no direct reads, no messageLock needed.
+        // Block listener receives "headers" response and dispatcher routes it to us.
+        let (_, responsePayload) = try await peer.sendAndWaitViaDispatcher(
+            command: "getheaders",
+            payload: payload,
+            expectedResponse: "headers",
+            timeoutSeconds: 5.0
+        )
+        let headers = try self.parseHeadersPayload(responsePayload, startingAt: headersStartHeight, fromPeer: peer.host)
 
         peer.recordSuccess()
 

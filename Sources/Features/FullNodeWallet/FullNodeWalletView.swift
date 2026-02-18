@@ -48,8 +48,17 @@ struct FullNodeWalletView: View {
     @State private var awaitingBlockBalanceSnapshot: UInt64? = nil
     // FIX #1408: Separate private balance snapshot for accurate pending delta display
     @State private var awaitingBlockPrivateSnapshot: UInt64? = nil
+    // FIX #1412: Last known stable private balance (when no unconfirmed activity).
+    // Used to auto-detect external spends and set the snapshot for FIX #1408 delta calculation.
+    @State private var lastStablePrivateBalance: UInt64 = 0
+    // FIX #1412: Actual sent amount from UI — display this directly instead of net balance delta.
+    // Net delta is wrong for intra-wallet transfers (shows -fee instead of -sentAmount).
+    @State private var pendingSentAmountZatoshis: UInt64? = nil
     @State private var lastKnownTxids: Set<String> = []
     @State private var pendingTxMonitorTask: Task<Void, Never>? = nil
+    // FIX #1414: Track last checked block height to avoid calling listsinceblock every poll
+    // cycle. listsinceblock triggers daemon keypool reserve/return spam via GetAccountAddress.
+    @State private var lastCheckedBlockHeight: UInt64 = 0
 
     @State private var showingSendSheet = false
     @State private var showingReceiveSheet = false
@@ -349,16 +358,24 @@ struct FullNodeWalletView: View {
             }
         }
         .sheet(isPresented: $showingSendSheet) {
-            RPCSendView(addresses: zAddresses + tAddresses, onSendSuccess: {
+            RPCSendView(addresses: zAddresses + tAddresses, onSendSuccess: { sentAmountZatoshis in
                 // FIX #286 v17: Refresh wallet data after successful send
                 Task {
-                    print("📊 FIX #286 v17: Transaction sent - refreshing wallet data")
+                    print("📊 FIX #286 v17: Transaction sent (\(sentAmountZatoshis) zat) - refreshing wallet data")
                     // FIX #1399: Immediately show "awaiting block confirmation" banner
                     await MainActor.run {
                         awaitingBlockConfirmation = true
                         awaitingBlockConfirmationSince = Date()
-                        awaitingBlockBalanceSnapshot = totalBalance.total
-                        awaitingBlockPrivateSnapshot = totalBalance.private  // FIX #1408
+                        // FIX #1412: Store actual sent amount for direct display.
+                        // Net balance delta is wrong for intra-wallet transfers (shows -fee
+                        // instead of -sentAmount because received output is also in our wallet).
+                        pendingSentAmountZatoshis = sentAmountZatoshis
+                        // FIX #1412: Use lastStablePrivateBalance (captured before send started)
+                        let preSendPrivate = lastStablePrivateBalance > 0
+                            ? lastStablePrivateBalance : totalBalance.private
+                        awaitingBlockBalanceSnapshot = lastStablePrivateBalance > 0
+                            ? lastStablePrivateBalance : totalBalance.total
+                        awaitingBlockPrivateSnapshot = preSendPrivate
                     }
                     await loadWalletData()
                 }
@@ -771,30 +788,26 @@ struct FullNodeWalletView: View {
                 Spacer()
 
                 // Show pending balance change
-                // FIX #1408: During a z-to-z send, getUnconfirmedBalance returns the CHANGE
-                // amount (positive) instead of the sent amount (negative). When we have a
-                // pre-send balance snapshot, calculate the net delta instead.
+                // FIX #1412: Show the actual sent amount when available (from UI send).
+                // FIX #1408 net delta is wrong for intra-wallet transfers (shows -fee
+                // instead of -sentAmount because destination is also in wallet.dat).
                 VStack(alignment: .trailing, spacing: 2) {
-                    if pendingUnconfirmedBalance.private_ != 0 {
-                        let pendingDisplay: Double = {
-                            if awaitingBlockConfirmation,
-                               let snapshot = awaitingBlockPrivateSnapshot,
-                               pendingUnconfirmedBalance.private_ > 0 {
-                                // FIX #1408: Net delta = (confirmed + unconfirmed) - preSendPrivateBalance
-                                // During a z-send: confirmed = 0 (input spent), unconfirmed = change
-                                // So delta = change - preSendBalance = negative (= -(sent + fee))
-                                let currentTotal = Double(totalBalance.private) / 100_000_000.0 + pendingUnconfirmedBalance.private_
-                                let preSend = Double(snapshot) / 100_000_000.0
-                                let delta = currentTotal - preSend
-                                print("📊 FIX #1408: Pending display delta: current=\(String(format: "%.8f", currentTotal)), preSend=\(String(format: "%.8f", preSend)), delta=\(String(format: "%.8f", delta))")
-                                return delta
-                            }
-                            return pendingUnconfirmedBalance.private_
-                        }()
-                        let sign = pendingDisplay > 0 ? "+" : ""
-                        Text("\(sign)\(String(format: "%.8f", pendingDisplay)) ZCL")
+                    if let sentAmount = pendingSentAmountZatoshis, awaitingBlockConfirmation {
+                        // FIX #1412: Display the actual sent amount from the UI (always correct)
+                        let displayValue = -Double(sentAmount) / 100_000_000.0
+                        Text("\(String(format: "%.8f", displayValue)) ZCL")
                             .font(.system(size: 12, weight: .bold, design: .monospaced))
-                            .foregroundColor(pendingDisplay > 0 ? theme.successColor : theme.errorColor)
+                            .foregroundColor(theme.errorColor)
+                    } else if pendingUnconfirmedBalance.private_ != 0 {
+                        // FIX #1416: Only show unconfirmed balance for INCOMING (positive).
+                        // For outgoing (negative), z_gettotalbalance delta shows fee/change,
+                        // not the actual sent amount. Without pendingSentAmountZatoshis,
+                        // showing the delta is misleading. Just show "pending" text instead.
+                        if pendingUnconfirmedBalance.private_ > 0 {
+                            Text("+\(String(format: "%.8f", pendingUnconfirmedBalance.private_)) ZCL")
+                                .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                .foregroundColor(theme.successColor)
+                        }
                     }
                     if pendingUnconfirmedBalance.transparent != 0 {
                         let sign = pendingUnconfirmedBalance.transparent > 0 ? "+" : ""
@@ -2209,24 +2222,40 @@ struct FullNodeWalletView: View {
         isLoading = true
         errorMessage = nil
 
-        do {
-            try await rpcWallet.connect()
+        // FIX #1416: Detach RPC work from SwiftUI task lifecycle.
+        // SwiftUI cancels Tasks on view refresh → z_getbalance/z_listreceivedbyaddress cancelled →
+        // addresses show wrong balances. Task.detached survives view changes.
+        let rpcWalletRef = rpcWallet
+        let result: Result<([WalletAddress], [WalletAddress], (transparent: UInt64, private: UInt64, total: UInt64), (height: UInt64, synced: Bool)), Error> = await Task.detached(priority: .userInitiated) {
+            do {
+                try await rpcWalletRef.connect()
 
-            async let z = rpcWallet.listZAddresses()
-            async let t = rpcWallet.listTAddresses()
-            async let balance = rpcWallet.getTotalBalance()
-            async let status = rpcWallet.getSyncStatus()
+                async let z = rpcWalletRef.listZAddresses()
+                async let t = rpcWalletRef.listTAddresses()
+                async let balance = rpcWalletRef.getTotalBalance()
+                async let status = rpcWalletRef.getSyncStatus()
 
-            let (zResult, tResult, balanceResult, statusResult) = try await (z, t, balance, status)
+                let (zResult, tResult, balanceResult, statusResult) = try await (z, t, balance, status)
+                return .success((zResult, tResult, balanceResult, statusResult))
+            } catch {
+                return .failure(error)
+            }
+        }.value
 
+        switch result {
+        case .success(let (zResult, tResult, balanceResult, statusResult)):
             await MainActor.run {
                 zAddresses = zResult
                 tAddresses = tResult
                 totalBalance = balanceResult
                 syncStatus = statusResult
                 isLoading = false
+                // FIX #1412: Capture initial stable balance for delta calculation
+                if lastStablePrivateBalance == 0 && balanceResult.private > 0 {
+                    lastStablePrivateBalance = balanceResult.private
+                }
             }
-        } catch {
+        case .failure(let error):
             print("❌ FIX #286 v3: FullNodeWalletView error: \(error.localizedDescription)")
             await MainActor.run {
                 errorMessage = error.localizedDescription
@@ -2246,9 +2275,15 @@ struct FullNodeWalletView: View {
             async let balance = rpcWallet.getTotalBalance()
             async let status = rpcWallet.getSyncStatus()
             let (balanceResult, statusResult) = try await (balance, status)
+            // FIX #1412: Check unconfirmed balance to update stable baseline
+            let unconfirmed = try? await RPCClient.shared.getUnconfirmedBalance()
             await MainActor.run {
                 totalBalance = balanceResult
                 syncStatus = statusResult
+                // FIX #1412: Update stable balance when no unconfirmed activity
+                if (unconfirmed?.private_ ?? 0) == 0 && balanceResult.private > 0 {
+                    lastStablePrivateBalance = balanceResult.private
+                }
             }
         } catch {
             // Silently ignore — monitor will retry
@@ -2520,6 +2555,12 @@ struct FullNodeWalletView: View {
             }
 
             await MainActor.run {
+                // FIX #1412: Before updating pendingUnconfirmedBalance, detect transition from
+                // no-unconfirmed → has-unconfirmed (external spend or UI send race).
+                // At this point totalBalance still has the PREVIOUS cycle's value.
+                let wasNoPrivateUnconf = pendingUnconfirmedBalance.private_ == 0
+                let nowHasPrivateUnconf = unconfirmed.private_ != 0
+
                 pendingOperations = operations
                 pendingUnconfirmedBalance = unconfirmed
 
@@ -2530,12 +2571,26 @@ struct FullNodeWalletView: View {
                         awaitingBlockConfirmation = true
                         awaitingBlockConfirmationSince = Date()
                         awaitingBlockBalanceSnapshot = totalBalance.total
-                        // FIX #1408: Only set private snapshot if not already captured by onSendSuccess
-                        // (at this point totalBalance may already be post-send = 0)
+                        // FIX #1412: Use lastStablePrivateBalance (captured before spend) instead of
+                        // totalBalance.private which may already be 0 due to monitor updates during
+                        // waitForOperation() polling (30s+ during Groth16 proof generation).
                         if awaitingBlockPrivateSnapshot == nil {
-                            awaitingBlockPrivateSnapshot = totalBalance.private
+                            awaitingBlockPrivateSnapshot = lastStablePrivateBalance > 0
+                                ? lastStablePrivateBalance : totalBalance.private
                         }
                     }
+                }
+
+                // FIX #1412: Auto-detect external spend — unconfirmed private balance appeared
+                // without a UI-initiated send (no awaitingBlockConfirmation set).
+                // Use lastStablePrivateBalance as the pre-send snapshot for delta calculation.
+                if wasNoPrivateUnconf && nowHasPrivateUnconf &&
+                   !awaitingBlockConfirmation && lastStablePrivateBalance > 0 {
+                    print("📊 FIX #1412: External spend detected — unconfirmed private \(String(format: "%.8f", unconfirmed.private_)) appeared, lastStable=\(lastStablePrivateBalance)")
+                    awaitingBlockConfirmation = true
+                    awaitingBlockConfirmationSince = Date()
+                    awaitingBlockBalanceSnapshot = lastStablePrivateBalance
+                    awaitingBlockPrivateSnapshot = lastStablePrivateBalance
                 }
             }
 
@@ -2559,6 +2614,7 @@ struct FullNodeWalletView: View {
                         awaitingBlockConfirmation = false
                         awaitingBlockConfirmationSince = nil
                         awaitingBlockPrivateSnapshot = nil  // FIX #1408
+                        pendingSentAmountZatoshis = nil  // FIX #1412
                     }
                     await refreshBalanceOnly()  // FIX #1405
                 }
@@ -2585,6 +2641,7 @@ struct FullNodeWalletView: View {
                             awaitingBlockConfirmationSince = nil
                             awaitingBlockBalanceSnapshot = nil
                             awaitingBlockPrivateSnapshot = nil  // FIX #1408
+                        pendingSentAmountZatoshis = nil  // FIX #1412
                         }
                         await refreshBalanceOnly()  // FIX #1405
                     }
@@ -2599,9 +2656,19 @@ struct FullNodeWalletView: View {
                             awaitingBlockConfirmationSince = nil
                             awaitingBlockBalanceSnapshot = nil
                             awaitingBlockPrivateSnapshot = nil  // FIX #1408
+                        pendingSentAmountZatoshis = nil  // FIX #1412
                         }
                         await refreshBalanceOnly()  // FIX #1405
                     }
+                }
+            }
+
+            // FIX #1412: Track last stable private balance when no unconfirmed activity.
+            // This captures the pre-send balance BEFORE any send occurs, surviving the race
+            // where monitor updates totalBalance during waitForOperation() Groth16 proof.
+            if unconfirmed.private_ == 0 && totalBalance.private > 0 {
+                await MainActor.run {
+                    lastStablePrivateBalance = totalBalance.private
                 }
             }
 
@@ -2614,7 +2681,15 @@ struct FullNodeWalletView: View {
     }
 
     /// Check for newly confirmed transactions by comparing with last known state
+    /// FIX #1414: Only call listsinceblock when a new block has arrived.
+    /// listsinceblock triggers daemon keypool reserve/return spam (every call generates
+    /// "keypool reserve N / keypool return N" in debug.log via GetAccountAddress).
     private func checkForNewConfirmedTransactions() async {
+        // FIX #1414: Skip heavy RPC call if no new block since last check
+        let currentHeight = syncStatus.height
+        guard currentHeight != lastCheckedBlockHeight || lastCheckedBlockHeight == 0 else { return }
+        lastCheckedBlockHeight = currentHeight
+
         do {
             // Get all recent transactions
             let txs = try await RPCClient.shared.getAllWalletTransactions(limit: 20)
@@ -2638,6 +2713,7 @@ struct FullNodeWalletView: View {
                                 awaitingBlockConfirmationSince = nil
                                 awaitingBlockBalanceSnapshot = nil
                                 awaitingBlockPrivateSnapshot = nil  // FIX #1408
+                        pendingSentAmountZatoshis = nil  // FIX #1412
                             }
                         }
                         // Refresh balance (no address listing needed)

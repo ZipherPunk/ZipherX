@@ -603,37 +603,41 @@ struct RPCTransactionHistoryView: View {
             currentPage = 0
         }
 
-        do {
-            print("📜 FIX #286 v7: RPCTransactionHistoryView - loading ALL transactions...")
+        // FIX #1416: Detach RPC work from SwiftUI task lifecycle.
+        // SwiftUI cancels Tasks when views refresh → URLSession requests cancelled →
+        // z_listreceivedbyaddress fails for most addresses → incomplete history/balances.
+        // Task.detached survives view lifecycle changes.
+        let rpcWalletRef = rpcWallet
+        let result: Result<[WalletTransaction], Error> = await Task.detached(priority: .userInitiated) {
+            do {
+                print("📜 FIX #286 v7: RPCTransactionHistoryView - loading ALL transactions...")
+                let txs = try await rpcWalletRef.getTransactionHistory(address: nil, limit: 10000)
 
-            // FIX #286 v7: Load ALL transactions (no limit)
-            let txs = try await rpcWallet.getTransactionHistory(address: nil, limit: 10000)
+                let sentCount = txs.filter { $0.type == .sent }.count
+                let receivedCount = txs.filter { $0.type == .received }.count
+                let confirmedCount = txs.filter { $0.confirmations > 0 }.count
+                let pendingCount = txs.filter { $0.confirmations == 0 }.count
+                print("📜 FIX #286 v7: Loaded \(txs.count) transactions:")
+                print("   - Sent: \(sentCount), Received: \(receivedCount)")
+                print("   - Confirmed: \(confirmedCount), Pending: \(pendingCount)")
 
-            // FIX #286 v7: Log transaction summary
-            let sentCount = txs.filter { $0.type == .sent }.count
-            let receivedCount = txs.filter { $0.type == .received }.count
-            let confirmedCount = txs.filter { $0.confirmations > 0 }.count
-            let pendingCount = txs.filter { $0.confirmations == 0 }.count
-            print("📜 FIX #286 v7: Loaded \(txs.count) transactions:")
-            print("   - Sent: \(sentCount), Received: \(receivedCount)")
-            print("   - Confirmed: \(confirmedCount), Pending: \(pendingCount)")
+                if let first = txs.first {
+                    print("📜 FIX #286 v7: First TX: type=\(first.type.rawValue), amount=\(first.amount), conf=\(first.confirmations), height=\(first.height ?? 0)")
+                }
 
-            if let first = txs.first {
-                print("📜 FIX #286 v7: First TX: type=\(first.type.rawValue), amount=\(first.amount), conf=\(first.confirmations), height=\(first.height ?? 0)")
+                return .success(txs)
+            } catch {
+                return .failure(error)
             }
+        }.value
 
+        switch result {
+        case .success(let txs):
             await MainActor.run {
-                // Sort by timestamp descending (newest first)
                 transactions = txs.sorted { $0.timestamp > $1.timestamp }
                 isLoading = false
             }
-        } catch is CancellationError {
-            // FIX #854: Task cancellation is normal SwiftUI behavior (view dismissed/recreated)
-            // Don't log as error or show error message
-            await MainActor.run {
-                isLoading = false
-            }
-        } catch {
+        case .failure(let error):
             print("❌ FIX #286 v7: RPCTransactionHistoryView - error: \(error.localizedDescription)")
             await MainActor.run {
                 errorMessage = error.localizedDescription

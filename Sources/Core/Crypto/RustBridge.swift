@@ -33,9 +33,11 @@ final class RustBridge {
     }
 
     /// Generate payment address from full viewing key
-    func derivePaymentAddress(from fvk: SaplingFullViewingKey, diversifierIndex: UInt64 = 0) throws -> String {
+    /// Returns (address, actualDiversifierIndex) — the actual index may differ from requested
+    /// if the requested index was not a valid diversifier for this key
+    func derivePaymentAddress(from fvk: SaplingFullViewingKey, diversifierIndex: UInt64 = 0) throws -> (String, UInt64) {
         // Use the real Rust FFI to derive address from spending key
-        guard let addressBytes = ZipherXFFI.deriveAddress(from: fvk.data, diversifierIndex: diversifierIndex) else {
+        guard let (addressBytes, actualIndex) = ZipherXFFI.deriveAddress(from: fvk.data, diversifierIndex: diversifierIndex) else {
             throw RustBridgeError.addressDerivationFailed
         }
 
@@ -43,7 +45,7 @@ final class RustBridge {
             throw RustBridgeError.addressDerivationFailed
         }
 
-        return encoded
+        return (encoded, actualIndex)
     }
 
     /// Derive incoming viewing key
@@ -52,6 +54,11 @@ final class RustBridge {
             throw RustBridgeError.viewingKeyDerivationFailed
         }
         return ivk
+    }
+
+    /// FIX #1402 (NEW-004): Get the last change diversifier index from Rust FFI
+    func getLastChangeDiversifierIndex() -> UInt64 {
+        return zipherx_get_last_change_diversifier_index()
     }
 
     // MARK: - Proof Generation (Placeholders)

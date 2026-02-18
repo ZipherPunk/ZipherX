@@ -185,6 +185,7 @@ struct ChatContact: Codable, Identifiable, Hashable {
     var isOnline: Bool              // Current online status
     var unreadCount: Int            // Number of unread messages
     var isFavorite: Bool            // Starred contact
+    var isBlocked: Bool             // FIX #1433: Contact is blocked (no incoming messages)
     var addedAt: Date               // When contact was added
     var notes: String?              // User notes about contact
 
@@ -196,6 +197,7 @@ struct ChatContact: Codable, Identifiable, Hashable {
         self.isOnline = false
         self.unreadCount = 0
         self.isFavorite = false
+        self.isBlocked = false
         self.addedAt = Date()
         self.notes = nil
     }
@@ -208,6 +210,21 @@ struct ChatContact: Codable, Identifiable, Hashable {
         // Show first 8 chars of onion address
         let prefix = String(onionAddress.prefix(8))
         return "\(prefix)..."
+    }
+
+    // FIX #1433: Custom decode for backward compatibility (isBlocked defaults to false)
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        onionAddress = try container.decode(String.self, forKey: .onionAddress)
+        nickname = try container.decode(String.self, forKey: .nickname)
+        lastSeen = try container.decodeIfPresent(Date.self, forKey: .lastSeen)
+        isOnline = try container.decodeIfPresent(Bool.self, forKey: .isOnline) ?? false
+        unreadCount = try container.decodeIfPresent(Int.self, forKey: .unreadCount) ?? 0
+        isFavorite = try container.decodeIfPresent(Bool.self, forKey: .isFavorite) ?? false
+        isBlocked = try container.decodeIfPresent(Bool.self, forKey: .isBlocked) ?? false
+        addedAt = try container.decodeIfPresent(Date.self, forKey: .addedAt) ?? Date()
+        notes = try container.decodeIfPresent(String.self, forKey: .notes)
     }
 
     func hash(into hasher: inout Hasher) {

@@ -294,11 +294,11 @@ actor CommitmentTreeUpdater {
                     }
                 }
 
-                // Check 3: Known boost file locations (prioritize correct directory)
+                // Check 3: Known boost file locations (standard app directories)
+                let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
                 let knownPaths = [
-                    "/Users/chris/Documents/BoostCache/zipherx_boost_v1.bin",  // PRIMARY - latest files
-                    "/Users/chris/ZipherX/Resources/BoostCache/zipherx_boost_v1.bin",
-                    "/Users/chris/ZipherX_Boost/zipherx_boost_v1.bin"  // OLD - may be outdated
+                    "\(homeDir)/Documents/BoostCache/zipherx_boost_v1.bin",
+                    "\(homeDir)/ZipherX_Boost/zipherx_boost_v1.bin"
                 ]
 
                 for knownPath in knownPaths {

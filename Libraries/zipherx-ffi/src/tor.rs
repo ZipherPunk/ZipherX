@@ -47,6 +47,10 @@ static TOR_ERROR: Mutex<Option<String>> = Mutex::new(None);
 /// Flag to stop the SOCKS proxy server
 static SOCKS_SERVER_RUNNING: AtomicBool = AtomicBool::new(false);
 
+/// FIX #1419: Track consecutive exit circuit failures
+/// Incremented when Arti fails to build exit circuits (stale consensus, relay unavailable)
+static TOR_EXIT_CIRCUIT_FAILURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Get or create the Tokio runtime
 fn get_runtime() -> &'static Runtime {
     TOKIO_RUNTIME.get_or_init(|| {
@@ -297,6 +301,12 @@ async fn handle_socks5_connection(
             // Always log .onion failures (important for debugging), reduce noise for clearnet
             let err_msg = format!("{}", e);
             let is_onion = host.ends_with(".onion");
+
+            // FIX #1419: Track exit circuit failures for auto-detection
+            if err_msg.contains("exit circuit") {
+                TOR_EXIT_CIRCUIT_FAILURES.fetch_add(1, Ordering::Relaxed);
+            }
+
             if is_onion {
                 eprintln!("🧅 [ONION] Failed to connect to {}:{} - {}", host, port, e);
             } else if !err_msg.contains("timed out") && !err_msg.contains("Protocol error") {
@@ -333,6 +343,65 @@ pub extern "C" fn zipherx_tor_stop() -> i32 {
 
     eprintln!("🧅 Tor stopped");
     0
+}
+
+/// FIX #1419: Get the count of consecutive exit circuit failures
+/// Used by Swift to detect when Arti can't build exit circuits (stale consensus)
+#[no_mangle]
+pub extern "C" fn zipherx_tor_get_exit_failures() -> u32 {
+    TOR_EXIT_CIRCUIT_FAILURES.load(Ordering::Relaxed)
+}
+
+/// FIX #1419: Reset the exit circuit failure counter (after successful restart)
+#[no_mangle]
+pub extern "C" fn zipherx_tor_reset_exit_failures() {
+    TOR_EXIT_CIRCUIT_FAILURES.store(0, Ordering::Relaxed);
+}
+
+/// FIX #1419: Clear Tor cache + stale guard state to force fresh circuit building
+/// Clears: cache/ (consensus/directory), state/state/guards.json, state/state/circuit_timeouts.json
+/// Preserves: state/keys/, state/keystore/ (persistent .onion identity)
+/// Returns 0 on success, 1 on error
+#[no_mangle]
+pub extern "C" fn zipherx_tor_clear_cache() -> i32 {
+    let data_dir = get_tor_data_dir();
+    let cache_dir = data_dir.join("cache");
+    let guards_file = data_dir.join("state").join("state").join("guards.json");
+    let timeouts_file = data_dir.join("state").join("state").join("circuit_timeouts.json");
+
+    eprintln!("🧹 FIX #1419: Clearing Tor cache at {:?}", cache_dir);
+
+    // 1. Clear cache directory (consensus + microdesc blobs)
+    let cache_ok = match std::fs::remove_dir_all(&cache_dir) {
+        Ok(_) => {
+            let _ = std::fs::create_dir_all(&cache_dir);
+            eprintln!("✅ FIX #1419: Tor cache cleared");
+            true
+        }
+        Err(e) => {
+            eprintln!("⚠️ FIX #1419: Failed to clear cache: {}", e);
+            let _ = std::fs::create_dir_all(&cache_dir);
+            false
+        }
+    };
+
+    // 2. Clear stale guard state (forces fresh guard selection)
+    if guards_file.exists() {
+        match std::fs::remove_file(&guards_file) {
+            Ok(_) => eprintln!("✅ FIX #1419: Cleared guards.json (stale guard state)"),
+            Err(e) => eprintln!("⚠️ FIX #1419: Failed to clear guards.json: {}", e),
+        }
+    }
+
+    // 3. Clear circuit timeout data (may have pessimistic values)
+    if timeouts_file.exists() {
+        match std::fs::remove_file(&timeouts_file) {
+            Ok(_) => eprintln!("✅ FIX #1419: Cleared circuit_timeouts.json"),
+            Err(e) => eprintln!("⚠️ FIX #1419: Failed to clear circuit_timeouts.json: {}", e),
+        }
+    }
+
+    if cache_ok { 0 } else { 1 }
 }
 
 /// Get current Tor state

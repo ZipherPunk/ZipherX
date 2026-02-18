@@ -10,7 +10,8 @@ struct RPCSendView: View {
 
     let addresses: [WalletAddress]
     // FIX #286 v17: Callback when transaction is successfully sent
-    var onSendSuccess: (() -> Void)?
+    // FIX #1412: Pass sent amount (zatoshis) so parent can display it directly
+    var onSendSuccess: ((UInt64) -> Void)?
 
     @State private var selectedFromAddress: WalletAddress?
     @State private var toAddress: String = ""
@@ -616,11 +617,23 @@ struct RPCSendView: View {
                 successTxid = txid
                 isSending = false
                 // FIX #286 v17: Notify parent view to refresh
-                onSendSuccess?()
+                // FIX #1412: Pass sent amount for direct display
+                onSendSuccess?(amountZatoshis)
             }
         } catch {
+            // FIX #1404: Provide more descriptive error messages for common RPC failures
+            let rawError = error.localizedDescription
+            print("⚠️ FIX #1404: Full node send failed — \(rawError) (amount: \(amountValue), from: \(from.address.prefix(16))...)")
+            let userMessage: String
+            if rawError.lowercased().contains("invalid amount") {
+                userMessage = "Send failed: The daemon rejected the amount. This usually means the previous transaction's change hasn't confirmed yet (needs 1 confirmation). Wait for the next block and try again."
+            } else if rawError.lowercased().contains("insufficient") {
+                userMessage = "Send failed: Insufficient funds. Your available balance may be lower if a previous transaction is still pending confirmation."
+            } else {
+                userMessage = rawError
+            }
             await MainActor.run {
-                errorMessage = error.localizedDescription
+                errorMessage = userMessage
                 isSending = false
             }
         }

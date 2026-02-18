@@ -994,6 +994,8 @@ struct FullNodeSettingsView: View {
         biometricAvailable = context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error)
         useFaceID = UserDefaults.standard.bool(forKey: "useBiometricAuth")
         usePINCode = UserDefaults.standard.string(forKey: "walletPIN") != nil
+        // FIX #1438: Reload timeout from persisted value (same as SettingsView FIX #1346)
+        selectedTimeout = BiometricAuthManager.shared.authTimeout
     }
 
     private func getBiometricName() -> String {

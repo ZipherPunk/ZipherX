@@ -10,6 +10,12 @@
 //
 
 import SwiftUI
+#if os(iOS)
+import UIKit
+#else
+import AppKit
+#endif
+import UniformTypeIdentifiers
 
 // MARK: - Main Chat View
 
@@ -61,14 +67,22 @@ struct ChatView: View {
                 autoStartChatIfNeeded()
             }
             #else
-            NavigationView {
-                contactListView
-                    .frame(minWidth: 280, maxWidth: 320)
-
+            // FIX #1429: WhatsApp-style full-screen navigation (replaces split pane)
+            // FIX #1429b: Use if/else (not opacity) so contact list re-renders with fresh data
+            Group {
                 if let contact = selectedContact {
-                    ConversationView(contact: contact)
+                    ConversationView(
+                        contact: contact,
+                        onBack: {
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                selectedContact = nil
+                            }
+                        }
+                    )
+                    .transition(.move(edge: .trailing))
                 } else {
-                    emptyStateView
+                    contactListView
+                        .transition(.move(edge: .leading))
                 }
             }
             .sheet(isPresented: $showAddContact) {
@@ -258,6 +272,17 @@ struct ChatView: View {
                                         Label(contact.isFavorite ? "Remove from Favorites" : "Add to Favorites",
                                               systemImage: contact.isFavorite ? "star.slash" : "star")
                                     }
+                                    // FIX #1433: Block/Unblock contact
+                                    Button(action: {
+                                        if contact.isBlocked {
+                                            chatManager.unblockContact(contact)
+                                        } else {
+                                            chatManager.blockContact(contact)
+                                        }
+                                    }) {
+                                        Label(contact.isBlocked ? "Unblock" : "Block",
+                                              systemImage: contact.isBlocked ? "hand.raised.slash" : "hand.raised")
+                                    }
                                     Button(role: .destructive, action: { deleteContact(contact) }) {
                                         Label("Delete", systemImage: "trash")
                                     }
@@ -324,6 +349,17 @@ struct ChatView: View {
                                 Button(action: { toggleFavorite(contact) }) {
                                     Label(contact.isFavorite ? "Remove from Favorites" : "Add to Favorites",
                                           systemImage: contact.isFavorite ? "star.slash" : "star")
+                                }
+                                // FIX #1433: Block/Unblock contact
+                                Button(action: {
+                                    if contact.isBlocked {
+                                        chatManager.unblockContact(contact)
+                                    } else {
+                                        chatManager.blockContact(contact)
+                                    }
+                                }) {
+                                    Label(contact.isBlocked ? "Unblock" : "Block",
+                                          systemImage: contact.isBlocked ? "hand.raised.slash" : "hand.raised")
                                 }
                                 Button(role: .destructive, action: { deleteContact(contact) }) {
                                     Label("Delete", systemImage: "trash")
@@ -672,18 +708,16 @@ struct ContactRow: View {
                     )
                     .shadow(color: avatarGradient[0].opacity(0.3), radius: 4, y: 2)
 
-                // Online indicator with pulse
-                if contact.isOnline {
-                    ZStack {
-                        Circle()
-                            .fill(theme.accentColor)
-                            .frame(width: 14, height: 14)
-                        Circle()
-                            .stroke(theme.backgroundColor, lineWidth: 2)
-                            .frame(width: 14, height: 14)
-                    }
-                    .offset(x: 2, y: 2)
+                // FIX #1429: Always show status dot — green=online, orange=offline, red=blocked
+                ZStack {
+                    Circle()
+                        .fill(contact.isBlocked ? Color.red : (contact.isOnline ? Color.green : Color.orange))
+                        .frame(width: 14, height: 14)
+                    Circle()
+                        .stroke(theme.backgroundColor, lineWidth: 2)
+                        .frame(width: 14, height: 14)
                 }
+                .offset(x: 2, y: 2)
             }
 
             VStack(alignment: .leading, spacing: 4) {
@@ -771,6 +805,7 @@ struct ConversationView: View {
     @StateObject private var chatManager = ChatManager.shared
 
     let contact: ChatContact
+    var onBack: (() -> Void)? = nil  // FIX #1429: Back button callback (macOS)
 
     @State private var messageText = ""
     @State private var isTyping = false
@@ -926,22 +961,45 @@ struct ConversationView: View {
         }
     }
 
+    // FIX #1430: Live contact lookup — frozen `let contact` is a value type snapshot
+    private var liveContact: ChatContact {
+        chatManager.contacts.first(where: { $0.onionAddress == contact.onionAddress }) ?? contact
+    }
+
+    // FIX #1429: Contact status color (green=online, orange=offline, red=blocked)
+    private func contactStatusColor(_ contact: ChatContact) -> Color {
+        if contact.isBlocked { return .red }
+        if contact.isOnline { return .green }
+        return .orange
+    }
+
+    private func contactStatusText(_ contact: ChatContact) -> String {
+        if contact.isBlocked { return "blocked" }
+        if contact.isOnline { return "online" }
+        return "offline"
+    }
+
     private var conversationHeader: some View {
         HStack(spacing: 12) {
-            // Back button (iOS)
-            #if os(iOS)
-            // Handled by NavigationView
-            #endif
+            // FIX #1429: Back button (macOS — WhatsApp-style)
+            if let onBack = onBack {
+                Button(action: onBack) {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundColor(theme.accentColor)
+                }
+                .buttonStyle(.plain)
+            }
 
-            // Contact info
+            // Contact info — FIX #1430: Use liveContact for dynamic status
             HStack(spacing: 10) {
                 // Mini avatar
                 Circle()
                     .fill(
                         LinearGradient(
                             colors: [
-                                Color(hue: Double(abs(contact.displayName.hashValue) % 360) / 360.0, saturation: 0.7, brightness: 0.8),
-                                Color(hue: Double((abs(contact.displayName.hashValue) + 40) % 360) / 360.0, saturation: 0.6, brightness: 0.6)
+                                Color(hue: Double(abs(liveContact.displayName.hashValue) % 360) / 360.0, saturation: 0.7, brightness: 0.8),
+                                Color(hue: Double((abs(liveContact.displayName.hashValue) + 40) % 360) / 360.0, saturation: 0.6, brightness: 0.6)
                             ],
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
@@ -949,23 +1007,23 @@ struct ConversationView: View {
                     )
                     .frame(width: 36, height: 36)
                     .overlay(
-                        Text(contact.displayName.prefix(1).uppercased())
+                        Text(liveContact.displayName.prefix(1).uppercased())
                             .font(.system(size: 14, weight: .bold))
                             .foregroundColor(.white)
                     )
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(contact.displayName)
+                    Text(liveContact.displayName)
                         .font(.system(size: 15, weight: .semibold, design: .monospaced))
                         .foregroundColor(.white)
 
                     HStack(spacing: 4) {
                         Circle()
-                            .fill(contact.isOnline ? theme.accentColor : Color.gray)
+                            .fill(contactStatusColor(liveContact))
                             .frame(width: 6, height: 6)
-                        Text(contact.isOnline ? "online" : "offline")
+                        Text(contactStatusText(liveContact))
                             .font(.system(size: 10, design: .monospaced))
-                            .foregroundColor(contact.isOnline ? theme.accentColor : Color.gray)
+                            .foregroundColor(contactStatusColor(liveContact))
                     }
                 }
             }
@@ -1856,11 +1914,56 @@ struct ChatSettingsSheet: View {
     @State private var quote: String = ""
     // FIX #224: Track if address was copied
     @State private var showCopiedFeedback = false
+    // FIX #1436: Profile image picker
+    @State private var showImagePicker = false
 
     private var theme: AppTheme { themeManager.currentTheme }
 
     var body: some View {
         chatSettingsInner
+            #if os(iOS)
+            // FIX #1436: iOS image picker — UIKit fallback (iOS 15 compat)
+            .sheet(isPresented: $showImagePicker) {
+                ImagePickerView { imageData in
+                    if let resized = Self.resizedImageData(imageData, maxSize: 200) {
+                        chatManager.saveProfileImage(resized)
+                    }
+                }
+            }
+            #endif
+    }
+
+    // FIX #1436: Resize image to max dimension (keeps aspect ratio)
+    static func resizedImageData(_ data: Data, maxSize: CGFloat) -> Data? {
+        #if os(iOS)
+        guard let image = UIImage(data: data) else { return nil }
+        let scale = min(maxSize / image.size.width, maxSize / image.size.height, 1.0)
+        if scale >= 1.0 { return image.jpegData(compressionQuality: 0.8) }
+        let newSize = CGSize(width: image.size.width * scale, height: image.size.height * scale)
+        let renderer = UIGraphicsImageRenderer(size: newSize)
+        let resized = renderer.image { _ in
+            image.draw(in: CGRect(origin: .zero, size: newSize))
+        }
+        return resized.jpegData(compressionQuality: 0.8)
+        #else
+        guard let nsImage = NSImage(data: data) else { return nil }
+        let scale = min(maxSize / nsImage.size.width, maxSize / nsImage.size.height, 1.0)
+        let newSize: CGSize
+        if scale >= 1.0 {
+            newSize = nsImage.size
+        } else {
+            newSize = CGSize(width: nsImage.size.width * scale, height: nsImage.size.height * scale)
+        }
+        let newImage = NSImage(size: newSize)
+        newImage.lockFocus()
+        nsImage.draw(in: CGRect(origin: .zero, size: newSize),
+                     from: CGRect(origin: .zero, size: nsImage.size),
+                     operation: .copy, fraction: 1.0)
+        newImage.unlockFocus()
+        guard let tiffData = newImage.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiffData) else { return nil }
+        return bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.8])
+        #endif
     }
 
     private var chatSettingsInner: some View {
@@ -1908,6 +2011,115 @@ struct ChatSettingsSheet: View {
                     // Identity Section (FIX #224: QR code + copy button)
                     VStack(alignment: .leading, spacing: 16) {
                         sectionHeader("YOUR IDENTITY")
+
+                        // FIX #1436: Profile Picture
+                        HStack {
+                            Spacer()
+                            Button(action: {
+                                #if os(macOS)
+                                // macOS: NSOpenPanel directly (fileImporter silently fails inside sheets)
+                                let panel = NSOpenPanel()
+                                panel.allowedContentTypes = [.image]
+                                panel.allowsMultipleSelection = false
+                                panel.canChooseDirectories = false
+                                panel.title = "Choose Profile Picture"
+                                if panel.runModal() == .OK, let url = panel.url {
+                                    if let data = try? Data(contentsOf: url),
+                                       let resized = Self.resizedImageData(data, maxSize: 200) {
+                                        chatManager.saveProfileImage(resized)
+                                    }
+                                }
+                                #else
+                                showImagePicker = true
+                                #endif
+                            }) {
+                                ZStack {
+                                    if let imageData = chatManager.profileImage {
+                                        #if os(iOS)
+                                        if let uiImage = UIImage(data: imageData) {
+                                            Image(uiImage: uiImage)
+                                                .resizable()
+                                                .scaledToFill()
+                                                .frame(width: 100, height: 100)
+                                                .clipShape(Circle())
+                                                .overlay(
+                                                    Circle()
+                                                        .stroke(theme.accentColor.opacity(0.5), lineWidth: 2)
+                                                )
+                                        }
+                                        #else
+                                        if let nsImage = NSImage(data: imageData) {
+                                            Image(nsImage: nsImage)
+                                                .resizable()
+                                                .scaledToFill()
+                                                .frame(width: 100, height: 100)
+                                                .clipShape(Circle())
+                                                .overlay(
+                                                    Circle()
+                                                        .stroke(theme.accentColor.opacity(0.5), lineWidth: 2)
+                                                )
+                                        }
+                                        #endif
+                                    } else {
+                                        Circle()
+                                            .fill(
+                                                LinearGradient(
+                                                    colors: [theme.accentColor.opacity(0.6), theme.accentColor.opacity(0.3)],
+                                                    startPoint: .topLeading,
+                                                    endPoint: .bottomTrailing
+                                                )
+                                            )
+                                            .frame(width: 100, height: 100)
+                                            .overlay(
+                                                Image(systemName: "camera.fill")
+                                                    .font(.system(size: 30))
+                                                    .foregroundColor(.white.opacity(0.7))
+                                            )
+                                    }
+
+                                    // Edit badge
+                                    Circle()
+                                        .fill(theme.accentColor)
+                                        .frame(width: 28, height: 28)
+                                        .overlay(
+                                            Image(systemName: "pencil")
+                                                .font(.system(size: 12, weight: .bold))
+                                                .foregroundColor(.black)
+                                        )
+                                        .offset(x: 35, y: 35)
+                                }
+                            }
+                            .buttonStyle(.plain)
+                            .contextMenu {
+                                if chatManager.profileImage != nil {
+                                    Button(role: .destructive, action: {
+                                        chatManager.saveProfileImage(nil)
+                                    }) {
+                                        Label("Remove Photo", systemImage: "trash")
+                                    }
+                                }
+                            }
+                            Spacer()
+                        }
+                        .padding(.bottom, 4)
+
+                        // FIX #1436: Share profile picture toggle
+                        HStack {
+                            Image(systemName: "eye")
+                                .font(.system(size: 12))
+                                .foregroundColor(theme.accentColor.opacity(0.6))
+                            Text("Share with contacts")
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundColor(theme.textPrimary.opacity(0.6))
+                            Spacer()
+                            Toggle("", isOn: Binding(
+                                get: { UserDefaults.standard.bool(forKey: "chatShareProfileImage") },
+                                set: { UserDefaults.standard.set($0, forKey: "chatShareProfileImage") }
+                            ))
+                            .labelsHidden()
+                            .tint(theme.accentColor)
+                        }
+                        .padding(.horizontal, 14)
 
                         VStack(spacing: 12) {
                             HStack {
@@ -2782,6 +2994,44 @@ struct SendViewForPayment: View {
         }
     }
 }
+
+// MARK: - FIX #1436: UIKit Image Picker (iOS 15+ compatible)
+
+#if os(iOS)
+/// UIImagePickerController wrapper for profile picture selection (works on iOS 15+)
+struct ImagePickerView: UIViewControllerRepresentable {
+    var onImageSelected: (Data) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    func makeUIViewController(context: Context) -> UIImagePickerController {
+        let picker = UIImagePickerController()
+        picker.sourceType = .photoLibrary
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: UIImagePickerController, context: Context) {}
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    class Coordinator: NSObject, UIImagePickerControllerDelegate, UINavigationControllerDelegate {
+        let parent: ImagePickerView
+        init(_ parent: ImagePickerView) { self.parent = parent }
+
+        func imagePickerController(_ picker: UIImagePickerController, didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]) {
+            if let image = info[.originalImage] as? UIImage,
+               let data = image.jpegData(compressionQuality: 0.9) {
+                parent.onImageSelected(data)
+            }
+            parent.dismiss()
+        }
+
+        func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
+            parent.dismiss()
+        }
+    }
+}
+#endif
 
 // MARK: - Corner Radius Extension (Cross-Platform)
 

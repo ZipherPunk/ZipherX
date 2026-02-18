@@ -76,18 +76,19 @@ Resources/shielded_outputs_manifest.json
 Resources/block_timestamps.bin
 Sources/Resources/shielded_outputs.bin
 
-# Build artifacts for FFI (not needed in repo - build from source)
+# Build artifacts for FFI and static libraries (not needed in repo - build from source)
 Libraries/zipherx-ffi/libzipherx_ffi_ios.a
 Libraries/libzipherx_ffi.a
 Libraries/ZipherXFFI.xcframework/*/libzipherx_ffi.a
-*.xcframework/*/*.a
+**/*.xcframework/**/*.a
 
 # Tools directory (private scripts, not for public repo)
 Tools/
 scripts/tools/
 
-# Security audit docs (never commit to public repo)
+# Documentation directories (private analysis, never public)
 docs/
+Docs/
 
 # Claude Code settings and docs (never commit)
 .claude/
@@ -210,3 +211,27 @@ logs/orchestrator/
 # Orchestrator agent output files
 *.agent_output
 .orchestrator_state.json
+
+# Documentation files that should not be public
+DISCLAIMER.md
+Package.swift
+BUG_FIXES.md
+ANALYSIS.md
+
+# Rust FFI debug binaries (contain developer wallet data — NEVER commit)
+Libraries/zipherx-ffi/src/bin/verify_nullifier.rs
+Libraries/zipherx-ffi/src/bin/verify_nullifier_full.rs
+Libraries/zipherx-ffi/src/bin/find_cmu_position.rs
+Libraries/zipherx-ffi/src/bin/export_serialized_tree.rs
+Libraries/zipherx-ffi/src/bin/verify_balance.rs
+Libraries/zipherx-ffi/src/bin/bench_boost_scan.rs
+Libraries/zipherx-ffi/src/bin/bench_decrypt.rs
+Libraries/zipherx-ffi/src/bin/build_tree_from_cmus.rs
+Libraries/zipherx-ffi/src/bin/regenerate_boost_tree.rs
+Libraries/zipherx-ffi/src/bin/serialize_tree.rs
+Libraries/zipherx-ffi/src/bin/verify_tree.rs
+Libraries/zipherx-ffi/src/bin/verify_tree_correct.rs
+Libraries/zipherx-ffi/src/bin/verify_tree_no_reverse.rs
+
+# Zcash proofs library (build artifact)
+Libraries/zcash_proofs_zcl/

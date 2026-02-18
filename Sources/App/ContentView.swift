@@ -311,6 +311,129 @@ struct ContentView: View {
                             print("⏭️ FIX #1341: Skipping boost header loading on first import (saves 207s)")
                         }
 
+                        // FIX #1422b: EARLY INSTANT START — skip network connect entirely when
+                        // all conditions are already met locally: checkpoint valid, headers healthy,
+                        // tree loaded from DB. The 10+ second peer wait for chainHeight is unnecessary
+                        // when we have cached balance and valid wallet state.
+                        // Network connect, header sync, health check run in background after UI shows.
+                        let earlyHeadersBehind = cachedChainHeight > headerStoreHeight ? cachedChainHeight - headerStoreHeight : 0
+                        let earlyIsHeaderStoreHealthy = headerStoreHeight > 0 && earlyHeadersBehind <= 100
+                        let earlyTreeLoaded = walletManager.isTreeLoaded && ZipherXFFI.treeSize() > 0
+
+                        if isCheckpointValid && earlyIsHeaderStoreHealthy && earlyTreeLoaded && !cacheIsStale && lastScannedHeight > 0 {
+                            let treeSize = ZipherXFFI.treeSize()
+                            print("⚡ FIX #1422b: EARLY INSTANT START — all conditions met locally")
+                            print("   Checkpoint=\(checkpointHeight), HeaderStore=\(headerStoreHeight), Tree=\(treeSize)")
+                            print("   Skipping network connect + peer wait + header sync (saves ~12s)")
+
+                            // Load cached balance immediately
+                            walletManager.loadCachedBalance()
+
+                            // Show UI immediately
+                            await MainActor.run {
+                                walletManager.setRepairingHistory(false)
+                                walletManager.setConnecting(false, status: nil)
+                                isInitialSync = false
+                                hasCompletedInitialSync = true
+                                walletManager.completeProgress()
+
+                                walletManager.updateSyncTask(id: "fast_balance", status: .completed)
+                                walletManager.updateSyncTask(id: "fast_peers", status: .completed)
+                                walletManager.updateSyncTask(id: "fast_headers", status: .completed)
+                                walletManager.updateSyncTask(id: "fast_health", status: .completed)
+
+                                networkManager.enableBackgroundProcesses()
+                                walletManager.startPeriodicWitnessRefresh()
+                                walletManager.startPeriodicDeepVerification()
+                                walletManager.checkForBoostUpdate()
+                            }
+
+                            let instantStartTotal = CFAbsoluteTimeGetCurrent() - startupStart
+                            print("⚡ FIX #1422b: UI shown in \(String(format: "%.2f", instantStartTotal))s (no network needed)")
+
+                            // Background: network connect + header sync + health check + verification
+                            Task {
+                                // Connect to network
+                                do {
+                                    try await networkManager.connect()
+                                    // Wait for peers with chain height
+                                    var peerWait = 0
+                                    while (networkManager.connectedPeers < 3 || networkManager.chainHeight == 0) && peerWait < 300 {
+                                        try? await Task.sleep(nanoseconds: 100_000_000)
+                                        peerWait += 1
+                                    }
+                                    // Sync any missing headers
+                                    let currentHeaderHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+                                    let chainHeight = networkManager.chainHeight
+                                    if chainHeight > currentHeaderHeight {
+                                        let hsm = HeaderSyncManager(headerStore: HeaderStore.shared, networkManager: networkManager)
+                                        try await hsm.syncHeaders(from: currentHeaderHeight + 1, maxHeaders: chainHeight - currentHeaderHeight + 100)
+                                        print("✅ FIX #1422b: Background header sync complete (to \(chainHeight))")
+                                    }
+                                    await networkManager.fetchNetworkStats()
+                                } catch {
+                                    print("⚠️ FIX #1422b: Background network error: \(error.localizedDescription)")
+                                }
+
+                                // Wait for gap-fill if running
+                                var gapFillAttempts = 0
+                                while await MainActor.run(body: { walletManager.isGapFillingDelta }) && gapFillAttempts < 240 {
+                                    try? await Task.sleep(nanoseconds: 500_000_000)
+                                    gapFillAttempts += 1
+                                }
+
+                                // Health check
+                                let healthResults = await WalletHealthCheck.shared.runAllChecks()
+                                let criticalIssues = healthResults.filter {
+                                    !$0.passed && ($0.critical || $0.details.contains("REPAIR") || $0.details.contains("Full Rescan"))
+                                }
+                                if !criticalIssues.isEmpty {
+                                    print("⚠️ FIX #1422b: Background health check found \(criticalIssues.count) issue(s)")
+                                    for issue in criticalIssues {
+                                        print("   ⚠️ \(issue.checkName): \(issue.details)")
+                                    }
+                                } else {
+                                    print("✅ FIX #1422b: Background health check passed")
+                                }
+
+                                // Witness rebuild if needed
+                                if !WalletHealthCheck.shared.witnessesRebuiltThisSession &&
+                                   !WalletHealthCheck.shared.hasValidVerifiedState() {
+                                    print("🔄 FIX #1422b: Background witness rebuild...")
+                                    await walletManager.rebuildWitnessesForStartup()
+                                    print("✅ FIX #1422b: Background witness rebuild complete")
+                                }
+
+                                // Nullifier verification
+                                do {
+                                    let fixedNullifiers = try await walletManager.recomputeNullifiersWithCorrectPositions()
+                                    if fixedNullifiers > 0 {
+                                        try? await walletManager.refreshBalance()
+                                    }
+                                    let externalSpends = try await walletManager.verifyAllUnspentNotesOnChain(
+                                        forceFullVerification: fixedNullifiers > 0
+                                    )
+                                    if externalSpends > 0 {
+                                        try? await walletManager.refreshBalance()
+                                        await MainActor.run {
+                                            walletManager.balanceIntegrityIssue = true
+                                            walletManager.balanceIntegrityMessage = "Balance corrected — phantom notes detected and removed"
+                                        }
+                                    }
+                                } catch {
+                                    print("⚠️ FIX #1422b: Background nullifier verification failed: \(error)")
+                                }
+
+                                // Delta compaction
+                                let compactResult = DeltaCMUManager.shared.compactDeltaBundleIfNeeded()
+                                if compactResult.removed > 0 {
+                                    print("✅ FIX #1128: Background compaction removed \(compactResult.removed) duplicate CMUs")
+                                }
+                            }
+
+                            return  // EXIT — balance view shown in ~2 seconds!
+                        }
+
                         // Connect to P2P network for delta header sync
                         // FIX #1341: Skip on first import — FULL START handles its own P2P connection
                         // and PHASE 2 fetches delta headers via P2P internally.
@@ -425,6 +548,123 @@ struct ContentView: View {
 
                                 print("⚡ FIX #168: INSTANT START - checkpoint valid (gap=\(checkpointGap))")
                                 print("⚡ FIX #408: HeaderStore healthy (within \(headersBehind) blocks)")
+
+                                // FIX #1422: FAST INSTANT START — skip 40s tree re-init when already loaded from DB.
+                                // preloadCommitmentTree() (WalletManager.init) deserializes from DB in <100ms
+                                // and sets isTreeLoaded=true. Without this guard, ContentView re-inits from
+                                // boost file → root mismatch → treeLoadFromCMUs() rebuilding 1M+ CMUs (~40s).
+                                // Health check, witness rebuild, and nullifier verification are deferred to
+                                // background so the balance view shows in ≤5 seconds.
+                                let treeAlreadyLoaded = walletManager.isTreeLoaded && ZipherXFFI.treeSize() > 0
+                                if treeAlreadyLoaded {
+                                    let treeSize = ZipherXFFI.treeSize()
+                                    print("⚡ FIX #1422: Tree already loaded from DB (\(treeSize) commitments) — INSTANT UI")
+
+                                    // Load cached balance immediately
+                                    let balanceLoadStart = CFAbsoluteTimeGetCurrent()
+                                    walletManager.loadCachedBalance()
+                                    logPhase("Cached balance load", since: balanceLoadStart)
+
+                                    // Show UI immediately
+                                    await MainActor.run {
+                                        walletManager.setRepairingHistory(false)
+                                        walletManager.setConnecting(false, status: nil)
+                                        isInitialSync = false
+                                        hasCompletedInitialSync = true
+                                        walletManager.completeProgress()
+
+                                        walletManager.updateSyncTask(id: "fast_balance", status: .completed)
+                                        walletManager.updateSyncTask(id: "fast_peers", status: .completed)
+                                        walletManager.updateSyncTask(id: "fast_headers", status: .completed)
+                                        walletManager.updateSyncTask(id: "fast_health", status: .completed)
+
+                                        networkManager.enableBackgroundProcesses()
+                                        walletManager.startPeriodicWitnessRefresh()
+                                        walletManager.startPeriodicDeepVerification()
+                                        walletManager.checkForBoostUpdate()
+                                    }
+
+                                    // FIX #881: Log timing
+                                    let instantStartTotal = CFAbsoluteTimeGetCurrent() - instantStartBegin
+                                    print("⚡ FIX #1422: INSTANT START total: \(String(format: "%.2f", instantStartTotal))s (tree pre-loaded)")
+                                    print("⚡ FIX #1422: Phase breakdown:")
+                                    for (phase, elapsed) in phaseTimings {
+                                        print("   • \(phase): \(String(format: "%.2f", elapsed * 1000))ms")
+                                    }
+
+                                    // Deferred background: health check, witness rebuild, nullifier verification
+                                    Task {
+                                        // Wait for gap-fill if still running
+                                        var gapFillAttempts = 0
+                                        while await MainActor.run(body: { walletManager.isGapFillingDelta }) && gapFillAttempts < 240 {
+                                            try? await Task.sleep(nanoseconds: 500_000_000)
+                                            gapFillAttempts += 1
+                                        }
+                                        if gapFillAttempts > 0 {
+                                            print("✅ FIX #1422: Gap-fill completed after \(gapFillAttempts * 500)ms")
+                                        }
+
+                                        // Health check
+                                        let healthResults = await WalletHealthCheck.shared.runAllChecks()
+                                        let criticalIssues = healthResults.filter {
+                                            !$0.passed && ($0.critical || $0.details.contains("REPAIR") || $0.details.contains("Full Rescan"))
+                                        }
+                                        if !criticalIssues.isEmpty {
+                                            print("⚠️ FIX #1422: Background health check found \(criticalIssues.count) issue(s)")
+                                            for issue in criticalIssues {
+                                                print("   ⚠️ \(issue.checkName): \(issue.details)")
+                                            }
+                                        } else {
+                                            print("✅ FIX #1422: Background health check passed")
+                                        }
+
+                                        // Witness rebuild if needed
+                                        if !WalletHealthCheck.shared.witnessesRebuiltThisSession &&
+                                           !WalletHealthCheck.shared.hasValidVerifiedState() {
+                                            print("🔄 FIX #1422: Background witness rebuild...")
+                                            await walletManager.rebuildWitnessesForStartup()
+                                            print("✅ FIX #1422: Background witness rebuild complete")
+                                        }
+
+                                        // Nullifier verification
+                                        do {
+                                            let fixedNullifiers = try await walletManager.recomputeNullifiersWithCorrectPositions()
+                                            if fixedNullifiers > 0 {
+                                                try? await walletManager.refreshBalance()
+                                            }
+                                            let externalSpends = try await walletManager.verifyAllUnspentNotesOnChain(
+                                                forceFullVerification: fixedNullifiers > 0
+                                            )
+                                            if externalSpends > 0 {
+                                                try? await walletManager.refreshBalance()
+                                                await MainActor.run {
+                                                    walletManager.balanceIntegrityIssue = true
+                                                    walletManager.balanceIntegrityMessage = "Balance corrected — phantom notes detected and removed"
+                                                }
+                                            }
+                                        } catch {
+                                            print("⚠️ FIX #1422: Background nullifier verification failed: \(error)")
+                                        }
+
+                                        // Delta compaction
+                                        let compactResult = DeltaCMUManager.shared.compactDeltaBundleIfNeeded()
+                                        if compactResult.removed > 0 {
+                                            print("✅ FIX #1128: Background compaction removed \(compactResult.removed) duplicate CMUs")
+                                        }
+                                    }
+
+                                    // Background network
+                                    Task {
+                                        do {
+                                            try await networkManager.connect()
+                                            await networkManager.fetchNetworkStats()
+                                        } catch {
+                                            print("⚠️ FIX #1422: Background connect error: \(error.localizedDescription)")
+                                        }
+                                    }
+
+                                    return  // EXIT — balance view showing immediately!
+                                }
 
                                 // FIX #530: CRITICAL - Initialize tree from boost file before health checks
                                 // Without this, FFI tree state is corrupted from previous session

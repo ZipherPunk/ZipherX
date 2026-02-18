@@ -303,40 +303,40 @@ final class FilterScanner {
         if isLightweightScan {
             print("🔍 FIX #1410: Lightweight scan (\(expectedBlockCount) blocks) — keeping block listeners active")
         } else {
-            // FIX #907: Block all block listeners during the entire scan operation
-            // Block listeners can only run when app is idle on main screen
-            await PeerManager.shared.stopAllBlockListeners(timeout: 3.0)
-            PeerManager.shared.setBlockListenersBlocked(true)
-
-            // FIX #1228: Reconnect peers with dead connections after stopping block listeners.
-            // FIX #1184b kills NWConnections → peers have handshake=true but connection=nil.
-            // Without this, FilterScanner can't fetch blocks or chain height → scan fails.
-            let deadPeersScan = await MainActor.run {
-                networkManager.peers.filter { $0.isHandshakeComplete && !$0.isConnectionReady }
-            }
-            if !deadPeersScan.isEmpty {
-                print("🔄 FIX #1228: Reconnecting \(deadPeersScan.count) peers with dead connections (FilterScanner start)...")
-                var reconnectedScan = Set<String>()  // FIX #1235
-                for peer in deadPeersScan {
-                    if reconnectedScan.contains(peer.host) { print("⏭️ FIX #1235: [\(peer.host)] Already reconnected - skipping"); continue }
-                    do {
-                        try await peer.ensureConnected()
-                        reconnectedScan.insert(peer.host)  // FIX #1235
-                        print("✅ FIX #1228: [\(peer.host)] Reconnected for FilterScanner")
-                    } catch {
-                        print("⚠️ FIX #1228: [\(peer.host)] Reconnect failed: \(error.localizedDescription)")
+            // FIX #1425: Use dispatcher pattern instead of stopping block listeners.
+            // OLD approach (FIX #907): stopAllBlockListeners → FIX #1184b killed ALL NWConnections
+            // → all peers dead (connection=nil) → FIX #1228 reconnected 5 peers via Tor (5-10s overhead)
+            // → scan proceeded with freshly reconnected peers.
+            // NEW approach: Keep block listeners RUNNING — they ARE the dispatcher.
+            // Block fetches route through dispatcher (lock-free, 300+ blocks/s).
+            // Same pattern as FIX #1423 (verifyNullifierSpendStatus) and FIX #1184 (verifyAllUnspentNotesOnChain).
+            print("🔍 FIX #1425: Full scan (\(expectedBlockCount) blocks) — using dispatcher (keeping block listeners active)")
+            PeerManager.shared.setBlockListenersBlocked(false)
+            PeerManager.shared.setHeaderSyncInProgress(false)
+            await networkManager.startBlockListenersOnMainScreen()
+            var activeDispatchers1425 = 0
+            for attempt in 1...10 {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                activeDispatchers1425 = 0
+                for peer in await MainActor.run(body: { networkManager.peers }) {
+                    if await peer.isDispatcherActive {
+                        activeDispatchers1425 += 1
                     }
                 }
+                if activeDispatchers1425 >= 3 {
+                    print("✅ FIX #1425: \(activeDispatchers1425) dispatcher(s) active after \(attempt * 500)ms")
+                    break
+                }
+            }
+            if activeDispatchers1425 == 0 {
+                print("⚠️ FIX #1425: No dispatchers active — getBlocksDataP2P will retry activation")
             }
         }
 
         defer {
             isScanning = false
             FilterScanner.setScanInProgress(false)
-            // FIX #907: Unblock block listeners when scan completes
-            if !isLightweightScan {
-                PeerManager.shared.setBlockListenersBlocked(false)
-            }
+            // FIX #1425: No need to unblock — we never blocked (dispatcher stays active)
         }
 
         // Get current chain height
@@ -1469,77 +1469,17 @@ final class FilterScanner {
             // - Result: "Anchor NOT FOUND" errors when sending
             print("⚡ FIX #525: Ensuring headers synced to target height \(targetHeight) for tree root validation")
 
-            // FIX #462: ALWAYS stop block listeners during header sync
-            // Block listeners consume "headers" responses, causing sync failures
-            // Even small syncs (100-600 headers) need listeners stopped
-            print("🛑 FIX #462: Stopping block listeners before header sync...")
+            // FIX #1418: Header sync now routes through the dispatcher (sendAndWaitViaDispatcher).
+            // Block listeners stay running — they receive "headers" responses and dispatch them.
+            // No more stop/verify/reconnect cycle that killed NWConnections and dropped peer counts.
+            // Old FIX #462/#903/#1228/#1416 stop logic REMOVED — dispatcher handles everything.
 
-            // FIX #472: Set header sync in progress flag BEFORE stopping listeners
-            // This prevents NEW peers from starting listeners during sync
-            await PeerManager.shared.setHeaderSyncInProgress(true)
-
-            await PeerManager.shared.stopAllBlockListeners()
-
-            // FIX #903: CRITICAL - Verify block listeners are ACTUALLY stopped before proceeding!
-            // Same issue as FIX #900/902 - stopAllBlockListeners() has 5s timeout but "proceeds anyway"
-            // Block listeners can take 20+ seconds to actually stop
-            print("⏳ FIX #903: Verifying all block listeners are stopped...")
-            let verifyStartTime = Date()
-            let maxVerifyWait: Double = 30.0  // 30 seconds max wait
-            var lastListeningCount = 0
-
-            while true {
-                let elapsed = Date().timeIntervalSince(verifyStartTime)
-                if elapsed > maxVerifyWait {
-                    print("⚠️ FIX #903: Block listener verification timed out after \(Int(elapsed))s - proceeding anyway")
-                    break
-                }
-
-                let stillListening = await MainActor.run {
-                    networkManager.peers.filter { $0.isListening }.count
-                }
-                let peerManagerListening = await PeerManager.shared.hasActiveBlockListeners()
-
-                if stillListening == 0 && !peerManagerListening {
-                    print("✅ FIX #903: All block listeners stopped after \(String(format: "%.1f", elapsed))s")
-                    break
-                }
-
-                if stillListening != lastListeningCount {
-                    if verbose {
-                        print("⏳ FIX #903: Still waiting for \(stillListening) block listeners to stop...")
-                    }
-                    lastListeningCount = stillListening
-                }
-
-                try? await Task.sleep(nanoseconds: 500_000_000)  // Check every 500ms
+            // Quick check: skip sync entirely if headers already available
+            let preCheckHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
+            if preCheckHeight >= targetHeight {
+                print("✅ FIX #1418: Headers already at \(preCheckHeight) >= target \(targetHeight) — no sync needed")
+                headersAvailable = true
             }
-
-            print("⏳ FIX #903: Waiting 200ms for in-flight receives to complete...")
-            try? await Task.sleep(nanoseconds: 200_000_000)
-
-            // FIX #1228: Reconnect peers with dead connections after stopping block listeners.
-            // FIX #1184b kills NWConnections → peers have handshake=true but connection=nil.
-            // Without this, header sync in PHASE 1.5 fails to find ready peers → sync hangs.
-            let deadPeersPhase15 = await MainActor.run {
-                networkManager.peers.filter { $0.isHandshakeComplete && !$0.isConnectionReady }
-            }
-            if !deadPeersPhase15.isEmpty {
-                print("🔄 FIX #1228: Reconnecting \(deadPeersPhase15.count) peers with dead connections (PHASE 1.5 header sync)...")
-                var reconnectedPhase15 = Set<String>()  // FIX #1235
-                for peer in deadPeersPhase15 {
-                    if reconnectedPhase15.contains(peer.host) { print("⏭️ FIX #1235: [\(peer.host)] Already reconnected - skipping"); continue }
-                    do {
-                        try await peer.ensureConnected()
-                        reconnectedPhase15.insert(peer.host)  // FIX #1235
-                        print("✅ FIX #1228: [\(peer.host)] Reconnected for PHASE 1.5 header sync")
-                    } catch {
-                        print("⚠️ FIX #1228: [\(peer.host)] Reconnect failed: \(error.localizedDescription)")
-                    }
-                }
-            }
-
-            print("🛑 FIX #462: Block listeners stopped, starting header sync...")
 
             while headerSyncAttempts < maxHeaderSyncAttempts && !headersAvailable {
                 let headerStoreHeight = (try? HeaderStore.shared.getLatestHeight()) ?? 0
@@ -1630,15 +1570,8 @@ final class FilterScanner {
                 // Continue with on-demand fallback - it may work
             }
 
-            // FIX #1205: Block listeners will be RESTARTED on demand by getBlocksDataP2P.
-            // Old FIX #907 kept them stopped (for pre-dispatcher direct reads).
-            // FIX #1184 dispatcher NEEDS block listeners running for block fetches.
-            // getBlocksDataP2P will unblock + start listeners if no dispatchers active.
-
-            // FIX #472: Clear header sync in progress flag
-            await PeerManager.shared.setHeaderSyncInProgress(false)
-
-            print("▶️ FIX #1205: Block listeners will be restarted by getBlocksDataP2P for PHASE 2")
+            // FIX #1418: No listener restart needed — listeners were never stopped.
+            // Dispatcher-based header sync keeps connections alive throughout.
 
             // FIX #362: Explicit entry log to confirm PHASE 2 is running
             print("✅ FIX #362: Entering PHASE 2 sequential mode (currentHeight=\(currentHeight), targetHeight=\(targetHeight))")
@@ -2416,9 +2349,9 @@ final class FilterScanner {
             }
         }
 
-        // FIX #907: Resume block listeners now that all sync operations are complete
-        // Block listeners were stopped for header sync and PHASE 2 block fetch
+        // FIX #1425: Block listeners were kept running via dispatcher — just ensure unblocked
         print("▶️ FIX #907: Resuming block listeners after scan complete...")
+        PeerManager.shared.setBlockListenersBlocked(false)
         await PeerManager.shared.resumeAllBlockListeners()
         print("✅ FIX #907: Block listeners resumed")
 

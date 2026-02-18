@@ -984,15 +984,12 @@ struct BalanceView: View {
                     // FIX #462 v2: Force reload from database, don't populate (data already there)
                     print("📜 TXHIST: Force reload requested - skipping populate, reading existing data from database")
                 } else {
-                    // FIX #462: Only populate if history is empty (first load after app restart)
-                    // This prevents re-inserting change TXs that were just filtered out
-                    let currentCount = try WalletDatabase.shared.getTransactionHistoryCount()
-                    if currentCount == 0 {
-                        print("📜 TXHIST: History empty, populating from notes...")
-                        let populated = try WalletDatabase.shared.populateHistoryFromNotes()
-                        print("📜 TXHIST: Populated \(populated) entries (received + sent)")
-                    } else {
-                        print("📜 TXHIST: History has \(currentCount) entries, skipping populate (change TXs already filtered)")
+                    // FIX #1415: Always call populateHistoryFromNotes() — not just when empty.
+                    // Uses INSERT OR IGNORE so existing entries are preserved.
+                    // Also runs one-time cleanup of wrong-amount entries from previous builds.
+                    let populated = try WalletDatabase.shared.populateHistoryFromNotes()
+                    if populated > 0 {
+                        print("📜 TXHIST: Populated \(populated) new transaction history entries")
                     }
                 }
 
@@ -1109,12 +1106,22 @@ struct BalanceView: View {
                     // FIX #1409: Check BOTH isConnected AND connectedPeers.
                     // On iOS network path changes, peers drop to 0 but cached heights
                     // still satisfy "Synced" condition — must show "Disconnected" instead.
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundColor(theme.errorColor)
-                        .font(.system(size: 10))
-                    Text("Disconnected")
-                        .font(theme.captionFont)
-                        .foregroundColor(theme.errorColor)
+                    // FIX #1424: If backgroundProcessesEnabled but not connected yet,
+                    // we're in the FIX #1422b early start window — show "Connecting..." not "Disconnected".
+                    if networkManager.backgroundProcessesEnabled && networkManager.connectedPeers == 0 && !networkManager.isConnected {
+                        ProgressView()
+                            .scaleEffect(0.5)
+                        Text("Connecting...")
+                            .font(theme.captionFont)
+                            .foregroundColor(theme.textSecondary)
+                    } else {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundColor(theme.errorColor)
+                            .font(.system(size: 10))
+                        Text("Disconnected")
+                            .font(theme.captionFont)
+                            .foregroundColor(theme.errorColor)
+                    }
                     Spacer()
                 } else if networkManager.chainHeight > 0 && networkManager.walletHeight > 0 &&
                           networkManager.walletHeight + 5 >= networkManager.chainHeight {
@@ -1312,8 +1319,14 @@ struct BalanceView: View {
                     .font(.system(size: 14))
             } else if !networkManager.isConnected || networkManager.connectedPeers == 0 {
                 // FIX #1409: Not connected OR no peers — warning
-                Text("⚠️")
-                    .font(.system(size: 14))
+                // FIX #1424: Show spinner during initial connect, warning only when actually disconnected
+                if networkManager.backgroundProcessesEnabled && !networkManager.isConnected {
+                    Text("⏳")
+                        .font(.system(size: 14))
+                } else {
+                    Text("⚠️")
+                        .font(.system(size: 14))
+                }
             } else if networkManager.chainHeight > 0 && networkManager.walletHeight > 0 &&
                       networkManager.walletHeight + 5 >= networkManager.chainHeight {
                 // FIX #286 v6: Synced if within 5 blocks of chain tip
@@ -1459,7 +1472,8 @@ struct BalanceView: View {
                             .shadow(color: matrixGreen.opacity(0.8), radius: 4, x: 0, y: 0)
                     }
                     #endif
-                } else if isRefreshing {
+                } else if isRefreshing || (networkManager.backgroundProcessesEnabled && !networkManager.isConnected) {
+                    // FIX #1424: Also show "Connecting..." during FIX #1422b early start (background connect in progress)
                     Text("Connecting...")
                         .font(.system(size: 12, weight: .medium, design: .monospaced))
                         .foregroundColor(.orange)

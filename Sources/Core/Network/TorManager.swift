@@ -635,12 +635,39 @@ public final class TorManager: ObservableObject {
         }
     }
 
+    /// FIX #1419: Get exit circuit failure count from Rust FFI
+    public func getExitCircuitFailures() -> UInt32 {
+        return zipherx_tor_get_exit_failures()
+    }
+
+    /// FIX #1419: Reset exit circuit failure counter (after successful restart)
+    public func resetExitCircuitFailures() {
+        zipherx_tor_reset_exit_failures()
+    }
+
     /// Restart Tor completely (stop + start) with circuit readiness wait
-    public func restartTor() async {
-        print("🔄 Restarting Tor due to SOCKS5 failure or all-peers-dead event...")
+    /// FIX #1419: clearCache parameter forces fresh consensus download
+    public func restartTor(clearCache: Bool = false) async {
+        if clearCache {
+            print("🧹 FIX #1419: Restarting Tor WITH cache clear (force fresh consensus)...")
+        } else {
+            print("🔄 Restarting Tor due to SOCKS5 failure or all-peers-dead event...")
+        }
 
         // Stop Tor
         await stopArti()
+
+        // FIX #1419: Clear cache if requested (stale consensus causes exit circuit failures)
+        if clearCache {
+            let result = zipherx_tor_clear_cache()
+            if result == 0 {
+                print("✅ FIX #1419: Tor cache cleared — will download fresh consensus")
+            } else {
+                print("⚠️ FIX #1419: Tor cache clear returned error (continuing anyway)")
+            }
+            // Also reset the exit failure counter
+            zipherx_tor_reset_exit_failures()
+        }
 
         // Wait for cleanup
         try? await Task.sleep(nanoseconds: 1_000_000_000)  // 1 second
@@ -656,7 +683,7 @@ public final class TorManager: ObservableObject {
             attempts += 1
         }
 
-        print("✅ Tor restarted, circuits ready: \(isOnionCircuitsReady)")
+        print("✅ Tor restarted, circuits ready: \(isOnionCircuitsReady), clearCache: \(clearCache)")
     }
 
     // MARK: - Mode Change Handling

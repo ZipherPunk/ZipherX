@@ -14,7 +14,7 @@ size_t zipherx_generate_mnemonic(uint8_t *output);
 bool zipherx_validate_mnemonic(const char *mnemonic);
 bool zipherx_mnemonic_to_seed(const char *mnemonic, uint8_t *seed_out);
 bool zipherx_derive_spending_key(const uint8_t *seed, uint32_t account, uint8_t *sk_out);
-bool zipherx_derive_address(const uint8_t *sk, uint64_t diversifier_index, uint8_t *addr_out);
+bool zipherx_derive_address(const uint8_t *sk, uint64_t diversifier_index, uint8_t *addr_out, uint64_t *actual_index_out);
 
 // Address encoding/decoding
 size_t zipherx_encode_address(const uint8_t *addr_bytes, uint8_t *output);
@@ -560,6 +560,16 @@ void zipherx_tor_free_string(char *ptr);
 // Check if Tor is available (compiled in)
 bool zipherx_tor_is_available(void);
 
+// FIX #1419: Get consecutive exit circuit failure count
+uint32_t zipherx_tor_get_exit_failures(void);
+
+// FIX #1419: Reset exit circuit failure counter
+void zipherx_tor_reset_exit_failures(void);
+
+// FIX #1419: Clear Tor cache (force fresh consensus download)
+// Returns 0 on success, 1 on error
+int32_t zipherx_tor_clear_cache(void);
+
 // =============================================================================
 // Hidden Service (Onion Hosting)
 // =============================================================================
@@ -708,6 +718,9 @@ bool zipherx_compute_value_commitment(uint64_t value, const uint8_t *rcv, uint8_
 
 /// Generate random scalar (32 bytes)
 bool zipherx_random_scalar(uint8_t *output);
+
+/// NEW-004: Get the last change diversifier index used in TX construction
+uint64_t zipherx_get_last_change_diversifier_index(void);
 
 /// Encrypt a note for transmission
 bool zipherx_encrypt_note(

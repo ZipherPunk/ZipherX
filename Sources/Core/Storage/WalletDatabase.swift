@@ -1360,9 +1360,10 @@ final class WalletDatabase {
         return 0
     }
 
-    /// PRIVACY: P-DB-001 — Get the highest diversifier index for an account
+    /// PRIVACY: P-DB-001 — Get the highest RECEIVE diversifier index for an account
+    /// FIX #1402: Excludes change addresses (index >= 1B) which are stored in the same table
     func getHighestDiversifierIndex(accountId: Int64) -> UInt64 {
-        let sql = "SELECT MAX(diversifier_index) FROM diversified_addresses WHERE account_id = ?;"
+        let sql = "SELECT MAX(diversifier_index) FROM diversified_addresses WHERE account_id = ? AND diversifier_index < 1000000000;"
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return 0 }
         defer { sqlite3_finalize(stmt) }
@@ -2188,7 +2189,10 @@ final class WalletDatabase {
         // This ensures populateHistoryFromNotes() can still create SENT entries
         let syntheticTxid = hashedNullifier.prefix(32)
 
-        let sql = "UPDATE notes SET is_spent = 1, spent_height = ?, spent_in_tx = ? WHERE nf = ?;"
+        // FIX #1413: Use COALESCE to preserve existing real txid from FIX #303.
+        // If FIX #303 already set spent_in_tx to a real txid, don't overwrite with synthetic.
+        // Without this: FIX #1093 overwrites real txid → FIX #1169 sees "phantom" → oscillation loop.
+        let sql = "UPDATE notes SET is_spent = 1, spent_height = ?, spent_in_tx = COALESCE(spent_in_tx, ?) WHERE nf = ?;"
 
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -2209,7 +2213,9 @@ final class WalletDatabase {
         }
         // FIX #1390 / Security audit TASK 16: Write encrypted spent shadows
         writeSpentEncryptedShadows(hashedNullifier: hashedNullifier, spentHeight: spentHeight, txid: syntheticTxid)
-        print("📜 Marked note spent at height \(spentHeight) with synthetic txid")
+        if sqlite3_changes(db) > 0 {
+            print("📜 Marked note spent at height \(spentHeight)")
+        }
     }
 
     // MARK: - FIX #291: Atomic Spend + History Recording
@@ -2893,8 +2899,7 @@ final class WalletDatabase {
         // FIX #1210: Use getTotalUnspentBalance (no witness requirement) for integrity check.
         // getBalance() requires witnesses, returns 0 when witnesses are temporarily cleared.
         var notesBalance = try getTotalUnspentBalance(accountId: accountId)
-        let notesBalanceZCL = Double(notesBalance) / 100_000_000.0
-        details.append(String(format: "📊 Balance (unspent notes): %.8f ZCL", notesBalanceZCL))
+        details.append("📊 Balance (unspent notes): \(notesBalance.redactedAmount)")
 
         // 2. Count total notes for diagnostics
         let countSql = """
@@ -2955,8 +2960,7 @@ final class WalletDatabase {
                 let orphanCount = Int(sqlite3_column_int(orphanSpentStmt, 0))
                 let orphanTotal = UInt64(sqlite3_column_int64(orphanSpentStmt, 1))
                 if orphanCount > 0 {
-                    let orphanZCL = Double(orphanTotal) / 100_000_000.0
-                    details.append(String(format: "🚨 FIX #1233: %d orphan spent note(s) (%.8f ZCL) — spent_in_tx missing", orphanCount, orphanZCL))
+                    details.append("🚨 FIX #1233: \(orphanCount) orphan spent note(s) (\(orphanTotal.redactedAmount)) — spent_in_tx missing")
                     details.append("🔧 FIX #1233: Auto-restoring orphan spent notes to unspent...")
 
                     // Auto-fix: Restore orphan spent notes to unspent
@@ -2972,9 +2976,7 @@ final class WalletDatabase {
                             let restored = Int(sqlite3_changes(db))
                             // Recalculate balance after restoring notes
                             notesBalance = (try? getTotalUnspentBalance(accountId: accountId)) ?? notesBalance
-                            let balanceZCL = Double(notesBalance) / 100_000_000.0
-                            details.append(String(format: "✅ FIX #1233: Restored %d orphan note(s) (+%.8f ZCL) — balance now %.8f ZCL",
-                                                  restored, orphanZCL, balanceZCL))
+                            details.append("✅ FIX #1233: Restored \(restored) orphan note(s) (+\(orphanTotal.redactedAmount)) — balance now \(notesBalance.redactedAmount)")
                         }
                         sqlite3_finalize(restoreOrphanStmt)
                     }
@@ -2992,13 +2994,19 @@ final class WalletDatabase {
 
         // FIX #1169: CRITICAL - Detect notes spent by phantom TXs (TX doesn't exist in history or on chain)
         // A note marked as spent but whose spending TX was deleted/never existed = stolen balance
+        // FIX #1413: ONLY consider notes with spent_height IS NULL or 0 as potential phantoms.
+        // Notes with spent_height > 0 are CONFIRMED on-chain — they are NOT phantom even if
+        // the spending TX is missing from history (e.g. external spend with synthetic txid).
+        // Without this filter: FIX #1093 overwrites real txid with synthetic → FIX #1169
+        // sees "phantom" → restores note → FIX #303 re-marks → INFINITE LOOP.
         let phantomSpentSql = """
             SELECT n.id, n.value, hex(n.spent_in_tx) FROM notes n
             WHERE n.is_spent = 1 AND n.spent_in_tx IS NOT NULL AND n.account_id = ?
             AND NOT EXISTS (
                 SELECT 1 FROM transaction_history th WHERE th.txid = n.spent_in_tx
             )
-            AND hex(n.spent_in_tx) NOT LIKE '626F6F7374%';
+            AND hex(n.spent_in_tx) NOT LIKE '626F6F7374%'
+            AND (n.spent_height IS NULL OR n.spent_height = 0);
         """
         var phantomStmt: OpaquePointer?
         if sqlite3_prepare_v2(db, phantomSpentSql, -1, &phantomStmt, nil) == SQLITE_OK {
@@ -3010,20 +3018,19 @@ final class WalletDatabase {
                 let value = UInt64(sqlite3_column_int64(phantomStmt, 1))
                 phantomCount += 1
                 phantomTotal += value
-                let valueZCL = Double(value) / 100_000_000.0
-                details.append(String(format: "🚨 FIX #1169: Note #%d (%.8f ZCL) spent by TX not in history!", noteId, valueZCL))
+                details.append("🚨 FIX #1169: Note #\(noteId) (\(value.redactedAmount)) spent by TX not in history!")
             }
             sqlite3_finalize(phantomStmt)
 
             if phantomCount > 0 {
                 isValid = false
-                let totalZCL = Double(phantomTotal) / 100_000_000.0
-                issueFound = String(format: "%d note(s) spent by phantom TXs (%.8f ZCL missing)", phantomCount, totalZCL)
+                issueFound = "\(phantomCount) note(s) spent by phantom TXs (\(phantomTotal.redactedAmount) missing)"
                 details.append("🚨 FIX #1169: \(issueFound)")
                 details.append("🔧 FIX #1169: Auto-restoring notes spent by phantom TXs...")
 
                 // Auto-fix: Restore these notes to unspent
                 // FIX #1390: Clear spent shadow columns when restoring phantom TX notes
+                // FIX #1413: Only restore notes WITHOUT confirmed spend height (real phantoms only)
                 let restoreSql = """
                     UPDATE notes SET is_spent = 0, spent_in_tx = NULL, spent_height = NULL, spent_height_enc = NULL, spent_in_tx_enc = NULL
                     WHERE is_spent = 1 AND spent_in_tx IS NOT NULL AND account_id = ?
@@ -3034,6 +3041,7 @@ final class WalletDatabase {
                             SELECT 1 FROM transaction_history th WHERE th.txid = n2.spent_in_tx
                         )
                         AND hex(n2.spent_in_tx) NOT LIKE '626F6F7374%'
+                        AND (n2.spent_height IS NULL OR n2.spent_height = 0)
                     );
                 """
                 var restoreStmt: OpaquePointer?
@@ -3046,10 +3054,9 @@ final class WalletDatabase {
                         // getBalance() requires witness IS NOT NULL — returns 0 when witnesses are cleared/missing
                         // (FIX #1210 pattern). This caused restored amount to show as 0 or underflow.
                         let newBalance = (try? getTotalUnspentBalance(accountId: accountId)) ?? notesBalance
-                        let restoredZCL = Double(newBalance - notesBalance) / 100_000_000.0
+                        let restoredAmount = newBalance - notesBalance
                         notesBalance = newBalance
-                        details.append(String(format: "✅ FIX #1169: Restored %d note(s) (+%.8f ZCL) - balance corrected to %.8f ZCL",
-                                              restored, restoredZCL, Double(notesBalance) / 100_000_000.0))
+                        details.append("✅ FIX #1169: Restored \(restored) note(s) (+\(restoredAmount.redactedAmount)) - balance corrected to \(notesBalance.redactedAmount)")
                         // After restoring, the balance IS now valid
                         isValid = true
                         issueFound = ""
@@ -3058,6 +3065,10 @@ final class WalletDatabase {
                 }
             }
         }
+
+        // FIX #1413: History entries for external spends are created by populateHistoryFromNotes()
+        // which correctly calculates actualSent = input - change - fee.
+        // Do NOT create history entries here — the amount would be wrong (input - fee, missing change).
 
         // FIX #1245: Detect stale phantom TXs — sent TXs marked 'confirmed' but never mined (block_height=0).
         // These are created by FIX #1221's root cause: empty mempool response falsely confirms TX.
@@ -3086,9 +3097,7 @@ final class WalletDatabase {
                 stalePhantomCount += 1
                 stalePhantomTxids.append(txidData)
                 let txidHex = txidData.map { String(format: "%02x", $0) }.joined()
-                let valueZCL = Double(value) / 100_000_000.0
-                details.append(String(format: "🚨 FIX #1245: Stale phantom TX %@... (%.8f ZCL) — 'confirmed' but block_height=0 (never mined)",
-                                      String(txidHex.prefix(16)), valueZCL))
+                details.append("🚨 FIX #1245: Stale phantom TX \(String(txidHex.prefix(16)))... (\(value.redactedAmount)) — 'confirmed' but block_height=0 (never mined)")
             }
             sqlite3_finalize(stalePhantomStmt)
 
@@ -3133,8 +3142,7 @@ final class WalletDatabase {
 
                 // Recalculate balance after restoration
                 notesBalance = (try? getTotalUnspentBalance(accountId: accountId)) ?? notesBalance
-                let balanceZCL = Double(notesBalance) / 100_000_000.0
-                details.append(String(format: "✅ FIX #1245: Balance after stale phantom cleanup: %.8f ZCL", balanceZCL))
+                details.append("✅ FIX #1245: Balance after stale phantom cleanup: \(notesBalance.redactedAmount)")
             }
         }
 
@@ -3173,14 +3181,13 @@ final class WalletDatabase {
             ? historyReceived - historySent - historyFees
             : 0
 
-        let historyBalanceZCL = Double(historyBalance) / 100_000_000.0
-        details.append(String(format: "📈 History view (excludes change): %.8f ZCL", historyBalanceZCL))
+        details.append("📈 History view (excludes change): \(historyBalance.redactedAmount)")
 
         // The difference is expected - it's the unspent change outputs
         let changeInBalance = Int64(notesBalance) - Int64(historyBalance)
         if changeInBalance > 0 {
-            let changeZCL = Double(changeInBalance) / 100_000_000.0
-            details.append(String(format: "🔄 Unspent change outputs: %.8f ZCL (expected)", changeZCL))
+            let changeAmount = UInt64(changeInBalance)
+            details.append("🔄 Unspent change outputs: \(changeAmount.redactedAmount) (expected)")
         }
 
         // FIX #1130 + FIX #1169: History vs notes comparison
@@ -3198,12 +3205,12 @@ final class WalletDatabase {
         //   - FIX #1245: stale phantom TXs (confirmed but block_height=0)
         // The history/notes comparison is unreliable because history may be incomplete.
         if changeInBalance < 0 {
-            let diffZCL = Double(-changeInBalance) / 100_000_000.0
+            let diffAmount = UInt64(-changeInBalance)
             if -changeInBalance > 10000 {
-                details.append(String(format: "⚠️ FIX #1286/1360: History shows %.8f ZCL more than unspent notes (informational)", diffZCL))
+                details.append("⚠️ FIX #1286/1360: History shows \(diffAmount.redactedAmount) more than unspent notes (informational)")
                 details.append("   This may indicate incomplete transaction history (e.g., imported wallet)")
             } else {
-                details.append(String(format: "⚠️ FIX #1130: History shows %.8f ZCL more than notes (minor difference)", diffZCL))
+                details.append("⚠️ FIX #1130: History shows \(diffAmount.redactedAmount) more than notes (minor difference)")
             }
         }
 
@@ -4299,7 +4306,6 @@ final class WalletDatabase {
         let totalValue = affectedNotes.reduce(UInt64(0)) { $0 + $1.value }
 
         for note in affectedNotes {
-            let valueZCL = Double(note.value) / 100_000_000.0
             print("✅ FIX #1168: Restored note #\(note.id) (\(LogRedaction.redactAmount(note.value))) - TX was rejected by network")
         }
 
@@ -5741,6 +5747,30 @@ final class WalletDatabase {
         // Instead, we use INSERT OR IGNORE to only add missing entries.
         // try clearTransactionHistory() // REMOVED - this was wiping WalletManager's correct entries
 
+        // FIX #1415: One-time cleanup of wrong-amount entries from previous builds.
+        // FIX #1413/#1415/#303 used to insert history with amountSent = input - fee (WRONG).
+        // Correct: input - change - fee (calculated below). Delete the wrong entries so
+        // INSERT OR IGNORE can re-create them with correct amounts.
+        if !UserDefaults.standard.bool(forKey: "FIX1415_CleanedWrongAmountEntries") {
+            let cleanupSql = """
+                DELETE FROM transaction_history
+                WHERE memo IN ('[External spend - FIX #1413]',
+                               '[External spend - FIX #1415]',
+                               '[External wallet spend detected by FIX #303]');
+            """
+            var cleanupStmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, cleanupSql, -1, &cleanupStmt, nil) == SQLITE_OK {
+                if sqlite3_step(cleanupStmt) == SQLITE_DONE {
+                    let deleted = sqlite3_changes(db)
+                    if deleted > 0 {
+                        print("🧹 FIX #1415: Cleaned \(deleted) wrong-amount history entries from previous build")
+                    }
+                }
+                sqlite3_finalize(cleanupStmt)
+            }
+            UserDefaults.standard.set(true, forKey: "FIX1415_CleanedWrongAmountEntries")
+        }
+
         // Get ALL notes - even those without txid (we'll create a synthetic txid based on nullifier)
         let sql = """
             SELECT n.diversifier, n.value, n.received_height, n.received_in_tx, n.is_spent, n.spent_in_tx, n.nf, n.spent_height
@@ -6976,7 +7006,6 @@ final class WalletDatabase {
                     let deleted = Int(sqlite3_changes(db))
                     if deleted > 0 {
                         let txidHex = tx.txid.map { String(format: "%02x", $0) }.joined()
-                        let changeZCL = Double(tx.changeAmount) / 100_000_000.0
                         print("🧹 FIX #852: Deleted mislabeled 'received' entry: \(txidHex.prefix(16))... (\(LogRedaction.redactAmount(UInt64(max(0, tx.changeAmount)))) was change)")
                         cleanedCount += deleted
                     }
@@ -7056,7 +7085,6 @@ final class WalletDatabase {
                             // Display in display format (reversed from wire)
                             let displayTxid = Data(tx.spentTxid.reversed())
                             let txidHex = displayTxid.map { String(format: "%02x", $0) }.joined()
-                            let sentZCL = Double(sentAmount) / 100_000_000.0
                             print("📤 FIX #852: Created missing 'sent' entry: \(txidHex.prefix(16))... (\(LogRedaction.redactAmount(UInt64(max(0, sentAmount)))))")
                         }
                         sqlite3_finalize(insertStmt)
@@ -7178,7 +7206,6 @@ final class WalletDatabase {
                     sqlite3_bind_int64(updateStmt, 1, Int64(fee))
                     sqlite3_bind_int64(updateStmt, 2, entry.rowid)
                     if sqlite3_step(updateStmt) == SQLITE_DONE && sqlite3_changes(db) > 0 {
-                        let oldZCL = String(format: "%.8f", Double(entry.storedValue) / 100_000_000.0)
                         print("🔧 FIX #1367: Marked self-send α entry at h=\(entry.blockHeight): was \(LogRedaction.redactAmount(UInt64(entry.storedValue))) → fee only (all outputs are change)")
                         correctedCount += 1
                     }
@@ -7192,8 +7219,6 @@ final class WalletDatabase {
                     sqlite3_bind_int64(updateStmt, 1, Int64(correctSent))
                     sqlite3_bind_int64(updateStmt, 2, entry.rowid)
                     if sqlite3_step(updateStmt) == SQLITE_DONE && sqlite3_changes(db) > 0 {
-                        let oldZCL = String(format: "%.8f", Double(entry.storedValue) / 100_000_000.0)
-                        let newZCL = String(format: "%.8f", Double(correctSent) / 100_000_000.0)
                         print("🔧 FIX #1367: Corrected sent amount at h=\(entry.blockHeight): \(LogRedaction.redactAmount(UInt64(entry.storedValue))) → \(LogRedaction.redactAmount(correctSent)) (was missing \(totalChange) zatoshis change)")
                         correctedCount += 1
                     }
@@ -7399,9 +7424,6 @@ final class WalletDatabase {
 
                 // Found a potential input note! This "received" is likely change.
                 let sentAmount = inputValue - rx.value - 10000  // Assume 10000 fee
-                let inputZCL = Double(inputValue) / 100_000_000.0
-                let changeZCL = Double(rx.value) / 100_000_000.0
-                let sentZCL = Double(sentAmount) / 100_000_000.0
 
                 print("🔍 FIX #1084 v2: Detected mislabeled change at height \(rx.blockHeight):")
                 print("   Input note #\(inputNoteId) at height \(inputHeight): \(LogRedaction.redactAmount(UInt64(max(0, inputValue)))) (marked unspent but likely spent)")
@@ -7463,7 +7485,7 @@ final class WalletDatabase {
                             }
                         }
 
-                        print("   ✅ Added 'sent' history entry for \(sentZCL) ZCL at height \(rx.blockHeight)")
+                        print("   ✅ Added 'sent' history entry for \(UInt64(max(0, sentAmount)).redactedAmount) at height \(rx.blockHeight)")
                     }
                     sqlite3_finalize(insertStmt)
                 }

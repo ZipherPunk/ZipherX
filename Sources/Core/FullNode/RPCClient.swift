@@ -78,6 +78,10 @@ public class RPCClient: ObservableObject {
     private let session: URLSession
     private var requestId: Int = 0
 
+    // FIX #1416: Track rescan state to avoid calling getwalletinfo every 3s
+    // getwalletinfo triggers keypool reserve/return spam in daemon debug.log
+    public var isRescanKnownInProgress = false
+
     private init() {
         let sessionConfig = URLSessionConfiguration.default
         sessionConfig.timeoutIntervalForRequest = 30
@@ -373,16 +377,22 @@ public class RPCClient: ObservableObject {
     /// Send transaction
     /// FIX #855: Track sent z-transactions locally to persist across daemon restarts
     public func sendTransaction(from: String, to: String, amount: Double, memo: String? = nil) async throws -> String {
+        // FIX #1411: Use NSDecimalNumber for JSON serialization to prevent floating point
+        // precision issues. Swift's JSONSerialization renders Double(0.0022) as
+        // 0.0021999999999999998 (19 decimal places). The daemon's ParseFixedPoint rejects
+        // amounts with >8 decimal places → "Invalid amount". NSDecimalNumber serializes
+        // with exact decimal representation.
         var recipient: [String: Any] = [
             "address": to,
-            "amount": amount
+            "amount": NSDecimalNumber(string: String(format: "%.8f", amount))
         ]
 
         if let memo = memo, to.hasPrefix("zs") || to.hasPrefix("zc") {
             recipient["memo"] = memo.data(using: .utf8)?.hexEncodedString() ?? ""
         }
 
-        let params: [Any] = [from, [recipient], 1, 0.0001]
+        let feeDecimal = NSDecimalNumber(string: "0.0001")
+        let params: [Any] = [from, [recipient], 1, feeDecimal]
         let result = try await call(method: "z_sendmany", params: params)
 
         guard let opid = result as? String else {
@@ -786,18 +796,27 @@ public class RPCClient: ObservableObject {
         onionPeers = await getOnionPeerCount()
 
         // Check for wallet rescan status
+        // FIX #1416: Only call getwalletinfo when needed — it triggers keypool reserve/return
+        // in the daemon every call, spamming debug.log. Only check when syncing or rescan known.
         var isRescanning = false
         var rescanProgress: Double = 0
         var rescanBlock = 0
 
-        if let walletInfo = try? await call(method: "getwalletinfo", params: []) as? [String: Any] {
-            // Check for scanning field (format: { "scanning": { "duration": N, "progress": P } })
-            if let scanning = walletInfo["scanning"] as? [String: Any] {
-                isRescanning = true
-                rescanProgress = scanning["progress"] as? Double ?? 0
-                // Estimate block from progress
-                rescanBlock = Int(Double(headers) * rescanProgress)
-                print("📊 FIX #286 v13: Wallet rescanning - progress: \(Int(rescanProgress * 100))%, block ~\(rescanBlock)")
+        let shouldCheckRescan = initialBlockDownload || isRescanKnownInProgress || blocks < headers - 10
+        if shouldCheckRescan {
+            if let walletInfo = try? await call(method: "getwalletinfo", params: []) as? [String: Any] {
+                // Check for scanning field (format: { "scanning": { "duration": N, "progress": P } })
+                if let scanning = walletInfo["scanning"] as? [String: Any] {
+                    isRescanning = true
+                    isRescanKnownInProgress = true
+                    rescanProgress = scanning["progress"] as? Double ?? 0
+                    // Estimate block from progress
+                    rescanBlock = Int(Double(headers) * rescanProgress)
+                    print("📊 FIX #286 v13: Wallet rescanning - progress: \(Int(rescanProgress * 100))%, block ~\(rescanBlock)")
+                } else {
+                    // Rescan finished
+                    isRescanKnownInProgress = false
+                }
             }
         }
 
@@ -923,12 +942,14 @@ public class RPCClient: ObservableObject {
     public func sendToAddress(from: String, to: String, amount: Double) async throws -> String {
         // For t-to-t, use sendtoaddress or z_sendmany
         // z_sendmany works for both z and t source addresses
+        // FIX #1411: Use NSDecimalNumber to prevent floating point precision issues in JSON
         var recipient: [String: Any] = [
             "address": to,
-            "amount": amount
+            "amount": NSDecimalNumber(string: String(format: "%.8f", amount))
         ]
 
-        let params: [Any] = [from, [recipient], 1, 0.0001]
+        let feeDecimal = NSDecimalNumber(string: "0.0001")
+        let params: [Any] = [from, [recipient], 1, feeDecimal]
         let result = try await call(method: "z_sendmany", params: params)
 
         guard let opid = result as? String else {

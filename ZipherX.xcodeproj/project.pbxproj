@@ -3,7 +3,7 @@
 	archiveVersion = 1;
 	classes = {
 	};
-	objectVersion = 77;
+	objectVersion = 63;
 	objects = {
 
 /* Begin PBXBuildFile section */
@@ -225,7 +225,7 @@
 		21F90AD0A6320975EB67A156 /* ParallelImportCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ParallelImportCoordinator.swift; sourceTree = "<group>"; };
 		22E00D44F9FE9297973549CE /* CypherpunkTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CypherpunkTheme.swift; sourceTree = "<group>"; };
 		235376F572F89B6D83EDA88C /* WalletTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletTests.swift; sourceTree = "<group>"; };
-		2D405818BAB8FDFF2B00EC05 /* WalletDatabase.swift.bak */ = {isa = PBXFileReference; path = WalletDatabase.swift.bak; sourceTree = "<group>"; };
+		2D405818BAB8FDFF2B00EC05 /* WalletDatabase.swift.bak */ = {isa = PBXFileReference; lastKnownFileType = text; path = WalletDatabase.swift.bak; sourceTree = "<group>"; };
 		2E99AAE134DFFBE985476459 /* FastWalletCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FastWalletCache.swift; sourceTree = "<group>"; };
 		2F15365AE4A32D33ADD3A2C9 /* PeerManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerManager.swift; sourceTree = "<group>"; };
 		2F8F776C5143A67A1A923FF1 /* PrivacyScoreView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivacyScoreView.swift; sourceTree = "<group>"; };
@@ -239,7 +239,7 @@
 		4F54464087D684EC795896B7 /* SaplingParams.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SaplingParams.swift; sourceTree = "<group>"; };
 		58A977985B736ECAC0C4E425 /* ZipherXFFI.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = ZipherXFFI.xcframework; path = Libraries/ZipherXFFI.xcframework; sourceTree = "<group>"; };
 		5A73F74D89DB53D27B28AF26 /* FilterScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilterScanner.swift; sourceTree = "<group>"; };
-		5CACD4E0F762EEB5883FE0BD /* sapling-spend.params */ = {isa = PBXFileReference; path = "sapling-spend.params"; sourceTree = "<group>"; };
+		5CACD4E0F762EEB5883FE0BD /* sapling-spend.params */ = {isa = PBXFileReference; lastKnownFileType = file; path = "sapling-spend.params"; sourceTree = "<group>"; };
 		5E41B773BA9C02028BF61946 /* WalletHealthCheck.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletHealthCheck.swift; sourceTree = "<group>"; };
 		630CFD90F45505D02500501A /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		6626F058762A0D0666024868 /* BundledBlockHashes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BundledBlockHashes.swift; sourceTree = "<group>"; };
@@ -261,7 +261,7 @@
 		84A22E847C368B61A1B198EE /* MnemonicGenerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MnemonicGenerator.swift; sourceTree = "<group>"; };
 		875C4F629D2DE7185FCBD4F9 /* BootstrapProgressView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BootstrapProgressView.swift; sourceTree = "<group>"; };
 		8AB898B285954293A4942B3D /* BootstrapManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BootstrapManager.swift; sourceTree = "<group>"; };
-		8BBDC7F9897C7508ABB3081C /* WalletManager.swift.backup */ = {isa = PBXFileReference; path = WalletManager.swift.backup; sourceTree = "<group>"; };
+		8BBDC7F9897C7508ABB3081C /* WalletManager.swift.backup */ = {isa = PBXFileReference; lastKnownFileType = text; path = WalletManager.swift.backup; sourceTree = "<group>"; };
 		9068ED711254490CAD1CD553 /* SQLCipherManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SQLCipherManager.swift; sourceTree = "<group>"; };
 		976B66D0357DED3CBC256EAB /* ModeSelectionView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModeSelectionView.swift; sourceTree = "<group>"; };
 		981EE3318B95CD2FF12ACE26 /* ChatManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatManager.swift; sourceTree = "<group>"; };
@@ -272,7 +272,7 @@
 		9CE0707D0A98DFEF7F487D9B /* TorManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TorManager.swift; sourceTree = "<group>"; };
 		9CE3820E5845DBDF0B46FF51 /* DebugLogger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugLogger.swift; sourceTree = "<group>"; };
 		9CE439D202EE45C834417E47 /* DatabaseEncryption.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabaseEncryption.swift; sourceTree = "<group>"; };
-		9DE32B9D0904800484773DAD /* SendView.swift.backup */ = {isa = PBXFileReference; path = SendView.swift.backup; sourceTree = "<group>"; };
+		9DE32B9D0904800484773DAD /* SendView.swift.backup */ = {isa = PBXFileReference; lastKnownFileType = text; path = SendView.swift.backup; sourceTree = "<group>"; };
 		A9C06A2912C98B98AD2E5D87 /* Constants.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Constants.swift; sourceTree = "<group>"; };
 		AB6E0682B3CE8F22BA1304C1 /* RPCClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RPCClient.swift; sourceTree = "<group>"; };
 		ACD23F43B8205785891BF585 /* BlockHeader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlockHeader.swift; sourceTree = "<group>"; };
@@ -292,7 +292,7 @@
 		C9F90E89701CC0D1CFDA0770 /* AppDirectories.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDirectories.swift; sourceTree = "<group>"; };
 		CC49EF4A7BB4B93B726B735E /* ModernTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModernTheme.swift; sourceTree = "<group>"; };
 		CF1F7BBA642E66EE6EE7D32A /* ReceiveView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReceiveView.swift; sourceTree = "<group>"; };
-		D0494671402CB598446E82E3 /* sapling-output.params */ = {isa = PBXFileReference; path = "sapling-output.params"; sourceTree = "<group>"; };
+		D0494671402CB598446E82E3 /* sapling-output.params */ = {isa = PBXFileReference; lastKnownFileType = file; path = "sapling-output.params"; sourceTree = "<group>"; };
 		D114627F3AC22A9229292187 /* HeaderSyncManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HeaderSyncManager.swift; sourceTree = "<group>"; };
 		D301D43373B396F4C45D6B6B /* WalletOperationsProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletOperationsProtocol.swift; sourceTree = "<group>"; };
 		D769A0AE4089D10446BFBBCE /* WalletMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletMode.swift; sourceTree = "<group>"; };
@@ -823,7 +823,6 @@
 			);
 			mainGroup = 1E0AB0F916282FFBD8E5F74E;
 			minimizedProjectReferenceProxies = 1;
-			preferredProjectObjectVersion = 77;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
@@ -1108,18 +1107,14 @@
 					"$(inherited)",
 					"\"Libraries\"",
 				);
-				HEADER_SEARCH_PATHS = (
-					"$(SRCROOT)/Libraries/SQLCipher.xcframework/macos-arm64_x86_64/Headers",
-				);
+				HEADER_SEARCH_PATHS = "$(SRCROOT)/Libraries/SQLCipher.xcframework/macos-arm64_x86_64/Headers";
 				INFOPLIST_FILE = "Info-macOS.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 12.0;
-				OTHER_LDFLAGS = (
-					"-lresolv",
-				);
+				OTHER_LDFLAGS = "-lresolv";
 				PRODUCT_BUNDLE_IDENTIFIER = com.zipherpunk.zipherx.mac;
 				SDKROOT = macosx;
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/ZipherX-Bridging-Header.h";
@@ -1146,9 +1141,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				OTHER_LDFLAGS = (
-					"-lresolv",
-				);
+				OTHER_LDFLAGS = "-lresolv";
 				PRODUCT_BUNDLE_IDENTIFIER = com.zipherpunk.zipherx;
 				SDKROOT = iphoneos;
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/ZipherX-Bridging-Header.h";
@@ -1176,9 +1169,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				OTHER_LDFLAGS = (
-					"-lresolv",
-				);
+				OTHER_LDFLAGS = "-lresolv";
 				PRODUCT_BUNDLE_IDENTIFIER = com.zipherpunk.zipherx;
 				SDKROOT = iphoneos;
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/ZipherX-Bridging-Header.h";
@@ -1196,18 +1187,14 @@
 					"$(inherited)",
 					"\"Libraries\"",
 				);
-				HEADER_SEARCH_PATHS = (
-					"$(SRCROOT)/Libraries/SQLCipher.xcframework/macos-arm64_x86_64/Headers",
-				);
+				HEADER_SEARCH_PATHS = "$(SRCROOT)/Libraries/SQLCipher.xcframework/macos-arm64_x86_64/Headers";
 				INFOPLIST_FILE = "Info-macOS.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 12.0;
-				OTHER_LDFLAGS = (
-					"-lresolv",
-				);
+				OTHER_LDFLAGS = "-lresolv";
 				PRODUCT_BUNDLE_IDENTIFIER = com.zipherpunk.zipherx.mac;
 				SDKROOT = macosx;
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/ZipherX-Bridging-Header.h";

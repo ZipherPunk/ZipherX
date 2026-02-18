@@ -1201,7 +1201,11 @@ public final class PeerManager: ObservableObject {
         for key in triedAddresses {
             if let info = knownAddresses[key] {
                 guard isAddressUsable(info.address) else { continue }
-                let chance = info.getChance()
+                var chance = info.getChance()
+                // NET-005: Boost .onion addresses 2x for Sybil resistance (harder to generate)
+                if isOnion(info.address.host) {
+                    chance *= 2.0
+                }
                 if chance > 0 {
                     candidates.append((key, chance))
                 }

@@ -103,18 +103,22 @@ enum ZipherXFFI {
     }
 
     /// Derive payment address from spending key (169 bytes)
-    static func deriveAddress(from spendingKey: Data, diversifierIndex: UInt64 = 0) -> Data? {
+    /// Returns (addressBytes, actualValidIndex) — actualValidIndex is the real diversifier index used
+    /// (may be > requested index if the requested one was invalid)
+    static func deriveAddress(from spendingKey: Data, diversifierIndex: UInt64 = 0) -> (Data, UInt64)? {
         guard spendingKey.count == 169 else {
             return nil
         }
 
         var address = [UInt8](repeating: 0, count: 43)
+        var actualIndex: UInt64 = diversifierIndex
 
         let success = spendingKey.withUnsafeBytes { skPtr in
             zipherx_derive_address(
                 skPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
                 diversifierIndex,
-                &address
+                &address,
+                &actualIndex
             )
         }
 
@@ -122,7 +126,7 @@ enum ZipherXFFI {
             return nil
         }
 
-        return Data(address)
+        return (Data(address), actualIndex)
     }
 
     /// Derive incoming viewing key from spending key (169 bytes)

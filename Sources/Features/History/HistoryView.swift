@@ -271,17 +271,11 @@ struct HistoryView: View {
                     if isRepairing {
                         print("📜 HistoryView: Skipping populateHistoryFromNotes (database repair in progress)")
                     } else {
-                        // FIX #462: Only populate if history is empty (first load after app restart)
-                        // This prevents re-inserting change TXs that were just filtered out
-                        let currentCount = try WalletDatabase.shared.getTransactionHistoryCount()
-                        if currentCount == 0 {
-                            print("📜 HistoryView: History empty, populating from notes...")
-                            let populatedCount = try WalletDatabase.shared.populateHistoryFromNotes()
-                            if populatedCount > 0 {
-                                print("📜 Populated \(populatedCount) transaction history entries (received + sent)")
-                            }
-                        } else {
-                            print("📜 HistoryView: History has \(currentCount) entries, skipping populate (change TXs already filtered)")
+                        // FIX #1415: Always call populateHistoryFromNotes() — not just when empty.
+                        // Uses INSERT OR IGNORE so existing entries are preserved.
+                        let populatedCount = try WalletDatabase.shared.populateHistoryFromNotes()
+                        if populatedCount > 0 {
+                            print("📜 FIX #1415: Populated \(populatedCount) new transaction history entries")
                         }
                     }
 
@@ -306,15 +300,12 @@ struct HistoryView: View {
                 if isRepairing {
                     print("📜 HistoryView: Skipping populateHistoryFromNotes (database repair in progress)")
                 } else {
-                    let currentCount = try WalletDatabase.shared.getTransactionHistoryCount()
-                    if currentCount == 0 {
-                        print("📜 HistoryView: History empty, populating from notes...")
-                        let populatedCount = try WalletDatabase.shared.populateHistoryFromNotes()
-                        if populatedCount > 0 {
-                            print("📜 Populated \(populatedCount) transaction history entries (received + sent)")
-                        }
-                    } else {
-                        print("📜 HistoryView: History has \(currentCount) entries, skipping populate")
+                    // FIX #1415: Always call populateHistoryFromNotes() — not just when empty.
+                    // Uses INSERT OR IGNORE so existing entries are preserved.
+                    // Without this: spends detected by FIX #1319 after first populate have no history.
+                    let populatedCount = try WalletDatabase.shared.populateHistoryFromNotes()
+                    if populatedCount > 0 {
+                        print("📜 FIX #1415: Populated \(populatedCount) new transaction history entries")
                     }
                 }
 

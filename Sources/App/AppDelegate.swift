@@ -62,6 +62,14 @@ class AppDelegate: NSObject, UIApplicationDelegate {
                     print("✅ Background sync: Already up to date")
                 }
 
+                // FIX #1437: Brief window for chat messages to arrive
+                // If chat is running, incoming messages during this window will
+                // trigger local notifications via notifyChatMessage()
+                if await MainActor.run(body: { ChatManager.shared.isAvailable }) {
+                    print("💬 FIX #1437: Chat active — waiting 5s for incoming messages...")
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)
+                }
+
                 task.setTaskCompleted(success: true)
             } catch {
                 print("⚠️ Background sync failed: \(error)")
@@ -126,7 +134,27 @@ class AppDelegate: NSObject, UIApplicationDelegate {
 
         // Schedule background refresh when app goes to background
         scheduleBackgroundRefresh()
-        print("📱 App entered background - scheduled sync")
+
+        // FIX #1437: Request background time to keep chat/Tor connections alive
+        // iOS grants ~30 seconds of background execution — messages arriving in this
+        // window will trigger local notifications via notifyChatMessage()
+        var bgTaskID: UIBackgroundTaskIdentifier = .invalid
+        bgTaskID = application.beginBackgroundTask(withName: "chat-linger") {
+            // Expiration handler
+            application.endBackgroundTask(bgTaskID)
+            bgTaskID = .invalid
+        }
+        Task {
+            print("📱 FIX #1437: Background task started — keeping chat alive for ~25s")
+            try? await Task.sleep(nanoseconds: 25_000_000_000) // 25s (leave 5s margin)
+            if bgTaskID != .invalid {
+                application.endBackgroundTask(bgTaskID)
+                bgTaskID = .invalid
+            }
+            print("📱 FIX #1437: Background task ended")
+        }
+
+        print("📱 App entered background - scheduled sync + chat linger")
     }
 
     func applicationWillEnterForeground(_ application: UIApplication) {

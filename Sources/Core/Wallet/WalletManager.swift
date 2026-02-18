@@ -12189,44 +12189,6 @@ final class WalletManager: ObservableObject {
             return
         }
 
-        // FIX #1096: Protect intensive P2P fetch from interference
-        // - Stop block listeners (consume P2P responses)
-        // - Set flag to suppress keepalive pings
-        // - Block other operations from starting block listeners
-        print("🔒 FIX #1096: Setting up P2P fetch isolation...")
-        await PeerManager.shared.stopAllBlockListeners(timeout: 3.0)
-        PeerManager.shared.setBlockListenersBlocked(true)
-        await MainActor.run { networkManager.isIntensiveP2PFetchInProgress = true }
-
-        // FIX #1228: Reconnect peers with dead connections after stopping block listeners.
-        // FIX #1184b kills NWConnections → peers have handshake=true but connection=nil.
-        let deadPeers1096a = await MainActor.run {
-            networkManager.peers.filter { $0.isHandshakeComplete && !$0.isConnectionReady }
-        }
-        if !deadPeers1096a.isEmpty {
-            print("🔄 FIX #1228: Reconnecting \(deadPeers1096a.count) peers with dead connections (unspent note verification)...")
-            var reconnected1096a = Set<String>()  // FIX #1235
-            for peer in deadPeers1096a {
-                if reconnected1096a.contains(peer.host) { print("⏭️ FIX #1235: [\(peer.host)] Already reconnected - skipping"); continue }
-                do {
-                    try await peer.ensureConnected()
-                    reconnected1096a.insert(peer.host)  // FIX #1235
-                    print("✅ FIX #1228: [\(peer.host)] Reconnected for unspent note verification")
-                } catch {
-                    print("⚠️ FIX #1228: [\(peer.host)] Reconnect failed: \(error.localizedDescription)")
-                }
-            }
-        }
-
-        defer {
-            // FIX #1096: Restore state after fetch completes
-            Task { @MainActor in
-                networkManager.isIntensiveP2PFetchInProgress = false
-            }
-            PeerManager.shared.setBlockListenersBlocked(false)
-            print("🔓 FIX #1096: P2P fetch isolation released")
-        }
-
         print("🔍 Checking \(unspentNotes.count) unspent note(s) for spend status...")
 
         // FIX #1093: PERFORMANCE - Build nullifier lookup set and scan ONCE
@@ -12283,6 +12245,8 @@ final class WalletManager: ObservableObject {
         if !deltaMatches1319.isEmpty {
             print("📦 FIX #1319: Found \(deltaMatches1319.count) spent note(s) in local delta")
             for (hashedNull, spentHeight, txid) in deltaMatches1319 {
+                // FIX #1415: History entries created by populateHistoryFromNotes() (always-run)
+                // which correctly calculates actualSent = input - change - fee.
                 try database.markNoteSpentByHashedNullifier(hashedNullifier: hashedNull, txid: txid, spentHeight: spentHeight)
                 nullifierToNote.removeValue(forKey: hashedNull)
             }
@@ -12310,6 +12274,42 @@ final class WalletManager: ObservableObject {
         }
 
         print("🔍 FIX #1093: Scanning \(blocksToScan) blocks (single pass for \(nullifierToNote.count) nullifiers)")
+
+        // FIX #1423: Use dispatcher instead of stopping block listeners.
+        // Old approach (FIX #1096) stopped all block listeners → FIX #1184b killed NWConnections
+        // → all peers dead → reconnect 300-600ms each via Tor → scan got 0% coverage → repeat every 30s.
+        // New approach: ensure block listeners are RUNNING so dispatcher routes P2P reads.
+        // Same pattern as verifyAllUnspentNotesOnChain (FIX #1184).
+        PeerManager.shared.setBlockListenersBlocked(false)
+        PeerManager.shared.setHeaderSyncInProgress(false)
+        await networkManager.startBlockListenersOnMainScreen()
+        // Wait for dispatchers to activate
+        var activeDispatchers1423 = 0
+        for attempt in 1...10 {
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            activeDispatchers1423 = 0
+            for peer in await MainActor.run(body: { networkManager.peers }) {
+                if await peer.isDispatcherActive {
+                    activeDispatchers1423 += 1
+                }
+            }
+            if activeDispatchers1423 >= 3 {
+                print("✅ FIX #1423: \(activeDispatchers1423) dispatcher(s) active after \(attempt * 500)ms")
+                break
+            }
+        }
+        if activeDispatchers1423 == 0 {
+            print("⚠️ FIX #1423: No dispatchers active — getBlocksDataP2P will retry activation")
+        }
+        await MainActor.run { networkManager.isIntensiveP2PFetchInProgress = true }
+        print("🔒 FIX #1423: P2P fetch via dispatcher (\(activeDispatchers1423) dispatchers active)")
+
+        defer {
+            Task { @MainActor in
+                networkManager.isIntensiveP2PFetchInProgress = false
+            }
+            print("🔓 FIX #1423: P2P fetch isolation released")
+        }
 
         // FIX #1095: Dynamic batch size based on peer capacity
         // FIX #1287: Cap at 3 concurrent peers to prevent TCP congestion collapse
@@ -12435,37 +12435,32 @@ final class WalletManager: ObservableObject {
             return 0
         }
 
-        // FIX #1096: Protect intensive P2P fetch from interference
-        print("🔒 FIX #1096: Setting up P2P fetch isolation for spent note verification...")
-        await PeerManager.shared.stopAllBlockListeners(timeout: 3.0)
-        PeerManager.shared.setBlockListenersBlocked(true)
-        networkManager.isIntensiveP2PFetchInProgress = true
-
-        // FIX #1228: Reconnect peers with dead connections after stopping block listeners.
-        // FIX #1184b kills NWConnections → peers have handshake=true but connection=nil.
-        let deadPeers1096b = await MainActor.run {
-            networkManager.peers.filter { $0.isHandshakeComplete && !$0.isConnectionReady }
-        }
-        if !deadPeers1096b.isEmpty {
-            print("🔄 FIX #1228: Reconnecting \(deadPeers1096b.count) peers with dead connections (spent note verification)...")
-            var reconnected1096b = Set<String>()  // FIX #1235
-            for peer in deadPeers1096b {
-                if reconnected1096b.contains(peer.host) { print("⏭️ FIX #1235: [\(peer.host)] Already reconnected - skipping"); continue }
-                do {
-                    try await peer.ensureConnected()
-                    reconnected1096b.insert(peer.host)  // FIX #1235
-                    print("✅ FIX #1228: [\(peer.host)] Reconnected for spent note verification")
-                } catch {
-                    print("⚠️ FIX #1228: [\(peer.host)] Reconnect failed: \(error.localizedDescription)")
+        // FIX #1423: Use dispatcher instead of stopping block listeners.
+        // Old approach killed NWConnections → all peers dead → destructive reconnect cycle.
+        // Same fix as verifyNullifierSpendStatus: keep listeners running, use dispatcher.
+        PeerManager.shared.setBlockListenersBlocked(false)
+        PeerManager.shared.setHeaderSyncInProgress(false)
+        await networkManager.startBlockListenersOnMainScreen()
+        var activeDispatchers1423b = 0
+        for attempt in 1...10 {
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            activeDispatchers1423b = 0
+            for peer in networkManager.peers {
+                if await peer.isDispatcherActive {
+                    activeDispatchers1423b += 1
                 }
             }
+            if activeDispatchers1423b >= 3 {
+                print("✅ FIX #1423: \(activeDispatchers1423b) dispatcher(s) active after \(attempt * 500)ms (spent note verification)")
+                break
+            }
         }
+        networkManager.isIntensiveP2PFetchInProgress = true
+        print("🔒 FIX #1423: P2P fetch via dispatcher (\(activeDispatchers1423b) dispatchers active) — spent note verification")
 
         defer {
-            // FIX #1096: Restore state after fetch completes
             networkManager.isIntensiveP2PFetchInProgress = false
-            PeerManager.shared.setBlockListenersBlocked(false)
-            print("🔓 FIX #1096: P2P fetch isolation released")
+            print("🔓 FIX #1423: P2P fetch isolation released (spent note verification)")
         }
 
         print("🔍 FIX #563 v19: Checking \(spentNotes.count) notes marked as SPENT...")
@@ -13611,6 +13606,8 @@ final class WalletManager: ObservableObject {
         if !deltaMatches1319b.isEmpty {
             print("📦 FIX #1319: Found \(deltaMatches1319b.count) spent note(s) in local delta")
             for (hashedNull, spentHeight, txid) in deltaMatches1319b {
+                // FIX #1415: History entries created by populateHistoryFromNotes() (always-run)
+                // which correctly calculates actualSent = input - change - fee.
                 try database.markNoteSpentByHashedNullifier(hashedNullifier: hashedNull, txid: txid, spentHeight: spentHeight)
                 ourNullifiers.removeValue(forKey: hashedNull)
                 externalSpendsFound += 1
@@ -13729,26 +13726,9 @@ final class WalletManager: ObservableObject {
                                         spentHeight: height
                                     )
 
-                                    // Create SENT history entry if it doesn't exist
-                                    let fee: UInt64 = 10_000 // Standard fee
-                                    let amountSent = matchedNote.value > fee ? matchedNote.value - fee : matchedNote.value
-
-                                    // Check if history entry already exists
-                                    let existsInHistory = try database.transactionExists(txid: txidData, type: .sent)
-                                    if !existsInHistory {
-                                        _ = try database.insertTransactionHistory(
-                                            txid: txidData,
-                                            height: height,
-                                            blockTime: UInt64(Date().timeIntervalSince1970),
-                                            type: .sent,
-                                            value: amountSent,
-                                            fee: fee,
-                                            toAddress: nil,
-                                            fromDiversifier: nil,
-                                            memo: "[External wallet spend detected by FIX #303]"
-                                        )
-                                        print("📜 FIX #303: Created SENT history entry for external spend")
-                                    }
+                                    // FIX #1415: History entries created by populateHistoryFromNotes() (always-run)
+                                    // which correctly calculates actualSent = input - change - fee.
+                                    // Do NOT insert here — amount would be wrong (input - fee, missing change).
 
                                     externalSpendsFound += 1
                                     // Remove from our tracking set (use the key that matched)

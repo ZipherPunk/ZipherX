@@ -2617,9 +2617,10 @@ public final class Peer {
     /// FIX #1181: On invalid magic, attempt resync (same as receiveMessage)
     /// FIX #1184b: Added headerTimeout parameter. Block listener uses 120s (blocks ~75s, pings ~60s).
     ///            Payload reads still use the default 15s since data should flow continuously.
-    private func receiveMessageTolerant(headerTimeout: TimeInterval = P2PTimeout.messageReceive) async throws -> (String, Data) {
+    private func receiveMessageTolerant(headerTimeout: TimeInterval = P2PTimeout.messageReceive, killConnectionOnTimeout: Bool = true) async throws -> (String, Data) {
         // Read header (24 bytes) — use headerTimeout for the initial wait
-        var header = try await receive(count: 24, timeout: headerTimeout)
+        // FIX #1418: killConnectionOnTimeout=false for block listener short poll mode
+        var header = try await receive(count: 24, timeout: headerTimeout, killConnectionOnTimeout: killConnectionOnTimeout)
 
         // FIX #1181: Verify magic — resync if invalid (unsolicited messages from peers)
         if Array(header.prefix(4)) != networkMagic {
@@ -3259,7 +3260,10 @@ public final class Peer {
         guard let (count, countLen) = readVarInt(data, at: offset) else { return [] }
         offset += countLen
 
-        for _ in 0..<count {
+        // NET-005: Cap at 100 addresses per peer response
+        let cappedCount = min(count, 100)
+
+        for _ in 0..<cappedCount {
             guard offset + 4 <= data.count else { break }
 
             // Timestamp (4 bytes)
@@ -3397,7 +3401,7 @@ public final class Peer {
         guard data.count > 0 else { return [] }
         guard let countValue = readCompactSize(from: data, at: &offset) else { return [] }
         let count = Int(countValue)
-        guard count <= 1000 else { return [] }  // FIX #1365: Sanity cap — no peer sends 1000+ addresses
+        guard count <= 100 else { return [] }  // NET-005: Cap at 100 addresses per peer response (was 1000)
 
         // Each addr entry: timestamp (4) + services (8) + IPv6 (16) + port (2) = 30 bytes
         let entrySize = 30
@@ -4241,7 +4245,7 @@ public final class Peer {
 
     /// FIX #1184b: Added `timeout` parameter so block listener can use a longer header timeout.
     /// Default remains P2PTimeout.messageReceive (15s) for normal operations.
-    private func receive(count: Int, timeout: TimeInterval = P2PTimeout.messageReceive) async throws -> Data {
+    private func receive(count: Int, timeout: TimeInterval = P2PTimeout.messageReceive, killConnectionOnTimeout: Bool = true) async throws -> Data {
         guard let connection = connection else {
             throw NetworkError.notConnected
         }
@@ -4318,12 +4322,18 @@ public final class Peer {
                     // If we're here, the receive is stuck (no data for the full timeout) -
                     // disconnect to prevent TCP stream desync from orphaned NWConnection.receive
                     // FIX #1196: This only fires for genuine stuck receives, NOT for cancelled tasks
-                    if let self = self {
-                        self.connectionLock.lock()
-                        let conn = self.connection
-                        self.connection = nil
-                        self.connectionLock.unlock()
-                        self.safeCancelConnection(conn, force: true)
+                    // FIX #1418: When killConnectionOnTimeout=false (block listener short poll),
+                    // DON'T kill the connection — just throw timeout so caller can check stop flag.
+                    // The orphaned NWConnection.receive callback is harmless here because we'll
+                    // immediately re-enter the same receive loop (no other reader).
+                    if killConnectionOnTimeout {
+                        if let self = self {
+                            self.connectionLock.lock()
+                            let conn = self.connection
+                            self.connection = nil
+                            self.connectionLock.unlock()
+                            self.safeCancelConnection(conn, force: true)
+                        }
                     }
                     outerContinuation.resume(throwing: NetworkError.timeout)
                 }
@@ -6004,12 +6014,15 @@ public struct ParkedPeer {
     private static let backoffPhase2: [TimeInterval] = [3600, 14400, 28800, 57600, 86400]
 
     /// FIX #352: Hardcoded seeds known to be reliable Zclassic nodes
+    /// FIX #1428: Keep in sync with NetworkManager.HARDCODED_SEEDS and PeerManager.HARDCODED_SEEDS
     private static let hardcodedSeeds: Set<String> = [
         "140.174.189.3",
         "140.174.189.17",
         "205.209.104.118",
         "95.179.131.117",
-        "45.77.216.198"
+        "45.77.216.198",
+        "212.23.222.231",
+        "157.90.223.151"
     ]
 
     /// Get the next retry interval based on retry count

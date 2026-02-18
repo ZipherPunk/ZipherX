@@ -2608,7 +2608,7 @@ struct CypherpunkMainView: View {
             }
 
             // FIX #270 + FIX #271 + FIX #272: Sync status - stable display
-            // Priority: Synced > Syncing > Connecting > Error
+            // Priority: No Peers > Synced > Syncing > Connecting > Error
             // NOTE: walletHeight = 0 means "not loaded yet", not "at block 0"
             let wHeight = networkManager.walletHeight
             let cHeight = networkManager.chainHeight
@@ -2617,7 +2617,17 @@ struct CypherpunkMainView: View {
             // This prevents flip-flopping between Synced/Syncing as new blocks arrive
             let syncTolerance: UInt64 = 5
 
-            if cHeight > 0 && wHeight > 0 && (wHeight >= cHeight || cHeight - wHeight <= syncTolerance) {
+            // FIX #1426: Show "No Peers" warning when connected to 0 peers
+            // Cached wHeight/cHeight can show "Synced" even when all peers are gone
+            if networkManager.connectedPeers == 0 && networkManager.backgroundProcessesEnabled && cHeight > 0 {
+                HStack(spacing: 2) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 8))
+                    Text("No Peers")
+                        .font(.system(size: 8, design: .monospaced))
+                }
+                .foregroundColor(.red)
+            } else if cHeight > 0 && wHeight > 0 && (wHeight >= cHeight || cHeight - wHeight <= syncTolerance) {
                 // Wallet height within tolerance - SYNCED
                 HStack(spacing: 2) {
                     Image(systemName: "checkmark.circle.fill")
@@ -2637,14 +2647,27 @@ struct CypherpunkMainView: View {
                 }
                 .foregroundColor(matrixGreen)
             } else if cHeight == 0 && !networkManager.isConnected {
-                // Never connected - Error
-                HStack(spacing: 2) {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 8))
-                    Text("Error")
-                        .font(.system(size: 8, design: .monospaced))
+                // FIX #1424: During FIX #1422b early start, backgroundProcessesEnabled=true but
+                // network connect hasn't completed yet → show "Connecting" not "Error"
+                if networkManager.backgroundProcessesEnabled {
+                    HStack(spacing: 2) {
+                        ProgressView()
+                            .scaleEffect(0.4)
+                            .tint(.orange)
+                        Text("Connecting")
+                            .font(.system(size: 8, design: .monospaced))
+                    }
+                    .foregroundColor(.orange)
+                } else {
+                    // Truly failed - no background processes, not connected
+                    HStack(spacing: 2) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 8))
+                        Text("Error")
+                            .font(.system(size: 8, design: .monospaced))
+                    }
+                    .foregroundColor(.red)
                 }
-                .foregroundColor(.red)
             } else {
                 // Waiting for heights to be loaded (walletHeight or chainHeight = 0)
                 HStack(spacing: 2) {
@@ -2715,15 +2738,12 @@ struct CypherpunkMainView: View {
                     // FIX #462 v2: Force reload from database, don't populate (data already there)
                     print("📜 TXHIST [S7]: Force reload requested - skipping populate, reading existing data from database")
                 } else {
-                    // FIX #462: Only populate if history is empty (first load after app restart)
-                    // This prevents re-inserting change TXs that were just filtered out
-                    let currentCount = try WalletDatabase.shared.getTransactionHistoryCount()
-                    if currentCount == 0 {
-                        print("📜 TXHIST [S7]: History empty, populating from notes...")
-                        let populated = try WalletDatabase.shared.populateHistoryFromNotes()
-                        print("📜 TXHIST [S7]: Populated \(populated) entries (received + sent)")
-                    } else {
-                        print("📜 TXHIST [S7]: History has \(currentCount) entries, skipping populate (change TXs already filtered)")
+                    // FIX #1415: Always call populateHistoryFromNotes() — not just when empty.
+                    // Uses INSERT OR IGNORE so existing entries are preserved.
+                    // Also runs one-time cleanup of wrong-amount entries from previous builds.
+                    let populated = try WalletDatabase.shared.populateHistoryFromNotes()
+                    if populated > 0 {
+                        print("📜 TXHIST [S7]: Populated \(populated) new transaction history entries")
                     }
                 }
 

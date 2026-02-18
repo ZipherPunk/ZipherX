@@ -85,6 +85,28 @@ use group::{GroupEncoding, cofactor::CofactorGroup, Curve};
 use ff::{PrimeField, Field};
 use subtle::ConstantTimeEq;  // FIX #1385: Side-channel resistant comparison for crypto data
 use rand::rngs::OsRng;
+use rand::Rng; // FIX #1402 (NEW-002): Random change diversifier
+use std::sync::atomic::AtomicU64; // FIX #1402 (NEW-004): Change diversifier persistence
+
+/// FIX #1402 (NEW-004): Stores the last change diversifier index used in TX construction.
+/// Read by Swift after a successful TX build to persist in the database.
+static LAST_CHANGE_DIVERSIFIER_INDEX: AtomicU64 = AtomicU64::new(0);
+
+/// FIX #1402 (META-001): Redact financial amounts in error messages (order of magnitude only)
+macro_rules! redact_amount {
+    ($zatoshis:expr) => {{
+        let zcl = $zatoshis as f64 / 100_000_000.0;
+        if zcl >= 1.0 {
+            format!("~{} ZCL", zcl as u64)
+        } else if zcl >= 0.1 {
+            "~0.X ZCL".to_string()
+        } else if zcl >= 0.01 {
+            "~0.0X ZCL".to_string()
+        } else {
+            "~dust ZCL".to_string()
+        }
+    }};
+}
 
 // Global prover instance
 static PROVER: Mutex<Option<LocalTxProver>> = Mutex::new(None);
@@ -451,6 +473,7 @@ pub unsafe extern "C" fn zipherx_derive_address(
     sk: *const u8,
     diversifier_index: u64,
     address_out: *mut u8,
+    actual_index_out: *mut u64,
 ) -> bool {
     ffi_catch_unwind!(false, {
     // FIX #230: Validate input pointer
@@ -475,14 +498,15 @@ pub unsafe extern "C" fn zipherx_derive_address(
 
     // PRIVACY: P-ADDR-003 — Support diversified address derivation
     let dfvk = account_key.to_diversifiable_full_viewing_key();
-    let (_, addr) = if diversifier_index == 0 {
+    let (actual_j, addr) = if diversifier_index == 0 {
         dfvk.default_address()
     } else {
         let j = DiversifierIndex::from(diversifier_index);
         match dfvk.find_address(j) {
-            Some((_, address)) => {
+            Some((found_j, address)) => {
                 // find_address returns the next VALID diversifier >= j
-                (j, address)
+                // FIX: Return the ACTUAL valid index, not the requested one
+                (found_j, address)
             }
             None => {
                 debug_log!("zipherx_derive_address: no valid diversifier at index {}", diversifier_index);
@@ -495,6 +519,15 @@ pub unsafe extern "C" fn zipherx_derive_address(
     let addr_bytes = addr.to_bytes();
 
     std::ptr::copy_nonoverlapping(addr_bytes.as_ptr(), address_out, 43);
+
+    // Write actual valid diversifier index to actual_index_out if provided
+    if !actual_index_out.is_null() {
+        // Convert DiversifierIndex ([u8; 11]) back to u64 (little-endian, first 8 bytes)
+        let mut idx_bytes = [0u8; 8];
+        idx_bytes.copy_from_slice(&actual_j.0[..8]);
+        let actual_idx = u64::from_le_bytes(idx_bytes);
+        std::ptr::write(actual_index_out, actual_idx);
+    }
 
     true
     })
@@ -1936,7 +1969,7 @@ pub unsafe extern "C" fn zipherx_build_transaction(
 
     // Verify funds
     if note_value < amount + fee {
-        eprintln!("❌ Insufficient funds: have {}, need {}", note_value, amount + fee);
+        eprintln!("❌ Insufficient funds: have {}, need {}", redact_amount!(note_value), redact_amount!(amount + fee));
         return false;
     }
 
@@ -2088,7 +2121,7 @@ pub unsafe extern "C" fn zipherx_build_transaction(
     let amount_val = match Amount::from_i64(amount as i64) {
         Ok(a) => a,
         Err(_) => {
-            eprintln!("❌ Invalid amount: {}", amount);
+            eprintln!("❌ Invalid amount: {}", redact_amount!(amount));
             return false;
         }
     };
@@ -2111,16 +2144,19 @@ pub unsafe extern "C" fn zipherx_build_transaction(
         let change_amount = match Amount::from_i64(change as i64) {
             Ok(a) => a,
             Err(_) => {
-                eprintln!("❌ Invalid change amount: {}", change);
+                eprintln!("❌ Invalid change amount: {}", redact_amount!(change));
                 return false;
             }
         };
         // PRIVACY: P-ADDR-002 — Use diversified change address (external scope, high index)
         // MUST stay in external scope so IVK-based scanning can discover change notes.
         // Uses index range >= 1_000_000_000 to separate from receive addresses (0..999_999_999).
+        // FIX #1402 (NEW-002): Random offset prevents TX linkage via identical change addresses
         let dfvk_change = extsk.to_diversifiable_full_viewing_key();
         let change_diversifier_base: u64 = 1_000_000_000;
-        let change_index = change_diversifier_base + (change as u64 % 1_000_000);
+        let change_offset: u64 = OsRng.gen_range(0u64..1_000_000_000);
+        let change_index = change_diversifier_base + change_offset;
+        LAST_CHANGE_DIVERSIFIER_INDEX.store(change_index, Ordering::SeqCst); // FIX #1402 (NEW-004)
         let change_j = DiversifierIndex::from(change_index);
         let (_, change_addr) = match dfvk_change.find_address(change_j) {
             Some(result) => result,
@@ -2145,7 +2181,7 @@ pub unsafe extern "C" fn zipherx_build_transaction(
     let fee_amount = match Amount::from_i64(fee as i64) {
         Ok(a) => a,
         Err(_) => {
-            eprintln!("❌ Invalid fee amount: {}", fee);
+            eprintln!("❌ Invalid fee amount: {}", redact_amount!(fee));
             return false;
         }
     };
@@ -2466,7 +2502,7 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi(
     // Verify funds
     if total_input < amount + fee {
         eprintln!("❌ Insufficient funds: have {}, need {} (amount={} + fee={})",
-                  total_input, amount + fee, amount, fee);
+                  redact_amount!(total_input), redact_amount!(amount + fee), redact_amount!(amount), redact_amount!(fee));
         return false;
     }
 
@@ -2524,7 +2560,7 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi(
     let amount_val = match Amount::from_i64(amount as i64) {
         Ok(a) => a,
         Err(_) => {
-            eprintln!("❌ Invalid amount in multi-input tx: {}", amount);
+            eprintln!("❌ Invalid amount in multi-input tx: {}", redact_amount!(amount));
             return false;
         }
     };
@@ -2545,14 +2581,17 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi(
         let change_amount = match Amount::from_i64(change as i64) {
             Ok(a) => a,
             Err(_) => {
-                eprintln!("❌ Invalid change amount in multi-input tx: {}", change);
+                eprintln!("❌ Invalid change amount in multi-input tx: {}", redact_amount!(change));
                 return false;
             }
         };
         // PRIVACY: P-ADDR-002 — Use diversified change address (external scope, high index)
+        // FIX #1402 (NEW-002): Random offset prevents TX linkage via identical change addresses
         let dfvk_change = extsk.to_diversifiable_full_viewing_key();
         let change_diversifier_base: u64 = 1_000_000_000;
-        let change_index = change_diversifier_base + (change as u64 % 1_000_000);
+        let change_offset: u64 = OsRng.gen_range(0u64..1_000_000_000);
+        let change_index = change_diversifier_base + change_offset;
+        LAST_CHANGE_DIVERSIFIER_INDEX.store(change_index, Ordering::SeqCst); // FIX #1402 (NEW-004)
         let change_j = DiversifierIndex::from(change_index);
         let (_, change_addr) = match dfvk_change.find_address(change_j) {
             Some(result) => result,
@@ -2578,7 +2617,7 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi(
     let fee_amount = match Amount::from_i64(fee as i64) {
         Ok(a) => a,
         Err(_) => {
-            eprintln!("❌ Invalid fee amount in multi-input tx: {}", fee);
+            eprintln!("❌ Invalid fee amount in multi-input tx: {}", redact_amount!(fee));
             return false;
         }
     };
@@ -2687,6 +2726,13 @@ pub unsafe extern "C" fn zipherx_random_scalar(output: *mut u8) -> bool {
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), output, 32);
     true
     })
+}
+
+/// FIX #1402 (NEW-004): Get the last change diversifier index used in TX construction.
+/// Call this from Swift after a successful TX build to persist the change address.
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_get_last_change_diversifier_index() -> u64 {
+    LAST_CHANGE_DIVERSIFIER_INDEX.load(Ordering::SeqCst)
 }
 
 /// Encrypt note plaintext for Sapling output
@@ -6671,7 +6717,7 @@ pub unsafe extern "C" fn zipherx_build_transaction_encrypted(
     // Verify funds
     if note_value < amount + fee {
         secure_zero(&mut decrypted_sk);
-        eprintln!("❌ Insufficient funds: have {}, need {}", note_value, amount + fee);
+        eprintln!("❌ Insufficient funds: have {}, need {}", redact_amount!(note_value), redact_amount!(amount + fee));
         return false;
     }
 
@@ -6897,7 +6943,7 @@ pub unsafe extern "C" fn zipherx_build_transaction_encrypted(
         Ok(a) => a,
         Err(_) => {
             secure_zero(&mut decrypted_sk);
-            eprintln!("❌ Invalid amount: {}", amount);
+            eprintln!("❌ Invalid amount: {}", redact_amount!(amount));
             return false;
         }
     };
@@ -6923,14 +6969,17 @@ pub unsafe extern "C" fn zipherx_build_transaction_encrypted(
             Ok(amt) => amt,
             Err(_) => {
                 secure_zero(&mut decrypted_sk);
-                eprintln!("❌ FIX #761: Invalid change amount: {}", change);
+                eprintln!("❌ FIX #761: Invalid change amount: {}", redact_amount!(change));
                 return false;
             }
         };
         // PRIVACY: P-ADDR-002 — Use diversified change address (external scope, high index)
+        // FIX #1402 (NEW-002): Random offset prevents TX linkage via identical change addresses
         let dfvk_change = extsk.to_diversifiable_full_viewing_key();
         let change_diversifier_base: u64 = 1_000_000_000;
-        let change_index = change_diversifier_base + (change as u64 % 1_000_000);
+        let change_offset: u64 = OsRng.gen_range(0u64..1_000_000_000);
+        let change_index = change_diversifier_base + change_offset;
+        LAST_CHANGE_DIVERSIFIER_INDEX.store(change_index, Ordering::SeqCst); // FIX #1402 (NEW-004)
         let change_j = DiversifierIndex::from(change_index);
         let (_, change_addr) = match dfvk_change.find_address(change_j) {
             Some(result) => result,
@@ -6957,7 +7006,7 @@ pub unsafe extern "C" fn zipherx_build_transaction_encrypted(
         Ok(amt) => amt,
         Err(_) => {
             secure_zero(&mut decrypted_sk);
-            eprintln!("❌ FIX #761: Invalid fee amount: {}", fee);
+            eprintln!("❌ FIX #761: Invalid fee amount: {}", redact_amount!(fee));
             return false;
         }
     };
@@ -7332,7 +7381,7 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi_encrypted(
     // Verify funds
     if total_input < amount + fee {
         secure_zero(&mut decrypted_sk);
-        eprintln!("❌ Insufficient funds: have {}, need {}", total_input, amount + fee);
+        eprintln!("❌ Insufficient funds: have {}, need {}", redact_amount!(total_input), redact_amount!(amount + fee));
         return false;
     }
 
@@ -7385,7 +7434,7 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi_encrypted(
         Ok(a) => a,
         Err(_) => {
             secure_zero(&mut decrypted_sk);
-            eprintln!("❌ Invalid amount: {}", amount);
+            eprintln!("❌ Invalid amount: {}", redact_amount!(amount));
             return false;
         }
     };
@@ -7408,14 +7457,17 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi_encrypted(
             Ok(a) => a,
             Err(_) => {
                 secure_zero(&mut decrypted_sk);
-                eprintln!("❌ Invalid change amount: {}", change);
+                eprintln!("❌ Invalid change amount: {}", redact_amount!(change));
                 return false;
             }
         };
         // PRIVACY: P-ADDR-002 — Use diversified change address (external scope, high index)
+        // FIX #1402 (NEW-002): Random offset prevents TX linkage via identical change addresses
         let dfvk_change = extsk.to_diversifiable_full_viewing_key();
         let change_diversifier_base: u64 = 1_000_000_000;
-        let change_index = change_diversifier_base + (change as u64 % 1_000_000);
+        let change_offset: u64 = OsRng.gen_range(0u64..1_000_000_000);
+        let change_index = change_diversifier_base + change_offset;
+        LAST_CHANGE_DIVERSIFIER_INDEX.store(change_index, Ordering::SeqCst); // FIX #1402 (NEW-004)
         let change_j = DiversifierIndex::from(change_index);
         let (_, change_addr) = match dfvk_change.find_address(change_j) {
             Some(result) => result,
@@ -7442,7 +7494,7 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi_encrypted(
         Ok(amt) => amt,
         Err(_) => {
             secure_zero(&mut decrypted_sk);
-            eprintln!("❌ FIX #761: Invalid fee amount: {}", fee);
+            eprintln!("❌ FIX #761: Invalid fee amount: {}", redact_amount!(fee));
             return false;
         }
     };

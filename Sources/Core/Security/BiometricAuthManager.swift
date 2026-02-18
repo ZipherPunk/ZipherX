@@ -21,12 +21,15 @@ final class BiometricAuthManager: ObservableObject {
     private static let defaultTimeout: TimeInterval = 30
 
     /// Time interval before requiring re-authentication (user configurable)
+    /// FIX #1438: 0 = "Never" (valid selection), not "unset". Use object check for default.
     var authTimeout: TimeInterval {
-        let saved = UserDefaults.standard.double(forKey: Self.timeoutKey)
-        return saved > 0 ? saved : Self.defaultTimeout
+        if UserDefaults.standard.object(forKey: Self.timeoutKey) != nil {
+            return UserDefaults.standard.double(forKey: Self.timeoutKey)  // Returns 0 for "Never"
+        }
+        return Self.defaultTimeout  // First launch — no value stored yet
     }
 
-    /// Set the inactivity timeout
+    /// Set the inactivity timeout (0 = Never)
     func setAuthTimeout(_ seconds: TimeInterval) {
         UserDefaults.standard.set(seconds, forKey: Self.timeoutKey)
     }
@@ -97,7 +100,9 @@ final class BiometricAuthManager: ObservableObject {
     }
 
     /// Check if inactivity timeout has been exceeded
+    /// FIX #1438: authTimeout == 0 means "Never" — never exceed
     var isInactivityTimeoutExceeded: Bool {
+        guard authTimeout > 0 else { return false }  // "Never" = never lock
         return Date().timeIntervalSince(lastActivityTime) >= authTimeout
     }
 

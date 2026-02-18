@@ -329,6 +329,11 @@ public final class NetworkManager: ObservableObject {
     /// Used to prevent parallel operations from interfering with bulk P2P fetches
     @Published var isIntensiveP2PFetchInProgress: Bool = false
 
+    /// FIX #1434: Recovery serialization — only 1 recovery at a time + exponential backoff
+    private var isRecoveringPeers = false
+    private var lastRecoveryAttempt: Date = .distantPast
+    private var recoveryBackoffSeconds: TimeInterval = 30  // Start at 30s, doubles on each attempt
+
     /// FIX #1317: Actor-based async semaphore for serializing getBlocksDataP2P calls.
     /// Only 1 caller at a time may use the shared P2P peers for block fetching.
     /// Eliminates both client-side dispatcher contention AND server-side cs_main queueing.
@@ -894,6 +899,9 @@ public final class NetworkManager: ObservableObject {
     private var peerRecoveryTimer: Timer?
     private var consecutiveSOCKS5Failures: Int = 0
     private let SOCKS5_FAILURE_THRESHOLD: Int = 5  // After 5 failures, bypass Tor
+    // FIX #1419: Track consecutive recovery failures with 0 peers (exit circuit failure detection)
+    private var consecutiveZeroPeerRecoveries: Int = 0
+    private let ZERO_PEER_RECOVERY_THRESHOLD: Int = 3  // After 3 consecutive 0-peer recoveries, restart Tor with cache clear
     private let PEER_RECOVERY_INTERVAL: TimeInterval = 30  // Check every 30 seconds
     private let STATS_REFRESH_INTERVAL: TimeInterval = 30 // Refresh chain height every 30 seconds
     private let queue = DispatchQueue(label: "com.zipherx.network", qos: .userInitiated)
@@ -1559,6 +1567,11 @@ public final class NetworkManager: ObservableObject {
         addressLock.unlock()
         print("✅ [SYBIL] Bypass complete - legitimate peers connected via direct P2P")
 
+        // FIX #1428: Restore TorManager bypass flag so Peer.connect() uses SOCKS5 again
+        Task {
+            await TorManager.shared.restoreAfterSingleTxBypass()
+        }
+
         // FIX #175: Clear the bypass flag (but keep alert for user to see)
         DispatchQueue.main.async {
             self.torBypassedForSybil = false
@@ -1792,8 +1805,8 @@ public final class NetworkManager: ObservableObject {
         let onionCount = knownAddresses.values.filter { $0.address.host.hasSuffix(".onion") }.count
         addressLock.unlock()
 
-        // Count peers connected via Tor SOCKS5
-        let torCount = peers.filter { $0.isConnectedViaTor }.count
+        // Count peers connected via Tor SOCKS5 (FIX #1417: require isConnectionReady to avoid stale counts)
+        let torCount = peers.filter { $0.isConnectedViaTor && $0.isConnectionReady }.count
         // Count .onion peers actually connected
         let onionConnected = peers.filter { $0.isOnion && $0.isConnectionReady }.count
 
@@ -2727,6 +2740,10 @@ public final class NetworkManager: ObservableObject {
                 // Collect successful connections
                 for await (peer, address) in group {
                     if let peer = peer {
+                        // FIX #1421: Dedup — remove stale peer for same host:port before adding fresh one
+                        if let existingIdx = peers.firstIndex(where: { $0.host == peer.host && $0.port == peer.port }) {
+                            peers.remove(at: existingIdx)
+                        }
                         peers.append(peer)
                         // FIX #478: Also add to PeerManager to keep peer lists in sync
                         PeerManager.shared.addPeer(peer)
@@ -2738,9 +2755,9 @@ public final class NetworkManager: ObservableObject {
                         // Set up block announcement listener
                         self.setupBlockListener(for: peer)
 
-                        // Update UI immediately
+                        // FIX #1420: Update UI from GLOBAL peers array, not batch-local count
                         await MainActor.run {
-                            self.connectedPeers = connectedCount
+                            self.connectedPeers = self.peers.filter { $0.isConnectionReady }.count
                             self.isConnected = true
                         }
 
@@ -2882,9 +2899,11 @@ public final class NetworkManager: ObservableObject {
                     // Note: Tor will be restored automatically by the bypass mechanism after massive ops
                 }
 
+                // FIX #1420: Update from GLOBAL peers array, not batch-local count
                 await MainActor.run {
-                    self.connectedPeers = connectedCount
-                    self.isConnected = connectedCount > 0
+                    let globalReady = self.peers.filter { $0.isConnectionReady }.count
+                    self.connectedPeers = globalReady
+                    self.isConnected = globalReady > 0
                 }
             }
         }
@@ -2898,9 +2917,11 @@ public final class NetworkManager: ObservableObject {
             throw NetworkError.insufficientPeers(connectedCount, MIN_PEERS)
         }
 
+        // FIX #1420: Update from GLOBAL peers array, not batch-local count
         DispatchQueue.main.async {
-            self.connectedPeers = connectedCount
-            self.isConnected = connectedCount > 0
+            let globalReady = self.peers.filter { $0.isConnectionReady }.count
+            self.connectedPeers = globalReady
+            self.isConnected = globalReady > 0
         }
 
         // Persist good addresses for next launch
@@ -3033,6 +3054,7 @@ public final class NetworkManager: ObservableObject {
 
         // 5. Reset SOCKS5 failure counter (Tor proxy is fine, just iOS killed sockets)
         consecutiveSOCKS5Failures = 0
+        consecutiveZeroPeerRecoveries = 0  // FIX #1419
 
         // 6. Update UI to show disconnected state
         await MainActor.run {
@@ -5177,6 +5199,10 @@ public final class NetworkManager: ObservableObject {
 
                 for await (peer, _) in group {
                     if let peer = peer {
+                        // FIX #1421: Dedup — remove stale peer for same host:port before adding fresh one
+                        if let existingIdx = peers.firstIndex(where: { $0.host == peer.host && $0.port == peer.port }) {
+                            peers.remove(at: existingIdx)
+                        }
                         peers.append(peer)
                         // FIX #478: Also add to PeerManager to keep peer lists in sync
                         PeerManager.shared.addPeer(peer)
@@ -5184,8 +5210,9 @@ public final class NetworkManager: ObservableObject {
                         self.resetSybilCounter()
                         self.setupBlockListener(for: peer)
 
+                        // FIX #1420: Update from GLOBAL peers array, not batch-local count
                         await MainActor.run {
-                            self.connectedPeers = connectedCount
+                            self.connectedPeers = self.peers.filter { $0.isConnectionReady }.count
                         }
 
                         if connectedCount >= targetPeers {
@@ -8287,9 +8314,13 @@ public final class NetworkManager: ObservableObject {
 
             // Check if Tor SOCKS failures are the cause
             if consecutiveSOCKS5Failures >= SOCKS5_FAILURE_THRESHOLD && !sybilBypassActive {
-                print("🚨 FIX #227: \(consecutiveSOCKS5Failures) SOCKS5 failures - bypassing Tor temporarily")
-                sybilBypassActive = true  // Reuse existing bypass flag
-                _torIsAvailable = false   // Force direct connections
+                print("🚨 FIX #1428: \(consecutiveSOCKS5Failures) SOCKS5 failures - bypassing Tor temporarily")
+                sybilBypassActive = true
+                _torIsAvailable = false
+                // FIX #1428: MUST set TorManager bypass — Peer.connect() checks TorManager.isTorBypassed
+                Task {
+                    await TorManager.shared.temporarilyBypassTor()
+                }
             }
 
             // Trigger immediate peer reconnection
@@ -8308,6 +8339,11 @@ public final class NetworkManager: ObservableObject {
             let newConnected = readyCount > 0
             if self.connectedPeers != readyCount { self.connectedPeers = readyCount }
             if self.isConnected != newConnected { self.isConnected = newConnected }
+            // FIX #1420: Also update Tor peer counts in keepalive timer
+            let newTorCount = self.peers.filter { $0.isConnectedViaTor && $0.isConnectionReady }.count
+            let newOnionCount = self.peers.filter { $0.isOnion && $0.isConnectionReady }.count
+            if self.torConnectedPeersCount != newTorCount { self.torConnectedPeersCount = newTorCount }
+            if self.onionConnectedPeersCount != newOnionCount { self.onionConnectedPeersCount = newOnionCount }
         }
     }
 
@@ -8318,6 +8354,28 @@ public final class NetworkManager: ObservableObject {
             print("🔄 FIX #1273: Skipping peer recovery — not authenticated yet")
             return
         }
+
+        // FIX #1434: Serialize recovery — only 1 at a time (prevents thundering herd)
+        guard !isRecoveringPeers else {
+            print("🔄 FIX #1434: Recovery already in progress, skipping")
+            return
+        }
+
+        // FIX #1434: Exponential backoff between recovery attempts (saves battery)
+        let elapsed = Date().timeIntervalSince(lastRecoveryAttempt)
+        guard elapsed >= recoveryBackoffSeconds else {
+            print("🔄 FIX #1434: Recovery backoff — \(Int(recoveryBackoffSeconds - elapsed))s remaining")
+            return
+        }
+
+        isRecoveringPeers = true
+        lastRecoveryAttempt = Date()
+        defer {
+            isRecoveringPeers = false
+            // Increase backoff: 30 → 60 → 120 → 240 → max 300s (5min)
+            recoveryBackoffSeconds = min(300, recoveryBackoffSeconds * 2)
+        }
+
         print("🔄 FIX #227: Attempting peer recovery...")
 
         // FIX #250: Diagnostic logging for real iOS debugging
@@ -8416,17 +8474,17 @@ public final class NetworkManager: ObservableObject {
             candidateAddresses.append((address, "parked"))
         }
 
-        // 3. Bundled addresses as fallback
-        let bundledAddresses = knownAddresses.values
-            .filter { $0.source == "bundled" }
-            .map { $0.address }
-        for address in bundledAddresses.prefix(5) {
+        // 3. All known addresses as fallback (bundled + discovered via addr messages)
+        // FIX #1428: Try ALL known addresses, not just bundled (107 known but only 5 were tried)
+        let allKnownAddresses = knownAddresses.values.map { $0.address }
+            .sorted { a, _ in a.host < "z" }  // Deterministic order
+        for address in allKnownAddresses.prefix(20) {
             // Skip if already in candidates
             if candidateAddresses.contains(where: { $0.address.host == address.host }) {
                 continue
             }
             if !shouldSkipPeer(address.host) && !isOnCooldown(address.host, port: address.port) {
-                candidateAddresses.append((address, "bundled"))
+                candidateAddresses.append((address, "discovered"))
             }
         }
 
@@ -8436,8 +8494,10 @@ public final class NetworkManager: ObservableObject {
         var recovered = 0
         let maxPeers = 5  // Limit to avoid overwhelming network
 
+        // FIX #1428: Try up to 16 candidates in parallel (was 8) — Tor circuits are unreliable
+        // on cellular, so more parallel attempts = better chance of getting 3+ peers
         await withTaskGroup(of: (Peer?, PeerAddress, String).self) { group in
-            for (address, source) in candidateAddresses.prefix(8) {
+            for (address, source) in candidateAddresses.prefix(16) {
                 group.addTask { [weak self] in
                     guard let self = self else { return (nil, address, source) }
 
@@ -8550,38 +8610,87 @@ public final class NetworkManager: ObservableObject {
         if recovered == 0 {
             print("⚠️ FIX #227: Could not recover any peers from preferred/parked/bundled lists")
 
+            // FIX #1419: Track consecutive 0-peer recoveries for exit circuit failure detection
+            consecutiveZeroPeerRecoveries += 1
+            let exitFailures = await TorManager.shared.getExitCircuitFailures()
+            print("📊 FIX #1419: Consecutive 0-peer recoveries: \(consecutiveZeroPeerRecoveries)/\(ZERO_PEER_RECOVERY_THRESHOLD), exit circuit failures: \(exitFailures)")
+
+            // FIX #1419: If Tor enabled and repeated failures, restart Tor with cache clear
+            // This detects stale consensus causing "Failed to obtain exit circuit" errors
+            if consecutiveZeroPeerRecoveries >= ZERO_PEER_RECOVERY_THRESHOLD && torMode == .enabled && !torBypassed {
+                if exitFailures > 0 {
+                    print("🚨 FIX #1419: \(consecutiveZeroPeerRecoveries) consecutive 0-peer recoveries + \(exitFailures) exit circuit failures → restarting Tor with cache clear")
+                    consecutiveZeroPeerRecoveries = 0
+                    await TorManager.shared.restartTor(clearCache: true)
+                    // Wait for new circuits to build
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)  // 5 seconds
+                    return  // Will retry on next recovery cycle
+                } else {
+                    print("⚠️ FIX #1419: 0-peer recoveries but no exit circuit failures — may be network issue")
+                }
+            }
+
             // If Tor bypass not active yet and we have failures, try direct
             if !sybilBypassActive {
-                print("🔧 FIX #227: Enabling Tor bypass for direct connections")
+                print("🔧 FIX #1428: Enabling Tor bypass for direct connections")
                 sybilBypassActive = true
                 _torIsAvailable = false
+                // FIX #1428: MUST set TorManager bypass — Peer.connect() checks TorManager.isTorBypassed,
+                // NOT NetworkManager._torIsAvailable. Without this, bypass is broken (all connections
+                // still go through SOCKS5).
+                await TorManager.shared.temporarilyBypassTor()
 
-                // Retry with direct connections using preferred seeds
-                for seed in preferredSeeds.prefix(3) {
-                    if isBanned(seed.host) { continue }
+                // FIX #1428: Retry with direct connections using hardcoded seeds (not preferredSeeds
+                // which is often empty). Clear parked seeds first so they're eligible.
+                clearParkedHardcodedSeeds()
+                var directRecovered = 0
+                for seedHost in HARDCODED_SEEDS {
+                    if isBanned(seedHost) || peers.contains(where: { $0.host == seedHost }) { continue }
 
                     do {
-                        let address = PeerAddress(host: seed.host, port: seed.port)
+                        let address = PeerAddress(host: seedHost, port: defaultPort)
                         let peer = try await connectToPeer(address)
                         peers.append(peer)
-                        // FIX #478: Also add to PeerManager to keep peer lists in sync
                         PeerManager.shared.addPeer(peer)
                         setupBlockListener(for: peer)
-                        unparkPeer(seed.host, port: seed.port)
-                        print("✅ FIX #227: Direct connection to \(seed.host) succeeded")
-                        break
+                        unparkPeer(seedHost, port: defaultPort)
+                        directRecovered += 1
+                        print("✅ FIX #1428: Direct connection to \(seedHost) succeeded (\(directRecovered))")
+                        if directRecovered >= 3 { break }
                     } catch {
-                        print("❌ FIX #227: Direct connection to \(seed.host) failed")
+                        print("❌ FIX #1428: Direct connection to \(seedHost) failed: \(error.localizedDescription)")
                     }
+                }
+
+                if directRecovered > 0 {
+                    print("✅ FIX #1428: Recovered \(directRecovered) peer(s) via direct connection (Tor bypassed)")
+                } else {
+                    // Direct also failed — restore Tor for next cycle
+                    print("⚠️ FIX #1428: Direct connections also failed — restoring Tor")
+                    await TorManager.shared.restoreAfterSingleTxBypass()
+                    sybilBypassActive = false
                 }
             }
         } else {
             print("✅ FIX #227: Recovered \(recovered) peer(s)")
+            // FIX #1419: Reset counter on successful recovery
+            consecutiveZeroPeerRecoveries = 0
+            // FIX #1434: Reset backoff on success — don't penalize after a good recovery
+            recoveryBackoffSeconds = 30
         }
 
         // FIX #384: Sync peer list to PeerManager
         await MainActor.run {
             PeerManager.shared.syncPeers(self.peers)
+        }
+
+        // FIX #1428: Start dispatchers for recovered peers — without this, block announcements
+        // don't get routed, FIX #859 scanner can't run, and getBlocksDataP2P has to activate
+        // dispatchers on demand (adding delay). Only start if we actually recovered peers.
+        let finalReadyCount = peers.filter { $0.isConnectionReady }.count
+        if finalReadyCount > 0 {
+            print("🔄 FIX #1428: Starting block listeners for \(finalReadyCount) recovered peer(s)...")
+            await startBlockListenersOnMainScreen()
         }
 
         // Update UI (CPU OPTIMIZATION: only if values changed)
@@ -8591,6 +8700,11 @@ public final class NetworkManager: ObservableObject {
             let newConnected = newCount > 0
             if self.connectedPeers != newCount { self.connectedPeers = newCount }
             if self.isConnected != newConnected { self.isConnected = newConnected }
+            // FIX #1420: Also update Tor peer counts
+            let newTorCount = self.peers.filter { $0.isConnectedViaTor && $0.isConnectionReady }.count
+            let newOnionCount = self.peers.filter { $0.isOnion && $0.isConnectionReady }.count
+            if self.torConnectedPeersCount != newTorCount { self.torConnectedPeersCount = newTorCount }
+            if self.onionConnectedPeersCount != newOnionCount { self.onionConnectedPeersCount = newOnionCount }
         }
     }
 
@@ -9131,6 +9245,11 @@ public final class NetworkManager: ObservableObject {
             let newConnected = newCount > 0
             if self.connectedPeers != newCount { self.connectedPeers = newCount }
             if self.isConnected != newConnected { self.isConnected = newConnected }
+            // FIX #1420: Also update Tor peer counts in keepalive timer
+            let newTorCount = self.peers.filter { $0.isConnectedViaTor && $0.isConnectionReady }.count
+            let newOnionCount = self.peers.filter { $0.isOnion && $0.isConnectionReady }.count
+            if self.torConnectedPeersCount != newTorCount { self.torConnectedPeersCount = newTorCount }
+            if self.onionConnectedPeersCount != newOnionCount { self.onionConnectedPeersCount = newOnionCount }
         }
 
         // Merge from connection health timer: update settings counts + Tor health
@@ -9299,6 +9418,11 @@ public final class NetworkManager: ObservableObject {
                 if self.connectedPeers != newCount { self.connectedPeers = newCount }
                 let newConnected = newCount > 0
                 if self.isConnected != newConnected { self.isConnected = newConnected }
+                // FIX #1420: Also update Tor peer counts
+                let newTorCount = self.peers.filter { $0.isConnectedViaTor && $0.isConnectionReady }.count
+                let newOnionCount = self.peers.filter { $0.isOnion && $0.isConnectionReady }.count
+                if self.torConnectedPeersCount != newTorCount { self.torConnectedPeersCount = newTorCount }
+                if self.onionConnectedPeersCount != newOnionCount { self.onionConnectedPeersCount = newOnionCount }
             }
         } catch {
             debugLog(.network, "❌ FIX #246: [\(host)] Reconnection failed: \(error.localizedDescription)")

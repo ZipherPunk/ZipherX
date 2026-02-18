@@ -154,4 +154,7 @@ bool zipherx_verify_block_header(
     uint8_t *hash_out
 );
 
+// FIX #1402 (NEW-004): Get the last change diversifier index used in TX construction
+uint64_t zipherx_get_last_change_diversifier_index(void);
+
 #endif // ZIPHERX_FFI_H

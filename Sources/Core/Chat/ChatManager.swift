@@ -128,6 +128,15 @@ final class ChatManager: ObservableObject {
         }
     }
 
+    /// FIX #1436: Our profile image (stored as file, not UserDefaults)
+    @Published var profileImage: Data? = nil
+
+    /// FIX #1436: Whether to share profile image with contacts
+    var isProfileImageShared: Bool {
+        get { UserDefaults.standard.bool(forKey: "chatShareProfileImage") }
+        set { UserDefaults.standard.set(newValue, forKey: "chatShareProfileImage") }
+    }
+
     // MARK: - Private Properties
 
     /// Connected peers (actor-isolated)
@@ -312,6 +321,26 @@ final class ChatManager: ObservableObject {
             database.saveContact(contacts[index])
             print("💬 \(contacts[index].isFavorite ? "Starred" : "Unstarred") contact: \(contact.displayName)")
         }
+    }
+
+    /// FIX #1433: Block a contact — no incoming messages will be shown
+    func blockContact(_ contact: ChatContact) {
+        guard let index = contacts.firstIndex(where: { $0.onionAddress == contact.onionAddress }) else { return }
+        var updated = contacts[index]
+        updated.isBlocked = true
+        contacts[index] = updated
+        database.saveContact(updated)
+        print("💬 FIX #1433: Blocked contact: \(contact.displayName)")
+    }
+
+    /// FIX #1433: Unblock a contact — incoming messages will be shown again
+    func unblockContact(_ contact: ChatContact) {
+        guard let index = contacts.firstIndex(where: { $0.onionAddress == contact.onionAddress }) else { return }
+        var updated = contacts[index]
+        updated.isBlocked = false
+        contacts[index] = updated
+        database.saveContact(updated)
+        print("💬 FIX #1433: Unblocked contact: \(contact.displayName)")
     }
 
     /// Connect to a contact via Tor SOCKS5 proxy
@@ -627,6 +656,17 @@ final class ChatManager: ObservableObject {
             status: .sending  // Start as sending
         )
 
+        // FIX #1432: If queue has pending messages for this contact, add to queue
+        // This preserves chronological order: queued M1, M2 must send before new M3
+        if let queued = messageQueue[contact.onionAddress], !queued.isEmpty {
+            print("💬 FIX #1432: Queue has \(queued.count) pending — adding new message to queue for ordering")
+            message.markQueued()
+            addMessageToConversation(message)
+            database.saveMessage(message, ourOnionAddress: ourOnionAddress)
+            queueMessage(message, for: contact.onionAddress)
+            return
+        }
+
         // Add to conversation immediately (shows as "sending")
         addMessageToConversation(message)
 
@@ -679,19 +719,54 @@ final class ChatManager: ObservableObject {
         address: String,
         memo: String?
     ) async throws {
-        let message = ChatMessage(
+        var message = ChatMessage(
             type: .paymentRequest,
             fromOnion: ourOnionAddress ?? "",
             toOnion: contact.onionAddress,
             content: memo ?? "Payment request",
             nickname: ourNickname.isEmpty ? nil : ourNickname,
             paymentAddress: address,
-            paymentAmount: amount
+            paymentAmount: amount,
+            status: .sending
         )
 
-        try await sendMessage(message, to: contact)
+        // FIX #1432: Gate behind queue for ordering
+        if let queued = messageQueue[contact.onionAddress], !queued.isEmpty {
+            print("💬 FIX #1432: Queue has \(queued.count) pending — adding payment request to queue for ordering")
+            message.markQueued()
+            addMessageToConversation(message)
+            database.saveMessage(message, ourOnionAddress: ourOnionAddress)
+            queueMessage(message, for: contact.onionAddress)
+            return
+        }
+
+        // FIX #1427: Add to conversation immediately (shows as "sending")
+        // Same pattern as sendTextMessage (FIX #249)
         addMessageToConversation(message)
-        database.saveMessage(message, ourOnionAddress: ourOnionAddress)
+
+        do {
+            try await sendMessage(message, to: contact)
+
+            // Update status to sent
+            message.markSent()
+            updateMessageInConversation(message)
+            database.saveMessage(message, ourOnionAddress: ourOnionAddress)
+        } catch {
+            // FIX #1427: Queue if recipient offline (same as FIX #249 for text messages)
+            if isOfflineError(error) {
+                print("💬 FIX #1427: Recipient offline, queueing payment request for \(contact.displayName)")
+                message.markQueued()
+                updateMessageInConversation(message)
+                database.saveMessage(message, ourOnionAddress: ourOnionAddress)
+                queueMessage(message, for: contact.onionAddress)
+                // Don't throw - message is queued, will be sent when online
+            } else {
+                message.markFailed()
+                updateMessageInConversation(message)
+                database.saveMessage(message, ourOnionAddress: ourOnionAddress)
+                throw error
+            }
+        }
     }
 
     /// Send payment confirmation back to the requester after completing a payment
@@ -706,21 +781,50 @@ final class ChatManager: ObservableObject {
         txId: String,
         requestId: String
     ) async throws {
-        let message = ChatMessage(
+        var message = ChatMessage(
             type: .paymentSent,
             fromOnion: ourOnionAddress ?? "",
             toOnion: contact.onionAddress,
             content: "Payment sent: \(txId)",
             nickname: ourNickname.isEmpty ? nil : ourNickname,
             paymentAmount: amount,
-            replyTo: requestId  // Link to the original payment request
+            replyTo: requestId,  // Link to the original payment request
+            status: .sending
         )
 
-        try await sendMessage(message, to: contact)
-        addMessageToConversation(message)
-        database.saveMessage(message, ourOnionAddress: ourOnionAddress)
+        // FIX #1432: Gate behind queue for ordering
+        if let queued = messageQueue[contact.onionAddress], !queued.isEmpty {
+            print("💬 FIX #1432: Queue has \(queued.count) pending — adding payment confirmation to queue for ordering")
+            message.markQueued()
+            addMessageToConversation(message)
+            database.saveMessage(message, ourOnionAddress: ourOnionAddress)
+            queueMessage(message, for: contact.onionAddress)
+            return
+        }
 
-        print("💸 Payment confirmation sent to \(contact.displayName) - txId: \(txId.prefix(16))...")
+        // FIX #1427: Add to conversation immediately, queue if offline
+        addMessageToConversation(message)
+
+        do {
+            try await sendMessage(message, to: contact)
+            message.markSent()
+            updateMessageInConversation(message)
+            database.saveMessage(message, ourOnionAddress: ourOnionAddress)
+            print("💸 Payment confirmation sent to \(contact.displayName) - txId: \(txId.prefix(16))...")
+        } catch {
+            if isOfflineError(error) {
+                print("💬 FIX #1427: Recipient offline, queueing payment confirmation for \(contact.displayName)")
+                message.markQueued()
+                updateMessageInConversation(message)
+                database.saveMessage(message, ourOnionAddress: ourOnionAddress)
+                queueMessage(message, for: contact.onionAddress)
+            } else {
+                message.markFailed()
+                updateMessageInConversation(message)
+                database.saveMessage(message, ourOnionAddress: ourOnionAddress)
+                throw error
+            }
+        }
     }
 
     /// Send typing indicator
@@ -742,9 +846,10 @@ final class ChatManager: ObservableObject {
         // Update unread count
         if let index = contacts.firstIndex(where: { $0.onionAddress == contact.onionAddress }) {
             var updatedContact = contacts[index]
-            totalUnreadCount -= updatedContact.unreadCount
             updatedContact.unreadCount = 0
             contacts[index] = updatedContact
+            // FIX #1431: Authoritative recompute instead of fragile subtract (prevents drift)
+            totalUnreadCount = contacts.reduce(0) { $0 + $1.unreadCount }
             conversation = ChatConversation(contact: updatedContact)
             conversation.messages = conversations[contact.onionAddress]?.messages ?? []
             conversations[contact.onionAddress] = conversation
@@ -1057,6 +1162,12 @@ final class ChatManager: ObservableObject {
     }
 
     private func handleReceivedMessage(_ message: ChatMessage, from peer: ChatPeer) {
+        // FIX #1433: Silently drop messages from blocked contacts
+        if let sender = contacts.first(where: { $0.onionAddress == message.fromOnion }), sender.isBlocked {
+            print("💬 FIX #1433: Dropped message from blocked contact: \(message.fromOnion.prefix(16))...")
+            return
+        }
+
         switch message.type {
         case .text, .paymentRequest, .paymentSent, .paymentReceived:
             addMessageToConversation(message)
@@ -1077,7 +1188,7 @@ final class ChatManager: ObservableObject {
                 if amount > 0 {
                     let txid = message.content.replacingOccurrences(of: "Payment sent: ", with: "")
                     NotificationManager.shared.notifyReceived(amount: amount, txid: txid)
-                    print("🔔 FIX #1386: System notification sent for chat payment of \(amount) zatoshis from \(senderName)")
+                    print("🔔 FIX #1386: System notification sent for chat payment of \(LogRedaction.redactAmount(UInt64(amount))) from \(senderName)")
                 }
             }
 
@@ -1379,6 +1490,28 @@ final class ChatManager: ObservableObject {
                     }
                 }
 
+                // FIX #1435: Proactive online check — try connecting to contacts not yet in peers dict
+                // This ensures contact list dots turn green when contacts come online (not just when they message us)
+                for contact in contacts where !contact.isBlocked {
+                    let isConnected: Bool
+                    if let peer = peers[contact.onionAddress] {
+                        isConnected = await peer.state.isConnected
+                    } else {
+                        isConnected = false
+                    }
+                    if !isConnected {
+                        do {
+                            try await connect(to: contact)
+                            print("💬 FIX #1435: Proactive connect to \(contact.displayName) succeeded — now online")
+                        } catch {
+                            // Silently fail — contact is genuinely offline
+                            if contact.isOnline {
+                                updateContactOnlineStatus(contact.onionAddress, isOnline: false)
+                            }
+                        }
+                    }
+                }
+
                 // FIX #249: Retry queued messages periodically
                 await retryQueuedMessages()
             }
@@ -1404,6 +1537,43 @@ final class ChatManager: ObservableObject {
         }
 
         totalUnreadCount = contacts.reduce(0) { $0 + $1.unreadCount }
+
+        // FIX #1436: Load profile image from disk
+        loadProfileImage()
+    }
+
+    // MARK: - FIX #1436: Profile Image
+
+    /// Directory for chat files (profile image, etc.)
+    private var chatFilesDirectory: URL {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("ZipherX/Chat")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    private var profileImageURL: URL {
+        chatFilesDirectory.appendingPathComponent("profile_image.jpg")
+    }
+
+    /// Save profile image to disk (nil to remove)
+    func saveProfileImage(_ imageData: Data?) {
+        profileImage = imageData
+        if let data = imageData {
+            try? data.write(to: profileImageURL)
+            print("💬 FIX #1436: Profile image saved (\(data.count) bytes)")
+        } else {
+            try? FileManager.default.removeItem(at: profileImageURL)
+            print("💬 FIX #1436: Profile image removed")
+        }
+    }
+
+    /// Load profile image from disk
+    private func loadProfileImage() {
+        if FileManager.default.fileExists(atPath: profileImageURL.path) {
+            profileImage = try? Data(contentsOf: profileImageURL)
+            print("💬 FIX #1436: Profile image loaded (\(profileImage?.count ?? 0) bytes)")
+        }
     }
 
     // MARK: - FIX #249: Message Queue Methods

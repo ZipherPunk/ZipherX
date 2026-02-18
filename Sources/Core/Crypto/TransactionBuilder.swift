@@ -517,6 +517,21 @@ final class TransactionBuilder {
         let txHex = rawTx.map { String(format: "%02x", $0) }.joined()
         print("📋 Raw TX hex: \(txHex)")
 
+        // FIX #1402 (NEW-004): Persist the change diversifier index used in this TX
+        let changeDivIndex = RustBridge.shared.getLastChangeDiversifierIndex()
+        if changeDivIndex >= 1_000_000_000 {
+            if let fvk = try? RustBridge.shared.deriveFullViewingKey(from: SaplingSpendingKey(data: spendingKey)),
+               let (changeAddr, _) = try? RustBridge.shared.derivePaymentAddress(from: fvk, diversifierIndex: changeDivIndex) {
+                try? WalletDatabase.shared.insertDiversifiedAddress(
+                    accountId: 1,
+                    diversifierIndex: changeDivIndex,
+                    address: changeAddr,
+                    label: "change"
+                )
+                print("📝 FIX #1402 (NEW-004): Persisted change diversifier index \(changeDivIndex)")
+            }
+        }
+
         // Return both transaction and nullifier of spent note
         print("📝 Spent note nullifier: \(note.nullifier.map { String(format: "%02x", $0) }.joined().prefix(16))...")
         return (rawTx, note.nullifier)
@@ -718,7 +733,7 @@ final class TransactionBuilder {
                     break
                 }
             }
-            print("📝 Selected \(selectedNotes.count) notes totaling \(accumulated) zatoshis")
+            print("📝 Selected \(selectedNotes.count) notes totaling \(accumulated.redactedAmount)")
         }
 
         let isMultiInput = selectedNotes.count > 1
@@ -1122,7 +1137,7 @@ final class TransactionBuilder {
             // FIX #803: Log spend info BEFORE FFI call for debugging
             print("🔍 FIX #803: Building multi-input TX with \(spends.count) spends")
             for (i, spend) in spends.enumerated() {
-                print("   Spend \(i): witness=\(spend.witness.count) bytes, value=\(spend.value)")
+                print("   Spend \(i): witness=\(spend.witness.count) bytes, value=\(spend.value.redactedAmount)")
             }
 
             // FIX #838: CRITICAL - Verify ALL witnesses are consistent BEFORE building multi-input TX
@@ -1193,6 +1208,21 @@ final class TransactionBuilder {
             let proofElapsed = Date().timeIntervalSince(proofStartTime)
             print("✅ Multi-input transaction built: \(result.txData.count) bytes [⏱️ Groth16: \(String(format: "%.2f", proofElapsed))s for \(spends.count) spends]")
             print("📝 Spent \(spends.count) notes")
+
+            // FIX #1402 (NEW-004): Persist the change diversifier index used in this TX
+            let changeDivIndex = RustBridge.shared.getLastChangeDiversifierIndex()
+            if changeDivIndex >= 1_000_000_000 {
+                if let fvk = try? RustBridge.shared.deriveFullViewingKey(from: SaplingSpendingKey(data: spendingKey)),
+                   let (changeAddr, _) = try? RustBridge.shared.derivePaymentAddress(from: fvk, diversifierIndex: changeDivIndex) {
+                    try? WalletDatabase.shared.insertDiversifiedAddress(
+                        accountId: 1,
+                        diversifierIndex: changeDivIndex,
+                        address: changeAddr,
+                        label: "change"
+                    )
+                    print("📝 FIX #1402 (NEW-004): Persisted change diversifier index \(changeDivIndex)")
+                }
+            }
 
             // Return transaction and first nullifier (for tracking)
             return (result.txData, result.nullifiers.first ?? Data())
@@ -1457,6 +1487,22 @@ final class TransactionBuilder {
                 // FIX #995: Log Groth16 proof generation time
                 let proofElapsed = Date().timeIntervalSince(proofStartTime)
                 print("✅ Transaction built: \(rawTx.count) bytes [⏱️ Groth16: \(String(format: "%.2f", proofElapsed))s]")
+
+                // FIX #1402 (NEW-004): Persist the change diversifier index used in this TX
+                let changeDivIndex = RustBridge.shared.getLastChangeDiversifierIndex()
+                if changeDivIndex >= 1_000_000_000 {
+                    if let fvk = try? RustBridge.shared.deriveFullViewingKey(from: SaplingSpendingKey(data: spendingKey)),
+                       let (changeAddr, _) = try? RustBridge.shared.derivePaymentAddress(from: fvk, diversifierIndex: changeDivIndex) {
+                        try? WalletDatabase.shared.insertDiversifiedAddress(
+                            accountId: 1,
+                            diversifierIndex: changeDivIndex,
+                            address: changeAddr,
+                            label: "change"
+                        )
+                        print("📝 FIX #1402 (NEW-004): Persisted change diversifier index \(changeDivIndex)")
+                    }
+                }
+
                 return (rawTx, note.nullifier)
             }  // End of else (single-input)
 
@@ -1525,7 +1571,7 @@ final class TransactionBuilder {
         for dbNote in dbNotes {
             // Calculate confirmations: chainHeight - noteHeight + 1
             let confirmations = chainHeight > dbNote.height ? Int(chainHeight - dbNote.height + 1) : 0
-            print("📝 Note: value=\(dbNote.value), height=\(dbNote.height), chainHeight=\(chainHeight), confirmations=\(confirmations), witness=\(dbNote.witness.count) bytes")
+            print("📝 Note: value=\(dbNote.value.redactedAmount), height=\(dbNote.height), chainHeight=\(chainHeight), confirmations=\(confirmations), witness=\(dbNote.witness.count) bytes")
             // Only include confirmed notes (1+ confirmations)
             guard confirmations >= 1 else {
                 print("📝 Skipping note: insufficient confirmations")
