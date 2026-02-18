@@ -233,5 +233,8 @@ Libraries/zipherx-ffi/src/bin/verify_tree.rs
 Libraries/zipherx-ffi/src/bin/verify_tree_correct.rs
 Libraries/zipherx-ffi/src/bin/verify_tree_no_reverse.rs
 
+# Tests (development only, not for public repo)
+Tests/
+
 # Zcash proofs library (build artifact)
 Libraries/zcash_proofs_zcl/

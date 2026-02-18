@@ -34,6 +34,7 @@ enum ChatMessageType: String, Codable {
     case ping = "ping"              // Presence check
     case pong = "pong"              // Presence response
     case nickname = "nickname"      // Nickname announcement
+    case avatar = "avatar"          // FIX #1441: Profile picture (base64 JPEG in content)
     case goodbye = "goodbye"        // User going offline
 }
 

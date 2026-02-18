@@ -227,17 +227,18 @@ struct ChatView: View {
             }
 
             // Only auto-start if not already available
-            guard !chatManager.isAvailable else {
-                print("💬 Chat: Already available")
-                return
+            if !chatManager.isAvailable {
+                do {
+                    try await chatManager.start()
+                    print("💬 Chat: Auto-started successfully")
+                } catch {
+                    print("💬 Chat: Auto-start failed: \(error.localizedDescription)")
+                    return
+                }
             }
 
-            do {
-                try await chatManager.start()
-                print("💬 Chat: Auto-started successfully")
-            } catch {
-                print("💬 Chat: Auto-start failed: \(error.localizedDescription)")
-            }
+            // FIX #1440: Trigger immediate online check so dots turn green right away
+            await chatManager.checkAllContactsOnline()
         }
     }
 
@@ -667,10 +668,24 @@ struct ChatView: View {
     }
 }
 
+// MARK: - FIX #1441: Cross-platform image helper
+
+/// Create a SwiftUI Image from Data (works on both iOS and macOS)
+private func platformImage(from data: Data) -> Image? {
+    #if os(iOS)
+    guard let uiImage = UIImage(data: data) else { return nil }
+    return Image(uiImage: uiImage)
+    #else
+    guard let nsImage = NSImage(data: data) else { return nil }
+    return Image(nsImage: nsImage)
+    #endif
+}
+
 // MARK: - Contact Row
 
 struct ContactRow: View {
     @EnvironmentObject private var themeManager: ThemeManager
+    @StateObject private var chatManager = ChatManager.shared
     let contact: ChatContact
     let isSelected: Bool
 
@@ -691,22 +706,33 @@ struct ContactRow: View {
         HStack(spacing: 14) {
             // Gradient Avatar with online indicator
             ZStack(alignment: .bottomTrailing) {
-                Circle()
-                    .fill(
-                        LinearGradient(
-                            colors: avatarGradient,
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
+                // FIX #1441: Show contact's avatar if available, otherwise gradient+initial
+                if let avatarData = chatManager.loadContactAvatar(for: contact.onionAddress),
+                   let avatarImage = platformImage(from: avatarData) {
+                    avatarImage
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 50, height: 50)
+                        .clipShape(Circle())
+                        .shadow(color: avatarGradient[0].opacity(0.3), radius: 4, y: 2)
+                } else {
+                    Circle()
+                        .fill(
+                            LinearGradient(
+                                colors: avatarGradient,
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
                         )
-                    )
-                    .frame(width: 50, height: 50)
-                    .overlay(
-                        Text(contact.displayName.prefix(1).uppercased())
-                            .font(.system(size: 20, weight: .bold, design: .rounded))
-                            .foregroundColor(.white)
-                            .shadow(color: .black.opacity(0.2), radius: 1)
-                    )
-                    .shadow(color: avatarGradient[0].opacity(0.3), radius: 4, y: 2)
+                        .frame(width: 50, height: 50)
+                        .overlay(
+                            Text(contact.displayName.prefix(1).uppercased())
+                                .font(.system(size: 20, weight: .bold, design: .rounded))
+                                .foregroundColor(.white)
+                                .shadow(color: .black.opacity(0.2), radius: 1)
+                        )
+                        .shadow(color: avatarGradient[0].opacity(0.3), radius: 4, y: 2)
+                }
 
                 // FIX #1429: Always show status dot — green=online, orange=offline, red=blocked
                 ZStack {
@@ -993,24 +1019,33 @@ struct ConversationView: View {
 
             // Contact info — FIX #1430: Use liveContact for dynamic status
             HStack(spacing: 10) {
-                // Mini avatar
-                Circle()
-                    .fill(
-                        LinearGradient(
-                            colors: [
-                                Color(hue: Double(abs(liveContact.displayName.hashValue) % 360) / 360.0, saturation: 0.7, brightness: 0.8),
-                                Color(hue: Double((abs(liveContact.displayName.hashValue) + 40) % 360) / 360.0, saturation: 0.6, brightness: 0.6)
-                            ],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
+                // Mini avatar — FIX #1441: Show contact's avatar if received
+                if let avatarData = chatManager.loadContactAvatar(for: liveContact.onionAddress),
+                   let avatarImage = platformImage(from: avatarData) {
+                    avatarImage
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 36, height: 36)
+                        .clipShape(Circle())
+                } else {
+                    Circle()
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    Color(hue: Double(abs(liveContact.displayName.hashValue) % 360) / 360.0, saturation: 0.7, brightness: 0.8),
+                                    Color(hue: Double((abs(liveContact.displayName.hashValue) + 40) % 360) / 360.0, saturation: 0.6, brightness: 0.6)
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
                         )
-                    )
-                    .frame(width: 36, height: 36)
-                    .overlay(
-                        Text(liveContact.displayName.prefix(1).uppercased())
-                            .font(.system(size: 14, weight: .bold))
-                            .foregroundColor(.white)
-                    )
+                        .frame(width: 36, height: 36)
+                        .overlay(
+                            Text(liveContact.displayName.prefix(1).uppercased())
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundColor(.white)
+                        )
+                }
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(liveContact.displayName)

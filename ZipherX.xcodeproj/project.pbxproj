@@ -10,6 +10,8 @@
 		002097046620424C5DEFD964 /* SQLCipherManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9068ED711254490CAD1CD553 /* SQLCipherManager.swift */; };
 		00F53085F3953FDC9CEEC6A9 /* InsightAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 710E39D55C6AFE9BB6AEA11D /* InsightAPI.swift */; };
 		027C0FBFA0CD3C9E21C357CD /* ClipboardManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C76A4256B2657D68B859C13 /* ClipboardManager.swift */; };
+		0A1B2C3D4E5F60718293A4B5 /* PrintSilencer.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5A4938271605F4E3D2C1B0A /* PrintSilencer.swift */; };
+		C6D7E8F90A1B2C3D4E5F6071 /* PrintSilencer.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5A4938271605F4E3D2C1B0A /* PrintSilencer.swift */; };
 		060287BCEAF96F0B259A3B7B /* Constants.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9C06A2912C98B98AD2E5D87 /* Constants.swift */; };
 		06809D718F601662F7E64D8B /* TorManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CE0707D0A98DFEF7F487D9B /* TorManager.swift */; };
 		0684A1BB0B46362A008208F3 /* System7Components.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79B539975C988B8093FB4106 /* System7Components.swift */; };
@@ -234,6 +236,7 @@
 		36B187CE34B94597E7499ACF /* AppUpdateChecker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppUpdateChecker.swift; sourceTree = "<group>"; };
 		374534D4E96BDE4077D846D2 /* BoostDownloadProgressView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BoostDownloadProgressView.swift; sourceTree = "<group>"; };
 		390E59ED284539CE4E8B6B8E /* ZSTDDecoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZSTDDecoder.swift; sourceTree = "<group>"; };
+		B5A4938271605F4E3D2C1B0A /* PrintSilencer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrintSilencer.swift; sourceTree = "<group>"; };
 		426F735D18C658425E86F4D4 /* ExplorerViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExplorerViewModel.swift; sourceTree = "<group>"; };
 		48D92FD9B357E6379040DA58 /* Peer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Peer.swift; sourceTree = "<group>"; };
 		4F54464087D684EC795896B7 /* SaplingParams.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SaplingParams.swift; sourceTree = "<group>"; };
@@ -666,6 +669,7 @@
 			isa = PBXGroup;
 			children = (
 				9C76A4256B2657D68B859C13 /* ClipboardManager.swift */,
+				B5A4938271605F4E3D2C1B0A /* PrintSilencer.swift */,
 				390E59ED284539CE4E8B6B8E /* ZSTDDecoder.swift */,
 			);
 			path = Utilities;
@@ -950,6 +954,7 @@
 				ED160AAE5D5BE3EE9480FEF2 /* WalletSetupView.swift in Sources */,
 				06B12D7857EFEC8AC250FC21 /* Win95Theme.swift in Sources */,
 				D12D1FC3E8D5528FFBD4BDCE /* ZSTDDecoder.swift in Sources */,
+				0A1B2C3D4E5F60718293A4B5 /* PrintSilencer.swift in Sources */,
 				40485458E29ECDBC6551AD18 /* ZipherXApp.swift in Sources */,
 				69439D42385913BA2D7F4EEC /* ZipherXFFI.swift in Sources */,
 			);
@@ -1041,6 +1046,7 @@
 				2A310DACA7C2E48D320A1600 /* WalletSetupView.swift in Sources */,
 				DFB88567CE1D7F8126F32FE6 /* Win95Theme.swift in Sources */,
 				AAAA7D846C416018A6016B6A /* ZSTDDecoder.swift in Sources */,
+				C6D7E8F90A1B2C3D4E5F6071 /* PrintSilencer.swift in Sources */,
 				8F90F1D58322A43F385FB321 /* ZipherXApp.swift in Sources */,
 				7EC2BE84340E3513C2F738E6 /* ZipherXFFI.swift in Sources */,
 			);

@@ -2603,11 +2603,13 @@ public final class Peer {
         // No other operation needs messageLock, so we can let receive(count:) block until
         // data arrives. ONE NWConnection.receive callback at a time = zero orphaned callbacks.
         //
-        // Timeout: 120s for the initial header read. Blocks come every ~75s, pings every ~60s.
-        // If 120s passes with zero data, the peer is dead — connection is killed, listener exits.
+        // FIX #1439: Increased from 120s to 300s. During witness rebuild / tree operations,
+        // block listeners may be paused for 2-3 minutes. 120s killed good peers prematurely
+        // causing peer count to drop to 1. 300s gives ample room for long operations.
+        // Blocks come every ~75s, pings every ~60s. If 300s passes with zero data, the peer is truly dead.
         // For stopping: FIX #1196's withTaskCancellationHandler resumes the continuation
         // immediately on blockListenerTask?.cancel().
-        return try await receiveMessageTolerant(headerTimeout: 120.0)
+        return try await receiveMessageTolerant(headerTimeout: 300.0)
     }
 
     /// Tolerant receive that throws invalidMagicBytes instead of handshakeFailed
@@ -2615,7 +2617,8 @@ public final class Peer {
     /// Without checksum validation, a corrupted message with wrong length field would
     /// read the wrong number of bytes, misaligning all subsequent reads.
     /// FIX #1181: On invalid magic, attempt resync (same as receiveMessage)
-    /// FIX #1184b: Added headerTimeout parameter. Block listener uses 120s (blocks ~75s, pings ~60s).
+    /// FIX #1184b: Added headerTimeout parameter. FIX #1439: Block listener uses 300s (was 120s).
+    ///            120s was too aggressive during witness rebuild — killed good peers.
     ///            Payload reads still use the default 15s since data should flow continuously.
     private func receiveMessageTolerant(headerTimeout: TimeInterval = P2PTimeout.messageReceive, killConnectionOnTimeout: Bool = true) async throws -> (String, Data) {
         // Read header (24 bytes) — use headerTimeout for the initial wait

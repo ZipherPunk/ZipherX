@@ -3422,30 +3422,11 @@ struct ContentView: View {
             .environmentObject(themeManager)
         }
         .sheet(isPresented: $showCypherpunkChat) {
-            ZStack(alignment: .topTrailing) {
-                // FIX #252: Pass callback to navigate to main app settings when Tor is disabled
-                ChatView(onShowAppSettings: {
-                    showCypherpunkChat = false
-                    showCypherpunkSettings = true
-                })
-
-                // Close button overlay
-                // FIX #252: Moved down to avoid overlapping with + button on iOS navigation bar
-                Button(action: { showCypherpunkChat = false }) {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 24))
-                        .foregroundColor(NeonColors.primary.opacity(0.8))
-                        .background(Color.black.opacity(0.5))
-                        .clipShape(Circle())
-                }
-                .buttonStyle(PlainButtonStyle())
-                #if os(iOS)
-                .padding(.top, 52)  // FIX #252: Below navigation bar to avoid overlap with + button
-                #else
-                .padding(.top, 8)
-                #endif
-                .padding(.trailing, 8)
-            }
+            // FIX #252: Pass callback to navigate to main app settings when Tor is disabled
+            ChatView(onShowAppSettings: {
+                showCypherpunkChat = false
+                showCypherpunkSettings = true
+            })
             .background(Color.black)
             #if os(macOS)
             // FIX #257: Use min/ideal/max constraints for better macOS window sizing

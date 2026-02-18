@@ -205,6 +205,50 @@ struct DisclaimerView: View {
                 """
             )
 
+            // Section 10: Beta / Experimental Software
+            sectionView(
+                title: "10. EXPERIMENTAL SOFTWARE",
+                icon: "exclamationmark.triangle.fill",
+                content: """
+                ZipherX is beta software under active development. It may contain bugs, errors, \
+                defects, or incomplete features that could result in loss of funds, corrupted data, \
+                or unexpected behavior. There is NO guarantee that the software will function correctly, \
+                continuously, or without interruption. \
+                DO NOT use this software with funds you cannot afford to lose entirely and permanently.
+                """
+            )
+
+            // Section 11: Indemnification
+            sectionView(
+                title: "11. INDEMNIFICATION",
+                content: """
+                BY USING THIS SOFTWARE, YOU AGREE TO INDEMNIFY, DEFEND, AND HOLD HARMLESS THE DEVELOPERS, \
+                CONTRIBUTORS, AND COPYRIGHT HOLDERS FROM AND AGAINST ANY AND ALL CLAIMS, LIABILITIES, \
+                DAMAGES, LOSSES, COSTS, AND EXPENSES (INCLUDING REASONABLE LEGAL FEES) ARISING OUT OF OR \
+                RELATED TO YOUR USE OR MISUSE OF THIS SOFTWARE, YOUR VIOLATION OF THIS DISCLAIMER, \
+                OR YOUR VIOLATION OF ANY APPLICABLE LAW OR REGULATION.
+                """
+            )
+
+            // Section 12: Third-Party Services & Force Majeure
+            sectionView(
+                title: "12. THIRD-PARTY SERVICES & FORCE MAJEURE",
+                icon: "link",
+                content: """
+                ZipherX relies on third-party decentralized services including but not limited to: \
+                the Zclassic blockchain network, the Tor anonymity network, and peer-to-peer node operators. \
+                The developer(s) have NO control over these networks and accept NO responsibility for:
+
+                \u{2022} Network outages, congestion, or failures
+                \u{2022} Blockchain forks, reorganizations, or protocol changes
+                \u{2022} Tor network disruptions or de-anonymization attacks
+                \u{2022} Malicious peer nodes or Sybil attacks
+                \u{2022} Acts of God, war, government action, or any event beyond reasonable control
+
+                Your use of these third-party networks is entirely at your own risk.
+                """
+            )
+
             // Cypherpunk quote
             quoteView
 
@@ -269,11 +313,13 @@ struct DisclaimerView: View {
                 .foregroundColor(.white)
 
             VStack(alignment: .leading, spacing: 8) {
-                acknowledgmentItem("You have read and understood this disclaimer")
+                acknowledgmentItem("You have read and understood all 12 sections of this disclaimer")
                 acknowledgmentItem("You are at least 18 years of age or the age of majority in your jurisdiction")
                 acknowledgmentItem("You accept full responsibility for your use of this software")
                 acknowledgmentItem("You will comply with all applicable laws in your jurisdiction")
-                acknowledgmentItem("You understand the risks of using cryptocurrency")
+                acknowledgmentItem("You understand the risks of using cryptocurrency and beta software")
+                acknowledgmentItem("You agree to the indemnification terms in Section 11")
+                acknowledgmentItem("You understand that third-party networks are outside the developer's control")
             }
         }
         .padding(16)

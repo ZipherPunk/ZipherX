@@ -1,5 +1,27 @@
 # ZipherX
 
+> **IMPORTANT LEGAL DISCLAIMER**
+>
+> THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT. THE ENTIRE RISK AS TO THE QUALITY, PERFORMANCE, ACCURACY, AND RELIABILITY OF THIS SOFTWARE REMAINS WITH YOU.
+>
+> **NO LIABILITY FOR LOSS OF FUNDS.** ZipherX is experimental, open-source software. The authors, contributors, and maintainers of this project shall NOT be held liable, under any circumstances, for any loss of funds, loss of cryptocurrency, loss of data, financial damages, or any other damages whatsoever (including but not limited to direct, indirect, incidental, special, consequential, or exemplary damages) arising out of or in connection with the use, misuse, or inability to use this software, even if advised of the possibility of such damages.
+>
+> **YOU ARE SOLELY RESPONSIBLE** for securing your private keys, spending keys, seed phrases, and wallet backups. If you lose your keys, your funds are permanently and irreversibly lost. No one — including the developers — can recover them.
+>
+> **CRYPTOCURRENCY TRANSACTIONS ARE IRREVERSIBLE.** Once a transaction is broadcast to the network, it cannot be undone, reversed, or refunded. Always verify recipient addresses and amounts before sending.
+>
+> **THIS IS NOT FINANCIAL ADVICE.** This software does not constitute financial, investment, tax, or legal advice. Consult a qualified professional before making any financial decisions involving cryptocurrency.
+>
+> **REGULATORY COMPLIANCE IS YOUR RESPONSIBILITY.** Cryptocurrency regulations vary by jurisdiction. It is your sole responsibility to ensure that your use of this software complies with all applicable local, state, national, and international laws and regulations.
+>
+> **NO GUARANTEE OF SECURITY.** While ZipherX implements industry-standard cryptographic protocols (zk-SNARKs, Groth16, Curve25519, AES-256), no software is guaranteed to be free of vulnerabilities. Use at your own risk.
+>
+> **BETA SOFTWARE.** This software is under active development and may contain bugs, errors, or incomplete features. Do not use this software with funds you cannot afford to lose.
+>
+> By downloading, installing, or using ZipherX, you acknowledge that you have read, understood, and agree to this disclaimer in its entirety. If you do not agree, do not use this software.
+
+---
+
 **Privacy-focused, non-custodial cryptocurrency wallet for Zclassic (ZCL)**
 
 ZipherX provides full-node-level security through direct P2P networking — without running a full node. Your keys never leave your device. All network traffic is routed through Tor for maximum privacy.
@@ -75,7 +97,7 @@ Parameters are stored in `~/Library/Application Support/ZipherX/SaplingParams/`.
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/AurumWallet/ZipherX.git
+git clone https://github.com/VictorLux/ZipherX.git
 cd ZipherX
 
 # 2. Build the Rust FFI library
@@ -95,7 +117,7 @@ open ZipherX.xcodeproj
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/AurumWallet/ZipherX.git
+git clone https://github.com/VictorLux/ZipherX.git
 cd ZipherX
 
 # 2. Build the Rust FFI library for iOS

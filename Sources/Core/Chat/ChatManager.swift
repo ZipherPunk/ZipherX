@@ -480,6 +480,11 @@ final class ChatManager: ObservableObject {
             try? await sendNickname(to: contact)
         }
 
+        // FIX #1441: Send our profile picture if sharing is enabled
+        if isProfileImageShared, let imageData = profileImage {
+            try? await sendAvatar(imageData, to: contact)
+        }
+
         updateContactOnlineStatus(contact.onionAddress, isOnline: true)
         print("💬 Connected to \(contact.displayName)")
     }
@@ -1260,6 +1265,13 @@ final class ChatManager: ObservableObject {
             }
             updateContactNickname(message.fromOnion, nickname: message.content)
 
+        case .avatar:
+            // FIX #1441: Received contact's profile picture (base64 JPEG in content)
+            if let avatarData = Data(base64Encoded: message.content), !avatarData.isEmpty {
+                saveContactAvatar(avatarData, for: message.fromOnion)
+                print("💬 FIX #1441: Received avatar from \(message.fromOnion.prefix(8))... (\(avatarData.count) bytes)")
+            }
+
         case .goodbye:
             // Peer is disconnecting
             updateContactOnlineStatus(message.fromOnion, isOnline: false)
@@ -1336,6 +1348,41 @@ final class ChatManager: ObservableObject {
             content: ourNickname
         )
         try await sendMessage(message, to: contact)
+    }
+
+    /// FIX #1441: Send our profile picture to a contact (base64 JPEG)
+    private func sendAvatar(_ imageData: Data, to contact: ChatContact) async throws {
+        let base64 = imageData.base64EncodedString()
+        let message = ChatMessage(
+            type: .avatar,
+            fromOnion: ourOnionAddress ?? "",
+            toOnion: contact.onionAddress,
+            content: base64
+        )
+        try await sendMessage(message, to: contact)
+        print("💬 FIX #1441: Sent avatar to \(contact.displayName) (\(imageData.count) bytes)")
+    }
+
+    /// FIX #1441: Save received contact avatar to disk
+    func saveContactAvatar(_ data: Data, for onionAddress: String) {
+        let url = contactAvatarURL(for: onionAddress)
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? data.write(to: url)
+        // Notify UI to refresh
+        objectWillChange.send()
+    }
+
+    /// FIX #1441: Load contact avatar from disk
+    func loadContactAvatar(for onionAddress: String) -> Data? {
+        let url = contactAvatarURL(for: onionAddress)
+        return try? Data(contentsOf: url)
+    }
+
+    /// FIX #1441: File URL for a contact's avatar
+    private func contactAvatarURL(for onionAddress: String) -> URL {
+        // Use first 16 chars of onion address as filename (safe, unique)
+        let safeName = String(onionAddress.prefix(16)).replacingOccurrences(of: ".", with: "_")
+        return chatFilesDirectory.appendingPathComponent("avatars/\(safeName).jpg")
     }
 
     // MARK: - Helper Methods
@@ -1460,8 +1507,34 @@ final class ChatManager: ObservableObject {
         return address.range(of: pattern, options: .regularExpression) != nil
     }
 
+    /// FIX #1440: Public method to trigger immediate online check for all contacts
+    /// Called when chat view first appears so dots are green right away (not after 30s)
+    func checkAllContactsOnline() async {
+        for contact in contacts where !contact.isBlocked {
+            let isConnected: Bool
+            if let peer = peers[contact.onionAddress] {
+                isConnected = await peer.state.isConnected
+            } else {
+                isConnected = false
+            }
+            if !isConnected {
+                do {
+                    try await connect(to: contact)
+                    print("💬 FIX #1440: Initial connect to \(contact.displayName) succeeded — online")
+                } catch {
+                    if contact.isOnline {
+                        updateContactOnlineStatus(contact.onionAddress, isOnline: false)
+                    }
+                }
+            }
+        }
+    }
+
     private func startMaintenanceLoop() {
         maintenanceTask = Task {
+            // FIX #1440: Run proactive online check immediately (don't wait 30s)
+            await checkAllContactsOnline()
+
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 30_000_000_000) // 30 seconds
 
