@@ -294,12 +294,16 @@ actor CommitmentTreeUpdater {
                     }
                 }
 
-                // Check 3: Known boost file locations (standard app directories)
+                // Check 3: Known boost file locations (macOS only — iOS sandbox has no user home access)
+                #if os(macOS)
                 let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
                 let knownPaths = [
                     "\(homeDir)/Documents/BoostCache/zipherx_boost_v1.bin",
                     "\(homeDir)/ZipherX_Boost/zipherx_boost_v1.bin"
                 ]
+                #else
+                let knownPaths: [String] = []
+                #endif
 
                 for knownPath in knownPaths {
                     if FileManager.default.fileExists(atPath: knownPath) {
