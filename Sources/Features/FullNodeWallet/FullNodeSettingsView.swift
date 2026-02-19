@@ -1045,7 +1045,10 @@ struct FullNodeSettingsView: View {
             authErrorMessage = "PINs do not match"
             return
         }
-        let hashedPIN = PINSecurity.hashPIN(pinCode)
+        /// VUL-U-004: Generate per-user random salt (same as SettingsView)
+        let salt = PINSecurity.generateSalt()
+        PINSecurity.storePINSalt(salt)
+        let hashedPIN = PINSecurity.hashPIN(pinCode, salt: salt)
         PINSecurity.storePINHash(hashedPIN)  // VUL-STOR-002
         pinCode = ""
         confirmPIN = ""

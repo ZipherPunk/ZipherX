@@ -2831,10 +2831,28 @@ struct ContentView: View {
             }
 
             // Security audit TASK 17: Privacy overlay — covers wallet content in app switcher
+            // VUL-U-006: Blur overlay with app name to protect sensitive data
             if showPrivacyOverlay {
-                Color.black
-                    .ignoresSafeArea()
-                    .transition(.opacity)
+                ZStack {
+                    Color.black
+                        .ignoresSafeArea()
+                    #if os(iOS)
+                    VisualEffectBlur(blurStyle: .systemUltraThinMaterialDark)
+                        .ignoresSafeArea()
+                    #else
+                    Color.black.opacity(0.95)
+                        .ignoresSafeArea()
+                    #endif
+                    VStack(spacing: 20) {
+                        Text("ZipherX")
+                            .font(.system(size: 48, weight: .bold, design: .monospaced))
+                            .foregroundColor(.white)
+                        Text("Privacy Protected")
+                            .font(.system(size: 16, weight: .medium, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.7))
+                    }
+                }
+                .transition(.opacity)
             }
         }
         .alert("Screenshot Detected", isPresented: $showScreenshotWarning) {
@@ -2867,6 +2885,8 @@ struct ContentView: View {
             // FIX #1273: Always lock app when going to background
             biometricManager.lockApp()
             isShowingLockScreen = true
+            // VUL-U-006: Privacy overlay to protect sensitive data in app switcher
+            showPrivacyOverlay = true
 
         case .active:
             // Security audit TASK 17: Clear privacy overlay when returning to foreground
@@ -4245,6 +4265,21 @@ struct HealthAlertSheet: View {
         }
     }
 }
+
+// VUL-U-006: Visual effect blur for iOS privacy overlay
+#if os(iOS)
+struct VisualEffectBlur: UIViewRepresentable {
+    var blurStyle: UIBlurEffect.Style
+
+    func makeUIView(context: Context) -> UIVisualEffectView {
+        return UIVisualEffectView(effect: UIBlurEffect(style: blurStyle))
+    }
+
+    func updateUIView(_ uiView: UIVisualEffectView, context: Context) {
+        uiView.effect = UIBlurEffect(style: blurStyle)
+    }
+}
+#endif
 
 #Preview {
     ContentView()

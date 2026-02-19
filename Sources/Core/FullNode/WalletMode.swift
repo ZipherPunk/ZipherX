@@ -60,17 +60,17 @@ public enum WalletSource: String, Codable, CaseIterable {
 /// Wallet operating mode - determines how ZipherX connects to the blockchain
 public enum WalletMode: String, Codable, CaseIterable {
     /// Light mode - P2P network, bundled commitment tree, mobile-friendly
-    /// Storage: ~50MB, Startup: Fast, Platform: iOS + macOS
+    /// Storage: ~1.5GB, Startup: Fast, Platform: iOS + macOS
     case light = "light"
 
     /// Full node mode - Local zclassicd daemon, full blockchain
-    /// Storage: ~5GB, Startup: Requires sync, Platform: macOS only
+    /// Storage: ~15GB, Startup: Requires sync, Platform: macOS only
     case fullNode = "fullNode"
 
     var displayName: String {
         switch self {
         case .light:
-            return "ZipherX Light"
+            return "ZipherX"
         case .fullNode:
             return "ZipherX Full Node"
         }
@@ -99,7 +99,7 @@ public enum WalletMode: String, Codable, CaseIterable {
         case .light:
             return [
                 "Instant startup with bundled tree",
-                "~50MB storage requirement",
+                "~1.5 GB storage requirement",
                 "P2P decentralized network",
                 "Works on iOS and macOS",
                 "Perfect for mobile use"
@@ -109,7 +109,7 @@ public enum WalletMode: String, Codable, CaseIterable {
                 "Full blockchain verification",
                 "Local zclassicd daemon",
                 "Built-in block explorer",
-                "~5GB storage requirement",
+                "~15 GB storage requirement",
                 "macOS only"
             ]
         }
@@ -126,9 +126,9 @@ public enum WalletMode: String, Codable, CaseIterable {
     var storageRequirement: String {
         switch self {
         case .light:
-            return "~50 MB"
+            return "~1.5 GB"
         case .fullNode:
-            return "~5 GB"
+            return "~15 GB"
         }
     }
 }

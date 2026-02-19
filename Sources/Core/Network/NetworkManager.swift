@@ -830,12 +830,8 @@ public final class NetworkManager: ObservableObject {
 
     /// Check if an address is on cooldown (recently attempted)
     /// FIX #235: Hardcoded seeds are NEVER on cooldown
+    /// VUL-N-014: ALL peers subject to cooldown (hardcoded seeds no longer exempt)
     private func isOnCooldown(_ host: String, port: UInt16) -> Bool {
-        // FIX #235: Hardcoded Zclassic seeds are exempt from cooldown
-        if HARDCODED_SEEDS.contains(host) {
-            return false  // Always retry hardcoded seeds
-        }
-
         let key = "\(host):\(port)"
         connectionAttemptsLock.lock()
         defer { connectionAttemptsLock.unlock() }
@@ -946,6 +942,10 @@ public final class NetworkManager: ObservableObject {
         "dnsseed.rotorproject.org",
         "dnsseed.zclnet.net"
     ]
+
+    // VUL-N-011: DNS cache with 1-hour TTL to reduce DNS queries and improve privacy
+    private var dnsCache: [String: (addresses: [PeerAddress], resolvedAt: Date)] = [:]
+    private let DNS_CACHE_TTL: TimeInterval = 3600 // 1 hour
 
     // FIX #229: Trusted peers are now loaded from database table
     // Use getTrustedPeersForBootstrap() instead of hardcoded array
@@ -1733,6 +1733,14 @@ public final class NetworkManager: ObservableObject {
     /// FIX #384: Delegates to PeerManager
     func clearParkedHardcodedSeeds() {
         PeerManager.shared.clearParkedHardcodedSeeds()
+    }
+
+    /// VUL-N-011: Clear DNS cache (useful for manual refresh or testing)
+    func clearDNSCache() {
+        dnsCache.removeAll()
+        if verbose {
+            print("🗑️ VUL-N-011: DNS cache cleared")
+        }
     }
 
     // MARK: - FIX #284: Preferred Seeds
@@ -5244,6 +5252,21 @@ public final class NetworkManager: ObservableObject {
     }
 
     private func resolveDNSSeed(_ hostname: String) async -> [PeerAddress] {
+        // VUL-N-011: Check DNS cache first (1-hour TTL)
+        if let cached = dnsCache[hostname] {
+            let age = Date().timeIntervalSince(cached.resolvedAt)
+            if age < DNS_CACHE_TTL {
+                if verbose {
+                    print("🗂️ VUL-N-011: Using cached DNS for \(hostname) (age: \(Int(age))s)")
+                }
+                return cached.addresses
+            } else {
+                if verbose {
+                    print("⏰ VUL-N-011: DNS cache expired for \(hostname) (age: \(Int(age))s)")
+                }
+            }
+        }
+
         return await withCheckedContinuation { continuation in
             // Dispatch DNS resolution to background queue to avoid priority inversion
             DispatchQueue.global(qos: .utility).async {
@@ -5266,6 +5289,12 @@ public final class NetworkManager: ObservableObject {
                     }
                     let hostStr = String(cString: hostnameBuffer)
                     peerAddresses.append(PeerAddress(host: hostStr, port: self.defaultPort))
+                }
+
+                // VUL-N-011: Store in cache
+                self.dnsCache[hostname] = (addresses: peerAddresses, resolvedAt: Date())
+                if self.verbose {
+                    print("💾 VUL-N-011: Cached \(peerAddresses.count) addresses for \(hostname)")
                 }
 
                 continuation.resume(returning: peerAddresses)

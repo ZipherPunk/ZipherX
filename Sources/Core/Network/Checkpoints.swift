@@ -114,8 +114,8 @@ enum ZclassicCheckpoints {
     /// FIX #234: Added known working Zclassic nodes (MagicBean) as DNS seeds often return Zcash nodes
     /// FIX #507: Added localhost as highest priority seed
     /// FIX #927: Production mode - all seeds enabled (same as Zclassic source)
+    /// VUL-N-003: localhost removed — only added dynamically in Full Node mode
     static let seedNodes: [String] = [
-        "127.0.0.1",          // Local node first (highest priority if running)
         "140.174.189.3",      // MagicBean node cluster
         "140.174.189.17",     // MagicBean node cluster
         "205.209.104.118",    // MagicBean node

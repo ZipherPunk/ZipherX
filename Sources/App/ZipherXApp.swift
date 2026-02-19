@@ -19,6 +19,7 @@ struct ZipherXApp: App {
     @State private var hasCheckedDaemon = false
     @State private var showModeSelection = false
     #endif
+    @State private var hasAcceptedDisclaimer = UserDefaults.standard.bool(forKey: "hasAcceptedDisclaimer")
 
     // iOS: Use AppDelegate for background fetch
     #if os(iOS)
@@ -94,43 +95,47 @@ struct ZipherXApp: App {
 
     var body: some Scene {
         WindowGroup {
-            #if os(macOS)
-            // macOS: Check for daemon and show mode selection if needed
             Group {
-                if showModeSelection {
+                if !hasAcceptedDisclaimer {
+                    // Step 1: Disclaimer (first launch)
+                    DisclaimerView(hasAcceptedDisclaimer: $hasAcceptedDisclaimer)
+                }
+                #if os(macOS)
+                else if !modeManager.hasSelectedMode && (showModeSelection || !hasCheckedDaemon) {
+                    // Step 2: Mode selection (macOS, first launch after disclaimer)
                     ModeSelectionView { mode in
                         modeManager.setMode(mode)
                         showModeSelection = false
                     }
                     .environmentObject(themeManager)
-                } else {
+                }
+                #endif
+                else {
+                    // Step 3: Main app
                     ContentView()
                         .environmentObject(walletManager)
                         .environmentObject(networkManager)
                         .environmentObject(themeManager)
                 }
             }
+            #if os(macOS)
             .task {
                 // Only check once at startup
                 guard !hasCheckedDaemon else { return }
-                hasCheckedDaemon = true
 
                 // Check if daemon is running
                 let daemonDetected = await modeManager.checkForRunningDaemon()
 
-                // Show mode selection if daemon detected and user hasn't chosen
-                if daemonDetected && !modeManager.hasSelectedMode {
-                    await MainActor.run {
+                await MainActor.run {
+                    hasCheckedDaemon = true
+                    // If no daemon and user hasn't chosen, auto-select light mode
+                    if !daemonDetected && !modeManager.hasSelectedMode {
+                        modeManager.setMode(.light)
+                    } else if daemonDetected && !modeManager.hasSelectedMode {
                         showModeSelection = true
                     }
                 }
             }
-            #else
-            // iOS: Always light mode, no selection needed
-            ContentView()
-                .environmentObject(walletManager)
-                .environmentObject(networkManager)
-                .environmentObject(themeManager)
             #endif
         }
     }

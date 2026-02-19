@@ -2435,4 +2435,30 @@ enum ZipherXFFI {
         }
         return result == 0
     }
+
+    // MARK: - VUL-F-007: Configurable Transaction Fee
+
+    /// Set the transaction fee used for all subsequent transaction builds
+    /// - Parameter fee: Fee in zatoshis (must be 10,000–1,000,000 i.e. 0.0001–0.01 ZCL)
+    /// - Returns: true if successful, false if invalid fee or lock failure
+    static func setTransactionFee(_ fee: UInt64) -> Bool {
+        // Swift-side guard (defense in depth — Rust also validates)
+        guard fee >= 10_000, fee <= 1_000_000 else {
+            print("VUL-F-007: Swift rejected fee \(fee) — must be 10,000–1,000,000 zatoshis")
+            return false
+        }
+        let result = zipherx_set_transaction_fee(fee)
+        if result != 1 {
+            print("VUL-F-007: Failed to set transaction fee to \(fee) zatoshis (error code: \(result))")
+            return false
+        }
+        print("VUL-F-007: Transaction fee set to \(fee) zatoshis (0.\(String(format: "%08d", fee)) ZCL)")
+        return true
+    }
+
+    /// Get the current transaction fee setting
+    /// - Returns: Current fee in zatoshis (default 10000)
+    static func getTransactionFee() -> UInt64 {
+        return zipherx_get_transaction_fee()
+    }
 }

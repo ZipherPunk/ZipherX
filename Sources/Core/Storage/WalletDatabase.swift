@@ -207,6 +207,12 @@ final class WalletDatabase {
         }
     }
 
+    /// VUL-S-003: Execute a database operation on the serial queue
+    /// Ensures all database operations are serialized to prevent concurrent access
+    private func dbSync<T>(_ block: () throws -> T) rethrows -> T {
+        return try dbQueue.sync { try block() }
+    }
+
     // MARK: - VUL-009: Nullifier Hashing
 
     /// Hash a nullifier for privacy-preserving storage
@@ -324,6 +330,9 @@ final class WalletDatabase {
 
     private var db: OpaquePointer?
     private let dbPath: String
+
+    /// VUL-S-003: Serial queue for thread-safe database access
+    private let dbQueue = DispatchQueue(label: "com.zipherx.walletdb", qos: .userInitiated)
 
     private init() {
         dbPath = AppDirectories.database.appendingPathComponent("zipherx_wallet.db").path
@@ -811,7 +820,26 @@ final class WalletDatabase {
     }
 
     /// Run database migrations for schema updates
+    /// VUL-S-006: Wrapped in exclusive transaction for atomic migration safety
     private func runMigrations() throws {
+        guard sqlite3_exec(db, "BEGIN EXCLUSIVE TRANSACTION;", nil, nil, nil) == SQLITE_OK else {
+            throw DatabaseError.transactionFailed("Migration BEGIN failed: \(String(cString: sqlite3_errmsg(db)))")
+        }
+
+        do {
+            try _runMigrationsBody()
+
+            guard sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
+                throw DatabaseError.transactionFailed("Migration COMMIT failed: \(String(cString: sqlite3_errmsg(db)))")
+            }
+        } catch {
+            _ = sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+            throw error
+        }
+    }
+
+    /// Internal migration body — called within VUL-S-006 transaction wrapper
+    private func _runMigrationsBody() throws {
         // Migration 1: Add cmu column to notes table if it doesn't exist
         // SQLite doesn't support IF NOT EXISTS for ALTER TABLE, so check column existence first
         var pragmaStmt: OpaquePointer?
@@ -1632,7 +1660,8 @@ final class WalletDatabase {
         _ = encryptedDiversifier.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(encryptedDiversifier.count), SQLITE_TRANSIENT)
         }
-        sqlite3_bind_int64(stmt, 3, Int64(value))
+        /// VUL-S-004: Zero plaintext value — real value only in value_enc shadow column
+        sqlite3_bind_int64(stmt, 3, 0)
         _ = encryptedRcm.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 4, ptr.baseAddress, Int32(encryptedRcm.count), SQLITE_TRANSIENT)
         }
@@ -1651,7 +1680,8 @@ final class WalletDatabase {
         _ = txid.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 7, ptr.baseAddress, Int32(txid.count), SQLITE_TRANSIENT)
         }
-        sqlite3_bind_int64(stmt, 8, Int64(height))
+        /// VUL-S-004: Zero plaintext height — real height only in received_height_enc
+        sqlite3_bind_int64(stmt, 8, 0)
         if let witness = witness {
             // SECURITY: Encrypt witness (Merkle path) - VUL-002: throws on failure
             let encryptedWitness = try encryptBlob(witness)
@@ -1760,7 +1790,8 @@ final class WalletDatabase {
                 _ = encryptedDiversifier.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(encryptedDiversifier.count), SQLITE_TRANSIENT)
                 }
-                sqlite3_bind_int64(stmt, 3, Int64(note.value))
+                /// VUL-S-004: Zero plaintext value — real value only in value_enc shadow column
+                sqlite3_bind_int64(stmt, 3, 0)
                 _ = encryptedRcm.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(stmt, 4, ptr.baseAddress, Int32(encryptedRcm.count), SQLITE_TRANSIENT)
                 }
@@ -1779,7 +1810,8 @@ final class WalletDatabase {
                 _ = note.txid.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(stmt, 7, ptr.baseAddress, Int32(note.txid.count), SQLITE_TRANSIENT)
                 }
-                sqlite3_bind_int64(stmt, 8, Int64(note.height))
+                /// VUL-S-004: Zero plaintext height — real height only in received_height_enc
+                sqlite3_bind_int64(stmt, 8, 0)
                 if let witness = note.witness {
                     let encryptedWitness = try encryptBlob(witness)
                     _ = encryptedWitness.withUnsafeBytes { ptr in
@@ -1908,11 +1940,12 @@ final class WalletDatabase {
             return []
         }
 
+        /// VUL-S-004: Include value_enc + received_height_enc shadow columns (indices 12, 13)
         let sql = """
-            SELECT id, diversifier, value, rcm, memo, nf, received_in_tx, received_height, witness, cmu, anchor, witness_index
+            SELECT id, diversifier, value, rcm, memo, nf, received_in_tx, received_height, witness, cmu, anchor, witness_index, value_enc, received_height_enc
             FROM notes
             WHERE account_id = ? AND is_spent = 0
-            ORDER BY received_height ASC;
+            ORDER BY id ASC;
         """
 
         var stmt: OpaquePointer?
@@ -1929,12 +1962,30 @@ final class WalletDatabase {
             let id = sqlite3_column_int64(stmt, 0)
             let divPtr = sqlite3_column_blob(stmt, 1)
             let divLen = sqlite3_column_bytes(stmt, 1)
-            let value = UInt64(sqlite3_column_int64(stmt, 2))
             let rcmPtr = sqlite3_column_blob(stmt, 3)
             let rcmLen = sqlite3_column_bytes(stmt, 3)
             let nfPtr = sqlite3_column_blob(stmt, 5)
             let nfLen = sqlite3_column_bytes(stmt, 5)
-            let height = UInt64(sqlite3_column_int64(stmt, 7))
+
+            /// VUL-S-004: Read value from encrypted shadow column (index 12)
+            var value: UInt64 = 0
+            if sqlite3_column_type(stmt, 12) != SQLITE_NULL {
+                let encPtr = sqlite3_column_blob(stmt, 12)
+                let encLen = sqlite3_column_bytes(stmt, 12)
+                if let encPtr = encPtr, encLen > 0 {
+                    value = decryptUInt64(Data(bytes: encPtr, count: Int(encLen))) ?? 0
+                }
+            }
+
+            /// VUL-S-004: Read height from encrypted shadow column (index 13)
+            var height: UInt64 = 0
+            if sqlite3_column_type(stmt, 13) != SQLITE_NULL {
+                let encPtr = sqlite3_column_blob(stmt, 13)
+                let encLen = sqlite3_column_bytes(stmt, 13)
+                if let encPtr = encPtr, encLen > 0 {
+                    height = decryptUInt64(Data(bytes: encPtr, count: Int(encLen))) ?? 0
+                }
+            }
 
             // SECURITY: Decrypt sensitive fields - VUL-002: throws on failure
             let encryptedDiv = Data(bytes: divPtr!, count: Int(divLen))
@@ -2001,11 +2052,12 @@ final class WalletDatabase {
     /// FIX #162 v3: Get ALL notes (both spent and unspent) - for balance reconciliation
     /// This is needed to calculate total received amount which must equal spent + unspent
     func getAllNotes(accountId: Int64) throws -> [WalletNote] {
+        /// VUL-S-004: Include value_enc + received_height_enc shadow columns (indices 12, 13)
         let sql = """
-            SELECT id, diversifier, value, rcm, memo, nf, received_in_tx, received_height, witness, cmu, anchor, witness_index
+            SELECT id, diversifier, value, rcm, memo, nf, received_in_tx, received_height, witness, cmu, anchor, witness_index, value_enc, received_height_enc
             FROM notes
             WHERE account_id = ?
-            ORDER BY received_height ASC;
+            ORDER BY id ASC;
         """
 
         var stmt: OpaquePointer?
@@ -2022,12 +2074,30 @@ final class WalletDatabase {
             let id = sqlite3_column_int64(stmt, 0)
             let divPtr = sqlite3_column_blob(stmt, 1)
             let divLen = sqlite3_column_bytes(stmt, 1)
-            let value = UInt64(sqlite3_column_int64(stmt, 2))
             let rcmPtr = sqlite3_column_blob(stmt, 3)
             let rcmLen = sqlite3_column_bytes(stmt, 3)
             let nfPtr = sqlite3_column_blob(stmt, 5)
             let nfLen = sqlite3_column_bytes(stmt, 5)
-            let height = UInt64(sqlite3_column_int64(stmt, 7))
+
+            /// VUL-S-004: Read value from encrypted shadow column (index 12)
+            var value: UInt64 = 0
+            if sqlite3_column_type(stmt, 12) != SQLITE_NULL {
+                let encPtr = sqlite3_column_blob(stmt, 12)
+                let encLen = sqlite3_column_bytes(stmt, 12)
+                if let encPtr = encPtr, encLen > 0 {
+                    value = decryptUInt64(Data(bytes: encPtr, count: Int(encLen))) ?? 0
+                }
+            }
+
+            /// VUL-S-004: Read height from encrypted shadow column (index 13)
+            var height: UInt64 = 0
+            if sqlite3_column_type(stmt, 13) != SQLITE_NULL {
+                let encPtr = sqlite3_column_blob(stmt, 13)
+                let encLen = sqlite3_column_bytes(stmt, 13)
+                if let encPtr = encPtr, encLen > 0 {
+                    height = decryptUInt64(Data(bytes: encPtr, count: Int(encLen))) ?? 0
+                }
+            }
 
             // SECURITY: Decrypt sensitive fields - VUL-002: throws on failure
             let encryptedDiv = Data(bytes: divPtr!, count: Int(divLen))
@@ -2099,11 +2169,12 @@ final class WalletDatabase {
             return []
         }
 
+        /// VUL-S-004: Include value_enc + received_height_enc shadow columns (indices 12, 13)
         let sql = """
-            SELECT id, diversifier, value, rcm, memo, nf, received_in_tx, received_height, witness, cmu, anchor, witness_index
+            SELECT id, diversifier, value, rcm, memo, nf, received_in_tx, received_height, witness, cmu, anchor, witness_index, value_enc, received_height_enc
             FROM notes
             WHERE account_id = ? AND is_spent = 0 AND witness IS NOT NULL
-            ORDER BY received_height ASC;
+            ORDER BY id ASC;
         """
 
         var stmt: OpaquePointer?
@@ -2120,12 +2191,30 @@ final class WalletDatabase {
             let id = sqlite3_column_int64(stmt, 0)
             let divPtr = sqlite3_column_blob(stmt, 1)
             let divLen = sqlite3_column_bytes(stmt, 1)
-            let value = UInt64(sqlite3_column_int64(stmt, 2))
             let rcmPtr = sqlite3_column_blob(stmt, 3)
             let rcmLen = sqlite3_column_bytes(stmt, 3)
             let nfPtr = sqlite3_column_blob(stmt, 5)
             let nfLen = sqlite3_column_bytes(stmt, 5)
-            let height = UInt64(sqlite3_column_int64(stmt, 7))
+
+            /// VUL-S-004: Read value from encrypted shadow column (index 12)
+            var value: UInt64 = 0
+            if sqlite3_column_type(stmt, 12) != SQLITE_NULL {
+                let encPtr = sqlite3_column_blob(stmt, 12)
+                let encLen = sqlite3_column_bytes(stmt, 12)
+                if let encPtr = encPtr, encLen > 0 {
+                    value = decryptUInt64(Data(bytes: encPtr, count: Int(encLen))) ?? 0
+                }
+            }
+
+            /// VUL-S-004: Read height from encrypted shadow column (index 13)
+            var height: UInt64 = 0
+            if sqlite3_column_type(stmt, 13) != SQLITE_NULL {
+                let encPtr = sqlite3_column_blob(stmt, 13)
+                let encLen = sqlite3_column_bytes(stmt, 13)
+                if let encPtr = encPtr, encLen > 0 {
+                    height = decryptUInt64(Data(bytes: encPtr, count: Int(encLen))) ?? 0
+                }
+            }
             let witnessPtr = sqlite3_column_blob(stmt, 8)
             let witnessLen = sqlite3_column_bytes(stmt, 8)
 
@@ -2221,16 +2310,22 @@ final class WalletDatabase {
 
         // Security audit TASK 15: Wrap SELECT+UPDATE in transaction to prevent race conditions
         try executeInTransaction {
-            // First, get the note's value so we can record it in transaction history
+            /// VUL-S-004: Read value from encrypted shadow column instead of zeroed plaintext
             var noteValue: UInt64 = 0
-            let selectSql = "SELECT value FROM notes WHERE nf = ?;"
+            let selectSql = "SELECT value_enc FROM notes WHERE nf = ?;"
             var selectStmt: OpaquePointer?
             if sqlite3_prepare_v2(db, selectSql, -1, &selectStmt, nil) == SQLITE_OK {
                 _ = hashedNullifier.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(selectStmt, 1, ptr.baseAddress, Int32(hashedNullifier.count), nil)
                 }
                 if sqlite3_step(selectStmt) == SQLITE_ROW {
-                    noteValue = UInt64(sqlite3_column_int64(selectStmt, 0))
+                    if sqlite3_column_type(selectStmt, 0) != SQLITE_NULL {
+                        let encPtr = sqlite3_column_blob(selectStmt, 0)
+                        let encLen = sqlite3_column_bytes(selectStmt, 0)
+                        if let encPtr = encPtr, encLen > 0 {
+                            noteValue = decryptUInt64(Data(bytes: encPtr, count: Int(encLen))) ?? 0
+                        }
+                    }
                 }
                 sqlite3_finalize(selectStmt)
             }
@@ -2247,7 +2342,8 @@ final class WalletDatabase {
             _ = txid.withUnsafeBytes { ptr in
                 sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txid.count), nil)
             }
-            sqlite3_bind_int64(stmt, 2, Int64(spentHeight))
+            /// VUL-S-004: Zero plaintext spent_height — real height only in spent_height_enc
+            sqlite3_bind_int64(stmt, 2, 0)
             _ = hashedNullifier.withUnsafeBytes { ptr in
                 sqlite3_bind_blob(stmt, 3, ptr.baseAddress, Int32(hashedNullifier.count), nil)
             }
@@ -2258,7 +2354,7 @@ final class WalletDatabase {
 
             let changedRows = sqlite3_changes(db)
             if changedRows > 0 {
-                print("✅ Marked \(changedRows) note(s) as spent at height \(spentHeight)")
+                print("✅ Marked \(changedRows) note(s) as spent")
                 // Security audit TASK 16: Write encrypted spent shadow columns
                 writeSpentEncryptedShadows(hashedNullifier: hashedNullifier, spentHeight: spentHeight, txid: txid)
             }
@@ -2850,9 +2946,10 @@ final class WalletDatabase {
     /// 866 < 1028 → all new witnesses excluded from balance!
     /// Witness = 4 (position) + D*32 (merkle path) + 28 (encryption overhead)
     /// Minimum practical: 4 + 1*32 + 28 = 64 bytes, using 100 for safety margin
+    /// VUL-S-004: Read value from encrypted shadow column, iterate and sum in Swift
     func getBalance(accountId: Int64) throws -> UInt64 {
         let sql = """
-            SELECT COALESCE(SUM(value), 0) FROM notes
+            SELECT value_enc FROM notes
             WHERE account_id = ?
             AND is_spent = 0
             AND witness IS NOT NULL
@@ -2868,11 +2965,17 @@ final class WalletDatabase {
 
         sqlite3_bind_int64(stmt, 1, accountId)
 
-        guard sqlite3_step(stmt) == SQLITE_ROW else {
-            return 0
+        var total: UInt64 = 0
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if sqlite3_column_type(stmt, 0) != SQLITE_NULL {
+                let encPtr = sqlite3_column_blob(stmt, 0)
+                let encLen = sqlite3_column_bytes(stmt, 0)
+                if let encPtr = encPtr, encLen > 0 {
+                    total += decryptUInt64(Data(bytes: encPtr, count: Int(encLen))) ?? 0
+                }
+            }
         }
-
-        return UInt64(sqlite3_column_int64(stmt, 0))
+        return total
     }
 
     /// FIX #292: Get total unspent balance INCLUDING notes without witnesses (for diagnostics)
@@ -2880,9 +2983,10 @@ final class WalletDatabase {
     /// FIX #1233: Also include orphan spent notes (is_spent=1 but spent_in_tx IS NULL or empty).
     /// These are notes that were marked spent during a failed TX/rollback but never actually spent.
     /// Without this, orphan notes are excluded from balance → missing balance.
+    /// VUL-S-004: Read value from encrypted shadow column, iterate and sum in Swift
     func getTotalUnspentBalance(accountId: Int64) throws -> UInt64 {
         let sql = """
-            SELECT COALESCE(SUM(value), 0) FROM notes WHERE account_id = ?
+            SELECT value_enc FROM notes WHERE account_id = ?
             AND (is_spent = 0 OR (is_spent = 1 AND (spent_in_tx IS NULL OR spent_in_tx = '')));
         """
 
@@ -2894,19 +2998,26 @@ final class WalletDatabase {
 
         sqlite3_bind_int64(stmt, 1, accountId)
 
-        guard sqlite3_step(stmt) == SQLITE_ROW else {
-            return 0
+        var total: UInt64 = 0
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if sqlite3_column_type(stmt, 0) != SQLITE_NULL {
+                let encPtr = sqlite3_column_blob(stmt, 0)
+                let encLen = sqlite3_column_bytes(stmt, 0)
+                if let encPtr = encPtr, encLen > 0 {
+                    total += decryptUInt64(Data(bytes: encPtr, count: Int(encLen))) ?? 0
+                }
+            }
         }
-
-        return UInt64(sqlite3_column_int64(stmt, 0))
+        return total
     }
 
     /// FIX #876: Get count and total value of notes WITHOUT valid witnesses
     /// These notes exist but cannot be spent until witnesses are rebuilt
     /// FIX #1107: Changed 1028 to 100 (see getBalance for explanation)
+    /// VUL-S-004: Read value/height from encrypted shadow columns, iterate in Swift
     func getNotesWithoutWitnesses(accountId: Int64) throws -> (count: Int, value: UInt64, minHeight: UInt64) {
         let sql = """
-            SELECT COUNT(*), COALESCE(SUM(value), 0), COALESCE(MIN(received_height), 0) FROM notes
+            SELECT value_enc, received_height_enc FROM notes
             WHERE account_id = ?
             AND is_spent = 0
             AND (witness IS NULL OR LENGTH(witness) < 100 OR witness = ZEROBLOB(LENGTH(witness)));
@@ -2920,22 +3031,39 @@ final class WalletDatabase {
 
         sqlite3_bind_int64(stmt, 1, accountId)
 
-        guard sqlite3_step(stmt) == SQLITE_ROW else {
-            return (0, 0, 0)
+        var count = 0
+        var totalValue: UInt64 = 0
+        var minHeight: UInt64 = UInt64.max
+
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            count += 1
+            if sqlite3_column_type(stmt, 0) != SQLITE_NULL {
+                let encPtr = sqlite3_column_blob(stmt, 0)
+                let encLen = sqlite3_column_bytes(stmt, 0)
+                if let encPtr = encPtr, encLen > 0 {
+                    totalValue += decryptUInt64(Data(bytes: encPtr, count: Int(encLen))) ?? 0
+                }
+            }
+            if sqlite3_column_type(stmt, 1) != SQLITE_NULL {
+                let encPtr = sqlite3_column_blob(stmt, 1)
+                let encLen = sqlite3_column_bytes(stmt, 1)
+                if let encPtr = encPtr, encLen > 0 {
+                    let h = decryptUInt64(Data(bytes: encPtr, count: Int(encLen))) ?? UInt64.max
+                    if h < minHeight { minHeight = h }
+                }
+            }
         }
 
-        let count = Int(sqlite3_column_int(stmt, 0))
-        let value = UInt64(sqlite3_column_int64(stmt, 1))
-        let minHeight = UInt64(sqlite3_column_int64(stmt, 2))
-        return (count, value, minHeight)
+        return (count, totalValue, minHeight == UInt64.max ? 0 : minHeight)
     }
 
     /// FIX #292: Get count and value of notes needing witness rebuild
     /// Returns (count, totalValue) of notes that exist but cannot be spent yet
     /// FIX #1107: Changed 1028 to 100 (see getBalance for explanation)
+    /// VUL-S-004: Read value from encrypted shadow column, iterate in Swift
     func getNotesNeedingWitness(accountId: Int64) throws -> (count: Int, value: UInt64) {
         let sql = """
-            SELECT COUNT(*), COALESCE(SUM(value), 0) FROM notes
+            SELECT value_enc FROM notes
             WHERE account_id = ?
             AND is_spent = 0
             AND (witness IS NULL OR LENGTH(witness) < 100 OR witness = ZEROBLOB(LENGTH(witness)));
@@ -2949,20 +3077,27 @@ final class WalletDatabase {
 
         sqlite3_bind_int64(stmt, 1, accountId)
 
-        guard sqlite3_step(stmt) == SQLITE_ROW else {
-            return (0, 0)
+        var count = 0
+        var totalValue: UInt64 = 0
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            count += 1
+            if sqlite3_column_type(stmt, 0) != SQLITE_NULL {
+                let encPtr = sqlite3_column_blob(stmt, 0)
+                let encLen = sqlite3_column_bytes(stmt, 0)
+                if let encPtr = encPtr, encLen > 0 {
+                    totalValue += decryptUInt64(Data(bytes: encPtr, count: Int(encLen))) ?? 0
+                }
+            }
         }
-
-        let count = Int(sqlite3_column_int(stmt, 0))
-        let value = UInt64(sqlite3_column_int64(stmt, 1))
-        return (count, value)
+        return (count, totalValue)
     }
 
     /// FIX #1082: Get max height of unspent notes
     /// Used to determine if all notes are in boost range (instant rebuild) vs delta range (needs P2P)
+    /// VUL-S-004: Read height from encrypted shadow column, iterate for max
     func getMaxUnspentNoteHeight(accountId: Int64) throws -> UInt64 {
         let sql = """
-            SELECT COALESCE(MAX(received_height), 0) FROM notes
+            SELECT received_height_enc FROM notes
             WHERE account_id = ? AND is_spent = 0;
         """
 
@@ -2974,11 +3109,18 @@ final class WalletDatabase {
 
         sqlite3_bind_int64(stmt, 1, accountId)
 
-        guard sqlite3_step(stmt) == SQLITE_ROW else {
-            return 0
+        var maxHeight: UInt64 = 0
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if sqlite3_column_type(stmt, 0) != SQLITE_NULL {
+                let encPtr = sqlite3_column_blob(stmt, 0)
+                let encLen = sqlite3_column_bytes(stmt, 0)
+                if let encPtr = encPtr, encLen > 0 {
+                    let h = decryptUInt64(Data(bytes: encPtr, count: Int(encLen))) ?? 0
+                    if h > maxHeight { maxHeight = h }
+                }
+            }
         }
-
-        return UInt64(sqlite3_column_int64(stmt, 0))
+        return maxHeight
     }
 
     /// FIX #1083: Verify balance integrity
@@ -6020,17 +6162,27 @@ final class WalletDatabase {
                 }
             }
 
-            let totalChangeValue = changeOutputs.reduce(0) { $0 + $1.value }
+            var totalChangeValue = changeOutputs.reduce(0) { $0 + $1.value }
+
+            // FIX #1402: If height-based matching inflated change beyond inputs, discard
+            // the height-based additions — they're unrelated notes at the same block height.
+            // Fall back to txid-only matching which is always correct.
+            if totalChangeValue > txInfo.inputValue {
+                let txidOnlyChange = allNotes.filter { $0.txid == spentTxid }
+                let txidOnlyValue = txidOnlyChange.reduce(0) { $0 + $1.value }
+                print("📜 FIX #1402: Height-based change (\(totalChangeValue)) > inputValue (\(txInfo.inputValue)) — falling back to txid-only change (\(txidOnlyValue))")
+                totalChangeValue = txidOnlyValue
+            }
 
             // totalBalanceImpact = sum(inputs) - sum(change) = amount to recipient + fee
             // This is the actual balance decrease, which makes history sum = current balance
-            let totalBalanceImpact = txInfo.inputValue - totalChangeValue
+            let totalBalanceImpact = txInfo.inputValue > totalChangeValue ? txInfo.inputValue - totalChangeValue : fee
             // amountToRecipient = balance impact - fee (for display info)
-            let amountToRecipient = totalBalanceImpact - fee
+            let amountToRecipient = totalBalanceImpact > fee ? totalBalanceImpact - fee : 0
 
             // FIX #1367: Self-send detection — amountToRecipient <= 1000 means all outputs are change
             let isSelfSend = amountToRecipient <= 1000
-            let displayValue = isSelfSend ? fee : UInt64(amountToRecipient)
+            let displayValue = isSelfSend ? fee : amountToRecipient
             let toAddressValue = isSelfSend ? "self" : nil
 
             if isSelfSend {

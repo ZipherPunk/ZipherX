@@ -109,6 +109,17 @@ struct ModeSelectionView: View {
                         Text(mode.description)
                             .font(theme.captionFont)
                             .foregroundColor(theme.textSecondary)
+
+                        // Show daemon detected badge on Full Node card
+                        if mode == .fullNode && modeManager.daemonDetected {
+                            HStack(spacing: 4) {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .font(.system(size: 10))
+                                Text("Local daemon running")
+                                    .font(.system(size: 11, weight: .medium))
+                            }
+                            .foregroundColor(theme.successColor)
+                        }
                     }
 
                     Spacer()
@@ -196,7 +207,7 @@ struct ModeSelectionView: View {
                 Image(systemName: "arrow.right")
                     .font(.system(size: 14))
             }
-            .foregroundColor(theme.textPrimary)
+            .foregroundColor(.white)
             .padding(.horizontal, 32)
             .padding(.vertical, 14)
             .background(theme.primaryColor)

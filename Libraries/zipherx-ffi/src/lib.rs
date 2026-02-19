@@ -115,6 +115,10 @@ static PROVER: Mutex<Option<LocalTxProver>> = Mutex::new(None);
 // These are used by zipherx_verify_transaction() to validate Sapling proofs before broadcast
 static VERIFYING_KEYS: Mutex<Option<ZcashParameters>> = Mutex::new(None);
 
+// VUL-F-007: Configurable transaction fee (default 10000 zatoshis = 0.0001 ZCL)
+// Set via zipherx_set_transaction_fee() from Swift
+static TRANSACTION_FEE: Mutex<u64> = Mutex::new(10000);
+
 // Sapling tree depth
 const SAPLING_COMMITMENT_TREE_DEPTH: u8 = 32;
 
@@ -343,6 +347,71 @@ impl Parameters for ZclassicNetwork {
     fn b58_script_address_prefix(&self) -> [u8; 2] {
         [0x1C, 0xBD] // Zclassic t3 prefix
     }
+}
+
+
+// =============================================================================
+// VUL-F-007: Configurable Transaction Fee
+// =============================================================================
+
+/// Set the transaction fee used for all subsequent transaction builds.
+/// Thread-safe via Mutex. Default is 10000 zatoshis (0.0001 ZCL).
+///
+/// # Parameters
+/// - `fee`: Fee in zatoshis (1 ZCL = 100,000,000 zatoshis)
+///
+/// # Safety
+/// This function is safe to call from any thread. The fee value is validated
+/// to be 10,000–1,000,000 zatoshis (0.0001–0.01 ZCL) to prevent fee misconfiguration.
+///
+/// # Example
+/// ```swift
+/// ZipherXFFI.setTransactionFee(5000)  // Set to 0.00005 ZCL
+/// ```
+#[no_mangle]
+pub extern "C" fn zipherx_set_transaction_fee(fee: u64) -> i32 {
+    ffi_catch_unwind!(FFI_ERROR_PANIC, {
+        // VUL-F-007: Validate fee is reasonable
+        // Min: 10,000 zatoshis (0.0001 ZCL) — standard network minimum
+        // Max: 1,000,000 zatoshis (0.01 ZCL) — above this is almost certainly a mistake
+        const MIN_FEE: u64 = 10_000;
+        const MAX_FEE: u64 = 1_000_000;
+        if fee < MIN_FEE {
+            debug_log!("VUL-F-007: Rejected too-low fee: {} (min {})", fee, MIN_FEE);
+            return FFI_ERROR_INVALID_DATA;
+        }
+        if fee > MAX_FEE {
+            debug_log!("VUL-F-007: Rejected excessive fee: {} (max {})", fee, MAX_FEE);
+            return FFI_ERROR_INVALID_DATA;
+        }
+
+        match safe_lock!(TRANSACTION_FEE) {
+            Some(mut fee_guard) => {
+                *fee_guard = fee;
+                debug_log!("VUL-F-007: Transaction fee set to {} zatoshis", fee);
+                FFI_SUCCESS
+            }
+            None => {
+                eprintln!("VUL-F-007: Failed to acquire TRANSACTION_FEE mutex");
+                FFI_ERROR_LOCK_FAILED
+            }
+        }
+    })
+}
+
+/// Get the current transaction fee setting.
+/// Returns the fee in zatoshis, or 0 if the mutex lock fails.
+#[no_mangle]
+pub extern "C" fn zipherx_get_transaction_fee() -> u64 {
+    ffi_catch_unwind!(0, {
+        match safe_lock!(TRANSACTION_FEE) {
+            Some(fee_guard) => *fee_guard,
+            None => {
+                eprintln!("VUL-F-007: Failed to acquire TRANSACTION_FEE mutex for read");
+                10000 // Return default on lock failure
+            }
+        }
+    })
 }
 
 
@@ -1980,8 +2049,14 @@ pub unsafe extern "C" fn zipherx_build_transaction(
         }
     };
 
-    // Calculate fee
-    let fee = 10000u64;
+    // VUL-F-007: Use configurable fee from global state
+    let fee = match safe_lock!(TRANSACTION_FEE) {
+        Some(fee_guard) => *fee_guard,
+        None => {
+            eprintln!("VUL-F-007: Failed to acquire TRANSACTION_FEE mutex, using default 10000");
+            10000u64
+        }
+    };
 
     // Verify funds
     if note_value < amount + fee {
@@ -2348,8 +2423,14 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi(
         }
     };
 
-    // Calculate fee (standard 10000 zatoshis)
-    let fee = 10000u64;
+    // VUL-F-007: Use configurable fee from global state
+    let fee = match safe_lock!(TRANSACTION_FEE) {
+        Some(fee_guard) => *fee_guard,
+        None => {
+            eprintln!("VUL-F-007: Failed to acquire TRANSACTION_FEE mutex, using default 10000");
+            10000u64
+        }
+    };
 
     // FIX #1385: Sanity cap on spend_count to prevent extreme allocations
     if spend_count > 1000 {
@@ -6732,8 +6813,14 @@ pub unsafe extern "C" fn zipherx_build_transaction_encrypted(
         }
     };
 
-    // Calculate fee
-    let fee = 10000u64;
+    // VUL-F-007: Use configurable fee from global state
+    let fee = match safe_lock!(TRANSACTION_FEE) {
+        Some(fee_guard) => *fee_guard,
+        None => {
+            eprintln!("VUL-F-007: Failed to acquire TRANSACTION_FEE mutex, using default 10000");
+            10000u64
+        }
+    };
 
     // Verify funds
     if note_value < amount + fee {
@@ -7197,8 +7284,14 @@ pub unsafe extern "C" fn zipherx_build_transaction_multi_encrypted(
         }
     };
 
-    // Calculate fee
-    let fee = 10000u64;
+    // VUL-F-007: Use configurable fee from global state
+    let fee = match safe_lock!(TRANSACTION_FEE) {
+        Some(fee_guard) => *fee_guard,
+        None => {
+            eprintln!("VUL-F-007: Failed to acquire TRANSACTION_FEE mutex, using default 10000");
+            10000u64
+        }
+    };
 
     // FIX #1385: Sanity cap on spend_count + checked multiplication
     if spend_count > 1000 {

@@ -524,6 +524,8 @@ struct SendView: View {
             preparationTask = nil
             proofCountdownTimer?.invalidate()  // FIX #1327: Clean up timer
             proofCountdownTimer = nil
+            // VUL-U-002: Clear sensitive form data from memory on dismiss
+            clearForm()
         }
         #if os(iOS)
         // FIX #1270: "Done" toolbar button for keyboards without a return key (decimalPad)

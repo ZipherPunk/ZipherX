@@ -149,8 +149,8 @@ public final class PeerManager: ObservableObject {
     /// FIX #235, FIX #423: Hardcoded Zclassic seed nodes - EXEMPT from cooldown
     /// These are VERIFIED good ZCL nodes that should ALWAYS be tried first
     // FIX #931: PRODUCTION MODE - All hardcoded seeds enabled
+    /// VUL-N-003: localhost removed — only added dynamically in Full Node mode
     public let HARDCODED_SEEDS: Set<String> = [
-        "127.0.0.1",          // Local node first (highest priority if running)
         "140.174.189.3",      // MagicBean node cluster
         "140.174.189.17",     // MagicBean node cluster
         "205.209.104.118",    // MagicBean node
@@ -665,12 +665,8 @@ public final class PeerManager: ObservableObject {
     // MARK: - Cooldown
 
     /// Check if an address is on cooldown
+    /// VUL-N-014: ALL peers subject to cooldown (hardcoded seeds no longer exempt)
     public func isOnCooldown(_ host: String, port: UInt16) -> Bool {
-        // Hardcoded seeds exempt from cooldown
-        if HARDCODED_SEEDS.contains(host) {
-            return false
-        }
-
         let key = "\(host):\(port)"
         connectionAttemptsLock.lock()
         defer { connectionAttemptsLock.unlock() }

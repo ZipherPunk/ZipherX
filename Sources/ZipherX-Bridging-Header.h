@@ -858,4 +858,17 @@ int32_t zipherx_verify_sha256(
     size_t expected_hash_len
 );
 
+// =============================================================================
+// VUL-F-007: Configurable Transaction Fee
+// =============================================================================
+
+/// Set the transaction fee used for all subsequent transaction builds
+/// @param fee Fee in zatoshis (must be > 0 and < 100,000,000)
+/// @return 1 on success, negative error code on failure
+int32_t zipherx_set_transaction_fee(uint64_t fee);
+
+/// Get the current transaction fee setting
+/// @return Current fee in zatoshis, or 10000 on lock failure
+uint64_t zipherx_get_transaction_fee(void);
+
 #endif // ZIPHERX_FFI_H
