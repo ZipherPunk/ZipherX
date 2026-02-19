@@ -396,12 +396,20 @@ final class WalletDatabase {
         // FIX #200: SQLite performance optimizations
         // WAL mode: 10-50x faster writes, concurrent reads during writes
         // cache_size: 32MB (default 2MB) - faster repeated queries
-        // mmap_size: 256MB - memory-mapped I/O for faster large reads
+        // mmap_size: 256MB on macOS, 0 on iOS - memory-mapped I/O for faster large reads
+        // FIX #1449: Disable mmap on iOS — memory-mapped files + iOS Data Protection = SIGBUS crash.
+        // When device locks, iOS encrypts files. mmap'd pages can't be paged in → KERN_MEMORY_ERROR.
+        // Regular read/write I/O returns errors gracefully instead of crashing.
+        #if os(iOS)
+        let mmapPragma = "PRAGMA mmap_size = 0;"           // FIX #1449: No mmap on iOS
+        #else
+        let mmapPragma = "PRAGMA mmap_size = 268435456;"   // 256MB on macOS
+        #endif
         let performancePragmas = [
             "PRAGMA journal_mode = WAL;",
             "PRAGMA synchronous = NORMAL;",  // Safe with WAL mode
             "PRAGMA cache_size = -32000;",   // 32MB (negative = KB)
-            "PRAGMA mmap_size = 268435456;", // 256MB
+            mmapPragma,
             "PRAGMA temp_store = MEMORY;"    // Temp tables in memory
         ]
 

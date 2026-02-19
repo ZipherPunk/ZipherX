@@ -1,11 +1,8 @@
 // PrintSilencer.swift
 // ZipherX
 //
-// Silences all print() calls in Release builds.
-// Debug builds retain full logging for development.
-
-#if !DEBUG
-func print(_ items: Any..., separator: String = " ", terminator: String = "\n") {
-    // Silenced in Release builds
-}
-#endif
+// NOTE: Print override is handled by DebugLogger.swift (global print function).
+// DebugLogger respects the isEnabled flag from Settings.
+// In Release builds, DebugLogger.minimumLevel = .warning (suppresses debug/info).
+//
+// This file is intentionally empty — kept to avoid Xcode project reference errors.

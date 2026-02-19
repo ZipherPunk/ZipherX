@@ -31,8 +31,12 @@ private func getCurrentTimestamp() -> String {
 
 /// Global print override - uses os_log for reliable device logging with timestamps
 /// FIX #763: Now writes to BOTH console AND file for complete debugging
+/// FIX #1442: Respects isEnabled — when debug logging is off, suppresses BOTH console AND file output
 /// NOTE: Only use os_log OR Swift.print, not both, to avoid duplicate log lines
 public func print(_ items: Any..., separator: String = " ", terminator: String = "\n") {
+    // FIX #1442: Skip all output when debug logging is disabled by user
+    guard DebugLogger.shared.isEnabled else { return }
+
     let output = items.map { "\($0)" }.joined(separator: separator)
     let timestamp = getCurrentTimestamp()
     let formattedOutput = "[\(timestamp)] DEBUGZIPHERX: \(output)"
@@ -40,7 +44,7 @@ public func print(_ items: Any..., separator: String = " ", terminator: String =
     // Write to Xcode console
     Swift.print(formattedOutput, terminator: terminator)
 
-    // FIX #763: Also write to debug log file (always enabled)
+    // FIX #763: Also write to debug log file
     DebugLogger.shared.writeToFile(formattedOutput + (terminator == "\n" ? "" : "\n"))
 }
 
@@ -90,8 +94,9 @@ final class DebugLogger {
 
     /// FIX #1376: Debug logging can be disabled by the user from Settings.
     /// When disabled, log file writes are suppressed (console output still works).
+    /// FIX #1442: Debug logging disabled by default. User must explicitly enable in Settings.
     var isEnabled: Bool {
-        get { UserDefaults.standard.object(forKey: "debugLoggingEnabled") == nil ? true : UserDefaults.standard.bool(forKey: "debugLoggingEnabled") }
+        get { UserDefaults.standard.bool(forKey: "debugLoggingEnabled") }
         set {
             UserDefaults.standard.set(newValue, forKey: "debugLoggingEnabled")
         }

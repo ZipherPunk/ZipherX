@@ -261,6 +261,7 @@ struct SettingsView: View {
     @State private var debugLoggingEnabled = DebugLogger.shared.isEnabled
     @State private var showDebugLogShare = false
     @State private var showLogExportWarning = false  // Privacy warning before export
+    @State private var showDebugEnableWarning = false  // FIX #1442: Warning when enabling debug logs
     @State private var debugLogSize: String = "0 KB"
 
     // Banned peers management
@@ -2129,15 +2130,20 @@ Both binaries must be installed to /usr/local/bin:
 
                 Spacer()
 
-                Toggle("", isOn: $debugLoggingEnabled)
-                    .labelsHidden()
-                    .onChange(of: debugLoggingEnabled) { newValue in
-                        DebugLogger.shared.isEnabled = newValue
+                Toggle("", isOn: Binding(
+                    get: { debugLoggingEnabled },
+                    set: { newValue in
                         if newValue {
-                            DebugLogger.shared.logSystemInfo()
+                            // FIX #1442: Show privacy warning before enabling
+                            showDebugEnableWarning = true
+                        } else {
+                            debugLoggingEnabled = false
+                            DebugLogger.shared.isEnabled = false
+                            updateDebugLogSize()
                         }
-                        updateDebugLogSize()
                     }
+                ))
+                    .labelsHidden()
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
@@ -2194,7 +2200,7 @@ Both binaries must be installed to /usr/local/bin:
             }
 
             // Info text
-            Text("When enabled, all app logs are saved to debug.log file that you can export for troubleshooting.")
+            Text("Debug logs may contain sensitive information including transaction details, peer addresses, and wallet state. Only enable for troubleshooting. Logs are stored locally and never sent automatically.")
                 .font(theme.captionFont)
                 .foregroundColor(theme.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -2208,6 +2214,18 @@ Both binaries must be installed to /usr/local/bin:
         )
         .onAppear {
             updateDebugLogSize()
+        }
+        // FIX #1442: Privacy warning before enabling debug logs
+        .alert("Enable Debug Logging?", isPresented: $showDebugEnableWarning) {
+            Button("Enable", role: .destructive) {
+                debugLoggingEnabled = true
+                DebugLogger.shared.isEnabled = true
+                DebugLogger.shared.logSystemInfo()
+                updateDebugLogSize()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Debug logs may contain sensitive information including transaction IDs, peer IP addresses, wallet balances, and sync state. Only enable for troubleshooting and disable when done. Logs are stored locally on your device.")
         }
         .sheet(isPresented: $showDebugLogShare) {
             ShareSheet(activityItems: [DebugLogger.shared.getLogFileURL()])

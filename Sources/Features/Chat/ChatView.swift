@@ -33,6 +33,8 @@ struct ChatView: View {
 
     // FIX #252: Callback to navigate to main app settings (for enabling Tor)
     var onShowAppSettings: (() -> Void)?
+    // Close the chat window (contact list only, not conversation)
+    var onClose: (() -> Void)?
 
     private var theme: AppTheme { themeManager.currentTheme }
 
@@ -415,7 +417,20 @@ struct ChatView: View {
                     .font(.system(size: 14, weight: .black, design: .monospaced))
                     .foregroundColor(theme.accentColor)
                     .shadow(color: theme.accentColor.opacity(0.3), radius: 2)
+
+                Spacer()
+
+                // Close chat window button
+                if let onClose = onClose {
+                    Button(action: onClose) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 18))
+                            .foregroundColor(theme.textPrimary.opacity(0.4))
+                    }
+                    .buttonStyle(.plain)
+                }
             }
+            .padding(.horizontal, 12)
 
             if let onion = chatManager.ourOnionAddress {
                 HStack(spacing: 4) {
@@ -897,9 +912,12 @@ struct ConversationView: View {
                     .padding(.vertical, 16)
                 }
                 .onAppear {
-                    // FIX #1388: Scroll to latest message when opening chat
-                    if let lastMessage = chatManager.conversations[contact.onionAddress]?.messages.last {
-                        proxy.scrollTo(lastMessage.id, anchor: .bottom)
+                    // FIX #1388 + FIX #1456: Scroll to latest message when opening chat
+                    // Delay needed: LazyVStack hasn't laid out all items when onAppear fires
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                        if let lastMessage = chatManager.conversations[contact.onionAddress]?.messages.last {
+                            proxy.scrollTo(lastMessage.id, anchor: .bottom)
+                        }
                     }
                 }
                 .onChange(of: chatManager.conversations[contact.onionAddress]?.messages.count) { _ in

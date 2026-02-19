@@ -160,7 +160,13 @@ public final class NetworkManager: ObservableObject {
 
     // MARK: - Constants
     private let MIN_PEERS = 8  // Increased from 3 for better reliability
-    private let MAX_PEERS = 30  // Increased from 20
+    // FIX #1450: Cap peers on iOS to reduce battery drain (30 peers × 15s TCP keepalive = 120 packets/min)
+    // 8 peers provides sufficient consensus (threshold=3) + redundancy for P2P sync
+    #if os(iOS)
+    private let MAX_PEERS = 8
+    #else
+    private let MAX_PEERS = 30
+    #endif
     private let TARGET_PEER_PERCENT = 0.15 // Connect to 15% of known addresses
     // FIX #934: Lowered from 7 to 3 - Zclassic network is small, can't reliably get 7 peers
     // Byzantine fault tolerance still applies but with realistic peer counts
@@ -488,6 +494,7 @@ public final class NetworkManager: ObservableObject {
                 await self?.performHealthCheck()
             }
         }
+        healthCheckTimer?.tolerance = 15.0  // FIX #1450: 25% tolerance for iOS timer coalescing
         print("🏥 FIX #409: Health monitoring started (interval: \(Int(HEALTH_CHECK_INTERVAL))s)")
 
         // FIX #410: Run immediate health check on startup
@@ -1880,6 +1887,7 @@ public final class NetworkManager: ObservableObject {
                 await self?.discoverMoreAddresses()
             }
         }
+        addressDiscoveryTimer?.tolerance = GETADDR_INTERVAL * 0.25  // FIX #1450: Timer coalescing
     }
 
     private func setupStatsRefresh() {
@@ -1888,6 +1896,7 @@ public final class NetworkManager: ObservableObject {
                 await self?.refreshChainHeight()
             }
         }
+        statsRefreshTimer?.tolerance = STATS_REFRESH_INTERVAL * 0.25  // FIX #1450: Timer coalescing
     }
 
     /// Refresh chain height (P2P consensus primary when Tor enabled, InsightAPI fallback)
@@ -2806,6 +2815,28 @@ public final class NetworkManager: ObservableObject {
                         }
                     }
                 }
+
+                // FIX #1444: Drain remaining completed peers — don't leak live NWConnections
+                // After cancelAll(), in-flight tasks throw CancellationError (yield nil),
+                // but already-completed tasks have results queued — capture them.
+                for await (peer, address) in group {
+                    if let peer = peer {
+                        if !peers.contains(where: { $0.host == peer.host && $0.port == peer.port }) {
+                            peers.append(peer)
+                            PeerManager.shared.addPeer(peer)
+                            connectedCount += 1
+                            self.setupBlockListener(for: peer)
+                            await MainActor.run {
+                                self.unparkPeer(address.host, port: address.port)
+                                self.connectedPeers = self.peers.filter { $0.isConnectionReady }.count
+                                self.isConnected = true
+                            }
+                            print("✅ FIX #1444: Captured in-flight peer \(peer.host) (was about to be leaked)")
+                        } else {
+                            peer.disconnect()
+                        }
+                    }
+                }
             }
 
             // FIX #1112 v4: If early exit flag set, skip to end immediately
@@ -3062,24 +3093,106 @@ public final class NetworkManager: ObservableObject {
             self.isConnected = false
         }
 
-        // 7. FIX #258 v2: If Tor is enabled, restart Tor to get fresh circuits
-        // iOS background kills Tor's network connections, making circuits stale
+        // 7. Reconnect peers
         let torMode = await TorManager.shared.mode
-        if torMode == .enabled {
-            print("🧅 FIX #258: Restarting Tor to refresh circuits after iOS background...")
-            debugLog(.network, "🧅 FIX #258: Restarting Tor - iOS background killed circuits")
 
-            // Stop and restart Tor to get fresh circuits
+        #if os(iOS)
+        // FIX #1445: On iOS, connect directly first for instant recovery.
+        // iOS background kills ALL sockets including Tor circuits.
+        // Waiting 15s for Tor wastes time and often fails anyway.
+        // Direct-first matches existing FIX #1428 behavior, just faster.
+        let strictPrivacy = await TorManager.shared.strictPrivacyMode
+        if torMode == .enabled && !strictPrivacy {
+            print("⚡ FIX #1445: iOS foreground recovery — connecting directly first, Tor restarts in background")
+            debugLog(.network, "⚡ FIX #1445: Direct-first iOS recovery (Tor restarts in background)")
+
+            // Temporarily bypass Tor for fast peer recovery
+            await TorManager.shared.temporarilyBypassTor()
+            sybilBypassActive = true
+
+            // Start Tor restart in background (non-blocking)
+            Task {
+                await TorManager.shared.stop()
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                await TorManager.shared.start()
+            }
+
+            // Connect directly — peers will be available in <3s
+            do {
+                try await connect()
+                print("✅ FIX #1445: iOS direct recovery — \(peers.count) peers")
+                debugLog(.network, "✅ FIX #1445: Recovered \(peers.count) peers via direct connection")
+            } catch {
+                print("❌ FIX #1445: Direct recovery failed: \(error.localizedDescription)")
+            }
+
+            // Restore Tor after onion circuits warm up (30s)
+            Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 30_000_000_000)
+                guard let self = self else { return }
+                await TorManager.shared.restoreAfterSingleTxBypass()
+                self.sybilBypassActive = false
+                print("🧅 FIX #1445: Tor restored after iOS foreground recovery")
+            }
+        } else if torMode == .enabled && strictPrivacy {
+            // FIX #1445: Strict privacy mode — wait for Tor (existing behavior)
+            print("🔒 FIX #1445: Strict privacy — waiting for Tor before connecting")
+            debugLog(.network, "🔒 FIX #1445: Strict privacy mode - waiting for Tor")
+
             await TorManager.shared.stop()
-            try? await Task.sleep(nanoseconds: 500_000_000)  // 500ms pause
+            try? await Task.sleep(nanoseconds: 500_000_000)
             await TorManager.shared.start()
 
-            // Wait for Tor to connect (max 15 seconds)
             var torConnected = await TorManager.shared.connectionState.isConnected
             var waitCount = 0
             let maxWait = 150  // 15 seconds
             while !torConnected && waitCount < maxWait {
-                try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                waitCount += 1
+                torConnected = await TorManager.shared.connectionState.isConnected
+                if waitCount % 50 == 0 {
+                    let state = await TorManager.shared.connectionState
+                    print("🧅 FIX #258: Waiting for Tor... (\(waitCount/10)s) state: \(state.displayText)")
+                }
+            }
+
+            if torConnected {
+                print("✅ FIX #258: Tor reconnected with fresh circuits")
+            } else {
+                print("⚠️ FIX #258: Tor did not reconnect in 15s - trying direct connections")
+            }
+
+            do {
+                try await connect()
+                print("✅ FIX #258: Reconnected after background - \(peers.count) peers")
+            } catch {
+                print("❌ FIX #258: Failed to reconnect: \(error.localizedDescription)")
+            }
+        } else {
+            // Tor disabled — just wait for iOS networking to stabilize
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            do {
+                try await connect()
+                print("✅ FIX #258: Reconnected after background - \(peers.count) peers")
+            } catch {
+                print("❌ FIX #258: Failed to reconnect: \(error.localizedDescription)")
+            }
+        }
+        #else
+        // macOS: FIX #258 v2 — wait for Tor, then connect (existing behavior)
+        if torMode == .enabled {
+            print("🧅 FIX #258: Restarting Tor to refresh circuits after background...")
+            debugLog(.network, "🧅 FIX #258: Restarting Tor - background killed circuits")
+
+            await TorManager.shared.stop()
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            await TorManager.shared.start()
+
+            var torConnected = await TorManager.shared.connectionState.isConnected
+            var waitCount = 0
+            let maxWait = 150
+            while !torConnected && waitCount < maxWait {
+                try? await Task.sleep(nanoseconds: 100_000_000)
                 waitCount += 1
                 torConnected = await TorManager.shared.connectionState.isConnected
                 if waitCount % 50 == 0 {
@@ -3096,8 +3209,7 @@ public final class NetworkManager: ObservableObject {
                 debugLog(.network, "⚠️ FIX #258: Tor timeout - will try direct connections")
             }
         } else {
-            // Non-Tor mode: just wait for iOS networking to stabilize
-            try? await Task.sleep(nanoseconds: 500_000_000)  // 500ms
+            try? await Task.sleep(nanoseconds: 500_000_000)
         }
 
         // 8. Reconnect fresh
@@ -3105,19 +3217,15 @@ public final class NetworkManager: ObservableObject {
             try await connect()
             print("✅ FIX #258: Reconnected after background - \(peers.count) peers")
             debugLog(.network, "✅ FIX #258: Successfully reconnected \(peers.count) peers after background")
-
-            // 9. Restart keepalive timer
-            await MainActor.run {
-                setupKeepaliveTimer()
-            }
         } catch {
             print("❌ FIX #258: Failed to reconnect after background: \(error.localizedDescription)")
             debugLog(.network, "❌ FIX #258: Reconnection failed: \(error.localizedDescription)")
+        }
+        #endif
 
-            // Still restart keepalive - it will trigger recovery
-            await MainActor.run {
-                setupKeepaliveTimer()
-            }
+        // 9. Restart keepalive timer (always, even if connect failed)
+        await MainActor.run {
+            setupKeepaliveTimer()
         }
     }
 
@@ -5175,8 +5283,16 @@ public final class NetworkManager: ObservableObject {
         var connectedCount = currentConnected
         var peerIndex = 0
         let maxConcurrent = 5 // Slower in background to not overwhelm network
+        let bgPeerCap = 8     // FIX #1446: Stop when 8 ready peers (sufficient for consensus + resilience)
 
         while connectedCount < targetPeers && peerIndex < remainingPeers.count {
+            // FIX #1446: Check live peer count — stop when sufficient
+            let readyPeers = peers.filter { $0.isConnectionReady }.count
+            if readyPeers >= bgPeerCap {
+                print("✅ FIX #1446: Background discovery stopped — \(readyPeers) peers ready (sufficient)")
+                break
+            }
+
             let batchEnd = min(peerIndex + maxConcurrent, remainingPeers.count)
             let batch = Array(remainingPeers[peerIndex..<batchEnd])
             peerIndex = batchEnd
@@ -5206,16 +5322,19 @@ public final class NetworkManager: ObservableObject {
                         peers.append(peer)
                         // FIX #478: Also add to PeerManager to keep peer lists in sync
                         PeerManager.shared.addPeer(peer)
-                        connectedCount += 1
                         self.resetSybilCounter()
                         self.setupBlockListener(for: peer)
 
-                        // FIX #1420: Update from GLOBAL peers array, not batch-local count
+                        // FIX #1446: Use live count from global peers array
+                        connectedCount = peers.filter { $0.isConnectionReady }.count
+
+                        // FIX #1420: Update UI from GLOBAL peers array
                         await MainActor.run {
                             self.connectedPeers = self.peers.filter { $0.isConnectionReady }.count
                         }
 
-                        if connectedCount >= targetPeers {
+                        // FIX #1446: Stop at bgPeerCap or targetPeers
+                        if connectedCount >= bgPeerCap || connectedCount >= targetPeers {
                             group.cancelAll()
                             break
                         }
@@ -8116,6 +8235,7 @@ public final class NetworkManager: ObservableObject {
         peerRotationTimer = Timer.scheduledTimer(withTimeInterval: PEER_ROTATION_INTERVAL, repeats: true) { [weak self] _ in
             self?.rotatePeers()
         }
+        peerRotationTimer?.tolerance = 60.0  // FIX #1450: Timer coalescing (5min interval, 1min tolerance)
     }
 
     private func rotatePeers() {
@@ -8292,6 +8412,7 @@ public final class NetworkManager: ObservableObject {
         peerRecoveryTimer = Timer.scheduledTimer(withTimeInterval: PEER_RECOVERY_INTERVAL, repeats: true) { [weak self] _ in
             self?.checkPeerRecovery()
         }
+        peerRecoveryTimer?.tolerance = PEER_RECOVERY_INTERVAL * 0.25  // FIX #1450: Timer coalescing
     }
 
     /// Check if peers need recovery and trigger reconnection if needed
@@ -8733,6 +8854,7 @@ public final class NetworkManager: ObservableObject {
                 await self?.performKeepalivePing()
             }
         }
+        keepaliveTimer?.tolerance = KEEPALIVE_INTERVAL * 0.25  // FIX #1450: 25% tolerance for iOS timer coalescing
         debugLog(.network, "🫀 FIX #246: Keepalive timer started (interval: \(KEEPALIVE_INTERVAL)s)")
     }
 

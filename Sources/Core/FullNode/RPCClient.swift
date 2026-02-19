@@ -501,8 +501,9 @@ public class RPCClient: ObservableObject {
     /// Import private key
     /// FIX #286 v9: Use async operation for rescan with progress callback
     /// FIX #286 v10: Check for duplicate keys before importing
+    /// FIX #1454: Support Sprout spending keys (SK prefix) via z_importkey
     public func importPrivateKey(_ key: String, rescan: Bool = false, progressCallback: ((Double, String) -> Void)? = nil) async throws -> String {
-        let isZKey = key.hasPrefix("secret-extended-key")
+        let isZKey = key.hasPrefix("secret-extended-key") || key.hasPrefix("SK") // FIX #1454: Sprout keys also use z_importkey
 
         // FIX #286 v10: Check if key already exists BEFORE importing
         progressCallback?(0.05, "Checking for duplicate key...")

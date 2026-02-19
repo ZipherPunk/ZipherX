@@ -10087,12 +10087,16 @@ final class WalletManager: ObservableObject {
         return clampedHeight
     }
 
-    /// Sapling activation date: November 6, 2016
+    /// Sapling activation date: February 25, 2019 01:27:04 UTC (block 476,969)
     static let saplingActivationDate: Date = {
         var components = DateComponents()
-        components.year = 2016
-        components.month = 11
-        components.day = 6
+        components.timeZone = TimeZone(identifier: "UTC")
+        components.year = 2019
+        components.month = 2
+        components.day = 25
+        components.hour = 1
+        components.minute = 27
+        components.second = 4
         return Calendar.current.date(from: components) ?? Date.distantPast
     }()
 

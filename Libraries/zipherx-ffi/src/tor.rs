@@ -618,6 +618,7 @@ pub extern "C" fn zipherx_tor_hidden_service_start() -> i32 {
         match start_hidden_service_async().await {
             Ok(onion_addr) => {
                 eprintln!("🧅 Hidden service started!");
+                #[cfg(debug_assertions)]
                 eprintln!("🧅 Your .onion address: {}", onion_addr);
                 if let Ok(mut addr) = HIDDEN_SERVICE_ADDRESS.lock() {
                     *addr = Some(onion_addr);
@@ -656,6 +657,7 @@ async fn start_hidden_service_async() -> Result<String, Box<dyn std::error::Erro
     let keys_dir = data_dir.join("state").join("keys");
     let hs_keys_dir = keys_dir.join("hs_id").join("zipherx");
     let _ = std::fs::create_dir_all(&hs_keys_dir);
+    #[cfg(debug_assertions)]
     eprintln!("🧅 FIX #430: Keystore directory: {:?}", hs_keys_dir);
 
     // Build hidden service configuration
@@ -704,6 +706,17 @@ async fn start_hidden_service_async() -> Result<String, Box<dyn std::error::Erro
         let expanded_keypair = ExpandedKeypair::from(&tor_keypair);
         let hs_id_keypair = HsIdKeypair::from(expanded_keypair);
 
+        // FIX #1457: Remove existing keystore entry before inserting
+        // Arti's launch_onion_service_with_hsid() inserts the key into its internal keystore.
+        // On subsequent launches, the key already exists → KeyAlreadyExists error.
+        // Solution: delete the stale keystore file so Arti accepts our Keychain-backed key.
+        let keystore_dir = data_dir.join("state").join("keystore").join("hss").join("zipherx");
+        let hs_id_keyfile = keystore_dir.join("ks_hs_id.ed25519_expanded_private");
+        if hs_id_keyfile.exists() {
+            eprintln!("🧅 FIX #1457: Removing stale keystore entry for re-insertion");
+            let _ = std::fs::remove_file(&hs_id_keyfile);
+        }
+
         // Launch with the persistent keypair using the keystore-based API
         // This inserts the keypair into Arti's keystore and launches the service
         // FIX #209: Try with keypair first, fall back to random if keystore fails
@@ -719,7 +732,7 @@ async fn start_hidden_service_async() -> Result<String, Box<dyn std::error::Erro
                 // FIX #430: Keystore access failed - fall back to random address
                 // This is a known Arti limitation with experimental-api keystore on iOS/macOS
                 // The hidden service still works, just with a new random address each launch
-                eprintln!("🧅 FIX #430: Persistent keypair not available (Arti keystore limitation), using random address");
+                eprintln!("🧅 FIX #430: Persistent keypair not available (Arti keystore limitation), using random address. Error: {:?}", e);
                 let (svc, rend) = client.launch_onion_service(config)?
                     .ok_or("Hidden service returned None (fallback)")?;
                 (svc, Box::pin(rend) as Pin<Box<dyn futures::Stream<Item = tor_hsservice::RendRequest> + Send>>)
@@ -740,6 +753,26 @@ async fn start_hidden_service_async() -> Result<String, Box<dyn std::error::Erro
     if let Ok(mut guard) = handle_storage.lock() {
         *guard = Some(service.clone());
         eprintln!("🧅 Hidden service handle stored - service will remain active");
+    }
+
+    // FIX #1457: Scrub .onion identity key from disk after launch
+    // Arti writes the key as plaintext OpenSSH file to its keystore.
+    // The authoritative copy lives in macOS Keychain — no need to keep on disk.
+    // Arti holds the key in memory for the running service; disk file is not needed.
+    let keystore_dir = data_dir.join("state").join("keystore").join("hss").join("zipherx");
+    let hs_id_keyfile = keystore_dir.join("ks_hs_id.ed25519_expanded_private");
+    if hs_id_keyfile.exists() {
+        let _ = std::fs::remove_file(&hs_id_keyfile);
+        eprintln!("🧅 FIX #1457: Scrubbed .onion key from disk (kept in memory only)");
+    }
+    // Also scrub any blind ID / desc signing keys Arti may have written
+    if let Ok(entries) = std::fs::read_dir(&keystore_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map_or(false, |ext| ext == "ed25519_expanded_private" || ext == "ed25519_private") {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
     }
 
     // Get the .onion address using the new API
@@ -773,6 +806,7 @@ async fn start_hidden_service_async() -> Result<String, Box<dyn std::error::Erro
     let onion_base32 = base32_encode(&address_bytes);
     let onion_addr_str = format!("{}.onion", onion_base32);
 
+    #[cfg(debug_assertions)]
     eprintln!("🧅 Hidden service published: {}", onion_addr_str);
 
     // Spawn task to handle incoming rendezvous requests
@@ -797,6 +831,7 @@ async fn handle_hidden_service_connections(
     use futures::stream::FuturesUnordered;
     use tor_hsservice::StreamRequest;
 
+    #[cfg(debug_assertions)]
     eprintln!("🧅 Hidden service connection handler started for {}", onion_addr);
     eprintln!("🧅 Waiting for rendezvous requests on port 8033...");
 

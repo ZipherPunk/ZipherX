@@ -158,11 +158,12 @@ public final class TorManager: ObservableObject {
 
     private init() {
         // Load persisted mode
+        // FIX #1443: Tor enabled by default for privacy. User can disable in Settings.
         if let savedMode = UserDefaults.standard.string(forKey: "torMode"),
            let torMode = TorMode(rawValue: savedMode) {
             self.mode = torMode
         } else {
-            self.mode = .disabled
+            self.mode = .enabled
         }
         // FIX #1401: Load strict privacy preference
         self.strictPrivacyMode = UserDefaults.standard.bool(forKey: "torStrictPrivacyMode")

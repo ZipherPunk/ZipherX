@@ -73,6 +73,7 @@ struct SendView: View {
     @State private var hasAttemptedWitnessRepair = false  // FIX #750: Track if we've tried auto-repair
     @State private var isAddressValid = false
     @State private var isAddressTransparent = false
+    @State private var isAddressSprout = false  // FIX #1455: Detect Sprout z-addresses
     @State private var showQRScanner = false
     @State private var scannedAddress: String = ""
 
@@ -591,16 +592,25 @@ struct SendView: View {
                     if newValue.isEmpty {
                         isAddressValid = false
                         isAddressTransparent = false
+                        isAddressSprout = false
                     } else if newValue.hasPrefix("t1") || newValue.hasPrefix("t3") {
                         isAddressValid = false
                         isAddressTransparent = true
+                        isAddressSprout = false
+                    } else if newValue.hasPrefix("zc") {
+                        // FIX #1455: Detect Sprout z-addresses (Base58Check, not Bech32)
+                        isAddressValid = false
+                        isAddressTransparent = false
+                        isAddressSprout = true
                     } else if newValue.hasPrefix("zs1") && newValue.count >= 70 {
                         // Only call FFI for complete-looking addresses
                         isAddressTransparent = false
+                        isAddressSprout = false
                         isAddressValid = walletManager.isValidZAddress(newValue)
                     } else {
                         isAddressValid = false
                         isAddressTransparent = false
+                        isAddressSprout = false
                     }
                 }
 
@@ -680,6 +690,20 @@ struct SendView: View {
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundColor(theme.textSecondary)
                     .italic()
+            }
+        } else if isAddressSprout {
+            // FIX #1455: Specific feedback for Sprout z-addresses
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 4) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(theme.warningColor)
+                    Text("Sprout z-address (pre-Sapling) — not supported")
+                        .foregroundColor(theme.warningColor)
+                }
+                .font(theme.captionFont)
+                Text("ZipherX only supports Sapling shielded addresses (zs1...).")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundColor(theme.textSecondary)
             }
         } else if isAddressValid {
             HStack(spacing: 4) {

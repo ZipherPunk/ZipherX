@@ -266,6 +266,26 @@ struct DisclaimerView: View {
                 """
             )
 
+            // Section 14: Voluntary Contributions
+            sectionView(
+                title: "14. VOLUNTARY CONTRIBUTIONS",
+                icon: "person.3.fill",
+                content: """
+                All contributions to the development of ZipherX — including but not limited to code, \
+                documentation, design, testing, bug reports, translations, and feedback — are made \
+                on a strictly voluntary and unpaid basis. Contributing to this project does NOT entitle \
+                any contributor to:\n\n\
+                \u{2022} Any form of compensation, payment, or remuneration\n\
+                \u{2022} Any ownership, equity, or intellectual property rights in the software\n\
+                \u{2022} Any share of revenue, profits, donations, or financial benefits\n\
+                \u{2022} Any employment, contractor, or business relationship with the developer(s)\n\
+                \u{2022} Any decision-making authority over the project's direction\n\n\
+                Contributions are made under the terms of the MIT License. By contributing, you agree \
+                that your contributions become part of the open-source project with no expectation of \
+                compensation or ownership of any kind, now or in the future.
+                """
+            )
+
             // Cypherpunk quote
             quoteView
 
@@ -330,7 +350,7 @@ struct DisclaimerView: View {
                 .foregroundColor(.white)
 
             VStack(alignment: .leading, spacing: 8) {
-                acknowledgmentItem("You have read and understood all 13 sections of this disclaimer")
+                acknowledgmentItem("You have read and understood all 14 sections of this disclaimer")
                 acknowledgmentItem("You are at least 18 years of age or the age of majority in your jurisdiction")
                 acknowledgmentItem("You accept full responsibility for your use of this software")
                 acknowledgmentItem("You will comply with all applicable laws in your jurisdiction")

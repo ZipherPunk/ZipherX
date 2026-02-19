@@ -44,11 +44,17 @@ final class HeaderStore {
         }
 
         // FIX #200: SQLite performance optimizations (same as WalletDatabase)
+        // FIX #1449: Disable mmap on iOS — Data Protection + mmap = SIGBUS crash when device locked
+        #if os(iOS)
+        let mmapPragma = "PRAGMA mmap_size = 0;"           // FIX #1449: No mmap on iOS
+        #else
+        let mmapPragma = "PRAGMA mmap_size = 134217728;"   // 128MB on macOS
+        #endif
         let performancePragmas = [
             "PRAGMA journal_mode = WAL;",
             "PRAGMA synchronous = NORMAL;",
             "PRAGMA cache_size = -16000;",   // 16MB for headers
-            "PRAGMA mmap_size = 134217728;", // 128MB
+            mmapPragma,
             "PRAGMA temp_store = MEMORY;"
         ]
         for pragma in performancePragmas {

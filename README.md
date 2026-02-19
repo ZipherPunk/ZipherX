@@ -20,6 +20,8 @@
 >
 > **BACKUP YOUR WALLET BEFORE INSTALLATION.** If you are running an existing Zclassic full node or any other wallet software, you MUST back up your wallet files, private keys, and spending keys BEFORE installing or using ZipherX. ZipherX's Full Node mode connects to your local node and software bugs could potentially overwrite, corrupt, or delete existing wallet data. The developers accept NO responsibility for loss of funds or data resulting from failure to back up. This applies to both P2P mode and Full Node mode. **Always maintain independent, offline backups of your keys and wallet files.**
 >
+> **VOLUNTARY CONTRIBUTIONS.** All contributions to ZipherX — including code, documentation, design, testing, bug reports, translations, and feedback — are made on a strictly voluntary and unpaid basis. Contributing does NOT entitle any contributor to compensation, ownership, equity, intellectual property rights, revenue sharing, or any financial benefit of any kind. Contributions are made under the MIT License with no expectation of remuneration, now or in the future.
+>
 > By downloading, installing, or using ZipherX, you acknowledge that you have read, understood, and agree to this disclaimer in its entirety. If you do not agree, do not use this software.
 
 ---

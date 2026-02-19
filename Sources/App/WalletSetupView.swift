@@ -923,19 +923,38 @@ struct WalletSetupView: View {
                 let cleanInput = privateKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
                 let charCount = cleanInput.count
                 let isBech32 = cleanInput.hasPrefix("secret-extended-key-main")
-                let isValidLength = charCount == 338 || (isBech32 && charCount > 100)
+                // FIX #1455: Hex key must contain only valid hex characters
+                let isValidHex = charCount == 338 && cleanInput.allSatisfy { $0.isHexDigit }
+                let isValidLength = isValidHex || (isBech32 && charCount > 100)
+
+                // FIX #1452: Detect pre-Sapling key formats and warn user
+                let isSproutKey = cleanInput.hasPrefix("SK") && charCount > 40 && charCount < 60
+                let isTransparentWIF = charCount > 40 && charCount < 55 &&
+                    (cleanInput.hasPrefix("5") || cleanInput.hasPrefix("K") || cleanInput.hasPrefix("L"))
+                let isPreSaplingKey = isSproutKey || isTransparentWIF
 
                 HStack {
                     if isBech32 {
                         Image(systemName: "checkmark.circle.fill")
                             .foregroundColor(theme.successColor)
-                        Text("Bech32 format detected")
+                        Text("Sapling key detected (Bech32)")
                             .foregroundColor(theme.successColor)
-                    } else if charCount == 338 {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundColor(theme.successColor)
-                        Text("Hex format detected")
-                            .foregroundColor(theme.successColor)
+                    } else if charCount == 338 && isValidHex {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(theme.warningColor)
+                        // FIX #1455: Hex format has no checksum — warn user
+                        Text("Hex key detected — no checksum (use Bech32 format if possible)")
+                            .foregroundColor(theme.warningColor)
+                    } else if isSproutKey {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(theme.warningColor)
+                        Text("Sprout key detected — not supported")
+                            .foregroundColor(theme.warningColor)
+                    } else if isTransparentWIF {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(theme.warningColor)
+                        Text("Transparent key (WIF) — not supported")
+                            .foregroundColor(theme.warningColor)
                     } else if charCount > 0 {
                         Text("\(charCount) characters (hidden)")
                             .foregroundColor(theme.textSecondary)
@@ -945,6 +964,35 @@ struct WalletSetupView: View {
                     }
                 }
                 .font(.system(size: 11, weight: .regular, design: .monospaced))
+
+                // FIX #1452: Warning for pre-Sapling key formats
+                if isPreSaplingKey {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(isSproutKey
+                            ? "This is a Sprout (pre-Sapling) spending key. ZipherX only supports Sapling shielded transactions (block 476,969+ — Feb 25, 2019 UTC)."
+                            : "This is a transparent private key (t-address). ZipherX only supports Sapling shielded transactions.")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(theme.warningColor)
+
+                        if isSproutKey {
+                            Text("To import this key: switch to ZipherX Full Node mode (requires zclassicd running on macOS), then use Import Private Key. Once imported, use z_sendmany to migrate your funds to a Sapling z-address.")
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundColor(theme.textSecondary)
+                        } else {
+                            Text("To import this key: switch to ZipherX Full Node mode (requires zclassicd running on macOS), then use Import Private Key to add it to wallet.dat. Once imported, send your funds to a shielded z-address to protect your privacy.")
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundColor(theme.textSecondary)
+                        }
+                    }
+                    .padding(10)
+                    .background(theme.warningColor.opacity(0.1))
+                    .cornerRadius(theme.cornerRadius)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: theme.cornerRadius)
+                            .stroke(theme.warningColor.opacity(0.3), lineWidth: 1)
+                    )
+                    .padding(.horizontal, 24)
+                }
 
                 Spacer()
 
@@ -963,10 +1011,10 @@ struct WalletSetupView: View {
                         .foregroundColor(theme.backgroundColor)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 14)
-                        .background(isValidLength && !isProcessing ? theme.primaryColor : theme.textSecondary)
+                        .background(isValidLength && !isProcessing && !isPreSaplingKey ? theme.primaryColor : theme.textSecondary)
                         .cornerRadius(theme.cornerRadius)
                     }
-                    .disabled(!isValidLength || isProcessing)
+                    .disabled(!isValidLength || isProcessing || isPreSaplingKey)  // FIX #1452: Block pre-Sapling key import
                     .buttonStyle(PlainButtonStyle())
 
                     Button(action: {
@@ -1184,6 +1232,33 @@ struct WalletSetupView: View {
 
     private var mnemonicButtonsView: some View {
         VStack(spacing: 12) {
+            // FIX #1452: Sapling-only warning for seed restore
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 4) {
+                    Image(systemName: "info.circle.fill")
+                        .foregroundColor(theme.primaryColor)
+                    Text("SAPLING ONLY")
+                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                        .foregroundColor(theme.textPrimary)
+                }
+
+                Text("ZipherX derives only the Sapling shielded key (ZIP-32) from your seed. Only Sapling transactions (block 476,969+ — February 25, 2019 at 01:27:04 UTC) will be detected.")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(theme.textSecondary)
+
+                Text("If this seed was also used for transparent (t-addresses) or Sprout (zc-addresses) in another wallet, those funds will NOT be visible here. To recover them, use the original wallet software that created those addresses.")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(theme.warningColor)
+            }
+            .padding(10)
+            .background(theme.primaryColor.opacity(0.08))
+            .cornerRadius(theme.cornerRadius)
+            .overlay(
+                RoundedRectangle(cornerRadius: theme.cornerRadius)
+                    .stroke(theme.primaryColor.opacity(0.2), lineWidth: 1)
+            )
+            .padding(.horizontal, 24)
+
             Button(action: { restoreFromMnemonic() }) {
                 HStack {
                     if isProcessing {

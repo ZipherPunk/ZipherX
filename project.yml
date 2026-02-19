@@ -82,7 +82,7 @@ targets:
       properties:
         keychain-access-groups:
           - $(AppIdentifierPrefix)com.zipherpunk.zipherx
-        com.apple.developer.default-data-protection: NSFileProtectionComplete
+        com.apple.developer.default-data-protection: NSFileProtectionCompleteUntilFirstUserAuthentication
 
   # macOS Target
   ZipherXMac:

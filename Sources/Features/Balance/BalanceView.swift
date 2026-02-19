@@ -1557,6 +1557,7 @@ struct BalanceView: View {
                 }
             }
         }
+        heartTimer?.tolerance = 0.2  // FIX #1450: Tolerance for iOS timer coalescing
     }
 
     /// Stop the heartbeat animation
@@ -1738,6 +1739,7 @@ struct BalanceView: View {
                 guard walletManager != nil, networkManager != nil else { return }
                 self.autoRefreshTick()
             }
+            self.refreshTimer?.tolerance = 1.0  // FIX #1450: Tolerance for iOS timer coalescing
         }
     }
 

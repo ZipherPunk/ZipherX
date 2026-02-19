@@ -37,32 +37,40 @@ struct RPCSendView: View {
         addresses.filter { $0.balance > 0 }
     }
 
-    // FIX #286: Validate receiver address (z or t address)
+    // FIX #286 + FIX #1453 + FIX #1455: Validate receiver address (z or t address)
     private var isValidReceiverAddress: Bool {
         guard !toAddress.isEmpty else { return false }
-        // Z-address validation (Sapling)
-        if toAddress.hasPrefix("zs1") || toAddress.hasPrefix("zs") || toAddress.hasPrefix("zc") {
-            // Sapling z-address should be 78 chars for zs1, or legacy format
-            return toAddress.count >= 69
+        // FIX #1455: Sprout z-addresses (zc...) — NOT supported, reject early
+        if toAddress.hasPrefix("zc") {
+            return false
         }
-        // T-address validation
+        // Sapling z-address validation — FFI does full Bech32 decode + checksum + 43-byte payload
+        if toAddress.hasPrefix("zs1") || toAddress.hasPrefix("zs") {
+            return ZipherXFFI.validateAddress(toAddress)
+        }
+        // FIX #1455: T-address validation — length + Base58 character set check
         if toAddress.hasPrefix("t1") || toAddress.hasPrefix("t3") {
-            // T-address should be 34-35 chars
-            return toAddress.count >= 34 && toAddress.count <= 35
+            guard toAddress.count >= 34 && toAddress.count <= 35 else { return false }
+            // Base58 alphabet: no 0, O, I, l
+            let base58Chars = CharacterSet(charactersIn: "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+            return toAddress.unicodeScalars.allSatisfy { base58Chars.contains($0) }
         }
         return false
     }
 
-    // FIX #286: Error message for invalid address
+    // FIX #286 + FIX #1453 + FIX #1455: Error message for invalid address
     private var addressValidationError: String? {
         guard !toAddress.isEmpty else { return nil }
         if !isValidReceiverAddress {
-            if toAddress.hasPrefix("zs") || toAddress.hasPrefix("zc") {
-                return "Invalid z-address format"
+            // FIX #1455: Specific Sprout detection
+            if toAddress.hasPrefix("zc") {
+                return "Sprout z-address (pre-Sapling) — only Sapling zs1... addresses supported"
+            } else if toAddress.hasPrefix("zs") {
+                return "Invalid z-address (Bech32 checksum verification failed)"
             } else if toAddress.hasPrefix("t") {
-                return "Invalid t-address format"
+                return "Invalid t-address format (must be 34-35 Base58 characters)"
             } else {
-                return "Address must start with 'zs1', 'zc', 't1', or 't3'"
+                return "Address must start with 'zs1' (shielded) or 't1'/'t3' (transparent)"
             }
         }
         return nil

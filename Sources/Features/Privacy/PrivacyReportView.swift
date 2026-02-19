@@ -183,7 +183,7 @@ class PrivacyReportGenerator: ObservableObject {
                 category: "NETWORK",
                 name: "Tor Routing",
                 status: .secure,
-                description: "All HTTP traffic routed through Tor network. Your IP is hidden from API servers.",
+                description: "Tor active. Network traffic routed through onion circuits. Your IP is hidden from peers.",
                 recommendation: nil,
                 points: 15,
                 maxPoints: 15
@@ -193,7 +193,7 @@ class PrivacyReportGenerator: ObservableObject {
                 category: "NETWORK",
                 name: "Tor Routing",
                 status: .warning,
-                description: "Tor is enabled but not connected. Traffic may be exposed during reconnection.",
+                description: "Tor is enabled but not connected. P2P traffic may expose your IP during reconnection.",
                 recommendation: "Wait for Tor to connect or check your network connection.",
                 points: 5,
                 maxPoints: 15
@@ -203,8 +203,8 @@ class PrivacyReportGenerator: ObservableObject {
                 category: "NETWORK",
                 name: "Tor Routing",
                 status: .critical,
-                description: "Tor is disabled. Your IP address is visible to API servers and blockchain explorers.",
-                recommendation: "Enable Tor in Settings → Privacy → Route through Tor for maximum anonymity.",
+                description: "Tor is disabled. Your IP address is visible to P2P peers and DNS seed nodes.",
+                recommendation: "Enable Tor in Settings for maximum network privacy.",
                 points: 0,
                 maxPoints: 15
             )
@@ -248,14 +248,23 @@ class PrivacyReportGenerator: ObservableObject {
         let peerCount = networkManager.connectedPeers
         let torEnabled = TorManager.shared.mode == .enabled
 
-        // P2P goes direct even with Tor (known limitation)
-        if torEnabled {
+        if torEnabled && peerCount >= 3 {
+            return PrivacyCheckItem(
+                category: "NETWORK",
+                name: "P2P Connections",
+                status: .secure,
+                description: "\(peerCount) peers connected via Tor. Your IP is hidden from blockchain peers.",
+                recommendation: nil,
+                points: 10,
+                maxPoints: 10
+            )
+        } else if torEnabled {
             return PrivacyCheckItem(
                 category: "NETWORK",
                 name: "P2P Connections",
                 status: .warning,
-                description: "P2P peer connections are direct (Tor SOCKS5 limitation). \(peerCount) peers connected.",
-                recommendation: "P2P traffic reveals your IP to peers. Use a VPN for additional protection.",
+                description: "Only \(peerCount) peers connected via Tor. Low peer count reduces consensus reliability.",
+                recommendation: "Wait for more peer connections (3+ recommended).",
                 points: 5,
                 maxPoints: 10
             )
@@ -263,9 +272,9 @@ class PrivacyReportGenerator: ObservableObject {
             return PrivacyCheckItem(
                 category: "NETWORK",
                 name: "P2P Connections",
-                status: .info,
-                description: "\(peerCount) diverse peers connected. Good peer diversity reduces single-point tracking.",
-                recommendation: "Enable Tor for API traffic to complement P2P privacy.",
+                status: .warning,
+                description: "\(peerCount) peers connected directly. Your IP is visible to all peers.",
+                recommendation: "Enable Tor to hide your IP from P2P peers.",
                 points: 3,
                 maxPoints: 10
             )
@@ -274,8 +283,8 @@ class PrivacyReportGenerator: ObservableObject {
                 category: "NETWORK",
                 name: "P2P Connections",
                 status: .warning,
-                description: "Only \(peerCount) peers connected. Low peer diversity increases tracking risk.",
-                recommendation: "Connect to more peers to improve network privacy.",
+                description: "Only \(peerCount) peers connected without Tor. IP exposed and low diversity.",
+                recommendation: "Enable Tor and wait for more peer connections.",
                 points: 1,
                 maxPoints: 10
             )
@@ -337,26 +346,26 @@ class PrivacyReportGenerator: ObservableObject {
     }
 
     private func checkKeyStorage() async -> PrivacyCheckItem {
-        #if os(iOS) && !targetEnvironment(simulator)
-        // Real iOS device with Secure Enclave
-        return PrivacyCheckItem(
-            category: "SECURITY",
-            name: "Key Storage",
-            status: .secure,
-            description: "Spending key protected by Secure Enclave hardware. Keys never leave the secure chip.",
-            recommendation: nil,
-            points: 15,
-            maxPoints: 15
-        )
-        #else
-        // Simulator or macOS - AES-GCM encrypted
+        #if targetEnvironment(simulator)
+        // Simulator — no Secure Enclave
         return PrivacyCheckItem(
             category: "SECURITY",
             name: "Key Storage",
             status: .warning,
-            description: "Spending key encrypted with AES-GCM-256. Hardware Secure Enclave unavailable on this device.",
-            recommendation: "For maximum security, use a real iOS device with Secure Enclave.",
+            description: "Running in simulator. Spending key encrypted with AES-GCM-256 (no hardware Secure Enclave).",
+            recommendation: "Deploy to a real device for hardware-backed key protection.",
             points: 10,
+            maxPoints: 15
+        )
+        #else
+        // Real device (iOS or macOS Apple Silicon) — Secure Enclave available
+        return PrivacyCheckItem(
+            category: "SECURITY",
+            name: "Key Storage",
+            status: .secure,
+            description: "Spending key protected by hardware Secure Enclave. Keys never leave the secure chip.",
+            recommendation: nil,
+            points: 15,
             maxPoints: 15
         )
         #endif
@@ -479,14 +488,15 @@ class PrivacyReportGenerator: ObservableObject {
     }
 
     private func checkAPIPrivacy() async -> PrivacyCheckItem {
+        // ZipherX uses 100% P2P — no centralized API servers in normal operation
         let torEnabled = TorManager.shared.mode == .enabled && TorManager.shared.connectionState.isConnected
 
         if torEnabled {
             return PrivacyCheckItem(
                 category: "NETWORK",
-                name: "API Privacy",
+                name: "Network Architecture",
                 status: .secure,
-                description: "InsightAPI requests routed through Tor. Explorer cannot link requests to your IP.",
+                description: "100% peer-to-peer via Tor. No centralized API servers. No third-party can track your queries.",
                 recommendation: nil,
                 points: 5,
                 maxPoints: 5
@@ -494,11 +504,11 @@ class PrivacyReportGenerator: ObservableObject {
         } else {
             return PrivacyCheckItem(
                 category: "NETWORK",
-                name: "API Privacy",
-                status: .critical,
-                description: "API requests expose your IP to blockchain explorer. Request patterns can be correlated.",
-                recommendation: "Enable Tor to hide your IP from the InsightAPI explorer.",
-                points: 0,
+                name: "Network Architecture",
+                status: .info,
+                description: "100% peer-to-peer (no centralized servers). Peers can see your IP without Tor.",
+                recommendation: "Enable Tor for full network privacy.",
+                points: 3,
                 maxPoints: 5
             )
         }
@@ -510,9 +520,9 @@ class PrivacyReportGenerator: ObservableObject {
         if torEnabled {
             return PrivacyCheckItem(
                 category: "NETWORK",
-                name: "DNS Leakage",
+                name: "DNS Privacy",
                 status: .secure,
-                description: "DNS resolved through Tor. No DNS queries leak to your ISP.",
+                description: "Peer discovery via Tor. DNS seed queries do not leak to your ISP.",
                 recommendation: nil,
                 points: 5,
                 maxPoints: 5
@@ -520,10 +530,10 @@ class PrivacyReportGenerator: ObservableObject {
         } else {
             return PrivacyCheckItem(
                 category: "NETWORK",
-                name: "DNS Leakage",
+                name: "DNS Privacy",
                 status: .warning,
-                description: "DNS queries may reveal domains you access to your ISP.",
-                recommendation: "Enable Tor to prevent DNS leakage.",
+                description: "Initial peer discovery uses DNS seeds. Your ISP can see you are connecting to Zclassic.",
+                recommendation: "Enable Tor to hide peer discovery from your ISP.",
                 points: 2,
                 maxPoints: 5
             )

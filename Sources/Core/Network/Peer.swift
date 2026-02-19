@@ -1388,12 +1388,17 @@ public final class Peer {
         // FIX #267: Configure TCP-level keepalive to prevent iOS from killing idle connections
         // iOS mobile networks are aggressive about dropping idle TCP connections
         // TCP keepalive is more reliable than app-level keepalive on mobile
-        // UPDATED: More aggressive keepalive (15s interval, 2 probes) for better connection stability
+        // FIX #1450: Relaxed keepalive on iOS (45s) to reduce battery drain.
+        // 15s × 30 peers = 120 TCP packets/min was excessive. 45s × 8 peers = 10 packets/min.
         let tcpOptions = NWProtocolTCP.Options()
         tcpOptions.enableKeepalive = true
-        tcpOptions.keepaliveInterval = 15  // Send keepalive every 15 seconds (was 30)
-        tcpOptions.keepaliveCount = 2      // Allow 2 missed probes before disconnect (was 4)
-        // Total timeout before disconnect: 15s * 2 = 30s (down from 120s)
+        #if os(iOS)
+        tcpOptions.keepaliveInterval = 45  // FIX #1450: 45s on iOS (battery)
+        tcpOptions.keepaliveCount = 3      // 3 probes × 45s = 135s timeout
+        #else
+        tcpOptions.keepaliveInterval = 15  // 15s on macOS (always on power)
+        tcpOptions.keepaliveCount = 2      // 2 probes × 15s = 30s timeout
+        #endif
         tcpOptions.connectionTimeout = 15  // 15 second connection timeout
         // FIX #1287: Disable Nagle's algorithm — send getdata requests immediately.
         // Without this, small writes are buffered up to 200ms. Bitcoin Core sets this on all peers.
@@ -1535,12 +1540,16 @@ public final class Peer {
 
         // FIX #267: Configure TCP-level keepalive for Tor connections too
         // Even more important for Tor since circuits can become stale
-        // UPDATED: More aggressive keepalive (15s interval, 2 probes) for better stability
+        // FIX #1450: Relaxed keepalive on iOS to reduce battery drain
         let tcpOptions = NWProtocolTCP.Options()
         tcpOptions.enableKeepalive = true
-        tcpOptions.keepaliveInterval = 15  // Send keepalive every 15 seconds (was 30)
-        tcpOptions.keepaliveCount = 2      // Allow 2 missed probes before disconnect (was 4)
-        // Total timeout: 15s * 2 = 30s (down from 120s)
+        #if os(iOS)
+        tcpOptions.keepaliveInterval = 45  // FIX #1450: 45s on iOS (battery)
+        tcpOptions.keepaliveCount = 3      // 3 probes × 45s = 135s timeout
+        #else
+        tcpOptions.keepaliveInterval = 15  // 15s on macOS
+        tcpOptions.keepaliveCount = 2      // 2 probes × 15s = 30s timeout
+        #endif
         tcpOptions.connectionTimeout = 20  // Tor connections can be slower
 
         let parameters = NWParameters(tls: nil, tcp: tcpOptions)

@@ -3,15 +3,13 @@
 	archiveVersion = 1;
 	classes = {
 	};
-	objectVersion = 63;
+	objectVersion = 77;
 	objects = {
 
 /* Begin PBXBuildFile section */
 		002097046620424C5DEFD964 /* SQLCipherManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9068ED711254490CAD1CD553 /* SQLCipherManager.swift */; };
 		00F53085F3953FDC9CEEC6A9 /* InsightAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 710E39D55C6AFE9BB6AEA11D /* InsightAPI.swift */; };
 		027C0FBFA0CD3C9E21C357CD /* ClipboardManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C76A4256B2657D68B859C13 /* ClipboardManager.swift */; };
-		0A1B2C3D4E5F60718293A4B5 /* PrintSilencer.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5A4938271605F4E3D2C1B0A /* PrintSilencer.swift */; };
-		C6D7E8F90A1B2C3D4E5F6071 /* PrintSilencer.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5A4938271605F4E3D2C1B0A /* PrintSilencer.swift */; };
 		060287BCEAF96F0B259A3B7B /* Constants.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9C06A2912C98B98AD2E5D87 /* Constants.swift */; };
 		06809D718F601662F7E64D8B /* TorManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9CE0707D0A98DFEF7F487D9B /* TorManager.swift */; };
 		0684A1BB0B46362A008208F3 /* System7Components.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79B539975C988B8093FB4106 /* System7Components.swift */; };
@@ -91,6 +89,7 @@
 		5B9788995FB9227C7F0D5864 /* WalletMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = D769A0AE4089D10446BFBBCE /* WalletMode.swift */; };
 		5F8917A38D769E814F71D5D7 /* AsyncTimeout.swift in Sources */ = {isa = PBXBuildFile; fileRef = AEC990C6CC128A4EE43E4F47 /* AsyncTimeout.swift */; };
 		60EA568D15B5804802223F01 /* CustomNodesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E571F50EFCC773E8C33F1455 /* CustomNodesView.swift */; };
+		62F31D30A9CD425F5ECB3BDA /* PrintSilencer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 31CCF4C554E0C437F76F9E7D /* PrintSilencer.swift */; };
 		637AD9599E602F666DC55B86 /* CustomNodesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E571F50EFCC773E8C33F1455 /* CustomNodesView.swift */; };
 		652A8B2EAD105A88B099985D /* AppDirectories.swift in Sources */ = {isa = PBXBuildFile; fileRef = C9F90E89701CC0D1CFDA0770 /* AppDirectories.swift */; };
 		65E4618185A5880E6AF8D15C /* ExplorerViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 426F735D18C658425E86F4D4 /* ExplorerViewModel.swift */; };
@@ -166,6 +165,7 @@
 		C6307F815EFF9450C89C86CD /* SQLCipherManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9068ED711254490CAD1CD553 /* SQLCipherManager.swift */; };
 		C87A8421B7A3118337C76A12 /* System7Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = ECCBAC8661E3E2AF844BA7CF /* System7Theme.swift */; };
 		C94BC882A943F71E0F919ED4 /* sapling-spend.params in Resources */ = {isa = PBXBuildFile; fileRef = 5CACD4E0F762EEB5883FE0BD /* sapling-spend.params */; };
+		CBE0C333AB29BEDFBEC6E3DE /* PrintSilencer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 31CCF4C554E0C437F76F9E7D /* PrintSilencer.swift */; };
 		CEA228C1D6634E2A20C27D04 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0CD9AE42E2111119140BAC99 /* AppDelegate.swift */; };
 		CF30A07128F9B9CDACBE838A /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DFCB4EE9BBE481DCD741022B /* ChatView.swift */; };
 		D12D1FC3E8D5528FFBD4BDCE /* ZSTDDecoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 390E59ED284539CE4E8B6B8E /* ZSTDDecoder.swift */; };
@@ -227,22 +227,22 @@
 		21F90AD0A6320975EB67A156 /* ParallelImportCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ParallelImportCoordinator.swift; sourceTree = "<group>"; };
 		22E00D44F9FE9297973549CE /* CypherpunkTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CypherpunkTheme.swift; sourceTree = "<group>"; };
 		235376F572F89B6D83EDA88C /* WalletTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletTests.swift; sourceTree = "<group>"; };
-		2D405818BAB8FDFF2B00EC05 /* WalletDatabase.swift.bak */ = {isa = PBXFileReference; lastKnownFileType = text; path = WalletDatabase.swift.bak; sourceTree = "<group>"; };
+		2D405818BAB8FDFF2B00EC05 /* WalletDatabase.swift.bak */ = {isa = PBXFileReference; path = WalletDatabase.swift.bak; sourceTree = "<group>"; };
 		2E99AAE134DFFBE985476459 /* FastWalletCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FastWalletCache.swift; sourceTree = "<group>"; };
 		2F15365AE4A32D33ADD3A2C9 /* PeerManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerManager.swift; sourceTree = "<group>"; };
 		2F8F776C5143A67A1A923FF1 /* PrivacyScoreView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivacyScoreView.swift; sourceTree = "<group>"; };
 		30119E869C42D69D497AEDB5 /* FullNodeManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FullNodeManager.swift; sourceTree = "<group>"; };
+		31CCF4C554E0C437F76F9E7D /* PrintSilencer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrintSilencer.swift; sourceTree = "<group>"; };
 		32F58618190CB98DA9E3EB4B /* BalanceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BalanceView.swift; sourceTree = "<group>"; };
 		36B187CE34B94597E7499ACF /* AppUpdateChecker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppUpdateChecker.swift; sourceTree = "<group>"; };
 		374534D4E96BDE4077D846D2 /* BoostDownloadProgressView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BoostDownloadProgressView.swift; sourceTree = "<group>"; };
 		390E59ED284539CE4E8B6B8E /* ZSTDDecoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZSTDDecoder.swift; sourceTree = "<group>"; };
-		B5A4938271605F4E3D2C1B0A /* PrintSilencer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrintSilencer.swift; sourceTree = "<group>"; };
 		426F735D18C658425E86F4D4 /* ExplorerViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExplorerViewModel.swift; sourceTree = "<group>"; };
 		48D92FD9B357E6379040DA58 /* Peer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Peer.swift; sourceTree = "<group>"; };
 		4F54464087D684EC795896B7 /* SaplingParams.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SaplingParams.swift; sourceTree = "<group>"; };
 		58A977985B736ECAC0C4E425 /* ZipherXFFI.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = ZipherXFFI.xcframework; path = Libraries/ZipherXFFI.xcframework; sourceTree = "<group>"; };
 		5A73F74D89DB53D27B28AF26 /* FilterScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilterScanner.swift; sourceTree = "<group>"; };
-		5CACD4E0F762EEB5883FE0BD /* sapling-spend.params */ = {isa = PBXFileReference; lastKnownFileType = file; path = "sapling-spend.params"; sourceTree = "<group>"; };
+		5CACD4E0F762EEB5883FE0BD /* sapling-spend.params */ = {isa = PBXFileReference; path = "sapling-spend.params"; sourceTree = "<group>"; };
 		5E41B773BA9C02028BF61946 /* WalletHealthCheck.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletHealthCheck.swift; sourceTree = "<group>"; };
 		630CFD90F45505D02500501A /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		6626F058762A0D0666024868 /* BundledBlockHashes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BundledBlockHashes.swift; sourceTree = "<group>"; };
@@ -264,7 +264,7 @@
 		84A22E847C368B61A1B198EE /* MnemonicGenerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MnemonicGenerator.swift; sourceTree = "<group>"; };
 		875C4F629D2DE7185FCBD4F9 /* BootstrapProgressView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BootstrapProgressView.swift; sourceTree = "<group>"; };
 		8AB898B285954293A4942B3D /* BootstrapManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BootstrapManager.swift; sourceTree = "<group>"; };
-		8BBDC7F9897C7508ABB3081C /* WalletManager.swift.backup */ = {isa = PBXFileReference; lastKnownFileType = text; path = WalletManager.swift.backup; sourceTree = "<group>"; };
+		8BBDC7F9897C7508ABB3081C /* WalletManager.swift.backup */ = {isa = PBXFileReference; path = WalletManager.swift.backup; sourceTree = "<group>"; };
 		9068ED711254490CAD1CD553 /* SQLCipherManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SQLCipherManager.swift; sourceTree = "<group>"; };
 		976B66D0357DED3CBC256EAB /* ModeSelectionView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModeSelectionView.swift; sourceTree = "<group>"; };
 		981EE3318B95CD2FF12ACE26 /* ChatManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatManager.swift; sourceTree = "<group>"; };
@@ -275,7 +275,7 @@
 		9CE0707D0A98DFEF7F487D9B /* TorManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TorManager.swift; sourceTree = "<group>"; };
 		9CE3820E5845DBDF0B46FF51 /* DebugLogger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugLogger.swift; sourceTree = "<group>"; };
 		9CE439D202EE45C834417E47 /* DatabaseEncryption.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabaseEncryption.swift; sourceTree = "<group>"; };
-		9DE32B9D0904800484773DAD /* SendView.swift.backup */ = {isa = PBXFileReference; lastKnownFileType = text; path = SendView.swift.backup; sourceTree = "<group>"; };
+		9DE32B9D0904800484773DAD /* SendView.swift.backup */ = {isa = PBXFileReference; path = SendView.swift.backup; sourceTree = "<group>"; };
 		A9C06A2912C98B98AD2E5D87 /* Constants.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Constants.swift; sourceTree = "<group>"; };
 		AB6E0682B3CE8F22BA1304C1 /* RPCClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RPCClient.swift; sourceTree = "<group>"; };
 		ACD23F43B8205785891BF585 /* BlockHeader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlockHeader.swift; sourceTree = "<group>"; };
@@ -295,7 +295,7 @@
 		C9F90E89701CC0D1CFDA0770 /* AppDirectories.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDirectories.swift; sourceTree = "<group>"; };
 		CC49EF4A7BB4B93B726B735E /* ModernTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModernTheme.swift; sourceTree = "<group>"; };
 		CF1F7BBA642E66EE6EE7D32A /* ReceiveView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReceiveView.swift; sourceTree = "<group>"; };
-		D0494671402CB598446E82E3 /* sapling-output.params */ = {isa = PBXFileReference; lastKnownFileType = file; path = "sapling-output.params"; sourceTree = "<group>"; };
+		D0494671402CB598446E82E3 /* sapling-output.params */ = {isa = PBXFileReference; path = "sapling-output.params"; sourceTree = "<group>"; };
 		D114627F3AC22A9229292187 /* HeaderSyncManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HeaderSyncManager.swift; sourceTree = "<group>"; };
 		D301D43373B396F4C45D6B6B /* WalletOperationsProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletOperationsProtocol.swift; sourceTree = "<group>"; };
 		D769A0AE4089D10446BFBBCE /* WalletMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletMode.swift; sourceTree = "<group>"; };
@@ -669,7 +669,7 @@
 			isa = PBXGroup;
 			children = (
 				9C76A4256B2657D68B859C13 /* ClipboardManager.swift */,
-				B5A4938271605F4E3D2C1B0A /* PrintSilencer.swift */,
+				31CCF4C554E0C437F76F9E7D /* PrintSilencer.swift */,
 				390E59ED284539CE4E8B6B8E /* ZSTDDecoder.swift */,
 			);
 			path = Utilities;
@@ -827,6 +827,7 @@
 			);
 			mainGroup = 1E0AB0F916282FFBD8E5F74E;
 			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
@@ -923,6 +924,7 @@
 				B8D6695938ADC2A20FD62580 /* ParallelImportProgressView.swift in Sources */,
 				DCB48F14E31DBA6705F0BC79 /* Peer.swift in Sources */,
 				B26FF06A04BCF61484270D64 /* PeerManager.swift in Sources */,
+				CBE0C333AB29BEDFBEC6E3DE /* PrintSilencer.swift in Sources */,
 				34481E26708F49AD37EB6C93 /* PrivacyQuotes.swift in Sources */,
 				27A383A84436B64371D21909 /* PrivacyReportView.swift in Sources */,
 				E482EBBAC733177124411B8C /* PrivacyScore.swift in Sources */,
@@ -954,7 +956,6 @@
 				ED160AAE5D5BE3EE9480FEF2 /* WalletSetupView.swift in Sources */,
 				06B12D7857EFEC8AC250FC21 /* Win95Theme.swift in Sources */,
 				D12D1FC3E8D5528FFBD4BDCE /* ZSTDDecoder.swift in Sources */,
-				0A1B2C3D4E5F60718293A4B5 /* PrintSilencer.swift in Sources */,
 				40485458E29ECDBC6551AD18 /* ZipherXApp.swift in Sources */,
 				69439D42385913BA2D7F4EEC /* ZipherXFFI.swift in Sources */,
 			);
@@ -1015,6 +1016,7 @@
 				181AA8222539CB2B4466F3B3 /* ParallelImportProgressView.swift in Sources */,
 				3742555859851725FDC9B9DE /* Peer.swift in Sources */,
 				9EC14CE9632CD7A08AC73157 /* PeerManager.swift in Sources */,
+				62F31D30A9CD425F5ECB3BDA /* PrintSilencer.swift in Sources */,
 				173DF1CDF6DDCC43B57B50F8 /* PrivacyQuotes.swift in Sources */,
 				958D0FA84BF6E75FFBB20282 /* PrivacyReportView.swift in Sources */,
 				577B429477EFC01E98AF29CC /* PrivacyScore.swift in Sources */,
@@ -1046,7 +1048,6 @@
 				2A310DACA7C2E48D320A1600 /* WalletSetupView.swift in Sources */,
 				DFB88567CE1D7F8126F32FE6 /* Win95Theme.swift in Sources */,
 				AAAA7D846C416018A6016B6A /* ZSTDDecoder.swift in Sources */,
-				C6D7E8F90A1B2C3D4E5F6071 /* PrintSilencer.swift in Sources */,
 				8F90F1D58322A43F385FB321 /* ZipherXApp.swift in Sources */,
 				7EC2BE84340E3513C2F738E6 /* ZipherXFFI.swift in Sources */,
 			);
@@ -1113,14 +1114,18 @@
 					"$(inherited)",
 					"\"Libraries\"",
 				);
-				HEADER_SEARCH_PATHS = "$(SRCROOT)/Libraries/SQLCipher.xcframework/macos-arm64_x86_64/Headers";
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/Libraries/SQLCipher.xcframework/macos-arm64_x86_64/Headers",
+				);
 				INFOPLIST_FILE = "Info-macOS.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 12.0;
-				OTHER_LDFLAGS = "-lresolv";
+				OTHER_LDFLAGS = (
+					"-lresolv",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.zipherpunk.zipherx.mac;
 				SDKROOT = macosx;
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/ZipherX-Bridging-Header.h";
@@ -1147,7 +1152,9 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				OTHER_LDFLAGS = "-lresolv";
+				OTHER_LDFLAGS = (
+					"-lresolv",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.zipherpunk.zipherx;
 				SDKROOT = iphoneos;
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/ZipherX-Bridging-Header.h";
@@ -1175,7 +1182,9 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				OTHER_LDFLAGS = "-lresolv";
+				OTHER_LDFLAGS = (
+					"-lresolv",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.zipherpunk.zipherx;
 				SDKROOT = iphoneos;
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/ZipherX-Bridging-Header.h";
@@ -1193,14 +1202,18 @@
 					"$(inherited)",
 					"\"Libraries\"",
 				);
-				HEADER_SEARCH_PATHS = "$(SRCROOT)/Libraries/SQLCipher.xcframework/macos-arm64_x86_64/Headers";
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/Libraries/SQLCipher.xcframework/macos-arm64_x86_64/Headers",
+				);
 				INFOPLIST_FILE = "Info-macOS.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 12.0;
-				OTHER_LDFLAGS = "-lresolv";
+				OTHER_LDFLAGS = (
+					"-lresolv",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.zipherpunk.zipherx.mac;
 				SDKROOT = macosx;
 				SWIFT_OBJC_BRIDGING_HEADER = "Sources/ZipherX-Bridging-Header.h";

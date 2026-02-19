@@ -2935,6 +2935,7 @@ struct ContentView: View {
         inactivityTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { _ in
             checkInactivityTimeout()
         }
+        inactivityTimer?.tolerance = 2.0  // FIX #1450: Tolerance for iOS timer coalescing
     }
 
     private func stopInactivityTimer() {
@@ -3423,22 +3424,13 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showCypherpunkChat) {
             // FIX #252: Pass callback to navigate to main app settings when Tor is disabled
-            ZStack(alignment: .topTrailing) {
-                ChatView(onShowAppSettings: {
-                    showCypherpunkChat = false
-                    showCypherpunkSettings = true
-                })
-                .background(Color.black)
-
-                // Close button for the chat window
-                Button(action: { showCypherpunkChat = false }) {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 20))
-                        .foregroundColor(.gray.opacity(0.7))
-                        .padding(12)
-                }
-                .buttonStyle(.plain)
-            }
+            ChatView(onShowAppSettings: {
+                showCypherpunkChat = false
+                showCypherpunkSettings = true
+            }, onClose: {
+                showCypherpunkChat = false
+            })
+            .background(Color.black)
             #if os(macOS)
             // FIX #257: Use min/ideal/max constraints for better macOS window sizing
             .frame(minWidth: 650, idealWidth: 750, maxWidth: 900,

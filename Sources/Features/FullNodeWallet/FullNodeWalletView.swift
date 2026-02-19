@@ -1412,14 +1412,19 @@ struct FullNodeWalletView: View {
     @State private var rescanElapsedSeconds: Int = 0
     @State private var rescanEstimatedTotalSeconds: Int = 7200  // Default 2 hours estimate
 
-    // FIX #286 v9: Validate private key format
+    // FIX #286 v9 + FIX #1454: Validate private key format (Sapling, Sprout, and transparent)
     private var isValidPrivateKey: Bool {
         let key = importPrivateKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !key.isEmpty else { return false }
 
-        // Z-address spending key (starts with "secret-extended-key")
+        // Sapling z-address spending key (starts with "secret-extended-key")
         if key.hasPrefix("secret-extended-key") {
             return key.count > 50
+        }
+
+        // FIX #1454: Sprout z-address spending key (starts with "SK")
+        if key.hasPrefix("SK") {
+            return key.count >= 40 && key.count <= 60
         }
 
         // T-address WIF private key (starts with 5, K, or L for mainnet)
@@ -1435,11 +1440,13 @@ struct FullNodeWalletView: View {
         if key.isEmpty { return "" }
 
         if key.hasPrefix("secret-extended-key") {
-            return "✅ Z-address (shielded) spending key detected"
+            return "Z-address (Sapling shielded) spending key detected"
+        } else if key.hasPrefix("SK") {
+            return "Z-address (Sprout pre-Sapling) spending key detected — will be imported via z_importkey"
         } else if key.hasPrefix("5") || key.hasPrefix("K") || key.hasPrefix("L") {
-            return "✅ T-address (transparent) private key detected"
+            return "T-address (transparent) private key detected"
         } else {
-            return "❌ Invalid key format. Z-keys start with 'secret-extended-key', T-keys start with '5', 'K', or 'L'"
+            return "Invalid key format. Z-keys start with 'secret-extended-key' or 'SK', T-keys start with '5', 'K', or 'L'"
         }
     }
 
