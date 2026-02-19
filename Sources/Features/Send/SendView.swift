@@ -641,26 +641,41 @@ struct SendView: View {
     }
 
     /// Extract address from QR code string (handles zcash: URIs and plain addresses)
+    /// VUL-UI-004: Sanitize QR input — reject oversized/undersized, strip non-alphanumeric
     private func extractAddressFromQR(_ qrString: String) -> String {
+        // VUL-UI-004: Reject obviously malformed QR codes
+        let trimmed = qrString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 10, trimmed.count <= 500 else {
+            return ""
+        }
+
+        var address: String
         // Handle zcash: URI format
-        if qrString.lowercased().hasPrefix("zcash:") {
-            let withoutPrefix = String(qrString.dropFirst(6))
+        if trimmed.lowercased().hasPrefix("zcash:") {
+            let withoutPrefix = String(trimmed.dropFirst(6))
             // Remove any query parameters
             if let questionMark = withoutPrefix.firstIndex(of: "?") {
-                return String(withoutPrefix[..<questionMark])
+                address = String(withoutPrefix[..<questionMark])
+            } else {
+                address = withoutPrefix
             }
-            return withoutPrefix
         }
         // Handle zclassic: URI format
-        if qrString.lowercased().hasPrefix("zclassic:") {
-            let withoutPrefix = String(qrString.dropFirst(9))
+        else if trimmed.lowercased().hasPrefix("zclassic:") {
+            let withoutPrefix = String(trimmed.dropFirst(9))
             if let questionMark = withoutPrefix.firstIndex(of: "?") {
-                return String(withoutPrefix[..<questionMark])
+                address = String(withoutPrefix[..<questionMark])
+            } else {
+                address = withoutPrefix
             }
-            return withoutPrefix
+        } else {
+            // Plain address
+            address = trimmed
         }
-        // Plain address
-        return qrString.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // VUL-UI-004: Strip non-alphanumeric characters (Zclassic addresses are base58/bech32)
+        address = String(address.filter { $0.isLetter || $0.isNumber })
+        return address
     }
 
     private var addressBorderColor: Color {
@@ -826,7 +841,9 @@ struct SendView: View {
 
         // Handle both comma and period as decimal separator
         let normalizedAmount = amount.replacingOccurrences(of: ",", with: ".")
-        guard let amountValue = Double(normalizedAmount),
+        // VUL-UI-002: Reject negative amounts before Double conversion
+        guard !normalizedAmount.contains("-"),
+              let amountValue = Double(normalizedAmount),
               amountValue > 0 else {
             return false
         }
@@ -963,6 +980,14 @@ struct SendView: View {
 
     /// Actually proceed with the send (after Tor check passed or user chose to bypass)
     private func proceedWithSend() {
+        // VUL-UI-001: Re-validate address immediately before broadcast
+        // Prevents sending to an address modified after initial validation (e.g., clipboard replace attack)
+        guard walletManager.isValidZAddress(recipientAddress) else {
+            errorMessage = "Invalid recipient address. Please verify and try again."
+            showError = true
+            return
+        }
+
         // Require Face ID / Touch ID authentication before sending
         let normalizedAmount = amount.replacingOccurrences(of: ",", with: ".")
         // Use round() to avoid floating-point precision loss

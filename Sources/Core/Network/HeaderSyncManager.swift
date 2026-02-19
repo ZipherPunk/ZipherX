@@ -1577,11 +1577,18 @@ final class HeaderSyncManager {
             // FIX #695 v2: Allow zero sapling roots - recovery via RPC later
             // P2P peers send zeros; actual roots need RPC getblock
 
-            // FIX #562: Disable Equihash verification during initial sync for 10x faster startup
-            // Equihash verification will be done later via health check on sampled headers
+            // VUL-NET-001: Sampled Equihash verification (replaces FIX #562 total bypass)
+            // Incremental sync (≤160 headers): verify ALL — recent blocks, most security-critical
+            // Initial sync (>160 headers): verify every 100th + last — probabilistic deterrent
+            let shouldVerifyEquihash: Bool
+            if count <= 160 {
+                shouldVerifyEquihash = true  // Incremental: verify every header
+            } else {
+                shouldVerifyEquihash = (i % 100 == 0) || (i == count - 1)  // Sample + last
+            }
             let height = startHeight + UInt64(i)
             do {
-                let header = try ZclassicBlockHeader.parseWithSolution(data: fullHeaderData, height: height, verifyEquihash: false)
+                let header = try ZclassicBlockHeader.parseWithSolution(data: fullHeaderData, height: height, verifyEquihash: shouldVerifyEquihash)
                 headers.append(header)
             } catch ParseError.equihashVerificationFailed(let failHeight) {
                 print("🚨 [SECURITY] Equihash verification FAILED at height \(failHeight) - rejecting header")

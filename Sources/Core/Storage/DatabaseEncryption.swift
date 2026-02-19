@@ -13,14 +13,32 @@ import UIKit
 import IOKit
 #endif
 
+/// VUL-STOR-009: Encryption domain for HKDF key separation
+/// Each domain derives a unique encryption key via HKDF with a distinct info string
+enum EncryptionDomain: String {
+    case notes = "ZipherX-db-notes-v2"
+    case transactions = "ZipherX-db-transactions-v2"
+    case keys = "ZipherX-db-keys-v2"
+    case chat = "ZipherX-db-chat-v2"
+    case general = "ZipherX-db-general-v2"
+}
+
 /// Provides AES-GCM-256 encryption for sensitive database fields
 /// Key is derived from device-specific identifier + stored salt using HKDF
+/// VUL-STOR-009: Per-domain key derivation prevents cross-purpose key reuse
 @available(macOS 10.15, iOS 13.0, *)
 final class DatabaseEncryption {
     static let shared = DatabaseEncryption()
 
-    /// Encryption key (derived on first use)
+    /// VUL-STOR-009: Version prefix for encrypted blobs
+    /// v1 (0x01) = legacy single-key; v2 (0x02) = domain-separated
+    private static let VERSION_V2: UInt8 = 0x02
+
+    /// Legacy encryption key (v1, single key for all domains)
     private var encryptionKey: SymmetricKey?
+
+    /// VUL-STOR-009: Per-domain encryption keys (v2)
+    private var domainKeys: [EncryptionDomain: SymmetricKey] = [:]
 
     /// Salt for key derivation (stored in keychain)
     private var salt: Data?
@@ -33,7 +51,7 @@ final class DatabaseEncryption {
 
     // MARK: - Public API
 
-    /// Encrypt data for database storage
+    /// Encrypt data for database storage (legacy v1, single key)
     /// Returns: nonce (12 bytes) + ciphertext + tag (16 bytes)
     func encrypt(_ data: Data) throws -> Data {
         let key = try getOrCreateEncryptionKey()
@@ -46,11 +64,49 @@ final class DatabaseEncryption {
         return combined
     }
 
+    /// VUL-STOR-009: Encrypt data with domain-separated key
+    /// Returns: [0x02] + nonce (12 bytes) + ciphertext + tag (16 bytes)
+    func encrypt(_ data: Data, domain: EncryptionDomain) throws -> Data {
+        let key = try getOrCreateDomainKey(domain)
+        let sealedBox = try AES.GCM.seal(data, using: key)
+
+        guard let combined = sealedBox.combined else {
+            throw EncryptionError.encryptionFailed
+        }
+
+        // Prepend version byte
+        var result = Data([Self.VERSION_V2])
+        result.append(combined)
+        return result
+    }
+
     /// Decrypt data from database storage
+    /// VUL-STOR-009: Handles both v1 (legacy) and v2 (domain-separated) formats
     func decrypt(_ encryptedData: Data) throws -> Data {
         let key = try getOrCreateEncryptionKey()
         let sealedBox = try AES.GCM.SealedBox(combined: encryptedData)
         return try AES.GCM.open(sealedBox, using: key)
+    }
+
+    /// VUL-STOR-009: Decrypt data with domain awareness
+    /// Detects version prefix and uses correct key
+    /// Falls back to v1 legacy if v2 decryption fails (handles false v2 prefix match)
+    func decrypt(_ encryptedData: Data, domain: EncryptionDomain) throws -> Data {
+        // Check for v2 version prefix
+        if encryptedData.count > 29 && encryptedData[encryptedData.startIndex] == Self.VERSION_V2 {
+            do {
+                let payload = encryptedData.dropFirst()
+                let key = try getOrCreateDomainKey(domain)
+                let sealedBox = try AES.GCM.SealedBox(combined: payload)
+                return try AES.GCM.open(sealedBox, using: key)
+            } catch {
+                // V2 failed — first nonce byte of v1 data may coincidentally equal 0x02
+                // Fall through to v1 legacy
+            }
+        }
+
+        // Fall back to v1 legacy decryption
+        return try decrypt(encryptedData)
     }
 
     /// Check if data appears to be encrypted (has AES-GCM structure)
@@ -72,7 +128,7 @@ final class DatabaseEncryption {
 
     // MARK: - Key Management
 
-    /// Get or create the database encryption key
+    /// Get or create the database encryption key (v1 legacy)
     private func getOrCreateEncryptionKey() throws -> SymmetricKey {
         if let key = encryptionKey {
             return key
@@ -94,6 +150,28 @@ final class DatabaseEncryption {
         )
 
         self.encryptionKey = derivedKey
+        return derivedKey
+    }
+
+    /// VUL-STOR-009: Get or create a domain-separated encryption key
+    /// Each domain uses a unique HKDF info string to derive an independent key
+    private func getOrCreateDomainKey(_ domain: EncryptionDomain) throws -> SymmetricKey {
+        if let key = domainKeys[domain] {
+            return key
+        }
+
+        let salt = try getOrCreateSalt()
+        let deviceId = getDeviceIdentifier()
+
+        let inputKey = SymmetricKey(data: Data(deviceId.utf8))
+        let derivedKey = HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: inputKey,
+            salt: salt,
+            info: Data(domain.rawValue.utf8),
+            outputByteCount: 32
+        )
+
+        domainKeys[domain] = derivedKey
         return derivedKey
     }
 
@@ -232,9 +310,10 @@ final class DatabaseEncryption {
 
     // MARK: - Key Rotation (for future use)
 
-    /// Clear cached key (forces re-derivation on next use)
+    /// Clear cached keys (forces re-derivation on next use)
     func clearCachedKey() {
         encryptionKey = nil
+        domainKeys.removeAll()
         salt = nil
     }
 
@@ -287,8 +366,18 @@ extension Data {
         try DatabaseEncryption.shared.encrypt(self)
     }
 
+    /// VUL-STOR-009: Encrypt with domain-separated key
+    func dbEncrypt(domain: EncryptionDomain) throws -> Data {
+        try DatabaseEncryption.shared.encrypt(self, domain: domain)
+    }
+
     /// Decrypt this data from database storage
     func dbDecrypt() throws -> Data {
         try DatabaseEncryption.shared.decrypt(self)
+    }
+
+    /// VUL-STOR-009: Decrypt with domain awareness
+    func dbDecrypt(domain: EncryptionDomain) throws -> Data {
+        try DatabaseEncryption.shared.decrypt(self, domain: domain)
     }
 }

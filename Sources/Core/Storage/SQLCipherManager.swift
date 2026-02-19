@@ -161,16 +161,10 @@ final class SQLCipherManager {
         // Get device-specific identifier
         let deviceId = getDeviceIdentifier()
 
-        // SECURITY NOTE: Database encryption uses device ID + salt + app secret
-        // The app-level biometric lock (Face ID/Touch ID) in ContentView provides
-        // user authentication protection. We don't need a separate biometric prompt
-        // for database encryption - this was causing DOUBLE Touch ID at startup.
-        //
-        // Security is maintained because:
-        // 1. Database is AES-256 encrypted (via SQLCipher)
-        // 2. Key is derived from device-specific identifier (cannot decrypt on other device)
-        // 3. App-level biometric lock prevents unauthorized app access
-        let appSecret = Data("ZipherX-Cypherpunk-2025".utf8)
+        // VUL-CRYPTO-002: Random 256-bit app secret stored in Keychain
+        // Replaces hardcoded "ZipherX-Cypherpunk-2025" string
+        // Security: device ID (unique) + random secret (in Keychain) + salt (in Keychain)
+        let appSecret = try getOrCreateAppSecret()
 
         // Combine all inputs: deviceId + appSecret
         var combinedInput = Data(deviceId.utf8)
@@ -412,6 +406,31 @@ final class SQLCipherManager {
         return nil
     }
     #endif
+
+    /// VUL-CRYPTO-002: Get or create random 256-bit app secret for SQLCipher key derivation
+    /// Replaces hardcoded string with cryptographically random secret stored in Keychain
+    private func getOrCreateAppSecret() throws -> Data {
+        let secretKey = "sqlcipher-app-secret"
+
+        // Try to load from keychain
+        if let existing = loadFromKeychain(key: secretKey) {
+            return existing
+        }
+
+        // Generate new random 256-bit secret
+        var secret = Data(count: 32)
+        let result = secret.withUnsafeMutableBytes { buffer in
+            SecRandomCopyBytes(kSecRandomDefault, 32, buffer.baseAddress!)
+        }
+        guard result == errSecSuccess else {
+            throw SQLCipherError.keyGenerationFailed
+        }
+
+        // Store in keychain
+        try saveToKeychain(data: secret, key: secretKey)
+        print("🔐 VUL-CRYPTO-002: Generated random app secret for SQLCipher key derivation")
+        return secret
+    }
 
     // MARK: - Database Operations
 

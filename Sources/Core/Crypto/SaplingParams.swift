@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// Actor for thread-safe ensuring state (eliminates priority inversion)
 private actor EnsureState {
@@ -102,7 +103,7 @@ final class SaplingParams {
         if !FileManager.default.fileExists(atPath: spendParamsPath.path) ||
            !verifyFileSize(spendParamsPath.path, expectedSize: spendParams.size) {
             debugLog(.params, "📦 Spend params not ready, copying from bundle...")
-            if !copyFromBundle(name: spendParams.bundleName, ext: spendParams.bundleExt, to: spendParamsPath, expectedSize: spendParams.size) {
+            if !copyFromBundle(name: spendParams.bundleName, ext: spendParams.bundleExt, to: spendParamsPath, expectedSize: spendParams.size, expectedHash: spendParams.hash) {
                 debugLog(.params, "⬇️ Bundle copy failed, downloading spend params...")
                 try await downloadParam(
                     name: spendParams.name,
@@ -118,7 +119,7 @@ final class SaplingParams {
         if !FileManager.default.fileExists(atPath: outputParamsPath.path) ||
            !verifyFileSize(outputParamsPath.path, expectedSize: outputParams.size) {
             debugLog(.params, "📦 Output params not ready, copying from bundle...")
-            if !copyFromBundle(name: outputParams.bundleName, ext: outputParams.bundleExt, to: outputParamsPath, expectedSize: outputParams.size) {
+            if !copyFromBundle(name: outputParams.bundleName, ext: outputParams.bundleExt, to: outputParamsPath, expectedSize: outputParams.size, expectedHash: outputParams.hash) {
                 debugLog(.params, "⬇️ Bundle copy failed, downloading output params...")
                 try await downloadParam(
                     name: outputParams.name,
@@ -137,7 +138,7 @@ final class SaplingParams {
 
     /// Copy uncompressed params from app bundle to Documents directory
     /// Returns true if successful
-    private func copyFromBundle(name: String, ext: String, to destination: URL, expectedSize: Int) -> Bool {
+    private func copyFromBundle(name: String, ext: String, to destination: URL, expectedSize: Int, expectedHash: String) -> Bool {
         debugLog(.params, "🔍 Looking for bundled \(name).\(ext)...")
 
         // Try to find in main bundle
@@ -165,7 +166,14 @@ final class SaplingParams {
                 return false
             }
 
-            debugLog(.params, "✅ Copied \(name).\(ext) to \(destination.path)")
+            // VUL-CRYPTO-004: Verify SHA-512 hash integrity
+            guard verifySHA512(destination, expectedHash: expectedHash) else {
+                debugLog(.error, "🚨 VUL-CRYPTO-004: Hash verification failed for bundled \(name).\(ext) — removing")
+                try? FileManager.default.removeItem(at: destination)
+                return false
+            }
+
+            debugLog(.params, "✅ Copied \(name).\(ext) with verified SHA-512 hash")
             return true
 
         } catch {
@@ -233,7 +241,14 @@ final class SaplingParams {
             throw ParamsError.invalidSize
         }
 
-        debugLog(.params, "✅ Downloaded \(name)")
+        // VUL-CRYPTO-004: Verify SHA-512 hash after download
+        guard verifySHA512(destination, expectedHash: expectedHash) else {
+            debugLog(.error, "🚨 VUL-CRYPTO-004: Hash verification failed for downloaded \(name) — removing")
+            try? FileManager.default.removeItem(at: destination)
+            throw ParamsError.invalidHash
+        }
+
+        debugLog(.params, "✅ Downloaded \(name) with verified SHA-512 hash")
         onProgress?(name, 1.0)
     }
 
@@ -245,6 +260,24 @@ final class SaplingParams {
             return false
         }
         return size == expectedSize
+    }
+
+    /// VUL-CRYPTO-004: Verify file integrity via SHA-512 hash
+    /// One-time check after copy/download — prevents tampered param files
+    private func verifySHA512(_ fileURL: URL, expectedHash: String) -> Bool {
+        guard let data = try? Data(contentsOf: fileURL) else {
+            debugLog(.error, "❌ VUL-CRYPTO-004: Cannot read file for hash verification: \(fileURL.lastPathComponent)")
+            return false
+        }
+        let digest = SHA512.hash(data: data)
+        let computedHash = digest.map { String(format: "%02x", $0) }.joined()
+        let matches = computedHash == expectedHash
+        if !matches {
+            debugLog(.error, "🚨 VUL-CRYPTO-004: SHA-512 MISMATCH for \(fileURL.lastPathComponent)!")
+            debugLog(.error, "   Expected: \(expectedHash.prefix(32))...")
+            debugLog(.error, "   Got:      \(computedHash.prefix(32))...")
+        }
+        return matches
     }
 
     /// Delete downloaded parameters

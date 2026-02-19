@@ -563,6 +563,24 @@ struct BalanceView: View {
                             .font(.system(size: 10, weight: .medium))
                             .foregroundColor(theme.textSecondary.opacity(0.6))
                     }
+                    // VUL-UI-008: Prevent VoiceOver from reading exact balance aloud
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("Shielded balance")
+                }
+
+                // VUL-CRYPTO-010: Warning when Secure Enclave is not protecting the key
+                if UserDefaults.standard.bool(forKey: "secureEnclaveFallbackUsed") {
+                    HStack(spacing: 4) {
+                        Image(systemName: "exclamationmark.shield")
+                            .font(.system(size: 10))
+                        Text("Key stored without Secure Enclave")
+                            .font(.system(size: 10))
+                    }
+                    .foregroundColor(.orange)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 2)
+                    .background(Color.orange.opacity(0.1))
+                    .cornerRadius(4)
                 }
 
                 // Debug: Always log the balance card state

@@ -402,12 +402,13 @@ final class TransactionBuilder {
         print("🔍 FIX #803: Building TX with anchor: \(anchorHex)... (witness: \(witnessToUse.count) bytes)")
 
         // FIX #982: Log all note components for CMU debugging
-        // CRITICAL: These are the values Rust uses to compute CMU
-        // If stored CMU differs from Rust-computed CMU, anchor will differ!
+        // VUL-CRYPTO-007: Diversifier is privacy-sensitive — only log in debug builds
+        #if DEBUG
         print("🔍 FIX #982: Note components being sent to Rust FFI:")
         print("   Diversifier: \(note.diversifier.map { String(format: "%02x", $0) }.joined())")
         print("   RCM: \(note.rcm.prefix(8).map { String(format: "%02x", $0) }.joined())...")
         print("   Value: \(note.value.redactedAmount)")
+        #endif
         if let cmu = noteCMU {
             print("   Stored CMU: \(cmu.prefix(8).map { String(format: "%02x", $0) }.joined())...")
             // Also print reversed CMU for comparison with Rust logs

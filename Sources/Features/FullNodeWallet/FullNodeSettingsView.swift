@@ -530,7 +530,7 @@ struct FullNodeSettingsView: View {
                             if newValue {
                                 showPINSetup = true
                             } else {
-                                UserDefaults.standard.removeObject(forKey: "walletPIN")
+                                PINSecurity.deletePINHash()  // VUL-STOR-002
                             }
                         }
                 }
@@ -993,7 +993,7 @@ struct FullNodeSettingsView: View {
         var error: NSError?
         biometricAvailable = context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error)
         useFaceID = UserDefaults.standard.bool(forKey: "useBiometricAuth")
-        usePINCode = UserDefaults.standard.string(forKey: "walletPIN") != nil
+        usePINCode = PINSecurity.hasPIN()  // VUL-STOR-002
         // FIX #1438: Reload timeout from persisted value (same as SettingsView FIX #1346)
         selectedTimeout = BiometricAuthManager.shared.authTimeout
     }
@@ -1046,7 +1046,7 @@ struct FullNodeSettingsView: View {
             return
         }
         let hashedPIN = PINSecurity.hashPIN(pinCode)
-        UserDefaults.standard.set(hashedPIN, forKey: "walletPIN")
+        PINSecurity.storePINHash(hashedPIN)  // VUL-STOR-002
         pinCode = ""
         confirmPIN = ""
         showPINSetup = false

@@ -111,8 +111,57 @@ enum PINSecurity {
         let salt = generateSalt()
         storePINSalt(salt)
         let newHash = hashPIN(pin, salt: salt)
-        UserDefaults.standard.set(newHash, forKey: "walletPIN")
+        storePINHash(newHash)  // VUL-STOR-002: Keychain instead of UserDefaults
         print("🔐 Security audit TASK 14: Migrated PIN to PBKDF2 with random salt")
+    }
+
+    // MARK: - VUL-STOR-002: PIN hash Keychain storage (replaces UserDefaults)
+
+    private static let pinKeychainService = "com.zipherx.pin-hash"
+
+    /// Store PIN hash in Keychain (NOT UserDefaults)
+    static func storePINHash(_ hash: String) {
+        guard let hashData = hash.data(using: .utf8) else { return }
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: pinKeychainService,
+            kSecAttrAccount as String: "walletPIN"
+        ]
+        SecItemDelete(query as CFDictionary)
+        var addQuery = query
+        addQuery[kSecValueData as String] = hashData
+        addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        SecItemAdd(addQuery as CFDictionary, nil)
+    }
+
+    /// Retrieve PIN hash from Keychain
+    static func retrievePINHash() -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: pinKeychainService,
+            kSecAttrAccount as String: "walletPIN",
+            kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecReturnData as String: true
+        ]
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess, let data = result as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    /// Delete PIN hash from Keychain
+    static func deletePINHash() {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: pinKeychainService,
+            kSecAttrAccount as String: "walletPIN"
+        ]
+        SecItemDelete(query as CFDictionary)
+    }
+
+    /// Check if PIN exists in Keychain
+    static func hasPIN() -> Bool {
+        return retrievePINHash() != nil
     }
 
     // MARK: - Security audit NEW-004: Constant-time comparison
@@ -222,7 +271,8 @@ struct SettingsView: View {
     @ObservedObject private var fullNodeManager = FullNodeManager.shared
     #endif
     @State private var showExportAlert = false
-    @State private var exportedKey = ""
+    // VUL-CRYPTO-003: Store exported key as Data to minimize String copies in memory
+    @State private var exportedKeyData: Data?
     @State private var showError = false
     @State private var errorMessage = ""
     @State private var useFaceID = false
@@ -333,22 +383,27 @@ struct SettingsView: View {
             // Export & error alerts
             .alert("Export Private Key", isPresented: $showExportAlert) {
                 Button("Copy Full Key") {
-                    // FIX #1360: TASK 6 — Auto-clear after 10 seconds for private keys
-                    ClipboardManager.copyWithAutoExpiry(exportedKey, seconds: 10)
+                    // VUL-CRYPTO-003: Convert Data→String only for clipboard, then discard
+                    if let keyData = exportedKeyData, let keyStr = String(data: keyData, encoding: .utf8) {
+                        ClipboardManager.copyWithAutoExpiry(keyStr, seconds: 10)
+                    }
+                    exportedKeyData = nil
                 }
                 Button("Cancel", role: .cancel) {
-                    // FIX #1360: TASK 6 — Clear sensitive data on dismissal
-                    exportedKey = ""
+                    exportedKeyData = nil
                 }
             } message: {
-                // FIX #1360: TASK 6 — Show truncated key in alert, not full key
-                let displayKey = String(exportedKey.prefix(8)) + "..." + String(exportedKey.suffix(8))
-                Text("Your private key:\n\n\(displayKey)\n\nKeep this safe! Anyone with this key can spend your funds.")
+                // VUL-CRYPTO-003: Show truncated key — minimal String exposure
+                if let keyData = exportedKeyData, let keyStr = String(data: keyData, encoding: .utf8) {
+                    let displayKey = String(keyStr.prefix(8)) + "..." + String(keyStr.suffix(8))
+                    Text("Your private key:\n\n\(displayKey)\n\nKeep this safe! Anyone with this key can spend your funds.")
+                } else {
+                    Text("Key unavailable")
+                }
             }
             .onDisappear {
-                // FIX #1360: TASK 6 — Clear sensitive data when alert is dismissed
                 if !showExportAlert {
-                    exportedKey = ""
+                    exportedKeyData = nil
                 }
             }
             .alert("Error", isPresented: $showError) {
@@ -1127,8 +1182,8 @@ Both binaries must be installed to /usr/local/bin:
                         if newValue {
                             showPINSetup = true
                         } else {
-                            // Clear PIN
-                            UserDefaults.standard.removeObject(forKey: "walletPIN")
+                            // VUL-STOR-002: Clear PIN from Keychain
+                            PINSecurity.deletePINHash()
                         }
                     }
             }
@@ -3194,7 +3249,8 @@ Both binaries must be installed to /usr/local/bin:
             do {
                 let key = try walletManager.exportSpendingKey()
                 DispatchQueue.main.async {
-                    exportedKey = key
+                    // VUL-CRYPTO-003: Store as Data to minimize String copies
+                    exportedKeyData = Data(key.utf8)
                     showExportAlert = true
                 }
                 // SECURITY: Never log private key operations
@@ -3214,7 +3270,7 @@ Both binaries must be installed to /usr/local/bin:
 
         // Load saved preferences
         useFaceID = UserDefaults.standard.bool(forKey: "useBiometricAuth")
-        usePINCode = UserDefaults.standard.string(forKey: "walletPIN") != nil
+        usePINCode = PINSecurity.hasPIN()  // VUL-STOR-002: Keychain instead of UserDefaults
         // FIX #1346: Reload timeout from persisted value — @State only initializes once at view creation
         selectedTimeout = BiometricAuthManager.shared.authTimeout
     }
@@ -3284,7 +3340,7 @@ Both binaries must be installed to /usr/local/bin:
         let salt = PINSecurity.generateSalt()
         PINSecurity.storePINSalt(salt)
         let hashedPIN = PINSecurity.hashPIN(pinCode, salt: salt)
-        UserDefaults.standard.set(hashedPIN, forKey: "walletPIN")
+        PINSecurity.storePINHash(hashedPIN)  // VUL-STOR-002: Keychain instead of UserDefaults
         pinCode = ""
         confirmPIN = ""
         showPINSetup = false

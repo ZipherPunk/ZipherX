@@ -2068,18 +2068,34 @@ actor CommitmentTreeUpdater {
         print("✅ Successfully decompressed to: \(target.lastPathComponent)")
     }
 
+    /// VUL-STOR-007: Streaming SHA-256 verification (1MB chunks) to avoid loading entire file into memory
     private func verifySHA256(file: URL, expected: String) -> Bool {
-        guard let data = try? Data(contentsOf: file) else {
+        guard let handle = try? FileHandle(forReadingFrom: file) else {
             return false
         }
+        defer { handle.closeFile() }
 
-        let computed = sha256(data: data)
+        var context = CC_SHA256_CTX()
+        CC_SHA256_Init(&context)
+
+        let chunkSize = 1_048_576 // 1MB chunks
+        while autoreleasepool(invoking: {
+            let chunk = handle.readData(ofLength: chunkSize)
+            if chunk.isEmpty { return false }
+            chunk.withUnsafeBytes { buffer in
+                CC_SHA256_Update(&context, buffer.baseAddress, CC_LONG(chunk.count))
+            }
+            return true
+        }) {}
+
+        var hash = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        CC_SHA256_Final(&hash, &context)
+        let computed = hash.map { String(format: "%02x", $0) }.joined()
+
         let matches = computed.lowercased() == expected.lowercased()
-
         if !matches {
             print("⚠️ SHA256 mismatch: expected \(expected), got \(computed)")
         }
-
         return matches
     }
 

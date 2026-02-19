@@ -663,7 +663,10 @@ async fn start_hidden_service_async() -> Result<String, Box<dyn std::error::Erro
     // Build hidden service configuration
     // The service will listen for rendezvous requests
     let mut config_builder = OnionServiceConfigBuilder::default();
-    config_builder.nickname("zipherx".parse().unwrap());
+    config_builder.nickname(match "zipherx".parse() {
+        Ok(n) => n,
+        Err(_) => return Err("Failed to parse hidden service nickname".into()),
+    });
 
     let config: OnionServiceConfig = config_builder.build()?;
 
@@ -907,7 +910,7 @@ async fn handle_hidden_service_connections(
                         if !callback_ptr.is_null() {
                             unsafe {
                                 let callback: IncomingConnectionFn = std::mem::transmute(callback_ptr);
-                                let host = std::ffi::CString::new("tor-hidden-service").unwrap();
+                                let host = std::ffi::CString::new("tor-hidden-service").unwrap_or_default();
                                 callback(conn_id, host.as_ptr(), HIDDEN_SERVICE_P2P_PORT);
                             }
                         }
@@ -1547,7 +1550,10 @@ pub extern "C" fn zipherx_tor_get_keypair_onion_address() -> *mut libc::c_char {
     };
 
     // Extract public key (second 32 bytes)
-    let pubkey_bytes: [u8; 32] = keypair[32..64].try_into().unwrap();
+    let pubkey_bytes: [u8; 32] = match keypair[32..64].try_into() {
+        Ok(b) => b,
+        Err(_) => return std::ptr::null_mut(),
+    };
 
     // Compute .onion address from public key
     // Tor v3 spec: CHECKSUM = H(".onion checksum" || PUBKEY || VERSION)[:2]

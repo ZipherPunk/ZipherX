@@ -1954,199 +1954,86 @@ final class ChatManager: ObservableObject {
 
 /// FIX #249 v2: Encrypted database for chat persistence
 /// All data is encrypted at rest using ChaChaPoly with a Keychain-stored key
+/// VUL-STOR-003: Chat storage now uses SQLCipher (WalletDatabase) instead of UserDefaults
+/// Data is encrypted at rest by SQLCipher — no separate ChaChaPoly layer needed
 class ChatDatabase {
-    private let contactsKey = "chat_contacts_encrypted"
-    private let messagesPrefix = "chat_messages_encrypted_"
-    private let encryptionKeyKeychainKey = "com.zipherx.chat-database-key"
 
-    /// Cached encryption key
-    private var encryptionKey: SymmetricKey?
-
-    // MARK: - Contacts (Encrypted)
+    // MARK: - Contacts (SQLCipher)
 
     func saveContact(_ contact: ChatContact) {
-        var contacts = loadContacts()
-        if let index = contacts.firstIndex(where: { $0.onionAddress == contact.onionAddress }) {
-            contacts[index] = contact
-        } else {
-            contacts.append(contact)
-        }
-
-        saveContactsEncrypted(contacts)
+        WalletDatabase.shared.saveChatContact(
+            onionAddress: contact.onionAddress,
+            nickname: contact.nickname.isEmpty ? nil : contact.nickname,
+            unreadCount: contact.unreadCount,
+            lastMessageTime: nil
+        )
     }
 
     func loadContacts() -> [ChatContact] {
-        guard let key = getOrCreateEncryptionKey(),
-              let encryptedData = UserDefaults.standard.data(forKey: contactsKey),
-              let decryptedData = decrypt(encryptedData, using: key),
-              let contacts = try? JSONDecoder().decode([ChatContact].self, from: decryptedData) else {
-            return []
+        let rows = WalletDatabase.shared.loadChatContacts()
+        return rows.map { row in
+            var contact = ChatContact(onionAddress: row.onionAddress, nickname: row.nickname ?? "")
+            contact.unreadCount = row.unreadCount
+            contact.isBlocked = row.isBlocked
+            return contact
         }
-        return contacts
     }
 
     func deleteContact(_ contact: ChatContact) {
-        var contacts = loadContacts()
-        contacts.removeAll { $0.onionAddress == contact.onionAddress }
-        saveContactsEncrypted(contacts)
-
-        // Delete encrypted messages
-        UserDefaults.standard.removeObject(forKey: messagesPrefix + contact.onionAddress)
+        WalletDatabase.shared.deleteChatContact(onionAddress: contact.onionAddress)
+        WalletDatabase.shared.deleteChatMessages(for: contact.onionAddress)
     }
 
-    private func saveContactsEncrypted(_ contacts: [ChatContact]) {
-        guard let key = getOrCreateEncryptionKey(),
-              let jsonData = try? JSONEncoder().encode(contacts),
-              let encryptedData = encrypt(jsonData, using: key) else {
-            print("💬 ChatDatabase: Failed to encrypt contacts")
-            return
-        }
-        UserDefaults.standard.set(encryptedData, forKey: contactsKey)
-    }
-
-    // MARK: - Messages (Encrypted)
+    // MARK: - Messages (SQLCipher)
 
     func saveMessage(_ message: ChatMessage, ourOnionAddress: String? = nil) {
-        // FIX #264: Store messages by conversation partner's address, not sender's
-        // Previous bug: used `fromOnion` if it contains ".onion" (always true!)
-        // Correct: use the OTHER party's address (same as addMessageToConversation)
+        // FIX #264: Store by conversation partner's address
         let onion: String
         if let ourAddress = ourOnionAddress {
             onion = message.fromOnion == ourAddress ? message.toOnion : message.fromOnion
         } else {
-            // Fallback if no ourOnionAddress yet - use non-empty address
             onion = message.fromOnion.isEmpty ? message.toOnion : message.fromOnion
         }
-        var messages = loadMessages(for: onion)
 
-        // Check if message already exists (update) or new (append)
-        if let index = messages.firstIndex(where: { $0.id == message.id }) {
-            messages[index] = message
-        } else {
-            messages.append(message)
-        }
+        let isSent = message.status == .sent || message.status == .delivered || message.status == .read
+        let isDelivered = message.status == .delivered || message.status == .read
+        let isRead = message.status == .read
 
-        // Keep only last 1000 messages per conversation
-        if messages.count > 1000 {
-            messages = Array(messages.suffix(1000))
-        }
-
-        saveMessagesEncrypted(messages, for: onion)
+        WalletDatabase.shared.saveChatMessage(
+            id: message.id,
+            conversationAddress: onion,
+            fromOnion: message.fromOnion,
+            toOnion: message.toOnion,
+            content: message.content,
+            messageType: message.type.rawValue,
+            isSent: isSent,
+            isDelivered: isDelivered,
+            isRead: isRead,
+            timestamp: Int64(message.timestamp.timeIntervalSince1970),
+            replyToId: message.replyTo
+        )
     }
 
     func loadMessages(for onionAddress: String) -> [ChatMessage] {
-        guard let key = getOrCreateEncryptionKey(),
-              let encryptedData = UserDefaults.standard.data(forKey: messagesPrefix + onionAddress),
-              let decryptedData = decrypt(encryptedData, using: key),
-              let messages = try? JSONDecoder().decode([ChatMessage].self, from: decryptedData) else {
-            return []
+        let rows = WalletDatabase.shared.loadChatMessages(for: onionAddress)
+        return rows.compactMap { row in
+            guard let type = ChatMessageType(rawValue: row.messageType) else { return nil }
+            // Reconstruct status from booleans
+            let status: MessageStatus
+            if row.isRead { status = .read }
+            else if row.isDelivered { status = .delivered }
+            else if row.isSent { status = .sent }
+            else { status = .sending }
+
+            return ChatMessage(
+                type: type,
+                fromOnion: row.fromOnion,
+                toOnion: row.toOnion,
+                content: row.content,
+                replyTo: row.replyToId,
+                status: status
+            )
         }
-        return messages
-    }
-
-    private func saveMessagesEncrypted(_ messages: [ChatMessage], for onionAddress: String) {
-        guard let key = getOrCreateEncryptionKey(),
-              let jsonData = try? JSONEncoder().encode(messages),
-              let encryptedData = encrypt(jsonData, using: key) else {
-            print("💬 ChatDatabase: Failed to encrypt messages")
-            return
-        }
-        UserDefaults.standard.set(encryptedData, forKey: messagesPrefix + onionAddress)
-    }
-
-    // MARK: - Encryption Helpers (ChaChaPoly + Keychain)
-
-    /// Get or create the database encryption key from Keychain
-    private func getOrCreateEncryptionKey() -> SymmetricKey? {
-        // Return cached key if available
-        if let cached = encryptionKey {
-            return cached
-        }
-
-        // Try to load from Keychain
-        if let keyData = loadKeyFromKeychain() {
-            let key = SymmetricKey(data: keyData)
-            encryptionKey = key
-            return key
-        }
-
-        // Generate new 256-bit key
-        let newKey = SymmetricKey(size: .bits256)
-
-        // Save to Keychain
-        let keyData = newKey.withUnsafeBytes { Data($0) }
-        if saveKeyToKeychain(keyData) {
-            encryptionKey = newKey
-            print("💬 ChatDatabase: Generated new encryption key")
-            return newKey
-        }
-
-        print("💬 ChatDatabase: Failed to save encryption key to Keychain")
-        return nil
-    }
-
-    /// Encrypt data using ChaChaPoly (AEAD - authenticated encryption)
-    private func encrypt(_ data: Data, using key: SymmetricKey) -> Data? {
-        do {
-            let sealedBox = try ChaChaPoly.seal(data, using: key)
-            return sealedBox.combined
-        } catch {
-            print("💬 ChatDatabase: Encryption error: \(error)")
-            return nil
-        }
-    }
-
-    /// Decrypt data using ChaChaPoly
-    private func decrypt(_ data: Data, using key: SymmetricKey) -> Data? {
-        do {
-            let sealedBox = try ChaChaPoly.SealedBox(combined: data)
-            return try ChaChaPoly.open(sealedBox, using: key)
-        } catch {
-            print("💬 ChatDatabase: Decryption error: \(error)")
-            return nil
-        }
-    }
-
-    /// Save encryption key to Keychain (device-only, when unlocked)
-    private func saveKeyToKeychain(_ keyData: Data) -> Bool {
-        // Delete existing if any
-        let deleteQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "ZipherX",
-            kSecAttrAccount as String: encryptionKeyKeychainKey
-        ]
-        SecItemDelete(deleteQuery as CFDictionary)
-
-        // Add new key with strict access control
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "ZipherX",
-            kSecAttrAccount as String: encryptionKeyKeychainKey,
-            kSecValueData as String: keyData,
-            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-        ]
-
-        let status = SecItemAdd(query as CFDictionary, nil)
-        return status == errSecSuccess
-    }
-
-    /// Load encryption key from Keychain
-    private func loadKeyFromKeychain() -> Data? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "ZipherX",
-            kSecAttrAccount as String: encryptionKeyKeychainKey,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-
-        if status == errSecSuccess, let data = result as? Data, data.count == 32 {
-            return data
-        }
-        return nil
     }
 }
 

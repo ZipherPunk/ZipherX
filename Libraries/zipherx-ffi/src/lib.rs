@@ -132,7 +132,8 @@ const SAPLING_COMMITMENT_TREE_DEPTH: u8 = 32;
 /// Safe wrapper for creating a slice from raw pointer with bounds validation
 /// Returns None if pointer is null or alignment is incorrect
 #[inline]
-unsafe fn safe_slice<'a, T>(ptr: *const T, len: usize) -> Option<&'a [T]> {
+// VUL-FFI-004: pub(crate) so download.rs can use it
+pub(crate) unsafe fn safe_slice<'a, T>(ptr: *const T, len: usize) -> Option<&'a [T]> {
     if ptr.is_null() {
         debug_log!("FFI Safety: null pointer passed to safe_slice");
         return None;
@@ -357,6 +358,18 @@ pub unsafe extern "C" fn zipherx_generate_mnemonic(output: *mut u8) -> usize {
     // FIX #1385: catch_unwind to prevent panics crossing FFI boundary
     ffi_catch_unwind!(0, {
         let mnemonic: Mnemonic<English> = Mnemonic::generate(Count::Words24);
+
+        // VUL-CRYPTO-009: Entropy health check — reject degenerate RNG output
+        let entropy = mnemonic.entropy();
+        if entropy.iter().all(|&b| b == 0x00) || entropy.iter().all(|&b| b == 0xFF) {
+            debug_log!("SECURITY: Rejected degenerate entropy (all-zero or all-0xFF)");
+            return 0;
+        }
+        let unique_bytes: std::collections::HashSet<u8> = entropy.iter().copied().collect();
+        if (unique_bytes.len() * 2) < entropy.len() {
+            debug_log!("SECURITY: Rejected low-entropy mnemonic ({}/{} unique bytes)", unique_bytes.len(), entropy.len());
+            return 0;
+        }
 
         let phrase = mnemonic.phrase();
         let bytes = phrase.as_bytes();
@@ -1044,7 +1057,10 @@ pub unsafe extern "C" fn zipherx_try_decrypt_note_with_sk(
         debug_log!("DEBUG: ❌ EPK is NOT a valid curve point!");
         return 0;
     }
-    let epk_point = epk_point_opt.unwrap();
+    let epk_point: jubjub::ExtendedPoint = match Option::from(epk_point_opt) {
+        Some(p) => p,
+        None => return 0,
+    };
 
     // Manual KDF to debug decryption
     // Clear cofactor on EPK first, then multiply by IVK (matches working test)
@@ -2963,10 +2979,12 @@ pub unsafe extern "C" fn zipherx_tree_append(cmu: *const u8) -> u64 {
     {
         // FIX #1385: Replace .lock().unwrap() with safe_lock!
         let mut delta_guard = match safe_lock!(DELTA_CMUS) { Some(g) => g, None => return u64::MAX };
-        // FIX #1385: Cap delta CMUs to prevent unbounded memory growth
+        // FIX #1385 / VUL-FFI-005: Cap delta CMUs — batch drain to avoid O(n) per-append
         if delta_guard.len() >= MAX_DELTA_CMUS {
-            debug_log!("⚠️ FIX #1385: DELTA_CMUS at capacity ({}) — dropping oldest", MAX_DELTA_CMUS);
-            delta_guard.drain(..1);
+            let drain_count = MAX_DELTA_CMUS / 10; // 20K batch
+            debug_log!("⚠️ VUL-FFI-005: DELTA_CMUS at capacity ({}) — draining {} oldest", MAX_DELTA_CMUS, drain_count);
+            delta_guard.drain(..drain_count);
+            delta_guard.shrink_to_fit();
         }
         delta_guard.push(node.clone());
         // Log every 100 delta CMUs to avoid spam
@@ -3685,7 +3703,9 @@ pub unsafe extern "C" fn zipherx_tree_get_witness(
     // Debug: Print the root that this witness produces
     let witness_root = witness.root();
     let mut witness_root_bytes = [0u8; 32];
-    witness_root.write(&mut witness_root_bytes[..]).unwrap();
+    if witness_root.write(&mut witness_root_bytes[..]).is_err() {
+        return false;
+    }
     debug_log!("🔍 Witness root (wire format): {}", hex::encode(&witness_root_bytes));
 
     // Serialize the IncrementalWitness using zcash standard format
@@ -5006,16 +5026,20 @@ pub unsafe extern "C" fn zipherx_tree_create_witnesses_batch(
         if let Some(witness) = witness_opt {
             let mut serialized = Vec::new();
             if write_incremental_witness(&witness, &mut serialized).is_ok() && serialized.len() <= 1028 {
-                unsafe {
-                    *positions_out.add(t_idx) = target_positions[t_idx].unwrap();
-                    let witness_ptr = witnesses_out.add(t_idx * 1028);
-                    std::ptr::copy_nonoverlapping(serialized.as_ptr(), witness_ptr, serialized.len());
-                    if serialized.len() < 1028 {
-                        std::ptr::write_bytes(witness_ptr.add(serialized.len()), 0, 1028 - serialized.len());
+                if let Some(pos) = target_positions[t_idx] {
+                    unsafe {
+                        *positions_out.add(t_idx) = pos;
+                        let witness_ptr = witnesses_out.add(t_idx * 1028);
+                        std::ptr::copy_nonoverlapping(serialized.as_ptr(), witness_ptr, serialized.len());
+                        if serialized.len() < 1028 {
+                            std::ptr::write_bytes(witness_ptr.add(serialized.len()), 0, 1028 - serialized.len());
+                        }
                     }
+                    success_count += 1;
+                    debug_log!("✅ FIX #557 v24: Witness[{}] serialized ({} bytes)", t_idx, serialized.len());
+                } else {
+                    debug_log!("❌ FIX #557 v24: Witness[{}] has None position (invariant violation)", t_idx);
                 }
-                success_count += 1;
-                debug_log!("✅ FIX #557 v24: Witness[{}] serialized ({} bytes)", t_idx, serialized.len());
             } else {
                 debug_log!("❌ FIX #557 v24: Failed to serialize witness[{}]", t_idx);
             }
@@ -6036,7 +6060,10 @@ pub unsafe extern "C" fn zipherx_try_recover_output_with_ovk(
             result.extend_from_slice(&payment_address.diversifier().0);
 
             // pk_d (32 bytes) - use to_bytes on the underlying point
-            let pk_d_bytes: [u8; 32] = payment_address.to_bytes()[11..43].try_into().unwrap();
+            let pk_d_bytes: [u8; 32] = match payment_address.to_bytes()[11..43].try_into() {
+                Ok(b) => b,
+                Err(_) => return 0,
+            };
             result.extend_from_slice(&pk_d_bytes);
 
             // Value (8 bytes, little-endian)
@@ -6458,17 +6485,11 @@ pub unsafe extern "C" fn zipherx_verify_block_header(
 // the Swift side and passed separately.
 
 /// Zero-fill a mutable byte slice to securely erase sensitive data
-/// Uses volatile write pattern to prevent compiler optimization
+/// VUL-CRYPTO-012: Uses zeroize crate (audited, compiler-fence backed)
 #[inline(never)]
 fn secure_zero(data: &mut [u8]) {
-    use std::ptr;
-    for byte in data.iter_mut() {
-        unsafe {
-            ptr::write_volatile(byte, 0);
-        }
-    }
-    // Memory barrier to ensure the writes are not optimized away
-    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    use zeroize::Zeroize;
+    data.zeroize();
 }
 
 /// Decrypt an AES-GCM-256 encrypted spending key

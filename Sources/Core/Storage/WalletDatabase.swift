@@ -40,6 +40,17 @@ final class WalletDatabase {
         }
     }
 
+    /// VUL-STOR-009: Encrypt with domain-separated key
+    /// Returns: [0x02] + nonce (12 bytes) + ciphertext + tag (16 bytes)
+    private func encryptBlob(_ data: Data, domain: EncryptionDomain) throws -> Data {
+        do {
+            return try DatabaseEncryption.shared.encrypt(data, domain: domain)
+        } catch {
+            print("🔐 SECURITY ERROR: Encryption failed - refusing to store plaintext")
+            throw EncryptionError.encryptionFailed(error.localizedDescription)
+        }
+    }
+
     /// Decrypt sensitive data retrieved from database
     /// Gracefully handles legacy unencrypted data from before encryption was enabled.
     private func decryptBlob(_ encryptedData: Data) throws -> Data {
@@ -57,45 +68,61 @@ final class WalletDatabase {
         }
     }
 
+    /// VUL-STOR-009: Decrypt with domain awareness
+    /// Handles v1 (legacy), v2 (domain-separated), and unencrypted data
+    private func decryptBlob(_ encryptedData: Data, domain: EncryptionDomain) throws -> Data {
+        guard encryptedData.count >= 29 else {
+            return encryptedData
+        }
+
+        do {
+            return try DatabaseEncryption.shared.decrypt(encryptedData, domain: domain)
+        } catch {
+            // Legacy plaintext data — return as-is
+            return encryptedData
+        }
+    }
+
 
     /// Check if database connection is open
     var isOpen: Bool { db != nil }
 
     // MARK: - Security audit TASK 16: Encrypted Shadow Column Helpers
+    // VUL-STOR-009: All shadow columns use .notes domain for key separation
 
     /// Encrypt a UInt64 value for shadow column storage
     /// Security audit TASK 16: Defense-in-depth encryption for note values
     private func encryptUInt64(_ value: UInt64) -> Data? {
         var v = value
-        return try? encryptBlob(Data(bytes: &v, count: 8))
+        return try? encryptBlob(Data(bytes: &v, count: 8), domain: .notes)
     }
 
     /// Decrypt a UInt64 value from shadow column
     private func decryptUInt64(_ encrypted: Data) -> UInt64? {
-        guard let decrypted = try? decryptBlob(encrypted), decrypted.count >= 8 else { return nil }
+        guard let decrypted = try? decryptBlob(encrypted, domain: .notes), decrypted.count >= 8 else { return nil }
         return decrypted.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
     }
 
     /// Encrypt an Int64 value for shadow column storage
     private func encryptInt64(_ value: Int64) -> Data? {
         var v = value
-        return try? encryptBlob(Data(bytes: &v, count: 8))
+        return try? encryptBlob(Data(bytes: &v, count: 8), domain: .notes)
     }
 
     /// Decrypt an Int64 value from shadow column
     private func decryptInt64(_ encrypted: Data) -> Int64? {
-        guard let decrypted = try? decryptBlob(encrypted), decrypted.count >= 8 else { return nil }
+        guard let decrypted = try? decryptBlob(encrypted, domain: .notes), decrypted.count >= 8 else { return nil }
         return decrypted.withUnsafeBytes { $0.loadUnaligned(as: Int64.self) }
     }
 
     /// Encrypt Data (txid) for shadow column storage
     private func encryptDataField(_ data: Data) -> Data? {
-        return try? encryptBlob(data)
+        return try? encryptBlob(data, domain: .notes)
     }
 
     /// Decrypt Data (txid) from shadow column
     private func decryptDataField(_ encrypted: Data) -> Data? {
-        return try? decryptBlob(encrypted)
+        return try? decryptBlob(encrypted, domain: .notes)
     }
 
     /// Write encrypted shadow columns for a note after INSERT
@@ -429,10 +456,23 @@ final class WalletDatabase {
         // and remove duplicates caused by the type mismatch bug
         try migrateTransactionHistoryTypes()
 
-        print("📂 Database opened successfully")
+        // VUL-STOR-005: Exclude wallet database from iCloud/iTunes backup
+        // Spending key is device-bound (Secure Enclave/Keychain) so backup-based restore
+        // cannot access the wallet anyway. Prevents leaking encrypted DB to cloud.
+        var dbURL = URL(fileURLWithPath: dbPath)
+        var resourceValues = URLResourceValues()
+        resourceValues.isExcludedFromBackup = true
+        try? dbURL.setResourceValues(resourceValues)
+
+        // Also exclude the parent directory (logs, delta files, etc.)
+        var parentURL = dbURL.deletingLastPathComponent()
+        try? parentURL.setResourceValues(resourceValues)
+
+        print("📂 Database opened successfully (backup exclusion set)")
     }
 
     /// Migrate existing unencrypted database to encrypted format
+    /// VUL-STOR-008: Atomic DB migration — verify encrypted DB before deleting original
     private func migrateToEncryptedDatabase() throws {
         print("🔐 Migrating existing database to encrypted format...")
 
@@ -451,6 +491,25 @@ final class WalletDatabase {
                 destPath: tempEncryptedPath
             )
 
+            // VUL-STOR-008: Verify encrypted DB opens before deleting original
+            var testDb: OpaquePointer?
+            let flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX
+            guard sqlite3_open_v2(tempEncryptedPath, &testDb, flags, nil) == SQLITE_OK else {
+                throw DatabaseError.openFailed("Encrypted DB verification failed: cannot open")
+            }
+            // Apply encryption key and verify it works
+            try SQLCipherManager.shared.applyEncryption(to: testDb!)
+            // Quick integrity check
+            var integrityStmt: OpaquePointer?
+            let integrityOK = sqlite3_prepare_v2(testDb, "SELECT count(*) FROM sqlite_master;", -1, &integrityStmt, nil) == SQLITE_OK
+                && sqlite3_step(integrityStmt) == SQLITE_ROW
+            sqlite3_finalize(integrityStmt)
+            sqlite3_close(testDb)
+
+            guard integrityOK else {
+                throw DatabaseError.openFailed("Encrypted DB verification failed: integrity check")
+            }
+
             // Replace original with encrypted version
             try fileManager.removeItem(atPath: dbPath)
             try fileManager.moveItem(atPath: tempEncryptedPath, toPath: dbPath)
@@ -461,12 +520,15 @@ final class WalletDatabase {
             print("🔐 Database migration to encrypted format complete")
 
         } catch {
-            // Restore from backup on failure
+            // VUL-STOR-008: Explicit error handling for restore (was try?)
+            print("⚠️ Database migration failed, restoring original: \(error)")
             try? fileManager.removeItem(atPath: dbPath)
-            try? fileManager.moveItem(atPath: backupPath, toPath: dbPath)
+            do {
+                try fileManager.moveItem(atPath: backupPath, toPath: dbPath)
+            } catch let restoreError {
+                print("🚨 CRITICAL: Failed to restore database from backup: \(restoreError)")
+            }
             try? fileManager.removeItem(atPath: tempEncryptedPath)
-
-            print("⚠️ Database migration failed, restored original: \(error)")
             throw error
         }
     }
@@ -689,6 +751,39 @@ final class WalletDatabase {
                 UNIQUE(host, port)
             );
             """,
+
+            // VUL-STOR-003: Chat tables — encrypted by SQLCipher at rest
+            """
+            CREATE TABLE IF NOT EXISTS chat_contacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                onion_address TEXT NOT NULL UNIQUE,
+                nickname TEXT,
+                avatar_hash TEXT,
+                is_blocked INTEGER NOT NULL DEFAULT 0,
+                unread_count INTEGER NOT NULL DEFAULT 0,
+                last_message_time INTEGER,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            );
+            """,
+
+            """
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id TEXT PRIMARY KEY,
+                conversation_address TEXT NOT NULL,
+                from_onion TEXT NOT NULL,
+                to_onion TEXT NOT NULL,
+                content BLOB NOT NULL,
+                message_type TEXT NOT NULL DEFAULT 'text',
+                is_sent INTEGER NOT NULL DEFAULT 0,
+                is_delivered INTEGER NOT NULL DEFAULT 0,
+                is_read INTEGER NOT NULL DEFAULT 0,
+                timestamp INTEGER NOT NULL,
+                reply_to_id TEXT,
+                FOREIGN KEY (conversation_address) REFERENCES chat_contacts(onion_address) ON DELETE CASCADE
+            );
+            """,
+
+            "CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation ON chat_messages(conversation_address, timestamp DESC);",
 
             // Indexes for performance
             "CREATE INDEX IF NOT EXISTS idx_notes_account ON notes(account_id);",
@@ -5941,7 +6036,7 @@ final class WalletDatabase {
             if isSelfSend {
                 print("📜 FIX #1367: Self-send txid=\(spentTxid.prefix(8).hexString)... - recording as self-send (fee only)")
             } else {
-                print("📜 SENT: txid=\(spentTxid.prefix(8).hexString)..., input=\(txInfo.inputValue), change=\(totalChangeValue), fee=\(fee), toRecipient=\(amountToRecipient), balanceImpact=\(totalBalanceImpact)")
+                print("📜 SENT: txid=\(spentTxid.prefix(8).hexString)..., amounts=[REDACTED]")
             }
 
             var spentStmt: OpaquePointer?
@@ -6268,7 +6363,7 @@ final class WalletDatabase {
             }
         }
 
-        print("📜 Recorded sent transaction: height=\(height), value=\(value) zatoshis, fee=\(fee), status=\(status.rawValue)")
+        print("📜 Recorded sent transaction: height=\(height), amounts=[REDACTED], status=\(status.rawValue)")
     }
 
     /// Record a pending transaction (just broadcast, not yet in any block)
@@ -8446,6 +8541,168 @@ final class WalletDatabase {
         }
         return 0
     }
+
+    // MARK: - VUL-STOR-003: Chat Storage (SQLCipher encrypted)
+
+    func saveChatContact(onionAddress: String, nickname: String?, unreadCount: Int, lastMessageTime: Int64?) {
+        guard db != nil else { return }
+        let sql = """
+            INSERT INTO chat_contacts (onion_address, nickname, unread_count, last_message_time)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(onion_address) DO UPDATE SET
+                nickname = excluded.nickname,
+                unread_count = excluded.unread_count,
+                last_message_time = excluded.last_message_time;
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, onionAddress, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        if let nick = nickname {
+            sqlite3_bind_text(stmt, 2, nick, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        } else {
+            sqlite3_bind_null(stmt, 2)
+        }
+        sqlite3_bind_int(stmt, 3, Int32(unreadCount))
+        if let time = lastMessageTime {
+            sqlite3_bind_int64(stmt, 4, time)
+        } else {
+            sqlite3_bind_null(stmt, 4)
+        }
+        sqlite3_step(stmt)
+    }
+
+    func loadChatContacts() -> [(onionAddress: String, nickname: String?, isBlocked: Bool, unreadCount: Int, lastMessageTime: Int64?)] {
+        guard db != nil else { return [] }
+        let sql = "SELECT onion_address, nickname, is_blocked, unread_count, last_message_time FROM chat_contacts ORDER BY last_message_time DESC;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(stmt) }
+
+        var results: [(String, String?, Bool, Int, Int64?)] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let onion = String(cString: sqlite3_column_text(stmt, 0))
+            let nick = sqlite3_column_type(stmt, 1) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 1)) : nil
+            let blocked = sqlite3_column_int(stmt, 2) != 0
+            let unread = Int(sqlite3_column_int(stmt, 3))
+            let lastTime = sqlite3_column_type(stmt, 4) != SQLITE_NULL ? sqlite3_column_int64(stmt, 4) : nil
+            results.append((onion, nick, blocked, unread, lastTime))
+        }
+        return results
+    }
+
+    func deleteChatContact(onionAddress: String) {
+        guard db != nil else { return }
+        let sql = "DELETE FROM chat_contacts WHERE onion_address = ?;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, onionAddress, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        sqlite3_step(stmt)
+    }
+
+    /// VUL-STOR-009: Chat content encrypted with .chat domain key
+    func saveChatMessage(id: String, conversationAddress: String, fromOnion: String, toOnion: String,
+                         content: String, messageType: String, isSent: Bool, isDelivered: Bool,
+                         isRead: Bool, timestamp: Int64, replyToId: String?) {
+        guard db != nil else { return }
+
+        // VUL-STOR-009: Encrypt content with .chat domain key
+        let contentData = Data(content.utf8)
+        let encryptedContent: Data
+        if let encrypted = try? encryptBlob(contentData, domain: .chat) {
+            encryptedContent = encrypted
+        } else {
+            encryptedContent = contentData
+        }
+
+        let sql = """
+            INSERT INTO chat_messages (id, conversation_address, from_onion, to_onion, content,
+                message_type, is_sent, is_delivered, is_read, timestamp, reply_to_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                is_sent = excluded.is_sent,
+                is_delivered = excluded.is_delivered,
+                is_read = excluded.is_read;
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, id, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        sqlite3_bind_text(stmt, 2, conversationAddress, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        sqlite3_bind_text(stmt, 3, fromOnion, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        sqlite3_bind_text(stmt, 4, toOnion, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        encryptedContent.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 5, ptr.baseAddress, Int32(encryptedContent.count), unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        }
+        sqlite3_bind_text(stmt, 6, messageType, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        sqlite3_bind_int(stmt, 7, isSent ? 1 : 0)
+        sqlite3_bind_int(stmt, 8, isDelivered ? 1 : 0)
+        sqlite3_bind_int(stmt, 9, isRead ? 1 : 0)
+        sqlite3_bind_int64(stmt, 10, timestamp)
+        if let reply = replyToId {
+            sqlite3_bind_text(stmt, 11, reply, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        } else {
+            sqlite3_bind_null(stmt, 11)
+        }
+        sqlite3_step(stmt)
+    }
+
+    func loadChatMessages(for conversationAddress: String, limit: Int = 1000) -> [(id: String, fromOnion: String, toOnion: String, content: String, messageType: String, isSent: Bool, isDelivered: Bool, isRead: Bool, timestamp: Int64, replyToId: String?)] {
+        guard db != nil else { return [] }
+        let sql = "SELECT id, from_onion, to_onion, content, message_type, is_sent, is_delivered, is_read, timestamp, reply_to_id FROM chat_messages WHERE conversation_address = ? ORDER BY timestamp ASC LIMIT ?;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, conversationAddress, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        sqlite3_bind_int(stmt, 2, Int32(limit))
+
+        var results: [(String, String, String, String, String, Bool, Bool, Bool, Int64, String?)] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let id = String(cString: sqlite3_column_text(stmt, 0))
+            let from = String(cString: sqlite3_column_text(stmt, 1))
+            let to = String(cString: sqlite3_column_text(stmt, 2))
+
+            // VUL-STOR-009: Decrypt content with .chat domain key
+            let content: String
+            if sqlite3_column_type(stmt, 3) == SQLITE_BLOB,
+               let blobPtr = sqlite3_column_blob(stmt, 3) {
+                let blobLen = Int(sqlite3_column_bytes(stmt, 3))
+                let encData = Data(bytes: blobPtr, count: blobLen)
+                if let decrypted = try? decryptBlob(encData, domain: .chat),
+                   let text = String(data: decrypted, encoding: .utf8) {
+                    content = text
+                } else if let text = String(data: encData, encoding: .utf8) {
+                    content = text  // Fallback: unencrypted text stored as blob
+                } else {
+                    content = ""
+                }
+            } else if sqlite3_column_type(stmt, 3) != SQLITE_NULL {
+                content = String(cString: sqlite3_column_text(stmt, 3))
+            } else {
+                content = ""
+            }
+
+            let type = String(cString: sqlite3_column_text(stmt, 4))
+            let sent = sqlite3_column_int(stmt, 5) != 0
+            let delivered = sqlite3_column_int(stmt, 6) != 0
+            let read = sqlite3_column_int(stmt, 7) != 0
+            let ts = sqlite3_column_int64(stmt, 8)
+            let reply = sqlite3_column_type(stmt, 9) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 9)) : nil
+            results.append((id, from, to, content, type, sent, delivered, read, ts, reply))
+        }
+        return results
+    }
+
+    func deleteChatMessages(for conversationAddress: String) {
+        guard db != nil else { return }
+        let sql = "DELETE FROM chat_messages WHERE conversation_address = ?;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, conversationAddress, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        sqlite3_step(stmt)
+    }
 }
 
 // MARK: - Data Types
@@ -8587,7 +8844,9 @@ struct TransactionHistoryItem {
         // Return nil if no real timestamp found - dates will appear after P2P header sync completes
         return nil
     }
+
 }
+
 
 // MARK: - Errors
 

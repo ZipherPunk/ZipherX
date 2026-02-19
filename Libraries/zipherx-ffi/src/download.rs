@@ -112,16 +112,21 @@ pub extern "C" fn zipherx_download_file(
         return 4;
     }
 
-    // Parse URL
-    let url = match unsafe { std::str::from_utf8(std::slice::from_raw_parts(url_ptr, url_len)) } {
-        Ok(s) => s.to_string(),
-        Err(_) => return 4,
+    // VUL-FFI-004: Use safe_slice instead of raw from_raw_parts
+    let url = match unsafe { crate::safe_slice(url_ptr, url_len) } {
+        Some(slice) => match std::str::from_utf8(slice) {
+            Ok(s) => s.to_string(),
+            Err(_) => return 4,
+        },
+        None => return 4,
     };
 
-    // Parse destination path
-    let dest_path = match unsafe { std::str::from_utf8(std::slice::from_raw_parts(dest_path_ptr, dest_path_len)) } {
-        Ok(s) => s.to_string(),
-        Err(_) => return 4,
+    let dest_path = match unsafe { crate::safe_slice(dest_path_ptr, dest_path_len) } {
+        Some(slice) => match std::str::from_utf8(slice) {
+            Ok(s) => s.to_string(),
+            Err(_) => return 4,
+        },
+        None => return 4,
     };
 
     // Reset state
@@ -360,16 +365,21 @@ pub extern "C" fn zipherx_verify_sha256(
         return -1;
     }
 
-    // Parse file path
-    let file_path = match unsafe { std::str::from_utf8(std::slice::from_raw_parts(file_path_ptr, file_path_len)) } {
-        Ok(s) => s,
-        Err(_) => return -1,
+    // VUL-FFI-004: Use safe_slice instead of raw from_raw_parts
+    let file_path = match unsafe { crate::safe_slice(file_path_ptr, file_path_len) } {
+        Some(slice) => match std::str::from_utf8(slice) {
+            Ok(s) => s,
+            Err(_) => return -1,
+        },
+        None => return -1,
     };
 
-    // Parse expected hash
-    let expected_hash = match unsafe { std::str::from_utf8(std::slice::from_raw_parts(expected_hash_ptr, expected_hash_len)) } {
-        Ok(s) => s.to_lowercase(),
-        Err(_) => return -1,
+    let expected_hash = match unsafe { crate::safe_slice(expected_hash_ptr, expected_hash_len) } {
+        Some(slice) => match std::str::from_utf8(slice) {
+            Ok(s) => s.to_lowercase(),
+            Err(_) => return -1,
+        },
+        None => return -1,
     };
 
     // Read file and compute hash (use std::fs::File for sync operation)

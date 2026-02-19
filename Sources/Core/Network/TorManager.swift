@@ -165,8 +165,12 @@ public final class TorManager: ObservableObject {
         } else {
             self.mode = .enabled
         }
-        // FIX #1401: Load strict privacy preference
-        self.strictPrivacyMode = UserDefaults.standard.bool(forKey: "torStrictPrivacyMode")
+        // FIX #1401 / VUL-NET-005: Strict privacy defaults to TRUE (user can opt-out)
+        if UserDefaults.standard.object(forKey: "torStrictPrivacyMode") != nil {
+            self.strictPrivacyMode = UserDefaults.standard.bool(forKey: "torStrictPrivacyMode")
+        } else {
+            self.strictPrivacyMode = true
+        }
 
         // Check if Arti is available
         let isAvailable = zipherx_tor_is_available()
@@ -1170,13 +1174,19 @@ public final class TorManager: ObservableObject {
         // Delete existing if any
         deleteKeypairFromKeychain()
 
-        let query: [String: Any] = [
+        // VUL-NET-007: Add device passcode protection for .onion keypair
+        // Ed25519 keys can't use Secure Enclave, so use Keychain with access control
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "ZipherX",
             kSecAttrAccount as String: hsKeypairKeychainKey,
-            kSecValueData as String: keypairData,
-            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+            kSecValueData as String: keypairData
         ]
+
+        // VUL-NET-007: Protect .onion key at rest — accessible only when device unlocked
+        // NOTE: .devicePasscode NOT used here — .onion key is read at Tor startup
+        // (before any user interaction) and does NOT protect spending keys
+        query[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
 
         let status = SecItemAdd(query as CFDictionary, nil)
         if status != errSecSuccess {
@@ -1187,20 +1197,31 @@ public final class TorManager: ObservableObject {
     }
 
     private func loadKeypairFromKeychain() -> Data? {
-        let query: [String: Any] = [
+        // First try without auth UI to detect if old item requires .devicePasscode
+        let checkQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "ZipherX",
             kSecAttrAccount as String: hsKeypairKeychainKey,
             kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
+            kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail
         ]
 
         var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        let status = SecItemCopyMatching(checkQuery as CFDictionary, &result)
 
         if status == errSecSuccess, let data = result as? Data, data.count == 64 {
             return data
         }
+
+        if status == errSecInteractionNotAllowed {
+            // Old item stored with .devicePasscode — delete and regenerate
+            // (.onion address will change, but avoids Touch ID on every startup)
+            print("🧅 VUL-NET-007: Migrating .onion key from .devicePasscode to accessibility-only")
+            deleteKeypairFromKeychain()
+            return nil
+        }
+
         return nil
     }
 

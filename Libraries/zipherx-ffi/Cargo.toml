@@ -42,6 +42,7 @@ equihash = "0.2"
 # Multi-input parallel path uses local 1-thread rayon pools to avoid contention.
 bellman = "0.14"
 subtle = "2.5"
+zeroize = { version = "1.7", features = ["derive"] }
 
 # Arti - Rust implementation of Tor for embedded use
 # onion-service-client: connecting to .onion addresses

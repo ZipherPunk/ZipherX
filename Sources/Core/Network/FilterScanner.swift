@@ -3640,7 +3640,7 @@ final class FilterScanner {
             let rcm = decryptedData[19..<51]
             let memo = decryptedData.count >= 563 ? decryptedData[51..<563] : Data()
 
-            debugLog(.wallet, "💰 Note found: \(Double(value)/100_000_000) ZCL @ height \(height)")
+            debugLog(.wallet, "💰 Note found: [REDACTED] ZCL @ height \(height)")
 
             let txidData = Data(hexString: txid) ?? Data()
 
@@ -4117,7 +4117,7 @@ final class FilterScanner {
             let height = UInt64(info.height)
             let position = info.globalPosition  // Position from boost file index (matches benchmark)
 
-            debugLog(.wallet, "💰 Note found: \(Double(note.value)/100_000_000) ZCL @ height \(height)")
+            debugLog(.wallet, "💰 Note found: [REDACTED] ZCL @ height \(height)")
 
             // Generate a pseudo-txid for bundled outputs (grouped by height)
             let txidData = "boost_\(height)_\(idx)".data(using: .utf8) ?? Data()
@@ -4267,9 +4267,9 @@ final class FilterScanner {
                     txid: note.spentTxid,
                     spentHeight: UInt64(note.spentHeight)
                 )
-                debugLog(.wallet, "💸 Note spent: \(Double(note.value) / 100_000_000) ZCL @ height \(note.height) (txid \(note.spentTxid.prefix(8).hexString)...)")
+                debugLog(.wallet, "💸 Note spent: [REDACTED] ZCL @ height \(note.height)")
             } else {
-                debugLog(.wallet, "💰 Unspent note: \(Double(note.value) / 100_000_000) ZCL @ height \(note.height)")
+                debugLog(.wallet, "💰 Unspent note: [REDACTED] ZCL @ height \(note.height)")
             }
         }
 
@@ -4392,7 +4392,7 @@ final class FilterScanner {
             let rcm = decryptedData[19..<51]
             let memo = decryptedData.count >= 563 ? decryptedData[51..<563] : Data()
 
-            debugLog(.wallet, "💰 Note found: \(Double(value)/100_000_000) ZCL @ height \(height)")
+            debugLog(.wallet, "💰 Note found: [REDACTED] ZCL @ height \(height)")
 
             let txidData = Data(hexString: txid) ?? Data()
 
@@ -4569,7 +4569,7 @@ final class FilterScanner {
                 memo: Data(memo)
             )
 
-            debugLog(.wallet, "💰 Note found: \(Double(value)/100_000_000) ZCL @ height \(height)")
+            debugLog(.wallet, "💰 Note found: [REDACTED] ZCL @ height \(height)")
 
             let txidData = Data(hexString: txid) ?? Data()
 
@@ -4800,7 +4800,7 @@ final class FilterScanner {
                 memo: memoString
             )
         }
-        debugLog(.wallet, "💰 Note found: \(Double(note.value)/100_000_000) ZCL @ height \(height)")
+        debugLog(.wallet, "💰 Note found: [REDACTED] ZCL @ height \(height)")
     }
 
     // MARK: - Helper Methods

@@ -2692,9 +2692,23 @@ public final class Peer {
         // Parse length (safe loading)
         let length = header.loadUInt32(at: 16)
 
-        // FIX #1365 / Security audit TASK 9: Max payload size per Bitcoin protocol (4MB cap)
-        guard length <= 4_000_000 else {
-            print("⚠️  FIX #1365: Rejecting oversized payload: \(length) bytes from \(host)")
+        // FIX #1365 / VUL-NET-004: Per-message payload size limits
+        let maxSizeBL: UInt32 = {
+            switch command {
+            case "version", "verack": return 300
+            case "ping", "pong": return 8
+            case "addr": return 1_000 * 30 + 4
+            case "inv", "getdata", "notfound": return 50_000 * 36 + 4
+            case "headers", "getheaders": return 162_000
+            case "tx": return 100_000
+            case "block": return 4_000_000
+            case "reject": return 1_000
+            case "mempool", "getaddr", "sendheaders": return 0
+            default: return 4_000_000
+            }
+        }()
+        guard length <= maxSizeBL else {
+            print("⚠️  VUL-NET-004: Rejecting oversized '\(command)' payload: \(length) bytes (max \(maxSizeBL)) from \(host)")
             throw NetworkError.invalidData
         }
 
@@ -3720,9 +3734,23 @@ public final class Peer {
         // Parse length (safe loading)
         let length = header.loadUInt32(at: 16)
 
-        // FIX #1365 / Security audit TASK 9: Max payload size per Bitcoin protocol (4MB cap)
-        guard length <= 4_000_000 else {
-            print("⚠️  FIX #1365: Rejecting oversized payload: \(length) bytes from \(host)")
+        // FIX #1365 / VUL-NET-004: Per-message payload size limits
+        let maxSizeRM: UInt32 = {
+            switch command {
+            case "version", "verack": return 300
+            case "ping", "pong": return 8
+            case "addr": return 1_000 * 30 + 4
+            case "inv", "getdata", "notfound": return 50_000 * 36 + 4
+            case "headers", "getheaders": return 162_000
+            case "tx": return 100_000
+            case "block": return 4_000_000
+            case "reject": return 1_000
+            case "mempool", "getaddr", "sendheaders": return 0
+            default: return 4_000_000
+            }
+        }()
+        guard length <= maxSizeRM else {
+            print("⚠️  VUL-NET-004: Rejecting oversized '\(command)' payload: \(length) bytes (max \(maxSizeRM)) from \(host)")
             throw NetworkError.invalidData
         }
 
