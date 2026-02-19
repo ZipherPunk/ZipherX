@@ -678,6 +678,8 @@ async fn start_hidden_service_async() -> Result<String, Box<dyn std::error::Erro
     // Box the rend_requests stream to unify the types from both branches
     // (launch_onion_service_with_hsid and launch_onion_service return different opaque types)
     use std::pin::Pin;
+    // FIX #1457v2: Capture public key for address derivation fallback
+    let mut persistent_pubkey: Option<[u8; 32]> = None;
     let (service, rend_requests): (_, Pin<Box<dyn futures::Stream<Item = tor_hsservice::RendRequest> + Send>>) = if let Some(keypair_bytes) = stored_keypair.clone() {
         // Use stored keypair for persistent .onion address
         eprintln!("🧅 Using persistent keypair for fixed .onion address");
@@ -688,6 +690,9 @@ async fn start_hidden_service_async() -> Result<String, Box<dyn std::error::Erro
             .map_err(|_| "Invalid secret key length")?;
         let stored_public_bytes: [u8; 32] = keypair_bytes[32..].try_into()
             .map_err(|_| "Invalid public key length")?;
+
+        // FIX #1457v2: Save public key for address derivation (in case onion_address() returns None)
+        persistent_pubkey = Some(stored_public_bytes);
 
         // Create tor_llcrypto Keypair from secret bytes
         // This internally uses ed25519_dalek::SigningKey and derives the public key
@@ -774,17 +779,33 @@ async fn start_hidden_service_async() -> Result<String, Box<dyn std::error::Erro
             }
         }
     }
+    // FIX #1457v2: Also scrub intro point keys in ipts/ subdirectory
+    let ipts_dir = keystore_dir.join("ipts");
+    if ipts_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&ipts_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().map_or(false, |ext| {
+                    ext == "ed25519_private" || ext == "ed25519_expanded_private" || ext == "x25519_private"
+                }) {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
 
     // Get the .onion address using the new API
-    let hs_id = service.onion_address()
-        .ok_or("No onion address available")?;
-
-    // Convert HsId to proper .onion v3 address format
-    // Tor v3 address = base32(pubkey(32) + checksum(2) + version(1)) + ".onion"
-    // HsId contains the 32-byte public key, we need to compute checksum and encode
-    let hs_id_bytes: &[u8] = hs_id.as_ref();
-    let pubkey_bytes: [u8; 32] = hs_id_bytes.try_into()
-        .map_err(|_| "Invalid HsId length")?;
+    // FIX #1457v2: Arti may return None before the service is fully published.
+    // When we have a persistent keypair, derive the address from the public key directly.
+    let pubkey_bytes: [u8; 32] = if let Some(hs_id) = service.onion_address() {
+        let hs_id_bytes: &[u8] = hs_id.as_ref();
+        hs_id_bytes.try_into().map_err(|_| "Invalid HsId length")?
+    } else if let Some(pk) = persistent_pubkey {
+        eprintln!("🧅 FIX #1457v2: onion_address() returned None — deriving from persistent keypair");
+        pk
+    } else {
+        return Err("No onion address available and no persistent keypair".into());
+    };
 
     // Compute checksum: SHA3-256(".onion checksum" + pubkey + version)[0..2]
     // Tor v3 spec: CHECKSUM = H(".onion checksum" || PUBKEY || VERSION)[:2]

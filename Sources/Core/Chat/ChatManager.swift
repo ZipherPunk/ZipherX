@@ -184,11 +184,16 @@ final class ChatManager: ObservableObject {
     /// Key: onionAddress, Value: consecutive failure count
     private var connectionFailureCount: [String: Int] = [:]
 
-    /// Maximum backoff delay (30 seconds)
-    private let maxBackoffSeconds: Double = 30.0
+    /// FIX #1458: Increased max backoff from 30s to 5 minutes.
+    /// Offline .onion contacts generate ~30 TCP connections per attempt (SOCKS5 + Tor circuit).
+    /// With 30s max backoff + 30s maintenance loop = constant retries = hundreds of "Connection reset by peer".
+    private let maxBackoffSeconds: Double = 300.0
 
-    /// Base backoff delay (1 second)
-    private let baseBackoffSeconds: Double = 1.0
+    /// Base backoff delay (2 seconds)
+    private let baseBackoffSeconds: Double = 2.0
+
+    /// FIX #1458: Track last attempt time to prevent overlapping connection attempts
+    private var lastConnectionAttempt: [String: Date] = [:]
 
     /// Calculate backoff delay using exponential formula: min(base * 2^failures, max)
     private func calculateBackoff(for onionAddress: String) -> Double {
@@ -197,15 +202,25 @@ final class ChatManager: ObservableObject {
         return min(delay, maxBackoffSeconds)
     }
 
+    /// FIX #1458: Check if we should skip this connection attempt (still within backoff window)
+    private func shouldSkipConnection(for onionAddress: String) -> Bool {
+        guard let lastAttempt = lastConnectionAttempt[onionAddress] else { return false }
+        let backoff = calculateBackoff(for: onionAddress)
+        let elapsed = Date().timeIntervalSince(lastAttempt)
+        return elapsed < backoff
+    }
+
     /// Record a connection failure for backoff calculation
     private func recordConnectionFailure(for onionAddress: String) {
         let current = connectionFailureCount[onionAddress] ?? 0
-        connectionFailureCount[onionAddress] = min(current + 1, 5) // Cap at 5 (32 second max)
+        connectionFailureCount[onionAddress] = min(current + 1, 8) // FIX #1458: Cap at 8 (5 min max)
+        lastConnectionAttempt[onionAddress] = Date()
     }
 
     /// Reset failure count on successful connection
     private func resetConnectionFailure(for onionAddress: String) {
         connectionFailureCount.removeValue(forKey: onionAddress)
+        lastConnectionAttempt.removeValue(forKey: onionAddress)
     }
 
     // MARK: - Initialization
@@ -381,12 +396,15 @@ final class ChatManager: ObservableObject {
         }
         print("💬 FIX #330: Tor circuit health check passed")
 
-        // FIX #329: Apply exponential backoff before retry
+        // FIX #329 + FIX #1458: Apply exponential backoff before retry
         let backoff = calculateBackoff(for: contact.onionAddress)
         if backoff > baseBackoffSeconds {
             print("💬 FIX #329: Waiting \(String(format: "%.1f", backoff))s before retry (backoff)...")
             try await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
         }
+
+        // FIX #1458: Mark attempt time to prevent overlapping connections
+        lastConnectionAttempt[contact.onionAddress] = Date()
 
         print("💬 Connecting to \(contact.displayName) via Tor...")
 
@@ -1518,6 +1536,10 @@ final class ChatManager: ObservableObject {
                 isConnected = false
             }
             if !isConnected {
+                // FIX #1458: Skip if we recently failed (don't spam on view appear)
+                if shouldSkipConnection(for: contact.onionAddress) {
+                    continue
+                }
                 do {
                     try await connect(to: contact)
                     print("💬 FIX #1440: Initial connect to \(contact.displayName) succeeded — online")
@@ -1563,8 +1585,8 @@ final class ChatManager: ObservableObject {
                     }
                 }
 
-                // FIX #1435: Proactive online check — try connecting to contacts not yet in peers dict
-                // This ensures contact list dots turn green when contacts come online (not just when they message us)
+                // FIX #1435 + FIX #1458: Proactive online check with backoff gate
+                // Only attempt connection if backoff window has elapsed
                 for contact in contacts where !contact.isBlocked {
                     let isConnected: Bool
                     if let peer = peers[contact.onionAddress] {
@@ -1573,6 +1595,10 @@ final class ChatManager: ObservableObject {
                         isConnected = false
                     }
                     if !isConnected {
+                        // FIX #1458: Skip if still within backoff window
+                        if shouldSkipConnection(for: contact.onionAddress) {
+                            continue
+                        }
                         do {
                             try await connect(to: contact)
                             print("💬 FIX #1435: Proactive connect to \(contact.displayName) succeeded — now online")
