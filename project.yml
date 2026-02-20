@@ -1,0 +1,193 @@
+name: ZipherX
+options:
+  bundleIdPrefix: com.zipherpunk
+  deploymentTarget:
+    iOS: "15.0"
+    macOS: "12.0"
+  xcodeVersion: "15.0"
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    ENABLE_BITCODE: false
+    DEVELOPMENT_TEAM: "5MW334LMXL"
+
+targets:
+  # iOS Target
+  ZipherX:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+        excludes:
+          - "**/.DS_Store"
+      - path: Assets.xcassets
+        buildPhase: resources
+      # FIX #344: Resources must be in sources section with buildPhase: resources
+      - path: Resources/sapling-spend.params
+        buildPhase: resources
+      - path: Resources/sapling-output.params
+        buildPhase: resources
+      # All sync data (outputs, timestamps, tree, block hashes) is downloaded from GitHub
+      # as a unified boost file (zipherx_boost_v1.bin, ~520 MB) on first sync
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: ZipherX
+        CFBundleShortVersionString: "1.0.0-beta.1"
+        CFBundleVersion: "3"
+        UILaunchScreen:
+          UIColorName: LaunchScreenColor
+        NSFaceIDUsageDescription: ZipherX uses Face ID to protect your wallet and authorize transactions.
+        NSLocalNetworkUsageDescription: ZipherX connects to Zclassic network peers to sync your wallet.
+        NSCameraUsageDescription: ZipherX uses the camera to scan QR codes for receiving payments.
+        UIBackgroundModes:
+          - fetch
+        ITSAppUsesNonExemptEncryption: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.zipherpunk.zipherx
+        INFOPLIST_FILE: Info.plist
+        CODE_SIGN_ENTITLEMENTS: ZipherX.entitlements
+        TARGETED_DEVICE_FAMILY: "1,2"
+        # Bridging header for Rust FFI
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/ZipherX-Bridging-Header.h
+        # Use SQLCipher headers instead of system sqlite3
+        HEADER_SEARCH_PATHS:
+          - "$(SRCROOT)/Libraries/SQLCipher.xcframework/$(PLATFORM_NAME)-$(CURRENT_ARCH)/Headers"
+          - "$(SRCROOT)/Libraries/SQLCipher.xcframework/ios-arm64_x86_64-simulator/Headers"
+          - "$(SRCROOT)/Libraries/SQLCipher.xcframework/ios-arm64/Headers"
+        # Link resolver library
+        OTHER_LDFLAGS:
+          - "-lresolv"
+    dependencies:
+      - framework: Libraries/ZipherXFFI.xcframework
+        embed: false
+      - framework: Libraries/SQLCipher.xcframework
+        embed: false
+      # FIX #342: SystemConfiguration required by reqwest for proxy detection
+      - sdk: SystemConfiguration.framework
+    entitlements:
+      path: ZipherX.entitlements
+      properties:
+        keychain-access-groups:
+          - $(AppIdentifierPrefix)com.zipherpunk.zipherx
+        com.apple.developer.default-data-protection: NSFileProtectionCompleteUntilFirstUserAuthentication
+
+  # macOS Target
+  ZipherXMac:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources
+        excludes:
+          - "**/.DS_Store"
+      - path: Assets.xcassets
+        buildPhase: resources
+      # FIX #344: Resources must be in sources section with buildPhase: resources
+      - path: Resources/sapling-spend.params
+        buildPhase: resources
+      - path: Resources/sapling-output.params
+        buildPhase: resources
+      # macOS only: Bundled zclassicd and zclassic-cli for Full Node mode
+      # FIX #338: Use type: folder to preserve directory structure in bundle
+      - path: Resources/Binaries
+        buildPhase: resources
+        type: folder
+    info:
+      path: Info-macOS.plist
+      properties:
+        CFBundleDisplayName: ZipherX
+        CFBundleShortVersionString: "1.0.0-beta.1"
+        CFBundleVersion: "3"
+        CFBundleName: ZipherX
+        LSMinimumSystemVersion: "12.0"
+        NSLocalNetworkUsageDescription: ZipherX connects to Zclassic network peers to sync your wallet.
+        NSHumanReadableCopyright: "Copyright © 2025 ZipherX. All rights reserved."
+        ITSAppUsesNonExemptEncryption: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.zipherpunk.zipherx.mac
+        INFOPLIST_FILE: Info-macOS.plist
+        CODE_SIGN_ENTITLEMENTS: ZipherXMac.entitlements
+        # Bridging header for Rust FFI
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/ZipherX-Bridging-Header.h
+        # Use SQLCipher headers instead of system sqlite3
+        HEADER_SEARCH_PATHS:
+          - "$(SRCROOT)/Libraries/SQLCipher.xcframework/macos-arm64_x86_64/Headers"
+        # Link resolver library
+        OTHER_LDFLAGS:
+          - "-lresolv"
+        MACOSX_DEPLOYMENT_TARGET: "12.0"
+        # App icon
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    dependencies:
+      - framework: Libraries/ZipherXFFI.xcframework
+        embed: false
+      - framework: Libraries/SQLCipher.xcframework
+        embed: false
+      # FIX #342: SystemConfiguration required by reqwest for proxy detection
+      - sdk: SystemConfiguration.framework
+    entitlements:
+      path: ZipherXMac.entitlements
+      properties:
+        com.apple.security.app-sandbox: false
+        com.apple.security.network.client: true
+        com.apple.security.files.user-selected.read-write: true
+        keychain-access-groups:
+          - $(AppIdentifierPrefix)com.zipherpunk.zipherx.mac
+
+  ZipherXTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests
+        excludes:
+          - "**/.DS_Store"
+    dependencies:
+      - target: ZipherX
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.zipherpunk.zipherx.tests
+
+schemes:
+  ZipherX:
+    build:
+      targets:
+        ZipherX: all
+        ZipherXTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - ZipherXTests
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release
+
+  ZipherXMac:
+    build:
+      targets:
+        ZipherXMac: all
+    run:
+      config: Debug
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release
