@@ -494,12 +494,15 @@ struct SendView: View {
         }
         // INSTANT SEND: Trigger transaction preparation when input becomes valid
         .onChange(of: recipientAddress) { _ in
+            BiometricAuthManager.shared.recordUserActivity() // FIX #1432: Prevent auto-lock while typing
             triggerPreparationIfNeeded()
         }
         .onChange(of: amount) { _ in
+            BiometricAuthManager.shared.recordUserActivity() // FIX #1432: Prevent auto-lock while typing
             triggerPreparationIfNeeded()
         }
         .onChange(of: memo) { _ in
+            BiometricAuthManager.shared.recordUserActivity() // FIX #1432: Prevent auto-lock while typing
             // FIX #1258: Do NOT invalidate or re-prepare on memo change.
             // Pre-build happens once when amount is entered. Memo is included
             // at actual send time — if memo differs from prepared TX, the send

@@ -28,6 +28,11 @@ struct FullNodeWalletView: View {
     @State private var debugLogRescanProgress: Double = 0
     @State private var debugLogLastUpdate: Date = Date.distantPast
 
+    // FIX #1454: Track actual sync speed for accurate ETA
+    @State private var lastSyncBlocks: Int = 0
+    @State private var lastSyncTime: Date = Date()
+    @State private var observedBlocksPerSec: Double = 0
+
     // FIX #286 v12: External rescan detection
     @State private var externalRescanDetected: Bool = false
     @State private var externalRescanProgress: Double = 0
@@ -467,9 +472,10 @@ struct FullNodeWalletView: View {
                             .font(theme.captionFont)
                             .foregroundColor(syncStatusTextColor)
                     }
-                    // FIX #286 v15: Show blocks/headers or debug.log progress
+                    // FIX #286 v15 + FIX #1454: Show blocks/headers with estimated target
                     if let sync = detailedSync, sync.isSyncing || sync.isRescanning {
-                        Text("\(sync.blocks)/\(sync.headers)")
+                        let currentBlock = sync.isRescanning ? sync.rescanBlock : sync.blocks
+                        Text("Block \(currentBlock) / ~\(sync.headers)")
                             .font(theme.monoFont)
                             .foregroundColor(statusBlue)
                     } else if daemonBusyDetected && debugLogRescanProgress > 0 {
@@ -1932,20 +1938,21 @@ struct FullNodeWalletView: View {
                             .font(.system(size: 10, weight: .bold, design: .monospaced))
                             .foregroundColor(statusBlue)
 
-                        // ETA estimate (if progress > 15%)
-                        if sync.progress > 0.15 {
-                            Text("•")
-                                .foregroundColor(theme.textSecondary)
-
+                        // FIX #1454: ETA based on observed sync speed (not hardcoded)
+                        if observedBlocksPerSec > 0.1 {
                             let blocksRemaining = sync.headers - (sync.isRescanning ? sync.rescanBlock : sync.blocks)
-                            // Rough estimate: ~100 blocks per minute for sync, ~50 for rescan
-                            let blocksPerMin = sync.isRescanning ? 50 : 100
-                            let etaMins = max(1, blocksRemaining / blocksPerMin)
-                            let etaStr = etaMins >= 60 ? "\(etaMins / 60)h \(etaMins % 60)m" : "\(etaMins)m"
+                            if blocksRemaining > 0 {
+                                Text("•")
+                                    .foregroundColor(theme.textSecondary)
 
-                            Text("ETA: \(etaStr)")
-                                .font(.system(size: 10, design: .monospaced))
-                                .foregroundColor(statusBlue)
+                                let etaSecs = Double(blocksRemaining) / observedBlocksPerSec
+                                let etaMins = Int(etaSecs / 60)
+                                let etaStr = etaMins >= 60 ? "\(etaMins / 60)h \(etaMins % 60)m" : etaMins > 0 ? "\(etaMins)m" : "<1m"
+
+                                Text("ETA: ~\(etaStr)")
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundColor(statusBlue)
+                            }
                         }
                     }
                 }
@@ -2411,6 +2418,33 @@ struct FullNodeWalletView: View {
                 RPCClient.shared.peerCount = status.connections
                 rpcUnavailableCount = 0  // Reset on success
                 daemonBusyDetected = false
+
+                // FIX #1454: Track actual sync speed from observed block progress
+                if status.isSyncing || status.isRescanning {
+                    let currentBlocks = status.isRescanning ? status.rescanBlock : status.blocks
+                    let now = Date()
+                    let elapsed = now.timeIntervalSince(lastSyncTime)
+                    if elapsed >= 2.5 && currentBlocks > lastSyncBlocks {
+                        let blocksDelta = Double(currentBlocks - lastSyncBlocks)
+                        let newSpeed = blocksDelta / elapsed
+                        // Smooth with exponential moving average (70% new, 30% old)
+                        if observedBlocksPerSec > 0 {
+                            observedBlocksPerSec = newSpeed * 0.7 + observedBlocksPerSec * 0.3
+                        } else {
+                            observedBlocksPerSec = newSpeed
+                        }
+                        lastSyncBlocks = currentBlocks
+                        lastSyncTime = now
+                    } else if lastSyncBlocks == 0 {
+                        // Initialize on first poll
+                        lastSyncBlocks = currentBlocks
+                        lastSyncTime = now
+                    }
+                } else {
+                    // Reset when synced
+                    observedBlocksPerSec = 0
+                    lastSyncBlocks = 0
+                }
             }
             // FIX #1380: Auto-reload wallet data when daemon comes back online
             if wasOffline {

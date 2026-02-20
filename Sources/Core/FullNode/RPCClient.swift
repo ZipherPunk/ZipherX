@@ -783,7 +783,7 @@ public class RPCClient: ObservableObject {
         // Get blockchain info
         let blockchainInfo = try await getBlockchainInfo()
         let blocks = blockchainInfo["blocks"] as? Int ?? 0
-        let headers = blockchainInfo["headers"] as? Int ?? 0
+        var headers = blockchainInfo["headers"] as? Int ?? 0
         let verificationProgress = blockchainInfo["verificationprogress"] as? Double ?? 0
         let initialBlockDownload = blockchainInfo["initialblockdownload"] as? Bool ?? false
 
@@ -793,6 +793,22 @@ public class RPCClient: ObservableObject {
         if let networkInfo = try? await getNetworkInfo() {
             connections = networkInfo["connections"] as? Int ?? 0
         }
+
+        // FIX #1454: When daemon is syncing, headers from getblockchaininfo may NOT be the
+        // real chain tip — header sync lags behind peer knowledge. After bootstrap restore,
+        // Zclassic sets initialBlockDownload=false even though thousands of blocks behind.
+        // Use getpeerinfo startingheight (peer's chain height at handshake) as the REAL chain tip.
+        // NOTE: verificationprogress is BROKEN in Zclassic — stuck at 0.63 until 100%. Do NOT use it.
+        let daemonIsBehind = blocks < headers - 2 || initialBlockDownload
+        if daemonIsBehind && connections > 0 {
+            if let peers = try? await getPeerInfo() {
+                let peerMaxHeight = peers.compactMap { $0["startingheight"] as? Int }.max() ?? 0
+                if peerMaxHeight > headers {
+                    headers = peerMaxHeight
+                }
+            }
+        }
+
         // FIX #1371: Count onion peers
         onionPeers = await getOnionPeerCount()
 
@@ -821,18 +837,26 @@ public class RPCClient: ObservableObject {
             }
         }
 
-        // Determine if blockchain is syncing
+        // FIX #1454: Determine if blockchain is syncing — use corrected headers (may include peer tip)
         let isSyncing = initialBlockDownload || blocks < headers - 2
+
+        // FIX #1454: More accurate progress using corrected headers
+        let syncProgress: Double
+        if isRescanning {
+            syncProgress = rescanProgress
+        } else if isSyncing && headers > 0 {
+            syncProgress = Double(blocks) / Double(headers)
+        } else {
+            syncProgress = verificationProgress
+        }
 
         // Generate human-readable status message
         let statusMessage: String
         if isRescanning {
             statusMessage = "Rescanning wallet at block \(rescanBlock) (\(Int(rescanProgress * 100))%)"
-        } else if initialBlockDownload {
-            statusMessage = "Downloading blockchain: \(blocks)/\(headers) blocks (\(Int(verificationProgress * 100))%)"
-        } else if blocks < headers - 2 {
+        } else if isSyncing {
             let blocksRemaining = headers - blocks
-            statusMessage = "Syncing: \(blocksRemaining) blocks behind"
+            statusMessage = "Syncing: \(blocks)/\(headers) (\(blocksRemaining) blocks remaining)"
         } else {
             statusMessage = "Synchronized at block \(blocks)"
         }
@@ -840,7 +864,7 @@ public class RPCClient: ObservableObject {
         return DetailedSyncStatus(
             blocks: blocks,
             headers: headers,
-            progress: isRescanning ? rescanProgress : verificationProgress,
+            progress: syncProgress,
             isSyncing: isSyncing,
             isRescanning: isRescanning,
             rescanProgress: rescanProgress,
@@ -1206,134 +1230,261 @@ public class RPCClient: ObservableObject {
         // - ALLOW same txid to appear as both SENT and RECEIVED when wallet holds both keys
         //   (e.g., macOS sends to sim, both PKs in wallet.dat → show IN and OUT)
         // - Only dedup identical outputs (same txid + same address)
+        // FIX #1445: Parallelize z_listreceivedbyaddress across all z-addresses.
+        // Old code: sequential loop = N addresses × 2-3s each = 20-30s for 10 addresses.
+        // New code: concurrent TaskGroup = all addresses in parallel ≈ 3-5s total.
         var zReceivedCount = 0
         var seenZOutputs = Set<String>()
-        for zAddr in zAddresses {
-            do {
-                let rawResult = try await call(method: "z_listreceivedbyaddress", params: [zAddr, 0])
-                guard let notes = rawResult as? [[String: Any]] else { continue }
 
-                for note in notes {
-                    guard let txid = note["txid"] as? String else { continue }
-                    let isChange = note["change"] as? Bool ?? false
-
-                    // FIX #1269: Skip change notes — they are NOT real receives.
-                    // Change outputs are handled by Stage 4 (sent TX detection via change notes).
-                    if isChange {
-                        continue
-                    }
-
-                    let amount = UInt64((note["amount"] as? Double ?? 0) * 100_000_000)
-                    let memoHex = note["memo"] as? String
-                    let memo = memoHex.flatMap { Self.decodeMemo($0) }
-
-                    // FIX #862: Composite key to avoid duplicate outputs
-                    let outputKey = "\(txid):\(zAddr)"
-                    guard !seenZOutputs.contains(outputKey) else { continue }
-                    seenZOutputs.insert(outputKey)
-
-                    // Get timing info
-                    var timestamp = Date()
-                    var confirmations = 0
-                    var height: UInt64? = nil
-                    if let txDetails = try? await getTransaction(txid: txid) {
-                        confirmations = txDetails["confirmations"] as? Int ?? 0
-                        if let time = txDetails["time"] as? Int {
-                            timestamp = Date(timeIntervalSince1970: TimeInterval(time))
-                        } else if let blocktime = txDetails["blocktime"] as? Int {
-                            timestamp = Date(timeIntervalSince1970: TimeInterval(blocktime))
+        // Collect all z-received notes in parallel
+        let zReceivedResults = await withTaskGroup(of: [(zAddr: String, txid: String, amount: UInt64, memo: String?, isChange: Bool)].self) { group in
+            for zAddr in zAddresses {
+                group.addTask {
+                    do {
+                        let rawResult = try await self.call(method: "z_listreceivedbyaddress", params: [zAddr, 0])
+                        guard let notes = rawResult as? [[String: Any]] else { return [] }
+                        return notes.compactMap { note -> (zAddr: String, txid: String, amount: UInt64, memo: String?, isChange: Bool)? in
+                            guard let txid = note["txid"] as? String else { return nil }
+                            let isChange = note["change"] as? Bool ?? false
+                            let amount = UInt64((note["amount"] as? Double ?? 0) * 100_000_000)
+                            let memoHex = note["memo"] as? String
+                            let memo = memoHex.flatMap { Self.decodeMemo($0) }
+                            return (zAddr: zAddr, txid: txid, amount: amount, memo: memo, isChange: isChange)
                         }
-                        if let h = txDetails["height"] as? Int { height = UInt64(h) }
+                    } catch {
+                        print("⚠️ FIX #1269: Failed z_listreceivedbyaddress for \(zAddr.prefix(16))...: \(error)")
+                        return []
                     }
+                }
+            }
+            var all: [(zAddr: String, txid: String, amount: UInt64, memo: String?, isChange: Bool)] = []
+            for await batch in group { all.append(contentsOf: batch) }
+            return all
+        }
 
-                    allTransactions.append(WalletTransaction(
-                        txid: txid,
-                        address: zAddr,
-                        amount: amount,
-                        fee: 0,
-                        type: .received,
-                        timestamp: timestamp,
-                        confirmations: confirmations,
-                        memo: memo,
-                        height: height
-                    ))
-                    seenTxids.insert(txid)
-                    zReceivedCount += 1
+        // FIX #1448: Collect ALL unique txids needing detail enrichment upfront
+        // (both non-change received AND change-note txids for sent detection)
+        // This single parallel batch replaces 3 separate sequential RPC rounds.
+        var txidsNeedingDetails = Set<String>()
+        var changeNoteTxids: [String: UInt64] = [:]  // txid → change amount
+        var allReceivedNotes: [(txid: String, zAddr: String, outindex: Int, amount: UInt64)] = []
+        var memosByTxid: [String: String] = [:]  // FIX #1449: Collect memos for self-send display
+
+        for note in zReceivedResults {
+            // Collect all non-change outputs needing detail
+            if !note.isChange {
+                let outputKey = "\(note.txid):\(note.zAddr)"
+                if !seenZOutputs.contains(outputKey) {
+                    txidsNeedingDetails.insert(note.txid)
+                }
+                // FIX #1449: Store memo from non-change note (for self-send sent entry)
+                if let memo = note.memo, !memo.isEmpty {
+                    memosByTxid[note.txid] = memo
+                }
+            }
+            // Collect change-note txids for sent detection
+            if note.isChange {
+                changeNoteTxids[note.txid, default: 0] += note.amount
+                txidsNeedingDetails.insert(note.txid)  // Need details for timestamp/height
+            }
+            // Track all received notes for spent-note detection
+            allReceivedNotes.append((txid: note.txid, zAddr: note.zAddr, outindex: 0, amount: note.amount))
+        }
+
+        // FIX #1448: Single parallel batch-fetch for ALL TX details
+        // Old code: 3 sequential rounds (received details + change details + enrichment)
+        // New code: 1 parallel batch covers all needs
+        var txDetailCache: [String: [String: Any]] = [:]
+        let detailResults = await withTaskGroup(of: (String, [String: Any]?).self) { group in
+            for txid in txidsNeedingDetails {
+                group.addTask {
+                    let details = try? await self.getTransaction(txid: txid)
+                    return (txid, details)
+                }
+            }
+            var results: [(String, [String: Any]?)] = []
+            for await result in group { results.append(result) }
+            return results
+        }
+        for (txid, details) in detailResults {
+            if let details = details { txDetailCache[txid] = details }
+        }
+
+        // FIX #1448: Also fetch z_listunspent in background while processing
+        // (needed for spent-note detection in change-note discovery)
+        var unspentKeys = Set<String>()
+        if !changeNoteTxids.isEmpty {
+            do {
+                let allUnspent = try await zListUnspent(minConf: 0, addresses: zAddresses)
+                for note in allUnspent {
+                    if let txid = note["txid"] as? String, let outindex = note["outindex"] as? Int {
+                        unspentKeys.insert("\(txid):\(outindex)")
+                    }
                 }
             } catch {
-                print("⚠️ FIX #1269: Failed z_listreceivedbyaddress for \(zAddr.prefix(16))...: \(error)")
+                print("⚠️ FIX #1448: Failed to get unspent notes: \(error)")
             }
+        }
+
+        // Process received results with cached details
+        for note in zReceivedResults {
+            // FIX #1269: Skip change notes
+            if note.isChange { continue }
+
+            let outputKey = "\(note.txid):\(note.zAddr)"
+            guard !seenZOutputs.contains(outputKey) else { continue }
+            seenZOutputs.insert(outputKey)
+
+            var timestamp = Date()
+            var confirmations = 0
+            var height: UInt64? = nil
+            if let txDetails = txDetailCache[note.txid] {
+                confirmations = txDetails["confirmations"] as? Int ?? 0
+                if let time = txDetails["time"] as? Int {
+                    timestamp = Date(timeIntervalSince1970: TimeInterval(time))
+                } else if let blocktime = txDetails["blocktime"] as? Int {
+                    timestamp = Date(timeIntervalSince1970: TimeInterval(blocktime))
+                }
+                if let h = txDetails["height"] as? Int { height = UInt64(h) }
+            }
+
+            allTransactions.append(WalletTransaction(
+                txid: note.txid,
+                address: note.zAddr,
+                amount: note.amount,
+                fee: 0,
+                type: .received,
+                timestamp: timestamp,
+                confirmations: confirmations,
+                memo: note.memo,
+                height: height
+            ))
+            seenTxids.insert(note.txid)
+            zReceivedCount += 1
         }
         print("📜 FIX #1269: Added \(zReceivedCount) z-address RECEIVED transactions (change notes excluded)")
 
-        // FIX #1269: Discover sent z-transactions via change-note detection.
-        // Zclassic does NOT have z_viewtransaction (that's Zcash 4.x+).
-        // z_getoperationstatus is in-memory only — lost on daemon restart.
-        // Instead: notes marked "change: true" in z_listreceivedbyaddress reveal
-        // our SENDING transactions (change goes back to us on every send).
-        print("📜 FIX #1269: Discovering sent z-transactions via change-note detection...")
-        let discoveredSentTxs = try await discoverSentZTransactionsViaChangeNotes(
-            zAddresses: zAddresses,
-            existingSentTxids: Set(allTransactions.filter { $0.type == .sent }.map { $0.txid })
-        )
+        // FIX #1448: Inline change-note sent detection using already-fetched data.
+        // Old discoverSentZTransactionsViaChangeNotes() re-fetched z_listreceivedbyaddress
+        // SEQUENTIALLY per address + getTransaction SEQUENTIALLY per txid = 60+ seconds.
+        // Now uses zReceivedResults (already fetched in parallel above) + txDetailCache.
+        let existingSentTxids = Set(allTransactions.filter { $0.type == .sent }.map { $0.txid })
         var discoveredCount = 0
-        for sentTx in discoveredSentTxs {
-            allTransactions.append(sentTx)
-            seenTxids.insert(sentTx.txid)
+        for (txid, changeAmount) in changeNoteTxids {
+            guard !existingSentTxids.contains(txid) else { continue }
+
+            var timestamp = Date()
+            var confirmations = 0
+            var height: UInt64? = nil
+            if let txDetails = txDetailCache[txid] {
+                if let time = txDetails["time"] as? Int {
+                    timestamp = Date(timeIntervalSince1970: TimeInterval(time))
+                } else if let blocktime = txDetails["blocktime"] as? Int {
+                    timestamp = Date(timeIntervalSince1970: TimeInterval(blocktime))
+                }
+                confirmations = txDetails["confirmations"] as? Int ?? 0
+                if let h = txDetails["height"] as? Int { height = UInt64(h) }
+            }
+
+            // Check total received for this txid (for self-send detection)
+            let totalReceivedForTx = allReceivedNotes
+                .filter { $0.txid == txid }
+                .reduce(0 as UInt64) { $0 + $1.amount }
+            let selfRecvAmount = totalReceivedForTx > changeAmount ? totalReceivedForTx - changeAmount : 0
+
+            // FIX #1367: Detect self-sends vs external sends
+            let sentAmount: UInt64
+            let txAddress: String
+            if selfRecvAmount > 0 {
+                sentAmount = selfRecvAmount
+                txAddress = "Shielded"
+            } else {
+                sentAmount = 10000  // Fee only (self-send)
+                txAddress = "self"
+            }
+
+            allTransactions.append(WalletTransaction(
+                txid: txid,
+                address: txAddress,
+                amount: sentAmount,
+                fee: 10000,
+                type: .sent,
+                timestamp: timestamp,
+                confirmations: confirmations,
+                memo: memosByTxid[txid],  // FIX #1449: Carry memo from non-change note
+                height: height
+            ))
+            seenTxids.insert(txid)
             discoveredCount += 1
         }
         if discoveredCount > 0 {
-            print("📜 FIX #1269: Discovered \(discoveredCount) additional sent z-transactions via change notes")
+            print("📜 FIX #1448: Discovered \(discoveredCount) sent z-transactions via change notes (inlined, no re-fetch)")
         }
 
         // 4. For any transaction we found, try to enrich with full details
         // FIX #855: Also refreshes confirmations from blockchain for pending transactions
-        print("📜 FIX #725: Enriching \(allTransactions.count) transactions with full details...")
-        var enrichedTransactions: [WalletTransaction] = []
-        for tx in allTransactions {
-            // FIX #855: Enrich ALL transactions, especially those with 0 confirmations
-            // This fixes "stuck pending" status by refreshing from blockchain
-            let needsEnrichment = tx.height == nil || tx.timestamp.timeIntervalSince1970 < 1000000 || tx.confirmations == 0
-            if needsEnrichment {
-                do {
-                    let details = try await getTransaction(txid: tx.txid)
-                    var enrichedTx = tx
+        // FIX #1448: Use txDetailCache from above first, only fetch missing txids in parallel.
+        // Old code fetched ALL txids again (even ones already cached from z-received step).
+        let txsNeedingEnrichment = allTransactions.filter { tx in
+            tx.height == nil || tx.timestamp.timeIntervalSince1970 < 1000000 || tx.confirmations == 0
+        }
+        let txsAlreadyGood = allTransactions.filter { tx in
+            !(tx.height == nil || tx.timestamp.timeIntervalSince1970 < 1000000 || tx.confirmations == 0)
+        }
 
-                    // Update height if available
-                    var newHeight = tx.height
-                    if let height = details["height"] as? Int {
-                        newHeight = UInt64(height)
+        // Only fetch txids NOT already in txDetailCache
+        let uncachedTxids = Set(txsNeedingEnrichment.map { $0.txid }).subtracting(txDetailCache.keys)
+        print("📜 FIX #1448: Enriching \(txsNeedingEnrichment.count) TXs (\(txDetailCache.count) cached, \(uncachedTxids.count) need fetch)...")
+
+        // Batch-fetch only missing TX details in parallel
+        if !uncachedTxids.isEmpty {
+            let newResults = await withTaskGroup(of: (String, [String: Any]?).self) { group in
+                for txid in uncachedTxids {
+                    group.addTask {
+                        let details = try? await self.getTransaction(txid: txid)
+                        return (txid, details)
                     }
-
-                    // Update confirmations from blockchain
-                    var newConfirmations = tx.confirmations
-                    if let confirmations = details["confirmations"] as? Int {
-                        newConfirmations = confirmations
-                    }
-
-                    // Update timestamp if available
-                    var newTimestamp = tx.timestamp
-                    if let blocktime = details["blocktime"] as? Int {
-                        newTimestamp = Date(timeIntervalSince1970: TimeInterval(blocktime))
-                    }
-
-                    enrichedTx = WalletTransaction(
-                        txid: tx.txid,
-                        address: tx.address,
-                        amount: tx.amount,
-                        fee: tx.fee,
-                        type: tx.type,
-                        timestamp: newTimestamp,
-                        confirmations: newConfirmations,
-                        memo: tx.memo,
-                        height: newHeight
-                    )
-
-                    enrichedTransactions.append(enrichedTx)
-                } catch {
-                    // Keep original if enrichment fails
-                    enrichedTransactions.append(tx)
                 }
+                var results: [(String, [String: Any]?)] = []
+                for await result in group { results.append(result) }
+                return results
+            }
+            for (txid, details) in newResults {
+                if let details = details { txDetailCache[txid] = details }
+            }
+        }
+
+        // Build enrichment lookup by index
+        let enrichmentResults: [Int: [String: Any]] = {
+            var results: [Int: [String: Any]] = [:]
+            for (index, tx) in txsNeedingEnrichment.enumerated() {
+                if let details = txDetailCache[tx.txid] { results[index] = details }
+            }
+            return results
+        }()
+
+        // Apply enrichment results
+        var enrichedTransactions: [WalletTransaction] = txsAlreadyGood
+        for (index, tx) in txsNeedingEnrichment.enumerated() {
+            if let details = enrichmentResults[index] {
+                let newHeight: UInt64? = (details["height"] as? Int).map { UInt64($0) } ?? tx.height
+                let newConfirmations = details["confirmations"] as? Int ?? tx.confirmations
+                var newTimestamp = tx.timestamp
+                if let blocktime = details["blocktime"] as? Int {
+                    newTimestamp = Date(timeIntervalSince1970: TimeInterval(blocktime))
+                }
+
+                enrichedTransactions.append(WalletTransaction(
+                    txid: tx.txid,
+                    address: tx.address,
+                    amount: tx.amount,
+                    fee: tx.fee,
+                    type: tx.type,
+                    timestamp: newTimestamp,
+                    confirmations: newConfirmations,
+                    memo: tx.memo,
+                    height: newHeight
+                ))
             } else {
                 enrichedTransactions.append(tx)
             }

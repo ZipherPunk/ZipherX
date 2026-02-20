@@ -15,6 +15,7 @@ struct FullNodeSettingsView: View {
 
     // State
     @State private var showingBootstrapSheet = false
+    @State private var showingBootstrapConfirmation = false  // FIX #1453
     @State private var showingConfigEditor = false
     @State private var isStartingDaemon = false
     @State private var isStoppingDaemon = false
@@ -156,6 +157,15 @@ struct FullNodeSettingsView: View {
             BootstrapProgressView()
                 .environmentObject(themeManager)
         }
+        // FIX #1453: Confirmation dialog before bootstrap download
+        .alert("Install Bootstrap?", isPresented: $showingBootstrapConfirmation) {
+            Button("Download Bootstrap", role: .destructive) {
+                showingBootstrapSheet = true
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This will download and extract blockchain data (~10 GB download, ~30 GB extracted).\n\nExisting blockchain data (blocks & chainstate) will be overwritten.\n\nMake sure you have backed up your wallet.dat and any important data before proceeding.")
+        }
         .sheet(isPresented: $showingConfigEditor) {
             configEditorSheet
         }
@@ -282,7 +292,8 @@ struct FullNodeSettingsView: View {
                     .foregroundColor(theme.textSecondary)
 
                 HStack(spacing: 12) {
-                    Button(action: { showingBootstrapSheet = true }) {
+                    // FIX #1453: Show confirmation before starting bootstrap
+                    Button(action: { showingBootstrapConfirmation = true }) {
                         HStack {
                             Image(systemName: "square.and.arrow.down")
                             Text("Install Bootstrap")

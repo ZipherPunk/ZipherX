@@ -636,9 +636,14 @@ struct SettingsView: View {
             Button("I Understand, Continue") {
                 // Check if daemon is already installed
                 if fullNodeManager.isDaemonInstalledAtPath {
-                    // Daemon already installed, proceed directly
-                    modeManager.setWalletSource(.walletDat)
+                    // FIX #1445: Set mode FIRST, then wallet source.
+                    // setWalletSource(.walletDat) rejects when currentMode != .fullNode.
+                    // Old order: setWalletSource → setMode caused walletSource to stay .zipherx
+                    // on first click (silently rejected), requiring a second click.
                     modeManager.setMode(.fullNode)
+                    modeManager.setWalletSource(.walletDat)
+                    // FIX #1445: Reset activity timer — mode switch is a user action
+                    BiometricAuthManager.shared.resetActivityTimeout()
                     if bootstrapManager.needsBootstrap {
                         showBootstrapSheet = true
                     }
@@ -753,9 +758,13 @@ Both binaries must be installed to /usr/local/bin:
                         BiometricAuthManager.shared.authenticateForSensitiveOperation(
                             reason: "Authenticate to switch to P2P mode"
                         ) { success, _ in
-                            if success {
-                                modeManager.setWalletSource(.zipherx)
-                                modeManager.setMode(.light)
+                            DispatchQueue.main.async {
+                                if success {
+                                    modeManager.setWalletSource(.zipherx)
+                                    modeManager.setMode(.light)
+                                    // FIX #1445: Reset activity timer — mode switch is a user action
+                                    BiometricAuthManager.shared.resetActivityTimeout()
+                                }
                             }
                         }
                     }
@@ -784,9 +793,13 @@ Both binaries must be installed to /usr/local/bin:
                         BiometricAuthManager.shared.authenticateForSensitiveOperation(
                             reason: "Authenticate to switch to Full Node mode"
                         ) { success, _ in
-                            if success {
-                                // Show mode change alert (handles daemon install + bootstrap)
-                                showModeChangeAlert = true
+                            // FIX #1436: Ensure @State update on main thread
+                            // Grace period (FIX #1433) calls completion synchronously —
+                            // @State mutations must be on main thread for SwiftUI to react.
+                            DispatchQueue.main.async {
+                                if success {
+                                    showModeChangeAlert = true
+                                }
                             }
                         }
                     }
@@ -3268,8 +3281,14 @@ Both binaries must be installed to /usr/local/bin:
         var error: NSError?
         biometricAvailable = context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error)
 
-        // Load saved preferences
-        useFaceID = UserDefaults.standard.bool(forKey: "useBiometricAuth")
+        // FIX #1434: Default to enabled when biometrics available and user never explicitly set preference.
+        // Without this: toggle shows OFF but Touch ID works (via deviceOwnerAuthentication passcode fallback).
+        if UserDefaults.standard.object(forKey: "useBiometricAuth") == nil && biometricAvailable {
+            useFaceID = true
+            UserDefaults.standard.set(true, forKey: "useBiometricAuth")
+        } else {
+            useFaceID = UserDefaults.standard.bool(forKey: "useBiometricAuth")
+        }
         usePINCode = PINSecurity.hasPIN()  // VUL-STOR-002: Keychain instead of UserDefaults
         // FIX #1346: Reload timeout from persisted value — @State only initializes once at view creation
         selectedTimeout = BiometricAuthManager.shared.authTimeout

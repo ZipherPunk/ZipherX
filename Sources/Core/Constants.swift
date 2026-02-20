@@ -10,6 +10,7 @@ enum ZipherXConstants {
     private static let treeHeightKey = "effectiveTreeHeight"
     private static let treeCMUCountKey = "effectiveTreeCMUCount"
     private static let treeRootKey = "effectiveTreeRoot"
+    private static let treeBlockHashKey = "effectiveTreeBlockHash"  // FIX #1446c
 
     /// Get the effective tree height (from downloaded boost file)
     /// Returns 0 if no boost file has been downloaded yet (forces download)
@@ -35,12 +36,22 @@ enum ZipherXConstants {
         return UserDefaults.standard.string(forKey: treeRootKey) ?? ""
     }
 
+    /// FIX #1446c: Get the block hash at boost file end height (for header sync locator)
+    /// Returns hex string in display format (big-endian), or empty if not set
+    static var effectiveBlockHash: String {
+        return UserDefaults.standard.string(forKey: treeBlockHashKey) ?? ""
+    }
+
     /// Update tree info from downloaded GitHub boost file
     /// Called by CommitmentTreeUpdater after successful download
-    static func updateTreeInfo(height: UInt64, cmuCount: UInt64, root: String) {
+    /// FIX #1446c: Also stores block_hash for dynamic header sync locator
+    static func updateTreeInfo(height: UInt64, cmuCount: UInt64, root: String, blockHash: String = "") {
         UserDefaults.standard.set(Int(height), forKey: treeHeightKey)
         UserDefaults.standard.set(Int(cmuCount), forKey: treeCMUCountKey)
         UserDefaults.standard.set(root, forKey: treeRootKey)
+        if !blockHash.isEmpty {
+            UserDefaults.standard.set(blockHash, forKey: treeBlockHashKey)
+        }
         print("📊 Updated tree info: height=\(height), CMUs=\(cmuCount), root=\(root.prefix(16))...")
     }
 
@@ -56,6 +67,7 @@ enum ZipherXConstants {
         UserDefaults.standard.removeObject(forKey: treeHeightKey)
         UserDefaults.standard.removeObject(forKey: treeCMUCountKey)
         UserDefaults.standard.removeObject(forKey: treeRootKey)
+        UserDefaults.standard.removeObject(forKey: treeBlockHashKey)
         print("📊 Cleared tree info from UserDefaults")
     }
 

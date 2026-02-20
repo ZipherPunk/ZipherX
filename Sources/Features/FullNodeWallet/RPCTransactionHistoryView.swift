@@ -297,6 +297,16 @@ struct RPCTransactionHistoryView: View {
         .task {
             await loadTransactions()
         }
+        // FIX #1449: Auto-refresh every 30s when there are pending (0-conf) transactions.
+        // Updates confirmation counts as new blocks are mined.
+        .onReceive(Timer.publish(every: 30, on: .main, in: .common).autoconnect()) { _ in
+            let hasPending = transactions.contains { $0.confirmations == 0 }
+            if hasPending {
+                Task {
+                    await loadTransactions()
+                }
+            }
+        }
         .sheet(item: $selectedTransaction) { tx in
             transactionDetailSheet(tx)
         }

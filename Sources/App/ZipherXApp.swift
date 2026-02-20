@@ -21,6 +21,15 @@ struct ZipherXApp: App {
     #endif
     @State private var hasAcceptedDisclaimer = UserDefaults.standard.bool(forKey: "hasAcceptedDisclaimer")
 
+    /// Whether mode selection screen should be shown (macOS only, when daemon detected)
+    private var needsModeSelection: Bool {
+        #if os(macOS)
+        return !modeManager.hasSelectedMode && (showModeSelection || !hasCheckedDaemon)
+        #else
+        return false
+        #endif
+    }
+
     // iOS: Use AppDelegate for background fetch
     #if os(iOS)
     @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
@@ -99,18 +108,23 @@ struct ZipherXApp: App {
                 if !hasAcceptedDisclaimer {
                     // Step 1: Disclaimer (first launch)
                     DisclaimerView(hasAcceptedDisclaimer: $hasAcceptedDisclaimer)
-                }
-                #if os(macOS)
-                else if !modeManager.hasSelectedMode && (showModeSelection || !hasCheckedDaemon) {
+                        .frame(minWidth: 600, idealWidth: 700, minHeight: 700, idealHeight: 850)
+                } else if needsModeSelection {
                     // Step 2: Mode selection (macOS, first launch after disclaimer)
+                    #if os(macOS)
                     ModeSelectionView { mode in
                         modeManager.setMode(mode)
                         showModeSelection = false
                     }
                     .environmentObject(themeManager)
-                }
-                #endif
-                else {
+                    #else
+                    // iOS: should never reach here, but safety fallback
+                    ContentView()
+                        .environmentObject(walletManager)
+                        .environmentObject(networkManager)
+                        .environmentObject(themeManager)
+                    #endif
+                } else {
                     // Step 3: Main app
                     ContentView()
                         .environmentObject(walletManager)

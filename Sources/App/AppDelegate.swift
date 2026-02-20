@@ -6,6 +6,7 @@
 
 #if os(iOS)
 import UIKit
+import SwiftUI
 import BackgroundTasks
 
 /// App Delegate for iOS-specific functionality
@@ -14,6 +15,9 @@ class AppDelegate: NSObject, UIApplicationDelegate {
 
     /// Background task identifier
     private let backgroundTaskIdentifier = "com.zipherx.wallet.refresh"
+
+    // VUL-UI-003 Fix 3: UIKit privacy window for synchronous overlay
+    private var privacyWindow: UIWindow?
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         // Register background task (iOS 13+)
@@ -120,6 +124,43 @@ class AppDelegate: NSObject, UIApplicationDelegate {
                 completionHandler(.failed)
             }
         }
+    }
+
+    // MARK: - Privacy Overlay (VUL-UI-003 Fix 3)
+
+    /// Show UIKit privacy window (synchronous, no SwiftUI race condition)
+    func showPrivacyOverlay() {
+        guard privacyWindow == nil else { return }
+        if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene {
+            let window = UIWindow(windowScene: windowScene)
+            window.windowLevel = .alert + 1
+            let hostingController = UIHostingController(rootView:
+                ZStack {
+                    Color.black
+                    VStack(spacing: 16) {
+                        Image(systemName: "lock.shield.fill")
+                            .font(.system(size: 40))
+                            .foregroundColor(.white)
+                        Text("ZipherX")
+                            .font(.title2)
+                            .foregroundColor(.white)
+                        Text("Privacy Protected")
+                            .font(.caption)
+                            .foregroundColor(.white.opacity(0.7))
+                    }
+                }
+                .ignoresSafeArea()
+            )
+            window.rootViewController = hostingController
+            window.makeKeyAndVisible()
+            privacyWindow = window
+        }
+    }
+
+    /// Hide UIKit privacy window
+    func hidePrivacyOverlay() {
+        privacyWindow?.isHidden = true
+        privacyWindow = nil
     }
 
     // MARK: - Scene Lifecycle

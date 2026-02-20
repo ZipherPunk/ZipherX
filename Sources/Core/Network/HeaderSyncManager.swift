@@ -640,11 +640,10 @@ final class HeaderSyncManager {
                 )
                 onProgress?(progress)
 
-                // FIX #707: Only log every 1000 headers or at 100%
+                // FIX #1440: Always show progress every ~1000 headers (not gated on verbose)
+                // Replaces the per-request getheaders log that was too spammy
                 if peer.score.headersProvided % 1000 < 160 || progress.percentComplete == 100 {
-                    if verbose {
-                        print("📡 Synced to \(actualEndHeight) (\(progress.percentComplete)%) - \(peer.score.headersProvided) headers from \(peer.host)")
-                    }
+                    print("📡 Header sync: \(actualEndHeight)/\(chainTip) (\(progress.percentComplete)%)")
                 }
 
                 // Clear failed peers on success - a working peer might recover
@@ -1404,6 +1403,16 @@ final class HeaderSyncManager {
                         locatorHash = boostEndHeader.blockHash  // Already in wire format
                         actualLocatorHeight = boostFileEndHeight
                         print("📋 FIX #901: Using boost file end (\(boostFileEndHeight)) as locator for height \(locatorHeight)")
+                    } else {
+                        // FIX #1446c: HeaderStore doesn't have boost headers (FIX #1341 skipped loading).
+                        // Use manifest's block_hash stored in ZipherXConstants instead.
+                        // This avoids falling back 22K+ blocks to the stale hardcoded checkpoint.
+                        let manifestHash = ZipherXConstants.effectiveBlockHash
+                        if !manifestHash.isEmpty, let hashData = Data(hexString: manifestHash) {
+                            locatorHash = Data(hashData.reversed())  // Convert display format → wire format
+                            actualLocatorHeight = boostFileEndHeight
+                            print("📋 FIX #1446c: Using manifest block_hash as locator at height \(boostFileEndHeight) (HeaderStore empty)")
+                        }
                     }
                 }
 
@@ -1853,7 +1862,7 @@ final class HeaderSyncManager {
         // FIX #679 v2: P2P headers don't include chainwork - it's computed locally during insert
         // Skip chainwork validation entirely - chainwork is only for detecting database corruption
         // The real validation is block hash continuity (verified elsewhere)
-        print("✅ FIX #679: Skipping chainwork validation - P2P headers don't include chainwork, it's computed during insert")
+        // FIX #1440: Removed spammy per-batch log (fires 30+ times during header sync)
         return
 
         /* Old validation code below - DISABLED because P2P headers have empty chainwork

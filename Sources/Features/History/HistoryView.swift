@@ -36,6 +36,11 @@ struct HistoryView: View {
         .onAppear {
             loadTransactions()
         }
+        // FIX #1438: Refresh when populateHistoryFromNotes completes or TX confirmed
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("transactionHistoryUpdated"))) { _ in
+            print("📜 FIX #1438: HistoryView received transactionHistoryUpdated — reloading")
+            loadTransactions()
+        }
         .sheet(item: $selectedTransaction) { transaction in
             TransactionDetailView(transaction: transaction)
                 .environmentObject(themeManager)
@@ -281,6 +286,16 @@ struct HistoryView: View {
 
                     // FIX #129: Show ALL transactions (up to 1000) - was limit:100 which cut off older transactions
                     let items = try WalletDatabase.shared.getTransactionHistory(limit: 1000)
+
+                    // DEBUG: Log loaded transactions summary
+                    let sentCount = items.filter { $0.type == .sent }.count
+                    let receivedCount = items.filter { $0.type == .received }.count
+                    let selfSendCount = items.filter { $0.type == .selfSend }.count
+                    let noTimestamp = items.filter { $0.blockTime == nil || $0.blockTime == 0 }.count
+                    print("🕐 DEBUG HistoryView.loadTransactions: \(items.count) total — sent=\(sentCount), received=\(receivedCount), selfSend=\(selfSendCount), noTimestamp=\(noTimestamp)")
+                    for item in items.prefix(10) {
+                        print("🕐 DEBUG   type=\(item.type.rawValue), height=\(item.height), blockTime=\(item.blockTime ?? 0), value=\(item.value)")
+                    }
 
                     // NOTE: Deduplication is now handled in SQL query (WalletDatabase.getTransactionHistory)
                     // The SQL uses rowid subquery to deduplicate while preserving ORDER BY block_height DESC
@@ -663,6 +678,7 @@ struct TransactionDetailView: View {
         // Priority 1: Use the real block timestamp if already stored in transaction
         if let blockTime = transaction.blockTime, blockTime > 0 {
             let date = Date(timeIntervalSince1970: TimeInterval(blockTime))
+            print("🕐 DEBUG blockDateString: height=\(transaction.height), P1 blockTime=\(blockTime) → \(formatter.string(from: date))")
             return formatter.string(from: date)
         }
 
@@ -673,6 +689,7 @@ struct TransactionDetailView: View {
         if transaction.height > 0 {
             if let timestamp = try? HeaderStore.shared.getBlockTime(at: transaction.height) {
                 let date = Date(timeIntervalSince1970: TimeInterval(timestamp))
+                print("🕐 DEBUG blockDateString: height=\(transaction.height), P2 HeaderStore=\(timestamp) → \(formatter.string(from: date))")
                 return formatter.string(from: date)
             }
         }
@@ -688,6 +705,7 @@ struct TransactionDetailView: View {
 
         // Last resort: show "Syncing..." - NO FAKE ESTIMATES!
         // Real timestamp will appear after P2P header sync completes
+        print("🕐 DEBUG blockDateString: height=\(transaction.height), blockTime=\(transaction.blockTime ?? 0) — ALL SOURCES FAILED → Syncing...")
         return "Syncing..."
     }
 

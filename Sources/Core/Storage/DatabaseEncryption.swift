@@ -21,6 +21,7 @@ enum EncryptionDomain: String {
     case keys = "ZipherX-db-keys-v2"
     case chat = "ZipherX-db-chat-v2"
     case general = "ZipherX-db-general-v2"
+    case database = "ZipherX-sqlcipher-key-v1"  // SQLCipher database encryption
 }
 
 /// Provides AES-GCM-256 encryption for sensitive database fields
@@ -50,6 +51,21 @@ final class DatabaseEncryption {
     private init() {}
 
     // MARK: - Public API
+
+    /// VUL-STOR-009: Derive SQLCipher database encryption key using HKDF
+    /// This is called from WalletManager to derive the database key from the spending key
+    /// - Parameter rawKey: SHA256(spendingKey) - 32 bytes
+    /// - Returns: HKDF-derived 256-bit key for SQLCipher
+    static func deriveDatabaseKey(from rawKey: Data) -> Data {
+        let inputKey = SymmetricKey(data: rawKey)
+        let derivedKey = HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: inputKey,
+            salt: Data("ZipherX-SQLCipher-Salt-v1".utf8),  // Constant salt for database key
+            info: Data(EncryptionDomain.database.rawValue.utf8),
+            outputByteCount: 32  // 256-bit key for SQLCipher
+        )
+        return derivedKey.withUnsafeBytes { Data($0) }
+    }
 
     /// Encrypt data for database storage (legacy v1, single key)
     /// Returns: nonce (12 bytes) + ciphertext + tag (16 bytes)

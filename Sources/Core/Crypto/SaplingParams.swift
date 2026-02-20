@@ -36,7 +36,7 @@ final class SaplingParams {
         bundleName: "sapling-spend",  // Uncompressed in bundle (46MB)
         bundleExt: "params",
         size: 47_958_396,
-        hash: "8270785a1a0d0bc77196f000ee6d221c9c9894f55307bd9357c3f0105d31ca63991ab91324160d8f53e2bbd3c2633a6eb8bdf5205d822e7f3f73edac51b2b70c"
+        hash: "320fbb5754c8b3f4ecb3dd4c2e3dbe1d138c4b343f073c7e31612d26fe769cdba8edab426a7f2c42e317bebdb2ca6f73af1312affa1fcf599a31d499ad4cb4e5"
     )
 
     private let outputParams = (
@@ -44,7 +44,7 @@ final class SaplingParams {
         bundleName: "sapling-output",  // Uncompressed in bundle (3.4MB)
         bundleExt: "params",
         size: 3_592_860,
-        hash: "657e3d38dbb5cb5e7dd2970e8b03d69b4787dd907285b5a7f0790dcc8072f60bf593b32cc2d1c030e00ff5ae64bf84c5c3beb84ddc841d48264b4a171744d028"
+        hash: "a7c87f52c0c1eb05b4da1e1e70d986bde95a2a74047b0679d0163ade7ced3cbf93c1c7e3954416e5baacff614e1d0d5dfaed7b9b7d3141fa595259b23c32f152"
     )
 
     // MARK: - Properties

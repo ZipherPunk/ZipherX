@@ -24,6 +24,8 @@ struct ContentView: View {
     // Security audit TASK 17: Privacy overlay for app switcher + screenshot warning
     @State private var showPrivacyOverlay: Bool = false
     @State private var showScreenshotWarning: Bool = false
+    // VUL-UI-003 Fix 1: Screen recording detection (iOS)
+    @State private var showScreenRecordingWarning: Bool = false
 
     // Startup timing - uses walletCreationTime from WalletManager
     // This ensures timing starts from when user clicks create/import/restore, not app launch
@@ -163,14 +165,26 @@ struct ContentView: View {
                         // The lock screen is a visual overlay, but the .task fires immediately.
                         // Without this guard, network connections, tree loading, header sync, and
                         // balance queries all run BEHIND the lock screen before user authenticates.
-                        // Auth is ALWAYS mandatory at startup (not just when biometric is enabled).
+                        // FIX #1437: No lock screen until balance view is displayed.
+                        // During setup/import/sync, user is obviously present — auto-authenticate.
+                        // Lock screen only gates on SUBSEQUENT launches (FAST/INSTANT START).
                         if !biometricManager.hasAuthenticatedThisSession {
-                            print("🔐 FIX #1273: Waiting for authentication before starting wallet operations...")
-                            while !biometricManager.hasAuthenticatedThisSession {
-                                try? await Task.sleep(nanoseconds: 200_000_000) // 200ms
-                                if Task.isCancelled { return }
+                            if hasCompletedInitialSync {
+                                // Subsequent launch — wait for user to authenticate via lock screen
+                                print("🔐 FIX #1273: Waiting for authentication before starting wallet operations...")
+                                while !biometricManager.hasAuthenticatedThisSession {
+                                    try? await Task.sleep(nanoseconds: 200_000_000) // 200ms
+                                    if Task.isCancelled { return }
+                                }
+                                print("🔐 FIX #1273: Authentication confirmed — proceeding with startup")
+                            } else {
+                                // First launch / import — auto-authenticate (no lock screen during setup)
+                                await MainActor.run {
+                                    biometricManager.unlockApp()
+                                    isShowingLockScreen = false
+                                }
+                                print("🔐 FIX #1437: Setup/import — auto-authenticated (no lock during init)")
                             }
-                            print("🔐 FIX #1273: Authentication confirmed — proceeding with startup")
                         }
 
                         // FIX #881: Startup timing profiler for performance analysis
@@ -414,10 +428,20 @@ struct ContentView: View {
                                         forceFullVerification: fixedNullifiers > 0
                                     )
                                     if externalSpends > 0 {
+                                        // FIX #1450: Create history entries for external spends BEFORE re-checking
+                                        let _ = try? WalletDatabase.shared.populateHistoryFromNotes()
                                         try? await walletManager.refreshBalance()
-                                        await MainActor.run {
-                                            walletManager.balanceIntegrityIssue = true
-                                            walletManager.balanceIntegrityMessage = "Balance corrected — phantom notes detected and removed"
+                                        // FIX #1450: Re-verify after corrections — only flag if issues REMAIN
+                                        let recheckResult = try? WalletDatabase.shared.verifyBalanceIntegrity(accountId: 1)
+                                        let recheckValid = recheckResult?.0 ?? true
+                                        if !recheckValid {
+                                            await MainActor.run {
+                                                walletManager.balanceIntegrityIssue = true
+                                                walletManager.balanceIntegrityMessage = "Balance discrepancy detected — run Full Resync in Settings"
+                                            }
+                                            print("⚠️ FIX #1450: External spends corrected but balance integrity re-check FAILED")
+                                        } else {
+                                            print("✅ FIX #1450: External spend(s) corrected — balance integrity re-check PASSED (no flag)")
                                         }
                                     }
                                 } catch {
@@ -467,6 +491,10 @@ struct ContentView: View {
                                         walletManager.setConnecting(true, status: "Syncing \(headersNeeded) headers...")
                                     }
 
+                                    // FIX #1426: Set header syncing flag to pause mempool scan, but DON'T stop listeners.
+                                    // Stopping listeners kills NWConnections → peers need 2-3s reconnect → first attempt fails.
+                                    await networkManager.setHeaderSyncing(true, stopListeners: false)
+
                                     let hsm = HeaderSyncManager(headerStore: HeaderStore.shared, networkManager: networkManager)
                                     hsm.onProgress = { progress in
                                         Task { @MainActor in
@@ -476,9 +504,11 @@ struct ContentView: View {
                                     }
 
                                     try await hsm.syncHeaders(from: currentHeaderHeight + 1, maxHeaders: headersNeeded + 100)
+                                    await networkManager.setHeaderSyncing(false)
                                     print("✅ FIX #535: Header sync complete")
                                 }
                             } catch {
+                                await networkManager.setHeaderSyncing(false)
                                 print("⚠️ FIX #535: Header sync failed: \(error.localizedDescription)")
                             }
                         }
@@ -636,10 +666,20 @@ struct ContentView: View {
                                                 forceFullVerification: fixedNullifiers > 0
                                             )
                                             if externalSpends > 0 {
+                                                // FIX #1450: Create history entries for external spends BEFORE re-checking
+                                                let _ = try? WalletDatabase.shared.populateHistoryFromNotes()
                                                 try? await walletManager.refreshBalance()
-                                                await MainActor.run {
-                                                    walletManager.balanceIntegrityIssue = true
-                                                    walletManager.balanceIntegrityMessage = "Balance corrected — phantom notes detected and removed"
+                                                // FIX #1450: Re-verify after corrections — only flag if issues REMAIN
+                                                let recheckResult = try? WalletDatabase.shared.verifyBalanceIntegrity(accountId: 1)
+                                                let recheckValid = recheckResult?.0 ?? true
+                                                if !recheckValid {
+                                                    await MainActor.run {
+                                                        walletManager.balanceIntegrityIssue = true
+                                                        walletManager.balanceIntegrityMessage = "Balance discrepancy detected — run Full Resync in Settings"
+                                                    }
+                                                    print("⚠️ FIX #1450: External spends corrected but balance integrity re-check FAILED")
+                                                } else {
+                                                    print("✅ FIX #1450: External spend(s) corrected — balance integrity re-check PASSED (no flag)")
                                                 }
                                             }
                                         } catch {
@@ -2815,19 +2855,21 @@ struct ContentView: View {
             }
 
             // FIX #1276: Lock screen is OUTSIDE the walletManager conditional.
-            // Previously inside the `if isWalletCreated` block — walletManager @Published
-            // property changes after auth caused SwiftUI to recreate the entire block,
-            // giving LockScreenView a new .onAppear → second Touch ID prompt.
-            // Now independent of wallet state changes.
-            if isShowingLockScreen && !biometricManager.hasAuthenticatedThisSession {
+            // FIX #1437: Only show lock screen when wallet exists AND not during initial sync.
+            // During first import: wallet just created → user is obviously present → skip lock.
+            // Lock screen appears on SUBSEQUENT launches only.
+            // FIX #1442: Remove withAnimation wrapper — state changes happen immediately.
+            // FIX #1443: Remove .zIndex(999) — on macOS SwiftUI, explicit zIndex on a conditional
+            // view can leave a phantom hit-testing layer after removal, blocking ALL touches on
+            // the views underneath (buttons disabled, scroll broken, entire app unresponsive).
+            // The lock screen is declared after mainWalletView in this ZStack, so it's naturally
+            // rendered on top by declaration order. No explicit zIndex needed.
+            if isShowingLockScreen && !biometricManager.hasAuthenticatedThisSession && walletManager.isWalletCreated && hasCompletedInitialSync {
                 LockScreenView(onUnlock: {
-                    withAnimation {
-                        isShowingLockScreen = false
-                        biometricManager.unlockApp()
-                        lastActivityTime = Date()
-                    }
+                    isShowingLockScreen = false
+                    biometricManager.unlockApp()
+                    lastActivityTime = Date()
                 })
-                .transition(.opacity)
             }
 
             // Security audit TASK 17: Privacy overlay — covers wallet content in app switcher
@@ -2854,6 +2896,27 @@ struct ContentView: View {
                 }
                 .transition(.opacity)
             }
+
+            // VUL-UI-003 Fix 1: Screen recording warning banner (iOS)
+            #if os(iOS)
+            if showScreenRecordingWarning {
+                VStack {
+                    HStack {
+                        Image(systemName: "record.circle.fill")
+                            .foregroundColor(.white)
+                        Text("Screen Recording Active - Wallet data may be captured")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundColor(.white)
+                        Spacer()
+                    }
+                    .padding()
+                    .background(Color.red)
+                    Spacer()
+                }
+                .ignoresSafeArea(edges: .top)
+                .allowsHitTesting(false)
+            }
+            #endif
         }
         .alert("Screenshot Detected", isPresented: $showScreenshotWarning) {
             Button("OK", role: .cancel) { }
@@ -2863,12 +2926,48 @@ struct ContentView: View {
         .onChange(of: scenePhase) { newPhase in
             handleScenePhaseChange(newPhase)
         }
+        // FIX #1443: Safety net — when authentication succeeds, ALWAYS dismiss lock screen.
+        // Races between authenticateForAppUnlock (nested DispatchQueue.main.async) and
+        // handleScenePhaseChange(.active) can leave isShowingLockScreen stuck on true.
+        // This .onChange fires whenever @Published hasAuthenticatedThisSession changes,
+        // guaranteeing the lock screen is dismissed even if onUnlock() races with scene phase.
+        .onChange(of: biometricManager.hasAuthenticatedThisSession) { authenticated in
+            if authenticated && isShowingLockScreen {
+                print("🔐 FIX #1443: hasAuthenticatedThisSession=true — force-dismissing lock screen")
+                isShowingLockScreen = false
+                lastActivityTime = Date()
+            }
+        }
         #if os(iOS)
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.userDidTakeScreenshotNotification)) { _ in
             // Record activity on screenshot (user is interacting)
             recordUserActivity()
             // Security audit TASK 17: Warn user about screenshots
             showScreenshotWarning = true
+        }
+        // VUL-UI-003 Fix 1: Screen recording detection
+        .onReceive(NotificationCenter.default.publisher(for: UIScreen.capturedDidChangeNotification)) { _ in
+            if UIScreen.main.isCaptured {
+                showScreenRecordingWarning = true
+            } else {
+                showScreenRecordingWarning = false
+            }
+        }
+        .onAppear {
+            // VUL-UI-003 Fix 1: Check if screen recording is already active on view appear
+            if UIScreen.main.isCaptured {
+                showScreenRecordingWarning = true
+            }
+        }
+        #endif
+        #if os(macOS)
+        // VUL-UI-003 Fix 2: Prevent screen sharing on macOS (defense in depth)
+        .onAppear {
+            DispatchQueue.main.async {
+                for window in NSApplication.shared.windows {
+                    window.sharingType = .none
+                }
+            }
         }
         #endif
     }
@@ -2886,14 +2985,28 @@ struct ContentView: View {
             biometricManager.lockApp()
             isShowingLockScreen = true
             // VUL-U-006: Privacy overlay to protect sensitive data in app switcher
+            #if os(iOS)
+            // VUL-UI-003 Fix 3: Use UIKit privacy window (synchronous, no SwiftUI race)
+            (UIApplication.shared.delegate as? AppDelegate)?.showPrivacyOverlay()
+            #else
             showPrivacyOverlay = true
+            #endif
 
         case .active:
             // Security audit TASK 17: Clear privacy overlay when returning to foreground
+            #if os(iOS)
+            // VUL-UI-003 Fix 3: Hide UIKit privacy window
+            (UIApplication.shared.delegate as? AppDelegate)?.hidePrivacyOverlay()
+            #else
             showPrivacyOverlay = false
+            #endif
 
             // App became active
-            if hasCompletedInitialSync {
+            // FIX #1443: Skip lock screen manipulation when auth is in progress.
+            // On macOS, the TouchID system dialog causes scene phase transitions
+            // (inactive → active). Re-locking during active auth creates a race:
+            // lockApp() resets hasAuthenticatedThisSession AFTER auth already succeeded.
+            if hasCompletedInitialSync && !biometricManager.isAuthInProgress {
                 // Check if we need to re-authenticate (inactivity timeout)
                 if biometricManager.isBiometricEnabled && biometricManager.isInactivityTimeoutExceeded {
                     isShowingLockScreen = true
@@ -2927,7 +3040,12 @@ struct ContentView: View {
 
         case .inactive:
             // Security audit TASK 17: Blur wallet content in app switcher
+            #if os(iOS)
+            // VUL-UI-003 Fix 3: Use UIKit privacy window (synchronous, no SwiftUI race)
+            (UIApplication.shared.delegate as? AppDelegate)?.showPrivacyOverlay()
+            #else
             showPrivacyOverlay = true
+            #endif
 
         @unknown default:
             break
@@ -3323,6 +3441,8 @@ struct ContentView: View {
             if modeManager.walletSource == .walletDat {
                 FullNodeWalletView()
                     .environmentObject(themeManager)
+                    // FIX #1436: Cap full node window height so user can resize smaller
+                    .frame(minHeight: 500, idealHeight: 700, maxHeight: 900)
                     // FIX #1372: Track user activity in Full Node mode for inactivity lock
                     .contentShape(Rectangle())
                     .onTapGesture { recordUserActivity() }

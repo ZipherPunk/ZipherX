@@ -2166,8 +2166,8 @@ struct ChatSettingsSheet: View {
                                 .foregroundColor(theme.textPrimary.opacity(0.6))
                             Spacer()
                             Toggle("", isOn: Binding(
-                                get: { UserDefaults.standard.bool(forKey: "chatShareProfileImage") },
-                                set: { UserDefaults.standard.set($0, forKey: "chatShareProfileImage") }
+                                get: { chatManager.isProfileImageShared },
+                                set: { chatManager.isProfileImageShared = $0 }
                             ))
                             .labelsHidden()
                             .tint(theme.accentColor)

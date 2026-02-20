@@ -174,6 +174,29 @@ public class FullNodeManager: ObservableObject {
             // In Light Mode, set status to unknown and don't poll
             daemonStatus = .unknown
         }
+
+        // FIX #1445: Observe mode changes — when user switches TO Full Node mode,
+        // start daemon polling immediately. Without this, FullNodeManager was only
+        // initialized once at startup and never detected mode switches, causing
+        // "daemon not running" until user manually triggered Settings → Edit Config.
+        NotificationCenter.default.addObserver(
+            forName: .walletSourceDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self = self else { return }
+            let source = notification.userInfo?["source"] as? WalletSource
+            if source == .walletDat {
+                print("🔄 FIX #1445: Mode switched to Full Node — starting daemon detection")
+                self.daemonDebugLevel = Self.getCurrentDebugLevelFromConf()
+                self.checkNodeStatus()
+                self.startAutoRefresh()
+            } else {
+                print("🔄 FIX #1445: Mode switched to P2P — stopping daemon polling")
+                self.stopAutoRefresh()
+                self.daemonStatus = .unknown
+            }
+        }
     }
 
     deinit {

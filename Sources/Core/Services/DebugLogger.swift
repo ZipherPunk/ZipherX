@@ -94,9 +94,16 @@ final class DebugLogger {
 
     /// FIX #1376: Debug logging can be disabled by the user from Settings.
     /// When disabled, log file writes are suppressed (console output still works).
-    /// FIX #1442: Debug logging disabled by default. User must explicitly enable in Settings.
+    /// FIX #1431: Default to ENABLED so diagnostic logs appear in zmac.log.
+    /// User can explicitly disable in Settings if desired.
     var isEnabled: Bool {
-        get { UserDefaults.standard.bool(forKey: "debugLoggingEnabled") }
+        get {
+            // FIX #1431: Default true when key not explicitly set
+            if UserDefaults.standard.object(forKey: "debugLoggingEnabled") == nil {
+                return true
+            }
+            return UserDefaults.standard.bool(forKey: "debugLoggingEnabled")
+        }
         set {
             UserDefaults.standard.set(newValue, forKey: "debugLoggingEnabled")
         }
@@ -104,7 +111,14 @@ final class DebugLogger {
 
     private init() {
         sessionStartTime = Date()
+        // FIX #1431: Use logsDirectory (which has DEBUG override) instead of AppDirectories.logs
         logFileURL = AppDirectories.logs.appendingPathComponent(currentLogName)
+        #if os(macOS) && DEBUG
+        let projectLogDir = URL(fileURLWithPath: "/Users/chris/ZipherX")
+        if FileManager.default.isWritableFile(atPath: projectLogDir.path) {
+            logFileURL = projectLogDir.appendingPathComponent(currentLogName)
+        }
+        #endif
 
         dateFormatter = DateFormatter()
         dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"

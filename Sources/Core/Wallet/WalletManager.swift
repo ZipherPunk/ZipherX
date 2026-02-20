@@ -791,8 +791,13 @@ final class WalletManager: ObservableObject {
                 var batchReceivedHeights = Set<UInt64>()
 
                 // Extract shielded outputs from blocks (FIX #1190 wire format conversion)
-                for (height, _, _, txData) in blocks {
+                // FIX #1428b: Collect block timestamps for caching (was discarded with _)
+                var batchTimestamps: [(UInt64, UInt32)] = []
+                for (height, _, timestamp, txData) in blocks {
                     batchReceivedHeights.insert(height)
+                    if timestamp > 0 {
+                        batchTimestamps.append((height, timestamp))
+                    }
                     var blockOutputIndex: UInt32 = 0
                     for (_, outputs, _) in txData {
                         for output in outputs {
@@ -814,6 +819,13 @@ final class WalletManager: ObservableObject {
                     }
                 }
                 totalReceivedBlocks += UInt64(batchReceivedHeights.count)
+
+                // FIX #1428b: Cache block timestamps so HistoryView can display dates
+                // Without this, delta-range transactions show "Syncing..." permanently
+                if !batchTimestamps.isEmpty {
+                    print("🕐 DEBUG FIX #1428b: Caching \(batchTimestamps.count) block timestamps from delta sync (heights \(batchTimestamps.first?.0 ?? 0)-\(batchTimestamps.last?.0 ?? 0))")
+                    BlockTimestampManager.shared.cacheTimestamps(batchTimestamps)
+                }
 
                 // FIX #1218: Strict height tracking — only advance to highest RECEIVED height + 1,
                 // NOT batchEnd + 1. Previous bug: advanced past unfetched blocks, permanently
@@ -1122,8 +1134,13 @@ final class WalletManager: ObservableObject {
                 // FIX #1190: Build DeltaOutput from getBlocksDataP2P format
                 // cmu/epk are hex display format → reverse to wire format
                 // ciphertext is hex → raw bytes (no reversal)
-                for (height, _, _, txData) in blocks {
+                // FIX #1428b: Also cache block timestamps (same fix as syncDeltaBundleIfNeeded)
+                var gapBatchTimestamps: [(UInt64, UInt32)] = []
+                for (height, _, timestamp, txData) in blocks {
                     batchReceivedHeights.insert(height)
+                    if timestamp > 0 {
+                        gapBatchTimestamps.append((height, timestamp))
+                    }
                     var blockOutputIndex: UInt32 = 0
                     for (_, outputs, _) in txData {
                         for output in outputs {
@@ -1146,6 +1163,12 @@ final class WalletManager: ObservableObject {
                 }
                 totalReceivedBlocks += UInt64(batchReceivedHeights.count)
                 allReceivedHeights.formUnion(batchReceivedHeights)
+
+                // FIX #1428b: Cache block timestamps from gap-fill
+                if !gapBatchTimestamps.isEmpty {
+                    print("🕐 DEBUG FIX #1428b: Caching \(gapBatchTimestamps.count) block timestamps from gap-fill")
+                    BlockTimestampManager.shared.cacheTimestamps(gapBatchTimestamps)
+                }
 
                 // FIX #1218: Strict height tracking
                 if batchReceivedHeights.isEmpty {
@@ -1853,11 +1876,13 @@ final class WalletManager: ObservableObject {
         }
 
         // For more precise verification, we need trial decryption
-        // Get spending key for trial decryption
-        guard let spendingKey = try? SecureKeyStorage().retrieveSpendingKey() else {
+        // VUL-U-002: Get spending key for trial decryption with secure zeroing
+        guard let secureKey = try? SecureKeyStorage().retrieveSpendingKeySecure() else {
             print("⚠️ FIX #1085: Cannot retrieve spending key for trial decryption")
             return false // Can't verify, don't change
         }
+        defer { secureKey.zero() }
+        let spendingKey = secureKey.data
 
         // Build array of outputs for parallel decryption
         var ffiOutputs: [ZipherXFFI.FFIShieldedOutput] = []
@@ -2569,8 +2594,13 @@ final class WalletManager: ObservableObject {
 
         // Open database if needed
         do {
-            let spendingKey = try secureStorage.retrieveSpendingKey()
-            let dbKey = Data(SHA256.hash(data: spendingKey))
+            // VUL-U-002: Use secure key retrieval with automatic zeroing
+            let secureKey = try secureStorage.retrieveSpendingKeySecure()
+            defer { secureKey.zero() }
+            let spendingKey = secureKey.data
+            // VUL-STOR-009: Use HKDF domain separation for SQLCipher key
+            let rawKey = Data(SHA256.hash(data: spendingKey))
+            let dbKey = DatabaseEncryption.deriveDatabaseKey(from: rawKey)
             try WalletDatabase.shared.open(encryptionKey: dbKey)
 
             // FIX #852: Clean mislabeled change outputs after database is open
@@ -3514,15 +3544,24 @@ final class WalletManager: ObservableObject {
     /// This can be called independently from FAST START mode to sync timestamps
     /// without requiring new blocks (which triggers backgroundSyncToHeight)
     func ensureHeaderTimestamps() async {
-        print("📜 FIX #120: Checking for transactions needing timestamps...")
+        print("🕐 DEBUG ensureHeaderTimestamps: ENTER")
 
-        // FIX #495: Skip if we're already at chain tip (no need to sync headers)
+        // FIX #495: Skip if we're already at chain tip AND no timestamps needed
+        // FIX #1428: After import, walletHeight IS at chain tip but transactions have NULL block_time.
+        // Must check for pending timestamps BEFORE early-returning.
         let currentChainHeight = await MainActor.run { NetworkManager.shared.chainHeight }
         let walletHeight = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
+        print("🕐 DEBUG ensureHeaderTimestamps: walletHeight=\(walletHeight), chainHeight=\(currentChainHeight)")
 
         if currentChainHeight > 0 && walletHeight >= currentChainHeight - 100 {
-            print("✅ FIX #495: Already at chain tip (walletHeight=\(walletHeight), chain=\(currentChainHeight)), skipping header sync")
-            return
+            let earliestNeeding = try? WalletDatabase.shared.getEarliestHeightNeedingTimestamp()
+            let hasTimestampGaps = earliestNeeding != nil
+            print("🕐 DEBUG ensureHeaderTimestamps: atChainTip=true, hasTimestampGaps=\(hasTimestampGaps), earliestNeeding=\(earliestNeeding ?? 0)")
+            if !hasTimestampGaps {
+                print("✅ FIX #495: Already at chain tip and all timestamps present, skipping header sync")
+                return
+            }
+            print("📜 FIX #1428: At chain tip but transactions need timestamps — proceeding with sync")
         }
 
         // FIX #120: First, detect and clear wrong timestamps in the gap between boost file and header store
@@ -3744,7 +3783,10 @@ final class WalletManager: ObservableObject {
         // FIX #136: Set header syncing flag to pause mempool scan during sync
         // This prevents P2P race conditions that cause header sync to get stuck
         // FIX #509: Now async - waits for listeners to actually stop
-        await NetworkManager.shared.setHeaderSyncing(true)
+        // FIX #1426: stopListeners: false — this sync is ≤100 headers (maxSyncRange=100).
+        // Stopping listeners kills NWConnections → peers need 2-3s reconnection → first attempt fails
+        // → needs Attempt 2. Matches import flow (line 7341) which already uses stopListeners: false.
+        await NetworkManager.shared.setHeaderSyncing(true, stopListeners: false)
         defer {
             Task { await NetworkManager.shared.setHeaderSyncing(false) }
         }
@@ -4196,8 +4238,10 @@ final class WalletManager: ObservableObject {
         await MainActor.run { self.hasPendingNetworkRetry = false }
 
         do {
-            // Get spending key for note detection
-            let spendingKey = try secureStorage.retrieveSpendingKey()
+            // VUL-U-002: Get spending key for note detection with secure zeroing
+            let secureKey = try secureStorage.retrieveSpendingKeySecure()
+            defer { secureKey.zero() }
+            let spendingKey = secureKey.data
 
             // Use FilterScanner for lightweight sync
             let scanner = FilterScanner()
@@ -6964,7 +7008,9 @@ final class WalletManager: ObservableObject {
         }
 
         // Open fresh database with new key
-        let dbKey = Data(SHA256.hash(data: spendingKey))
+        // VUL-STOR-009: Use HKDF domain separation for SQLCipher key
+        let rawKey = Data(SHA256.hash(data: spendingKey))
+        let dbKey = DatabaseEncryption.deriveDatabaseKey(from: rawKey)
         do {
             try WalletDatabase.shared.open(encryptionKey: dbKey)
             print("✅ Fresh database created with new key")
@@ -7179,7 +7225,10 @@ final class WalletManager: ObservableObject {
         await updateTask("keys", status: .inProgress)
         let spendingKey: Data
         do {
-            spendingKey = try secureStorage.retrieveSpendingKey()
+            // VUL-U-002: Use secure key retrieval with automatic zeroing
+            let secureKey = try secureStorage.retrieveSpendingKeySecure()
+            defer { secureKey.zero() }
+            spendingKey = secureKey.data
             let saplingKey = SaplingSpendingKey(data: spendingKey)
             _ = try RustBridge.shared.deriveFullViewingKey(from: saplingKey)
             await updateTask("keys", status: .completed)
@@ -7191,7 +7240,9 @@ final class WalletManager: ObservableObject {
         // Task 2: Open database
         await updateTask("database", status: .inProgress)
         do {
-            let dbKey = Data(SHA256.hash(data: spendingKey))
+            // VUL-STOR-009: Use HKDF domain separation for SQLCipher key
+            let rawKey = Data(SHA256.hash(data: spendingKey))
+            let dbKey = DatabaseEncryption.deriveDatabaseKey(from: rawKey)
             try WalletDatabase.shared.open(encryptionKey: dbKey)
 
             // Ensure account exists in database
@@ -7501,6 +7552,10 @@ final class WalletManager: ObservableObject {
                 if let index = self?.syncTasks.firstIndex(where: { $0.id == "scan" }) {
                     var task = self?.syncTasks[index] ?? SyncTask(id: "scan", title: "Scanning", status: .inProgress)
                     switch phase {
+                    case "headers":
+                        // FIX #1440: Show live header sync progress in task detail
+                        task.detail = status
+                        self?.updateOverallProgress(phase: .syncingHeaders, phaseProgress: 0.0)
                     case "phase1":
                         task.detail = "Parallel note decryption"
                         self?.updateOverallProgress(phase: .phase1Scanning, phaseProgress: 0.0)
@@ -7905,8 +7960,13 @@ final class WalletManager: ObservableObject {
         }
 
         // First open the database if needed
-        let spendingKey = try secureStorage.retrieveSpendingKey()
-        let dbKey = Data(SHA256.hash(data: spendingKey))
+        // VUL-U-002: Use secure key retrieval with automatic zeroing
+        let secureKey = try secureStorage.retrieveSpendingKeySecure()
+        defer { secureKey.zero() }
+        let spendingKey = secureKey.data
+        // VUL-STOR-009: Use HKDF domain separation for SQLCipher key
+        let rawKey = Data(SHA256.hash(data: spendingKey))
+        let dbKey = DatabaseEncryption.deriveDatabaseKey(from: rawKey)
         try WalletDatabase.shared.open(encryptionKey: dbKey)
 
         // Reset scan state to force full rescan from checkpoint
@@ -7948,12 +8008,16 @@ final class WalletManager: ObservableObject {
             }
         }
 
-        // Get spending key
-        let spendingKey = try secureStorage.retrieveSpendingKey()
+        // VUL-U-002: Get spending key with secure zeroing
+        let secureKey = try secureStorage.retrieveSpendingKeySecure()
+        defer { secureKey.zero() }
+        let spendingKey = secureKey.data
         // SECURITY: Key retrieved - not logged
 
         // Ensure database is open
-        let dbKey = Data(SHA256.hash(data: spendingKey))
+        // VUL-STOR-009: Use HKDF domain separation for SQLCipher key
+        let rawKey = Data(SHA256.hash(data: spendingKey))
+        let dbKey = DatabaseEncryption.deriveDatabaseKey(from: rawKey)
         try WalletDatabase.shared.open(encryptionKey: dbKey)
         print("📂 Database opened")
 
@@ -8229,12 +8293,16 @@ final class WalletManager: ObservableObject {
         // VUL-018: Use shared constant for downloaded tree height
         let downloadedTreeHeight = ZipherXConstants.effectiveTreeHeight
 
-        // Get spending key
-        let spendingKey = try secureStorage.retrieveSpendingKey()
+        // VUL-U-002: Get spending key with secure zeroing
+        let secureKey = try secureStorage.retrieveSpendingKeySecure()
+        defer { secureKey.zero() }
+        let spendingKey = secureKey.data
         // SECURITY: Key retrieved - not logged
 
         // Ensure database is open
-        let dbKey = Data(SHA256.hash(data: spendingKey))
+        // VUL-STOR-009: Use HKDF domain separation for SQLCipher key
+        let rawKey = Data(SHA256.hash(data: spendingKey))
+        let dbKey = DatabaseEncryption.deriveDatabaseKey(from: rawKey)
         try WalletDatabase.shared.open(encryptionKey: dbKey)
         print("📂 Database opened for repair")
 
@@ -8980,11 +9048,15 @@ final class WalletManager: ObservableObject {
             throw WalletError.walletNotCreated
         }
 
-        // Get spending key
-        let spendingKey = try secureStorage.retrieveSpendingKey()
+        // VUL-U-002: Get spending key with secure zeroing
+        let secureKey = try secureStorage.retrieveSpendingKeySecure()
+        defer { secureKey.zero() }
+        let spendingKey = secureKey.data
 
         // Ensure database is open
-        let dbKey = Data(SHA256.hash(data: spendingKey))
+        // VUL-STOR-009: Use HKDF domain separation for SQLCipher key
+        let rawKey = Data(SHA256.hash(data: spendingKey))
+        let dbKey = DatabaseEncryption.deriveDatabaseKey(from: rawKey)
         try WalletDatabase.shared.open(encryptionKey: dbKey)
 
         // Get account ID
@@ -9066,12 +9138,16 @@ final class WalletManager: ObservableObject {
             throw WalletError.walletNotCreated
         }
 
-        // Get spending key
-        let spendingKey = try secureStorage.retrieveSpendingKey()
+        // VUL-U-002: Get spending key with secure zeroing
+        let secureKey = try secureStorage.retrieveSpendingKeySecure()
+        defer { secureKey.zero() }
+        let spendingKey = secureKey.data
         // SECURITY: Key retrieved - not logged
 
         // Ensure database is open
-        let dbKey = Data(SHA256.hash(data: spendingKey))
+        // VUL-STOR-009: Use HKDF domain separation for SQLCipher key
+        let rawKey = Data(SHA256.hash(data: spendingKey))
+        let dbKey = DatabaseEncryption.deriveDatabaseKey(from: rawKey)
         try WalletDatabase.shared.open(encryptionKey: dbKey)
         print("📂 Database opened")
 
@@ -9300,9 +9376,13 @@ final class WalletManager: ObservableObject {
         }
 
         do {
-            // Get spending key
-            let spendingKey = try secureStorage.retrieveSpendingKey()
-            let dbKey = Data(SHA256.hash(data: spendingKey))
+            // VUL-U-002: Get spending key with secure zeroing
+            let secureKey = try secureStorage.retrieveSpendingKeySecure()
+            defer { secureKey.zero() }
+            let spendingKey = secureKey.data
+            // VUL-STOR-009: Use HKDF domain separation for SQLCipher key
+            let rawKey = Data(SHA256.hash(data: spendingKey))
+            let dbKey = DatabaseEncryption.deriveDatabaseKey(from: rawKey)
             try WalletDatabase.shared.open(encryptionKey: dbKey)
 
             // Get all unspent notes
@@ -9557,9 +9637,13 @@ final class WalletManager: ObservableObject {
         print("🔧 FIX #588: Rebuilding corrupted witnesses at specific positions...")
 
         do {
-            // Get spending key
-            let spendingKey = try secureStorage.retrieveSpendingKey()
-            let dbKey = Data(SHA256.hash(data: spendingKey))
+            // VUL-U-002: Get spending key with secure zeroing
+            let secureKey = try secureStorage.retrieveSpendingKeySecure()
+            defer { secureKey.zero() }
+            let spendingKey = secureKey.data
+            // VUL-STOR-009: Use HKDF domain separation for SQLCipher key
+            let rawKey = Data(SHA256.hash(data: spendingKey))
+            let dbKey = DatabaseEncryption.deriveDatabaseKey(from: rawKey)
             try WalletDatabase.shared.open(encryptionKey: dbKey)
 
             // Get account ID (don't assume it's 0)
@@ -9786,12 +9870,16 @@ final class WalletManager: ObservableObject {
             throw WalletError.walletNotCreated
         }
 
-        // Get spending key
-        let spendingKey = try secureStorage.retrieveSpendingKey()
+        // VUL-U-002: Get spending key with secure zeroing
+        let secureKey = try secureStorage.retrieveSpendingKeySecure()
+        defer { secureKey.zero() }
+        let spendingKey = secureKey.data
         // SECURITY: Key retrieved - not logged
 
         // Ensure database is open
-        let dbKey = Data(SHA256.hash(data: spendingKey))
+        // VUL-STOR-009: Use HKDF domain separation for SQLCipher key
+        let rawKey = Data(SHA256.hash(data: spendingKey))
+        let dbKey = DatabaseEncryption.deriveDatabaseKey(from: rawKey)
         try WalletDatabase.shared.open(encryptionKey: dbKey)
         print("📂 Database opened")
 
@@ -10936,8 +11024,10 @@ final class WalletManager: ObservableObject {
             throw WalletError.addressGenerationFailed
         }
 
-        // Derive address at next index via FFI
-        let spendingKey = try secureStorage.retrieveSpendingKey()
+        // VUL-U-002: Derive address at next index via FFI with secure zeroing
+        let secureKey = try secureStorage.retrieveSpendingKeySecure()
+        defer { secureKey.zero() }
+        let spendingKey = secureKey.data
         let saplingKey = SaplingSpendingKey(data: spendingKey)
         let fvk = try RustBridge.shared.deriveFullViewingKey(from: saplingKey)
 
@@ -11007,7 +11097,10 @@ final class WalletManager: ObservableObject {
         print("🔄 FIX #1402 (NEW-001): Recovering diversified addresses (0..\(highestStoredIndex))...")
 
         do {
-            let spendingKey = try secureStorage.retrieveSpendingKey()
+            // VUL-U-002: Use secure key retrieval with automatic zeroing
+            let secureKey = try secureStorage.retrieveSpendingKeySecure()
+            defer { secureKey.zero() }
+            let spendingKey = secureKey.data
             let saplingKey = SaplingSpendingKey(data: spendingKey)
             let fvk = try RustBridge.shared.deriveFullViewingKey(from: saplingKey)
 
@@ -11128,9 +11221,13 @@ final class WalletManager: ObservableObject {
     /// This provides instant balance display on app restart
     private func loadBalanceFromDatabase() async {
         do {
-            // Open database if needed
-            let spendingKey = try secureStorage.retrieveSpendingKey()
-            let dbKey = Data(SHA256.hash(data: spendingKey))
+            // VUL-U-002: Open database if needed with secure zeroing
+            let secureKey = try secureStorage.retrieveSpendingKeySecure()
+            defer { secureKey.zero() }
+            let spendingKey = secureKey.data
+            // VUL-STOR-009: Use HKDF domain separation for SQLCipher key
+            let rawKey = Data(SHA256.hash(data: spendingKey))
+            let dbKey = DatabaseEncryption.deriveDatabaseKey(from: rawKey)
             try WalletDatabase.shared.open(encryptionKey: dbKey)
 
             // Get account
@@ -11335,7 +11432,10 @@ final class WalletManager: ObservableObject {
     /// Export spending key as Bech32 string for backup (secret-extended-key-main1...)
     /// WARNING: This exposes the private key - handle with extreme care!
     func exportSpendingKey() throws -> String {
-        let spendingKey = try secureStorage.retrieveSpendingKey()
+        // VUL-U-002: Use secure key retrieval with automatic zeroing
+        let secureKey = try secureStorage.retrieveSpendingKeySecure()
+        defer { secureKey.zero() }
+        let spendingKey = secureKey.data
         guard let encoded = ZipherXFFI.encodeSpendingKey(spendingKey) else {
             throw WalletError.invalidSeed
         }
@@ -11445,7 +11545,9 @@ final class WalletManager: ObservableObject {
         }
 
         // Open fresh database with new key
-        let dbKey = Data(SHA256.hash(data: spendingKey))
+        // VUL-STOR-009: Use HKDF domain separation for SQLCipher key
+        let rawKey = Data(SHA256.hash(data: spendingKey))
+        let dbKey = DatabaseEncryption.deriveDatabaseKey(from: rawKey)
         do {
             try WalletDatabase.shared.open(encryptionKey: dbKey)
             print("✅ Fresh database created with new key")
@@ -11583,7 +11685,10 @@ final class WalletManager: ObservableObject {
 
     // Helper to derive address from stored key
     private func deriveZAddressFromStoredKey() throws -> String {
-        let spendingKey = try secureStorage.retrieveSpendingKey()
+        // VUL-U-002: Use secure key retrieval with automatic zeroing
+        let secureKey = try secureStorage.retrieveSpendingKeySecure()
+        defer { secureKey.zero() }
+        let spendingKey = secureKey.data
         return try deriveZAddress(from: spendingKey)
     }
 
@@ -13193,11 +13298,13 @@ final class WalletManager: ObservableObject {
         let secureStorage = SecureKeyStorage()
         let rustBridge = RustBridge.shared
 
-        // Get spending key for nullifier computation
-        guard let spendingKey = try? secureStorage.retrieveSpendingKey() else {
+        // VUL-U-002: Get spending key for nullifier computation with secure zeroing
+        guard let secureKey = try? secureStorage.retrieveSpendingKeySecure() else {
             print("⚠️ FIX #1090: Cannot get spending key - skipping nullifier recomputation")
             return 0
         }
+        defer { secureKey.zero() }
+        let spendingKey = secureKey.data
 
         // Get all unspent notes
         let unspentNotes = try database.getAllUnspentNotes(accountId: 1)
@@ -13982,7 +14089,10 @@ final class WalletManager: ObservableObject {
                 return 0
             }
 
-            let spendingKey = try secureStorage.retrieveSpendingKey()
+            // VUL-U-002: Use secure key retrieval with automatic zeroing
+            let secureKey = try secureStorage.retrieveSpendingKeySecure()
+            defer { secureKey.zero() }
+            let spendingKey = secureKey.data
 
             // Count notes/history before scan
             let notesBefore = (try? database.getAllNotes(accountId: 1).count) ?? 0
@@ -14278,7 +14388,10 @@ final class WalletManager: ObservableObject {
             return 0
         }
 
-        let spendingKey = try secureStorage.retrieveSpendingKey()
+        // VUL-U-002: Use secure key retrieval with automatic zeroing
+        let secureKey = try secureStorage.retrieveSpendingKeySecure()
+        defer { secureKey.zero() }
+        let spendingKey = secureKey.data
 
         // Run FilterScanner from checkpoint - this does:
         // 1. Trial decryption for incoming notes

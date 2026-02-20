@@ -208,8 +208,14 @@ final class WalletDatabase {
     }
 
     /// VUL-S-003: Execute a database operation on the serial queue
-    /// Ensures all database operations are serialized to prevent concurrent access
+    /// Ensures all database operations are serialized to prevent concurrent access.
+    /// Reentrant: if already on the queue (e.g., markNoteSpent calls markNoteSpentByHashedNullifier),
+    /// executes directly to avoid deadlock.
     private func dbSync<T>(_ block: () throws -> T) rethrows -> T {
+        if DispatchQueue.getSpecific(key: Self.dbQueueKey) == true {
+            // Already on the serial queue — execute directly to avoid deadlock
+            return try block()
+        }
         return try dbQueue.sync { try block() }
     }
 
@@ -334,9 +340,15 @@ final class WalletDatabase {
     /// VUL-S-003: Serial queue for thread-safe database access
     private let dbQueue = DispatchQueue(label: "com.zipherx.walletdb", qos: .userInitiated)
 
+    /// VUL-S-003: Key for reentrant dbSync detection (avoids deadlock when wrapped methods call each other)
+    private static let dbQueueKey = DispatchSpecificKey<Bool>()
+
     private init() {
         dbPath = AppDirectories.database.appendingPathComponent("zipherx_wallet.db").path
         // Thread safety is handled via SQLITE_OPEN_FULLMUTEX in open()
+
+        // VUL-S-003: Tag queue for reentrancy detection
+        dbQueue.setSpecific(key: Self.dbQueueKey, value: true)
 
         // SECURITY: Apply iOS Data Protection to the database file
         applyDataProtection()
@@ -362,6 +374,7 @@ final class WalletDatabase {
     private let openLock = NSLock()
 
     /// Open database with encryption key (thread-safe)
+    /// VUL-STOR-009: Uses HKDF-derived key with fallback to legacy key
     /// Uses SQLCipher for full database encryption when available
     func open(encryptionKey: Data) throws {
         openLock.lock()
@@ -394,33 +407,52 @@ final class WalletDatabase {
         }
 
         // SECURITY: Apply SQLCipher encryption if available
-        // This calls PRAGMA key with the derived encryption key
+        // VUL-STOR-009: Use HKDF-derived key from spending key (passed as parameter)
         if sqlCipher.isSQLCipherAvailable {
             do {
-                try sqlCipher.applyEncryption(to: db!)
-                print("🔐 Full database encryption active (SQLCipher)")
+                // Try new HKDF-derived key first
+                try applySQLCipherKey(encryptionKey, to: db!)
+                print("🔐 Full database encryption active (SQLCipher with HKDF key)")
             } catch {
-                // SQLCipher failed - close the connection
+                // New key failed - try legacy SQLCipherManager key as fallback
+                print("⚠️ VUL-STOR-009: HKDF key failed, attempting legacy key fallback...")
                 sqlite3_close(db)
                 db = nil
 
-                // If database is encrypted but key doesn't work, it may be corrupted
-                // from a failed migration. Try to recover by deleting it.
-                print("⚠️ Database encryption failed - attempting recovery...")
-                if sqlCipher.isDatabaseEncrypted(path: dbPath) {
-                    print("🗑️ Removing corrupted encrypted database...")
-                    try? FileManager.default.removeItem(atPath: dbPath)
-                    try? FileManager.default.removeItem(atPath: dbPath + "-wal")
-                    try? FileManager.default.removeItem(atPath: dbPath + "-shm")
+                // Reopen and try legacy key
+                guard sqlite3_open_v2(dbPath, &db, flags, nil) == SQLITE_OK else {
+                    throw DatabaseError.openFailed("Failed to reopen for legacy key attempt")
+                }
 
-                    // Retry opening (will create fresh database)
-                    guard sqlite3_open_v2(dbPath, &db, flags, nil) == SQLITE_OK else {
-                        throw DatabaseError.openFailed("Recovery failed")
-                    }
+                do {
+                    // Try legacy SQLCipherManager key
                     try sqlCipher.applyEncryption(to: db!)
-                    print("✅ Database recovered - created fresh encrypted database")
-                } else {
-                    throw DatabaseError.encryptionFailed
+                    print("✅ VUL-STOR-009: Legacy key worked - rekeying to HKDF key...")
+
+                    // Database opened with legacy key - rekey to new HKDF key
+                    try rekeyDatabase(from: "legacy", to: encryptionKey)
+                    print("✅ VUL-STOR-009: Database rekeyed to HKDF-derived key")
+                } catch {
+                    // Both keys failed - database may be corrupted
+                    sqlite3_close(db)
+                    db = nil
+
+                    print("⚠️ Database encryption failed with both keys - attempting recovery...")
+                    if sqlCipher.isDatabaseEncrypted(path: dbPath) {
+                        print("🗑️ Removing corrupted encrypted database...")
+                        try? FileManager.default.removeItem(atPath: dbPath)
+                        try? FileManager.default.removeItem(atPath: dbPath + "-wal")
+                        try? FileManager.default.removeItem(atPath: dbPath + "-shm")
+
+                        // Retry opening (will create fresh database)
+                        guard sqlite3_open_v2(dbPath, &db, flags, nil) == SQLITE_OK else {
+                            throw DatabaseError.openFailed("Recovery failed")
+                        }
+                        try applySQLCipherKey(encryptionKey, to: db!)
+                        print("✅ Database recovered - created fresh encrypted database with HKDF key")
+                    } else {
+                        throw DatabaseError.encryptionFailed
+                    }
                 }
             }
         } else {
@@ -458,6 +490,30 @@ final class WalletDatabase {
         }
         print("⚡ FIX #200: SQLite performance pragmas applied (WAL, 32MB cache, 256MB mmap)")
 
+        // FIX #1441: Register reverse_blob() custom SQLite function for txid byte-order matching.
+        // Wire format vs display format txids are reversed byte order. SQL BLOB comparisons
+        // need to match both orders for change filtering and self-send detection.
+        sqlite3_create_function(db, "reverse_blob", 1, 1 /* SQLITE_UTF8 */, nil, { context, argc, argv in
+            guard let argv = argv, let blobPtr = sqlite3_value_blob(argv[0]) else {
+                sqlite3_result_null(context)
+                return
+            }
+            let length = Int(sqlite3_value_bytes(argv[0]))
+            guard length > 0 else {
+                sqlite3_result_null(context)
+                return
+            }
+            let original = UnsafeRawBufferPointer(start: blobPtr, count: length)
+            var reversed = [UInt8](repeating: 0, count: length)
+            for i in 0..<length {
+                reversed[i] = original.load(fromByteOffset: length - 1 - i, as: UInt8.self)
+            }
+            let SQLITE_TRANSIENT_INNER = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+            reversed.withUnsafeMutableBufferPointer { ptr in
+                sqlite3_result_blob(context, ptr.baseAddress, Int32(length), SQLITE_TRANSIENT_INNER)
+            }
+        }, nil, nil)
+
         // Create tables
         try createTables()
 
@@ -478,6 +534,72 @@ final class WalletDatabase {
         try? parentURL.setResourceValues(resourceValues)
 
         print("📂 Database opened successfully (backup exclusion set)")
+    }
+
+    /// VUL-STOR-009: Apply SQLCipher encryption key to an open database
+    /// - Parameters:
+    ///   - keyData: Raw encryption key (32 bytes)
+    ///   - db: Open SQLite database connection
+    private func applySQLCipherKey(_ keyData: Data, to db: OpaquePointer) throws {
+        // Format key as hex for SQLCipher: PRAGMA key = "x'..hex..'";
+        let keyHex = keyData.map { String(format: "%02x", $0) }.joined()
+        let keySQL = "PRAGMA key = \"x'\(keyHex)'\";"
+
+        var errMsg: UnsafeMutablePointer<CChar>?
+        let result = sqlite3_exec(db, keySQL, nil, nil, &errMsg)
+
+        if result != SQLITE_OK {
+            let error = errMsg != nil ? String(cString: errMsg!) : "Unknown error"
+            sqlite3_free(errMsg)
+            throw DatabaseError.encryptionFailed
+        }
+
+        // Verify encryption is working by querying sqlite_master
+        var stmt: OpaquePointer?
+        let query = "SELECT count(*) FROM sqlite_master;"
+        guard sqlite3_prepare_v2(db, query, -1, &stmt, nil) == SQLITE_OK else {
+            // Key accepted but can't read database - wrong key or corrupted
+            throw DatabaseError.encryptionFailed
+        }
+        sqlite3_finalize(stmt)
+
+        // Log key fingerprint for debugging
+        let fingerprint = keyData.prefix(4).map { String(format: "%02x", $0) }.joined()
+        print("🔑 VUL-STOR-009: Applied HKDF key (fingerprint: \(fingerprint)...)")
+    }
+
+    /// VUL-STOR-009: Rekey an encrypted database to a new encryption key
+    /// - Parameters:
+    ///   - oldKeyType: Type of old key ("legacy" for SQLCipherManager)
+    ///   - newKey: New encryption key (32 bytes)
+    private func rekeyDatabase(from oldKeyType: String, to newKey: Data) throws {
+        guard let db = db else {
+            throw DatabaseError.notOpened
+        }
+
+        // Format new key as hex for SQLCipher
+        let newKeyHex = newKey.map { String(format: "%02x", $0) }.joined()
+        let rekeySQL = "PRAGMA rekey = \"x'\(newKeyHex)'\";"
+
+        var errMsg: UnsafeMutablePointer<CChar>?
+        let result = sqlite3_exec(db, rekeySQL, nil, nil, &errMsg)
+
+        if result != SQLITE_OK {
+            let error = errMsg != nil ? String(cString: errMsg!) : "Unknown error"
+            sqlite3_free(errMsg)
+            print("❌ VUL-STOR-009: Failed to rekey database: \(error)")
+            throw DatabaseError.encryptionFailed
+        }
+
+        // Verify new key works
+        var stmt: OpaquePointer?
+        let query = "SELECT count(*) FROM sqlite_master;"
+        guard sqlite3_prepare_v2(db, query, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.encryptionFailed
+        }
+        sqlite3_finalize(stmt)
+
+        print("✅ VUL-STOR-009: Database rekeyed from \(oldKeyType) to HKDF-derived key")
     }
 
     /// Migrate existing unencrypted database to encrypted format
@@ -789,6 +911,15 @@ final class WalletDatabase {
                 timestamp INTEGER NOT NULL,
                 reply_to_id TEXT,
                 FOREIGN KEY (conversation_address) REFERENCES chat_contacts(onion_address) ON DELETE CASCADE
+            );
+            """,
+
+            // VUL-STOR-003: Chat metadata storage (nickname, profile sharing, message queue)
+            // Encrypted in SQLCipher - no longer in plaintext UserDefaults
+            """
+            CREATE TABLE IF NOT EXISTS chat_settings (
+                key TEXT PRIMARY KEY,
+                value BLOB NOT NULL
             );
             """,
 
@@ -1586,9 +1717,13 @@ final class WalletDatabase {
         let birthday = UInt64(sqlite3_column_int64(stmt, 4))
 
         // Security audit TASK 2: Get spending key from Secure Enclave / Keychain
+        // VUL-U-002: Use secure key retrieval with automatic zeroing
         let spendingKey: Data
+        let secureKey: SecureData?
         do {
-            spendingKey = try SecureKeyStorage.shared.retrieveSpendingKey()
+            secureKey = try SecureKeyStorage.shared.retrieveSpendingKeySecure()
+            defer { secureKey?.zero() }
+            spendingKey = secureKey?.data ?? Data()
         } catch {
             print("⚠️ TASK 2: Failed to retrieve spending key from SecureKeyStorage: \(error)")
             // Fallback: try DB (for migration period)
@@ -1631,6 +1766,8 @@ final class WalletDatabase {
         witness: Data?,
         cmu: Data? = nil
     ) throws -> Int64 {
+        // VUL-S-003: Serialize to prevent concurrent insert races
+        return try dbSync {
         // Use INSERT OR IGNORE to skip notes that already exist (by nullifier uniqueness)
         // This prevents duplicates during rescanning
         let sql = """
@@ -1733,6 +1870,7 @@ final class WalletDatabase {
         writeNoteEncryptedShadows(noteId: insertedId, value: value, height: height, txid: txid)
 
         return insertedId
+        } // dbSync
     }
 
     /// Struct for batch note insertion (FIX #754)
@@ -1755,6 +1893,8 @@ final class WalletDatabase {
     /// - Returns: Number of notes successfully inserted
     @discardableResult
     func insertNotesBatch(_ notes: [BatchNote]) throws -> Int {
+        // VUL-S-003: Serialize to prevent concurrent access races
+        return try dbSync {
         guard !notes.isEmpty else { return 0 }
 
         let sql = """
@@ -1851,6 +1991,7 @@ final class WalletDatabase {
             _ = sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
             throw error
         }
+        } // dbSync
     }
 
     /// Debug: Get all notes (spent and unspent) with detailed info
@@ -2288,6 +2429,8 @@ final class WalletDatabase {
     /// NOTE: This function expects an UNHASHED nullifier from the blockchain
     /// Use markNoteSpentByHashedNullifier() if you have an already-hashed nullifier from the database
     func markNoteSpent(nullifier: Data, txid: Data, spentHeight: UInt64) throws {
+        // VUL-S-003: Serialize to prevent concurrent access races
+        try dbSync {
         // SECURITY: Never log nullifiers - they are sensitive privacy data
 
         // VUL-009: Hash the incoming nullifier to match stored hashed nullifiers
@@ -2301,11 +2444,14 @@ final class WalletDatabase {
             print("⚠️ FIX #1079: No match with hashed nullifier, trying raw...")
             try markNoteSpentByHashedNullifier(hashedNullifier: nullifier, txid: txid, spentHeight: spentHeight)
         }
+        } // dbSync
     }
 
     /// Mark note as spent using an already-hashed nullifier (from getUnspentNotes)
     /// This is used when we have the nullifier from a WalletNote which is already hashed
     func markNoteSpentByHashedNullifier(hashedNullifier: Data, txid: Data, spentHeight: UInt64) throws {
+        // VUL-S-003: Serialize to prevent concurrent access races
+        try dbSync {
         // SECURITY: Never log nullifiers - they are sensitive privacy data
 
         // Security audit TASK 15: Wrap SELECT+UPDATE in transaction to prevent race conditions
@@ -2363,6 +2509,7 @@ final class WalletDatabase {
         // NOTE: SENT transactions are now recorded by populateHistoryFromNotes() which
         // correctly calculates actualSent = input - change - fee. Do not add SENT here
         // as it would use the note value instead of the actual sent amount.
+        } // dbSync
     }
 
     /// Mark note as spent by height
@@ -2370,6 +2517,8 @@ final class WalletDatabase {
     /// Use markNoteSpentByHashedNullifier() if you have an already-hashed nullifier from the database
     /// Also sets spent_in_tx using nullifier as synthetic txid for history tracking
     func markNoteSpent(nullifier: Data, spentHeight: UInt64) throws {
+        // VUL-S-003: Serialize to prevent concurrent access races
+        try dbSync {
         // VUL-009: Hash the incoming nullifier to match stored hashed nullifiers
         let hashedNullifier = hashNullifier(nullifier)
         try markNoteSpentByHashedNullifier(hashedNullifier: hashedNullifier, spentHeight: spentHeight)
@@ -2379,11 +2528,14 @@ final class WalletDatabase {
             print("⚠️ FIX #1079: No match with hashed nullifier, trying raw...")
             try markNoteSpentByHashedNullifier(hashedNullifier: nullifier, spentHeight: spentHeight)
         }
+        } // dbSync
     }
 
     /// Mark note as spent using an already-hashed nullifier (from getUnspentNotes)
     /// This is used when we have the nullifier from a WalletNote which is already hashed
     func markNoteSpentByHashedNullifier(hashedNullifier: Data, spentHeight: UInt64) throws {
+        // VUL-S-003: Serialize to prevent concurrent access races
+        try dbSync {
         // Use nullifier hash as synthetic txid if no real txid available
         // This ensures populateHistoryFromNotes() can still create SENT entries
         let syntheticTxid = hashedNullifier.prefix(32)
@@ -2415,6 +2567,7 @@ final class WalletDatabase {
         if sqlite3_changes(db) > 0 {
             print("📜 Marked note spent at height \(spentHeight)")
         }
+        } // dbSync
     }
 
     // MARK: - FIX #291: Atomic Spend + History Recording
@@ -2445,6 +2598,8 @@ final class WalletDatabase {
         toAddress: String,
         memo: String?
     ) throws -> Int64 {
+        // VUL-S-003: Serialize to prevent concurrent access races
+        return try dbSync {
         // BEGIN TRANSACTION - both operations must succeed or both fail
         let beginResult = sqlite3_exec(db, "BEGIN IMMEDIATE TRANSACTION;", nil, nil, nil)
         guard beginResult == SQLITE_OK else {
@@ -2565,6 +2720,7 @@ final class WalletDatabase {
             print("❌ FIX #291: Transaction rolled back due to error: \(error)")
             throw error
         }
+        } // dbSync
     }
 
     /// FIX #291: Update sent transaction when confirmed in a block
@@ -2789,6 +2945,8 @@ final class WalletDatabase {
 
     /// Mark note as unspent (recover from failed broadcast)
     func markNoteUnspent(nullifier: Data) throws {
+        // VUL-S-003: Serialize to prevent concurrent access races
+        try dbSync {
         // VUL-009: Hash the incoming nullifier to match stored hashed nullifiers
         let hashedNullifier = hashNullifier(nullifier)
 
@@ -2809,6 +2967,7 @@ final class WalletDatabase {
             throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
         }
         print("Marked note as unspent")
+        } // dbSync
     }
 
     /// Get all spent notes for an account (for recovery from failed broadcasts)
@@ -3597,6 +3756,8 @@ final class WalletDatabase {
     /// FIX #1075: NEVER allow regression below checkpoint
     /// Requires peer consensus validation before accepting any height update
     func updateLastScannedHeight(_ height: UInt64, hash: Data) throws {
+        // VUL-S-003: Serialize to prevent concurrent access races
+        try dbSync {
         // FIX #166: Much stricter validation - block height should NEVER exceed ~3M on Zclassic
         // Current chain height is ~2.94M (Dec 2025)
         // Real max possible height by 2030: ~3.5M (at 150s/block)
@@ -3691,6 +3852,7 @@ final class WalletDatabase {
 
         // FIX #1031: Log successful height update for debugging slow startup issues
         print("✅ [DATABASE] lastScannedHeight updated to \(height)")
+        } // dbSync
     }
 
     // MARK: - FIX #165: Verified Checkpoint
@@ -3725,6 +3887,8 @@ final class WalletDatabase {
     /// 3. Any time balance/history is verified as correct
     /// FIX #241: Also stores in checkpoint_history (last 10 kept)
     func updateVerifiedCheckpointHeight(_ height: UInt64) throws {
+        // VUL-S-003: Serialize to prevent concurrent access races
+        try dbSync {
         // Validate height
         let maxReasonableHeight: UInt64 = 10_000_000
         guard height <= maxReasonableHeight else {
@@ -3757,6 +3921,7 @@ final class WalletDatabase {
         try addCheckpointToHistory(height: height)
 
         print("✅ [FIX #241] Updated verified checkpoint to height \(height)")
+        } // dbSync
     }
 
     // MARK: - FIX #241: Checkpoint History
@@ -3941,6 +4106,8 @@ final class WalletDatabase {
     /// FIX #741: Added height parameter - CRITICAL for persisting delta sync progress!
     /// Without saving tree_height, every startup re-syncs from boost file end (984 blocks)
     func saveTreeState(_ treeData: Data, height: UInt64? = nil) throws {
+        // VUL-S-003: Serialize to prevent concurrent access races
+        try dbSync {
         let sql: String
         if let height = height {
             sql = "UPDATE sync_state SET tree_state = ?, tree_height = ? WHERE id = 1;"
@@ -3969,11 +4136,14 @@ final class WalletDatabase {
         if let height = height {
             print("💾 FIX #741: Saved tree state with height \(height)")
         }
+        } // dbSync
     }
 
     /// FIX #741: Update tree height without modifying tree_state
     /// Called after delta CMU sync to persist the new height
     func updateTreeHeight(_ height: UInt64) throws {
+        // VUL-S-003: Serialize to prevent concurrent access races
+        try dbSync {
         let sql = "UPDATE sync_state SET tree_height = ? WHERE id = 1;"
 
         var stmt: OpaquePointer?
@@ -3989,10 +4159,13 @@ final class WalletDatabase {
         }
 
         print("💾 FIX #741: Updated tree height to \(height)")
+        } // dbSync
     }
 
     /// Clear commitment tree state (set to NULL)
     func clearTreeState() throws {
+        // VUL-S-003: Serialize to prevent concurrent access races
+        try dbSync {
         let sql = "UPDATE sync_state SET tree_state = NULL WHERE id = 1;"
 
         var stmt: OpaquePointer?
@@ -4004,6 +4177,7 @@ final class WalletDatabase {
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
         }
+        } // dbSync
     }
 
     /// Get commitment tree state
@@ -4455,6 +4629,8 @@ final class WalletDatabase {
     /// VUL-002: Delete a specific phantom transaction by txid
     /// Returns the value of the deleted transaction (for balance restoration)
     func deletePhantomTransaction(txid: Data) throws -> UInt64? {
+        // VUL-S-003: Serialize to prevent concurrent access races
+        return try dbSync {
         guard db != nil else {
             throw DatabaseError.notOpened
         }
@@ -4499,12 +4675,15 @@ final class WalletDatabase {
         }
 
         return deletedValue
+        } // dbSync
     }
 
     /// FIX #1168: Restore all notes that were incorrectly marked as spent by a phantom/rejected TX
     /// When a TX is rejected by the network, the notes it tried to spend must be restored to unspent
     /// Returns: count of restored notes and their total value
     func restoreNotesSpentByPhantomTx(txid: Data) throws -> (count: Int, totalValue: UInt64) {
+        // VUL-S-003: Serialize to prevent concurrent access races
+        return try dbSync {
         guard let db = db else { throw DatabaseError.notOpened }
 
         // First find what notes are affected
@@ -4555,6 +4734,7 @@ final class WalletDatabase {
         }
 
         return (count: updated, totalValue: totalValue)
+        } // dbSync
     }
 
     /// VUL-002: Unmark a note as spent (restore it after phantom TX removal)
@@ -5356,6 +5536,8 @@ final class WalletDatabase {
 
     /// Update witness for a note
     func updateNoteWitness(noteId: Int64, witness: Data) throws {
+        // VUL-S-003: Serialize to prevent concurrent access races
+        try dbSync {
         let sql = "UPDATE notes SET witness = ? WHERE id = ?;"
 
         var stmt: OpaquePointer?
@@ -5374,10 +5556,13 @@ final class WalletDatabase {
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
         }
+        } // dbSync
     }
 
     /// Update anchor for a note (the tree root when witness was last updated)
     func updateNoteAnchor(noteId: Int64, anchor: Data) throws {
+        // VUL-S-003: Serialize to prevent concurrent access races
+        try dbSync {
         let sql = "UPDATE notes SET anchor = ? WHERE id = ?;"
 
         var stmt: OpaquePointer?
@@ -5394,6 +5579,7 @@ final class WalletDatabase {
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
         }
+        } // dbSync
     }
 
     /// FIX #557 v45: Update witness_index for a note
@@ -5575,6 +5761,8 @@ final class WalletDatabase {
         fromDiversifier: Data?,
         memo: String?
     ) throws -> Int64 {
+        // VUL-S-003: Serialize to prevent concurrent access races
+        return try dbSync {
         // Use INSERT OR REPLACE to update existing entries with same (txid, tx_type)
         // This ensures sent transactions are properly recorded even if a "received"
         // entry for the same txid exists (e.g., change output detected during scan)
@@ -5652,6 +5840,7 @@ final class WalletDatabase {
         print("📜 DB: Insert result - rowId=\(rowId), rowsChanged=\(rowsChanged), txid=\(txid.prefix(8).map { String(format: "%02x", $0) }.joined())..., type=\(type.rawValue)")
 
         return rowId
+        } // dbSync
     }
 
     /// Get count of transaction history entries
@@ -5714,6 +5903,9 @@ final class WalletDatabase {
         // FIX #1367: Add height-based change detection (handles txid byte-order mismatch)
         //   When sent entry txid is display-format but received entry txid is wire-format,
         //   exact BLOB comparison fails. Height-based check catches these cases.
+        // FIX #1439: Count query matches display query — txid-based matching only (no height-based)
+        // Change β entries are deleted by populateHistoryFromNotes, SQL filter is backup defense
+        // FIX #1441: Count query matches display query — use reverse_blob for byte-order matching
         let countSql = """
             SELECT COUNT(*) FROM transaction_history t1
             WHERE t1.tx_type NOT IN ('change', 'γ')
@@ -5722,22 +5914,12 @@ final class WalletDatabase {
                 AND (
                     EXISTS (
                         SELECT 1 FROM transaction_history t2
-                        WHERE t2.txid = t1.txid
+                        WHERE (t2.txid = t1.txid OR t2.txid = reverse_blob(t1.txid))
                         AND t2.tx_type IN ('sent', 'α')
                     )
                     OR EXISTS (
                         SELECT 1 FROM notes n
-                        WHERE n.spent_in_tx = t1.txid
-                    )
-                    OR EXISTS (
-                        SELECT 1 FROM transaction_history t2
-                        WHERE t2.block_height = t1.block_height
-                        AND t2.tx_type IN ('sent', 'α')
-                    )
-                    OR EXISTS (
-                        SELECT 1 FROM notes n
-                        WHERE n.is_spent = 1
-                        AND n.spent_height = t1.block_height
+                        WHERE n.spent_in_tx = t1.txid OR n.spent_in_tx = reverse_blob(t1.txid)
                     )
                 )
             );
@@ -5763,34 +5945,25 @@ final class WalletDatabase {
             SELECT txid, block_height, block_time, tx_type, value, fee, to_address, memo, status, confirmations
             FROM transaction_history t1
             WHERE t1.tx_type NOT IN ('change', 'γ')
+            -- FIX #1427: Filter change outputs (received entries that are change from our sends)
+            -- Only use TXID-based matching — previous height-based matching (FIX #1367) incorrectly
+            -- filtered ALL received entries at any height where a send existed, hiding legitimate incoming TXs.
             AND NOT (
                 t1.tx_type IN ('received', 'β')
                 AND (
-                    -- FIX #1083: Filter β entries where there's an α entry with SAME txid
+                    -- FIX #1083+#1441: Filter β entries where there's an α entry with SAME txid
+                    -- FIX #1441: Also check reversed byte order (wire vs display format mismatch)
                     EXISTS (
                         SELECT 1 FROM transaction_history t2
-                        WHERE t2.txid = t1.txid
+                        WHERE (t2.txid = t1.txid OR t2.txid = reverse_blob(t1.txid))
                         AND t2.tx_type IN ('sent', 'α')
                     )
                     OR
-                    -- FIX #1083: Filter β entries received in tx where we spent a note (change)
+                    -- FIX #1083+#1441: Filter β entries received in tx where we spent a note (change)
+                    -- FIX #1441: Also check reversed byte order for spent_in_tx matching
                     EXISTS (
                         SELECT 1 FROM notes n
-                        WHERE n.spent_in_tx = t1.txid
-                    )
-                    OR
-                    -- FIX #1367: Height-based — α entry at same block height (handles txid format mismatch)
-                    EXISTS (
-                        SELECT 1 FROM transaction_history t2
-                        WHERE t2.block_height = t1.block_height
-                        AND t2.tx_type IN ('sent', 'α')
-                    )
-                    OR
-                    -- FIX #1367: Height-based — note spent at same block height (Zclassic logic)
-                    EXISTS (
-                        SELECT 1 FROM notes n
-                        WHERE n.is_spent = 1
-                        AND n.spent_height = t1.block_height
+                        WHERE n.spent_in_tx = t1.txid OR n.spent_in_tx = reverse_blob(t1.txid)
                     )
                 )
             )
@@ -5799,6 +5972,7 @@ final class WalletDatabase {
                 FROM transaction_history
                 WHERE tx_type NOT IN ('change', 'γ')
                 GROUP BY
+                    txid,
                     CASE
                         WHEN tx_type IN ('sent', 'α') THEN 'sent'
                         WHEN tx_type IN ('received', 'β') THEN 'received'
@@ -5832,12 +6006,16 @@ final class WalletDatabase {
             var blockTime = sqlite3_column_type(stmt, 2) != SQLITE_NULL ? UInt64(sqlite3_column_int64(stmt, 2)) : nil
 
             // ALWAYS try to get real timestamp - BlockTimestampManager first (bundled data), then HeaderStore
+            let dbBlockTime = blockTime
             if height > 0 {
                 if let timestamp = BlockTimestampManager.shared.getTimestamp(at: height) {
                     blockTime = UInt64(timestamp)
                 } else if let headerTime = try? HeaderStore.shared.getBlockTime(at: height) {
                     blockTime = UInt64(headerTime)
                 }
+            }
+            if blockTime == nil {
+                print("🕐 DEBUG getTransactionHistory: height=\(height) — NO TIMESTAMP (db=\(dbBlockTime ?? 0))")
             }
             // If still nil (header not synced yet), leave as nil - UI will handle it
             // VUL-015: Decrypt the obfuscated type code
@@ -5851,47 +6029,15 @@ final class WalletDatabase {
             let confirmations = Int(sqlite3_column_int(stmt, 9))
 
             let txidData = Data(bytes: txidPtr, count: Int(txidLen))
-            // FIX #1367: Detect self-send — check to_address marker OR compute from notes in real-time
-            // This catches both: (1) entries corrected at startup, (2) new sends during current session
+            // FIX #1424: Self-send detection — ONLY use to_address marker from populateHistoryFromNotes()
+            // Previous real-time detection (FIX #1367) used `received_height = ?` to find "change" outputs,
+            // which caught ALL unspent notes at the same block height — including unrelated incoming payments.
+            // This inflated totalChange, making netSent <= 1000, wrongly converting ALL regular SENT to self-sends.
+            // populateHistoryFromNotes() already correctly identifies self-sends via txid-based change matching
+            // with FIX #1402 fallback, and marks them with to_address='self'. That marker is authoritative.
             var resolvedType: TransactionType = txType
-            if txType == .sent {
-                if toAddress == "self" {
-                    resolvedType = .selfSend
-                } else if height > 0 {
-                    // Real-time self-send detection: check if all outputs are change
-                    // total_input - total_change_at_height <= fee + buffer → self-send
-                    let selfSendCheckSql = """
-                        SELECT
-                            COALESCE((SELECT SUM(value) FROM notes WHERE is_spent = 1 AND (spent_in_tx = ? OR spent_in_tx = ? OR spent_height = ?)), 0) as total_input,
-                            COALESCE((SELECT SUM(value) FROM notes WHERE is_spent = 0 AND received_height = ?), 0) as total_change
-                    """
-                    var checkStmt: OpaquePointer?
-                    if sqlite3_prepare_v2(db, selfSendCheckSql, -1, &checkStmt, nil) == SQLITE_OK {
-                        let SQLITE_TRANSIENT_LOCAL = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-                        // Bind txid (original byte order)
-                        _ = txidData.withUnsafeBytes { ptr in
-                            sqlite3_bind_blob(checkStmt, 1, ptr.baseAddress, Int32(txidData.count), SQLITE_TRANSIENT_LOCAL)
-                        }
-                        // Bind txid (reversed byte order)
-                        let reversedTxid = Data(txidData.reversed())
-                        _ = reversedTxid.withUnsafeBytes { ptr in
-                            sqlite3_bind_blob(checkStmt, 2, ptr.baseAddress, Int32(reversedTxid.count), SQLITE_TRANSIENT_LOCAL)
-                        }
-                        sqlite3_bind_int64(checkStmt, 3, Int64(height))
-                        sqlite3_bind_int64(checkStmt, 4, Int64(height))
-                        if sqlite3_step(checkStmt) == SQLITE_ROW {
-                            let totalInput = UInt64(sqlite3_column_int64(checkStmt, 0))
-                            let totalChange = UInt64(sqlite3_column_int64(checkStmt, 1))
-                            if totalInput > 0 && totalChange > 0 {
-                                let netSent = totalInput > (totalChange + 10000) ? totalInput - totalChange - 10000 : 0
-                                if netSent <= 1000 {
-                                    resolvedType = .selfSend
-                                }
-                            }
-                        }
-                        sqlite3_finalize(checkStmt)
-                    }
-                }
+            if txType == .sent && toAddress == "self" {
+                resolvedType = .selfSend
             }
             // FIX #1377: Self-sends must display the fee as the value, not the uncorrected DB amount
             // Real-time detection at line 5083 correctly sets resolvedType = .selfSend, but `value`
@@ -6017,8 +6163,12 @@ final class WalletDatabase {
         }
 
         // Get ALL notes - even those without txid (we'll create a synthetic txid based on nullifier)
+        // FIX #1430: Include encrypted shadow columns (value_enc, received_height_enc, spent_height_enc)
+        // VUL-S-004 zeroes plaintext value/received_height/spent_height — real values are in encrypted shadows
+        // FIX #1449: Include n.memo so received entries carry memos to transaction_history
         let sql = """
-            SELECT n.diversifier, n.value, n.received_height, n.received_in_tx, n.is_spent, n.spent_in_tx, n.nf, n.spent_height
+            SELECT n.diversifier, n.value, n.received_height, n.received_in_tx, n.is_spent, n.spent_in_tx, n.nf, n.spent_height,
+                   n.value_enc, n.received_height_enc, n.spent_height_enc, n.memo
             FROM notes n
             ORDER BY n.received_height ASC;
         """
@@ -6040,6 +6190,7 @@ final class WalletDatabase {
             let isSpent: Bool
             let spentTxid: Data?
             let spentHeight: UInt64?
+            let memo: String?  // FIX #1449
         }
         var allNotes: [NoteData] = []
 
@@ -6047,8 +6198,8 @@ final class WalletDatabase {
             notesFound += 1
             let diversifierPtr = sqlite3_column_blob(stmt, 0)
             let diversifierLen = sqlite3_column_bytes(stmt, 0)
-            let value = UInt64(sqlite3_column_int64(stmt, 1))
-            let receivedHeight = UInt64(sqlite3_column_int64(stmt, 2))
+            let plaintextValue = UInt64(sqlite3_column_int64(stmt, 1))
+            let plaintextReceivedHeight = UInt64(sqlite3_column_int64(stmt, 2))
             let txidPtr = sqlite3_column_type(stmt, 3) != SQLITE_NULL ? sqlite3_column_blob(stmt, 3) : nil
             let txidLen = sqlite3_column_bytes(stmt, 3)
             let isSpent = sqlite3_column_int(stmt, 4) != 0
@@ -6056,9 +6207,38 @@ final class WalletDatabase {
             let spentTxLen = sqlite3_column_bytes(stmt, 5)
             let nullifierPtr = sqlite3_column_blob(stmt, 6)
             let nullifierLen = sqlite3_column_bytes(stmt, 6)
-            let spentHeight: UInt64? = sqlite3_column_type(stmt, 7) != SQLITE_NULL
+            let plaintextSpentHeight: UInt64? = sqlite3_column_type(stmt, 7) != SQLITE_NULL
                 ? UInt64(sqlite3_column_int64(stmt, 7))
                 : nil
+
+            // FIX #1430: Read from encrypted shadow columns (indices 8, 9, 10)
+            // VUL-S-004 zeroes plaintext columns — encrypted shadows have real values
+            var value = plaintextValue
+            if sqlite3_column_type(stmt, 8) != SQLITE_NULL {
+                let encPtr = sqlite3_column_blob(stmt, 8)
+                let encLen = sqlite3_column_bytes(stmt, 8)
+                if let encPtr = encPtr, encLen > 0 {
+                    value = decryptUInt64(Data(bytes: encPtr, count: Int(encLen))) ?? plaintextValue
+                }
+            }
+
+            var receivedHeight = plaintextReceivedHeight
+            if sqlite3_column_type(stmt, 9) != SQLITE_NULL {
+                let encPtr = sqlite3_column_blob(stmt, 9)
+                let encLen = sqlite3_column_bytes(stmt, 9)
+                if let encPtr = encPtr, encLen > 0 {
+                    receivedHeight = decryptUInt64(Data(bytes: encPtr, count: Int(encLen))) ?? plaintextReceivedHeight
+                }
+            }
+
+            var spentHeight: UInt64? = plaintextSpentHeight
+            if sqlite3_column_type(stmt, 10) != SQLITE_NULL {
+                let encPtr = sqlite3_column_blob(stmt, 10)
+                let encLen = sqlite3_column_bytes(stmt, 10)
+                if let encPtr = encPtr, encLen > 0 {
+                    spentHeight = decryptUInt64(Data(bytes: encPtr, count: Int(encLen))) ?? plaintextSpentHeight
+                }
+            }
 
             // Use actual txid if available, otherwise use nullifier as synthetic txid
             let txid: Data
@@ -6074,6 +6254,19 @@ final class WalletDatabase {
             let diversifier = diversifierPtr != nil ? Data(bytes: diversifierPtr!, count: Int(diversifierLen)) : nil
             let spentTxid: Data? = (spentTxPtr != nil && spentTxLen > 0) ? Data(bytes: spentTxPtr!, count: Int(spentTxLen)) : nil
 
+            // FIX #1449: Read memo from notes table (column index 11)
+            let memoText: String? = {
+                guard sqlite3_column_type(stmt, 11) != SQLITE_NULL else { return nil }
+                let ptr = sqlite3_column_blob(stmt, 11)
+                let len = sqlite3_column_bytes(stmt, 11)
+                guard let ptr = ptr, len > 0 else { return nil }
+                let data = Data(bytes: ptr, count: Int(len))
+                // Memo is stored as raw bytes — filter nulls and 0xf6 padding
+                let filtered = data.prefix(512).filter { $0 != 0 && $0 != 0xf6 }
+                guard !filtered.isEmpty else { return nil }
+                return String(data: Data(filtered), encoding: .utf8)
+            }()
+
             allNotes.append(NoteData(
                 diversifier: diversifier,
                 value: value,
@@ -6081,7 +6274,8 @@ final class WalletDatabase {
                 txid: txid,
                 isSpent: isSpent,
                 spentTxid: spentTxid,
-                spentHeight: spentHeight
+                spentHeight: spentHeight,
+                memo: memoText
             ))
         }
         sqlite3_finalize(stmt)
@@ -6094,10 +6288,12 @@ final class WalletDatabase {
         }
 
         // Build a set of all spent_in_tx txids - these represent our SENT transactions
+        // FIX #1439: Include BOTH byte orders (wire vs display format) for reliable matching
         var sentTxids: Set<Data> = []
         for note in allNotes where note.isSpent {
             if let spentTxid = note.spentTxid {
                 sentTxids.insert(spentTxid)
+                sentTxids.insert(Data(spentTxid.reversed()))
             }
         }
 
@@ -6142,35 +6338,33 @@ final class WalletDatabase {
             // Root cause: Boost file notes may have different txids for change outputs
             // Solution: Also look for change outputs by HEIGHT (same block = likely change)
 
-            // Method 1: Direct txid match (original logic)
-            var changeOutputs = allNotes.filter { $0.txid == spentTxid }
-
-            // Method 2: Height-based match (FIX #464 v3 parity)
-            // FIX #1367: ALWAYS run height-based check, not just when direct match is empty.
-            // When txid byte-order varies between notes, direct match may find PARTIAL change
-            // (e.g., 1 of 2 outputs), missing the rest → sent amount computed wrong.
-            // Height-based adds any unspent notes received at the spent height that aren't already found.
-            if txInfo.spentHeight > 0 {
-                let heightBasedChange = allNotes.filter {
-                    !$0.isSpent && $0.receivedHeight == txInfo.spentHeight
-                }
-                for note in heightBasedChange {
-                    if !changeOutputs.contains(where: { $0.txid == note.txid && $0.value == note.value }) {
-                        changeOutputs.append(note)
-                        print("📜 FIX #1367: Found additional change output by HEIGHT at \(txInfo.spentHeight): \(note.value) zatoshis")
-                    }
-                }
+            // FIX #1427: Match change outputs by TXID in BOTH byte orders.
+            // Previous FIX #1367 used HEIGHT-based matching which caught ALL unspent notes at
+            // the same block height — including unrelated incoming payments — as "change".
+            // This inflated totalChangeValue, making amountToRecipient <= 1000, wrongly converting
+            // regular SENT transactions to self-sends.
+            // Boost file notes may have reversed txid byte order (wire vs display format).
+            // Solution: match by txid OR reversed txid — precise, no false positives.
+            let reversedTxid = Data(spentTxid.reversed())
+            // FIX #1441: Include ALL outputs (spent AND unspent) received in this TX.
+            // Previous filter used !$0.isSpent which missed change/self outputs that were
+            // later spent in subsequent TXs. For self-send TX A whose outputs were spent in TX B:
+            // old code found 0 change → totalBalanceImpact = full input → not a self-send!
+            // Correct: ALL notes with received_in_tx = this TX are our outputs (change/self).
+            // Recipient's output is NOT in our wallet, so it won't appear in allNotes.
+            // note.txid = received_in_tx, so this only finds outputs OF this TX, not inputs.
+            var changeOutputs = allNotes.filter {
+                $0.txid == spentTxid || $0.txid == reversedTxid
             }
 
             var totalChangeValue = changeOutputs.reduce(0) { $0 + $1.value }
 
-            // FIX #1402: If height-based matching inflated change beyond inputs, discard
-            // the height-based additions — they're unrelated notes at the same block height.
-            // Fall back to txid-only matching which is always correct.
+            // FIX #1402: Safety net — if change exceeds inputs, something is wrong.
+            // Fall back to strict txid-only matching (single byte order).
             if totalChangeValue > txInfo.inputValue {
                 let txidOnlyChange = allNotes.filter { $0.txid == spentTxid }
                 let txidOnlyValue = txidOnlyChange.reduce(0) { $0 + $1.value }
-                print("📜 FIX #1402: Height-based change (\(totalChangeValue)) > inputValue (\(txInfo.inputValue)) — falling back to txid-only change (\(txidOnlyValue))")
+                print("📜 FIX #1402: Change (\(totalChangeValue)) > inputValue (\(txInfo.inputValue)) — falling back to txid-only change (\(txidOnlyValue))")
                 totalChangeValue = txidOnlyValue
             }
 
@@ -6180,8 +6374,10 @@ final class WalletDatabase {
             // amountToRecipient = balance impact - fee (for display info)
             let amountToRecipient = totalBalanceImpact > fee ? totalBalanceImpact - fee : 0
 
-            // FIX #1367: Self-send detection — amountToRecipient <= 1000 means all outputs are change
-            let isSelfSend = amountToRecipient <= 1000
+            // FIX #1367+#1435: Self-send detection — amountToRecipient <= fee means all outputs are change
+            // FIX #1435: Previous threshold (1000) was too low — with real values from encrypted columns,
+            // a self-send has amountToRecipient = 0 (all outputs return to self), fee = 10000.
+            let isSelfSend = amountToRecipient <= fee
             let displayValue = isSelfSend ? fee : amountToRecipient
             let toAddressValue = isSelfSend ? "self" : nil
 
@@ -6203,9 +6399,12 @@ final class WalletDatabase {
             }
             sqlite3_bind_int64(spentStmt, 2, Int64(txInfo.spentHeight))
             // Get real block time - try BlockTimestampManager first (has bundled data), then HeaderStore
-            if let timestamp = BlockTimestampManager.shared.getTimestamp(at: txInfo.spentHeight) {
+            let btmTimestamp = BlockTimestampManager.shared.getTimestamp(at: txInfo.spentHeight)
+            let hsTimestamp = try? HeaderStore.shared.getBlockTime(at: txInfo.spentHeight)
+            print("🕐 DEBUG populateHistory SENT: height=\(txInfo.spentHeight), BTM=\(btmTimestamp ?? 0), HS=\(hsTimestamp ?? 0)")
+            if let timestamp = btmTimestamp {
                 sqlite3_bind_int64(spentStmt, 3, Int64(timestamp))
-            } else if let headerTime = try? HeaderStore.shared.getBlockTime(at: txInfo.spentHeight) {
+            } else if let headerTime = hsTimestamp {
                 sqlite3_bind_int64(spentStmt, 3, Int64(headerTime))
             } else {
                 sqlite3_bind_null(spentStmt, 3) // Will be fetched from BlockTimestampManager when displayed
@@ -6259,6 +6458,8 @@ final class WalletDatabase {
         for note in allNotes where note.isSpent {
             if let spentTxid = note.spentTxid {
                 txHasOurSpends.insert(spentTxid)
+                // FIX #1439: Also match reversed byte order
+                txHasOurSpends.insert(Data(spentTxid.reversed()))
             }
             if let spentHeight = note.spentHeight {
                 heightHasOurSpends.insert(spentHeight)
@@ -6310,9 +6511,12 @@ final class WalletDatabase {
             }
             sqlite3_bind_int64(insertStmt, 2, Int64(note.receivedHeight))
             // Get real block time - try BlockTimestampManager first (has bundled data), then HeaderStore
-            if let timestamp = BlockTimestampManager.shared.getTimestamp(at: note.receivedHeight) {
+            let rcvBtmTs = BlockTimestampManager.shared.getTimestamp(at: note.receivedHeight)
+            let rcvHsTs = try? HeaderStore.shared.getBlockTime(at: note.receivedHeight)
+            print("🕐 DEBUG populateHistory RECV: height=\(note.receivedHeight), BTM=\(rcvBtmTs ?? 0), HS=\(rcvHsTs ?? 0)")
+            if let timestamp = rcvBtmTs {
                 sqlite3_bind_int64(insertStmt, 3, Int64(timestamp))
-            } else if let headerTime = try? HeaderStore.shared.getBlockTime(at: note.receivedHeight) {
+            } else if let headerTime = rcvHsTs {
                 sqlite3_bind_int64(insertStmt, 3, Int64(headerTime))
             } else {
                 sqlite3_bind_null(insertStmt, 3) // Will be fetched from BlockTimestampManager when displayed
@@ -6330,7 +6534,12 @@ final class WalletDatabase {
             } else {
                 sqlite3_bind_null(insertStmt, 8)
             }
-            sqlite3_bind_null(insertStmt, 9) // memo
+            // FIX #1449: Pass memo from notes table instead of always NULL
+            if let memo = note.memo {
+                sqlite3_bind_text(insertStmt, 9, memo, -1, SQLITE_TRANSIENT)
+            } else {
+                sqlite3_bind_null(insertStmt, 9)
+            }
 
             let result = sqlite3_step(insertStmt)
             if result == SQLITE_DONE {
@@ -6340,6 +6549,88 @@ final class WalletDatabase {
                 print("📜 Insert failed: \(String(cString: sqlite3_errmsg(db)))")
             }
             sqlite3_finalize(insertStmt)
+        }
+
+        // FIX #1435: Delete change β entries that were pre-inserted by recordReceivedTransaction()
+        // during boost scan. recordReceivedTransaction inserts ALL decrypted notes as β before
+        // populateHistoryFromNotes runs. The SQL filter in getTransactionHistory checks txid match
+        // but boost file txids may have different byte orders (wire vs display format).
+        // Definitive fix: collect change txids identified above and delete their β entries.
+        var changeTxids: Set<Data> = []
+        for note in allNotes {
+            var isChange = sentTxids.contains(note.txid)
+            if !isChange { isChange = txHasOurSpends.contains(note.txid) }
+            if !isChange { isChange = heightHasOurSpends.contains(note.receivedHeight) }
+            if isChange {
+                changeTxids.insert(note.txid)
+                // FIX #1439: Also delete reversed byte order entry from DB
+                changeTxids.insert(Data(note.txid.reversed()))
+            }
+        }
+
+        if !changeTxids.isEmpty {
+            let deleteSql = "DELETE FROM transaction_history WHERE txid = ? AND tx_type IN ('received', 'β');"
+            var deleteCount = 0
+            for changeTxid in changeTxids {
+                var deleteStmt: OpaquePointer?
+                guard sqlite3_prepare_v2(db, deleteSql, -1, &deleteStmt, nil) == SQLITE_OK else { continue }
+                _ = changeTxid.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(deleteStmt, 1, ptr.baseAddress, Int32(changeTxid.count), SQLITE_TRANSIENT)
+                }
+                if sqlite3_step(deleteStmt) == SQLITE_DONE {
+                    deleteCount += sqlite3_changes(db) > 0 ? 1 : 0
+                }
+                sqlite3_finalize(deleteStmt)
+            }
+            if deleteCount > 0 {
+                print("📜 FIX #1435: Deleted \(deleteCount) change β entries from transaction_history")
+            }
+        }
+
+        // FIX #1439+#1441: Force-UPDATE self-send markers on existing α entries.
+        // INSERT OR IGNORE may have skipped the self-send insert if an old α entry already existed
+        // without to_address='self'. This UPDATE ensures the marker is set.
+        // FIX #1441: Use same !isSpent-free filter as PASS 1, and try BOTH txid byte orders.
+        var selfSendUpdateCount = 0
+        for (spentTxid, txInfo) in sentTxData {
+            let reversedTxid = Data(spentTxid.reversed())
+            let changeOutputs = allNotes.filter {
+                $0.txid == spentTxid || $0.txid == reversedTxid
+            }
+            var totalChangeValue = changeOutputs.reduce(0) { $0 + $1.value }
+            if totalChangeValue > txInfo.inputValue {
+                totalChangeValue = allNotes.filter { $0.txid == spentTxid }.reduce(0) { $0 + $1.value }
+            }
+            let totalBalanceImpact = txInfo.inputValue > totalChangeValue ? txInfo.inputValue - totalChangeValue : fee
+            let amountToRecipient = totalBalanceImpact > fee ? totalBalanceImpact - fee : 0
+            let isSelfSend = amountToRecipient <= fee
+
+            if isSelfSend {
+                // FIX #1441: Try BOTH byte orders — α entry may have been inserted with either
+                let updateSql = "UPDATE transaction_history SET to_address = 'self', value = ? WHERE (txid = ? OR txid = ?) AND tx_type IN ('sent', 'α');"
+                var updateStmt: OpaquePointer?
+                if sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK {
+                    sqlite3_bind_int64(updateStmt, 1, Int64(fee))
+                    _ = spentTxid.withUnsafeBytes { ptr in
+                        sqlite3_bind_blob(updateStmt, 2, ptr.baseAddress, Int32(spentTxid.count), SQLITE_TRANSIENT)
+                    }
+                    _ = reversedTxid.withUnsafeBytes { ptr in
+                        sqlite3_bind_blob(updateStmt, 3, ptr.baseAddress, Int32(reversedTxid.count), SQLITE_TRANSIENT)
+                    }
+                    sqlite3_step(updateStmt)
+                    let changes = sqlite3_changes(db)
+                    if changes > 0 { selfSendUpdateCount += 1 }
+                    sqlite3_finalize(updateStmt)
+                }
+            }
+        }
+        if selfSendUpdateCount > 0 {
+            print("📜 FIX #1441: Updated \(selfSendUpdateCount) self-send markers on existing α entries")
+        }
+
+        // FIX #1438: Post notification so HistoryView refreshes with correct data
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: Notification.Name("transactionHistoryUpdated"), object: nil)
         }
 
         print("📜 Found \(notesFound) notes, populated \(count) transaction history entries")
@@ -6358,6 +6649,8 @@ final class WalletDatabase {
         memo: String? = nil,
         blockTime: UInt64? = nil
     ) throws {
+        // VUL-S-003: Serialize to prevent concurrent access races
+        try dbSync {
         // VUL-015: Use obfuscated type code instead of plaintext
         let sql = """
             INSERT OR IGNORE INTO transaction_history
@@ -6427,6 +6720,7 @@ final class WalletDatabase {
                 print("📜 Recorded received transaction: height=\(height), value=\(value) zatoshis, time=\(actualBlockTime ?? 0)")
             }
         }
+        } // dbSync
     }
 
     /// Record a sent transaction immediately when user initiates send
@@ -6584,6 +6878,8 @@ final class WalletDatabase {
 
     /// Update transaction status (when it gets confirmed)
     func updateTransactionStatus(txid: Data, status: TransactionStatus, confirmations: Int, height: UInt64? = nil) throws {
+        // VUL-S-003: Serialize to prevent concurrent access races
+        try dbSync {
         var sql: String
         if let height = height {
             sql = "UPDATE transaction_history SET status = ?, confirmations = ?, block_height = ? WHERE txid = ?;"
@@ -6615,6 +6911,7 @@ final class WalletDatabase {
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             throw DatabaseError.updateFailed(String(cString: sqlite3_errmsg(db)))
         }
+        } // dbSync
     }
 
     /// Get the earliest transaction height that needs a timestamp
@@ -7433,13 +7730,22 @@ final class WalletDatabase {
 
             guard totalInput > 0 else { continue }
 
-            // Get ALL change: unspent notes received at the same height (Zclassic IsNoteSaplingChange)
-            let height = spentHeight > 0 ? spentHeight : entry.blockHeight
-            let changeSql = "SELECT COALESCE(SUM(value), 0) FROM notes WHERE is_spent = 0 AND received_height = ?;"
+            // FIX #1427+#1441: Get change using TXID matching (both byte orders), NOT height-based.
+            // Previous height-based query caught ALL unspent notes at the same block height as "change",
+            // including unrelated incoming payments — inflating totalChange → wrong sent amount → false self-sends.
+            // FIX #1441: Include ALL outputs (spent AND unspent) — change/self outputs may have been
+            // subsequently spent. Using is_spent=0 missed these → wrong self-send detection.
+            let reversedTxid = Data(entry.txid.reversed())
+            let changeSql = "SELECT COALESCE(SUM(value), 0) FROM notes WHERE (received_in_tx = ? OR received_in_tx = ?);"
             var totalChange: UInt64 = 0
             var changeStmt: OpaquePointer?
             if sqlite3_prepare_v2(db, changeSql, -1, &changeStmt, nil) == SQLITE_OK {
-                sqlite3_bind_int64(changeStmt, 1, Int64(height))
+                _ = entry.txid.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(changeStmt, 1, ptr.baseAddress, Int32(entry.txid.count), SQLITE_TRANSIENT)
+                }
+                _ = reversedTxid.withUnsafeBytes { ptr in
+                    sqlite3_bind_blob(changeStmt, 2, ptr.baseAddress, Int32(reversedTxid.count), SQLITE_TRANSIENT)
+                }
                 if sqlite3_step(changeStmt) == SQLITE_ROW {
                     totalChange = UInt64(sqlite3_column_int64(changeStmt, 0))
                 }
@@ -8853,6 +9159,136 @@ final class WalletDatabase {
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
         defer { sqlite3_finalize(stmt) }
         sqlite3_bind_text(stmt, 1, conversationAddress, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        sqlite3_step(stmt)
+    }
+
+    // MARK: - VUL-STOR-003: Chat Settings (Encrypted Metadata)
+
+    /// Save a chat setting to encrypted SQLCipher database
+    /// VUL-STOR-003: Replaces plaintext UserDefaults storage
+    /// Uses .chat domain key for encryption
+    func saveChatSetting(key: String, value: String) {
+        guard db != nil else { return }
+
+        // Encrypt value with .chat domain key
+        let valueData = Data(value.utf8)
+        let encryptedValue: Data
+        if let encrypted = try? encryptBlob(valueData, domain: .chat) {
+            encryptedValue = encrypted
+        } else {
+            encryptedValue = valueData
+        }
+
+        let sql = """
+            INSERT INTO chat_settings (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_text(stmt, 1, key, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        encryptedValue.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(encryptedValue.count), unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        }
+        sqlite3_step(stmt)
+    }
+
+    /// Get a chat setting from encrypted SQLCipher database
+    /// VUL-STOR-003: Replaces plaintext UserDefaults storage
+    /// Uses .chat domain key for decryption
+    func getChatSetting(key: String) -> String? {
+        guard db != nil else { return nil }
+
+        let sql = "SELECT value FROM chat_settings WHERE key = ?;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_text(stmt, 1, key, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+
+        // Decrypt value with .chat domain key
+        guard sqlite3_column_type(stmt, 0) == SQLITE_BLOB,
+              let blobPtr = sqlite3_column_blob(stmt, 0) else { return nil }
+
+        let blobLen = Int(sqlite3_column_bytes(stmt, 0))
+        let encData = Data(bytes: blobPtr, count: blobLen)
+
+        if let decrypted = try? decryptBlob(encData, domain: .chat),
+           let text = String(data: decrypted, encoding: .utf8) {
+            return text
+        } else if let text = String(data: encData, encoding: .utf8) {
+            return text  // Fallback: unencrypted text
+        }
+        return nil
+    }
+
+    /// Save encrypted message queue to SQLCipher database
+    /// VUL-STOR-003: Replaces ChaChaPoly-encrypted UserDefaults storage
+    /// SQLCipher encryption makes additional ChaChaPoly layer redundant
+    func saveChatMessageQueue(data: Data) {
+        guard db != nil else { return }
+
+        // Encrypt with .chat domain key
+        let encryptedData: Data
+        if let encrypted = try? encryptBlob(data, domain: .chat) {
+            encryptedData = encrypted
+        } else {
+            encryptedData = data
+        }
+
+        let sql = """
+            INSERT INTO chat_settings (key, value)
+            VALUES ('message_queue', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+
+        encryptedData.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(encryptedData.count), unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        }
+        sqlite3_step(stmt)
+    }
+
+    /// Get encrypted message queue from SQLCipher database
+    /// VUL-STOR-003: Replaces ChaChaPoly-encrypted UserDefaults storage
+    func getChatMessageQueue() -> Data? {
+        guard db != nil else { return nil }
+
+        let sql = "SELECT value FROM chat_settings WHERE key = 'message_queue';"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+
+        guard sqlite3_column_type(stmt, 0) == SQLITE_BLOB,
+              let blobPtr = sqlite3_column_blob(stmt, 0) else { return nil }
+
+        let blobLen = Int(sqlite3_column_bytes(stmt, 0))
+        let encData = Data(bytes: blobPtr, count: blobLen)
+
+        // Decrypt with .chat domain key
+        if let decrypted = try? decryptBlob(encData, domain: .chat) {
+            return decrypted
+        }
+        return encData  // Fallback: unencrypted data
+    }
+
+    /// Delete a chat setting
+    /// VUL-STOR-003: Helper for cleanup
+    func deleteChatSetting(key: String) {
+        guard db != nil else { return }
+        let sql = "DELETE FROM chat_settings WHERE key = ?;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, key, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
         sqlite3_step(stmt)
     }
 }

@@ -511,11 +511,13 @@ actor CommitmentTreeUpdater {
         print("🗑️ FIX #755: Cleared delta bundle (boost file updated)")
 
         // Update UserDefaults for effective tree height
+        // FIX #1446c: Also store block_hash for dynamic header sync locator
         await MainActor.run {
             ZipherXConstants.updateTreeInfo(
                 height: remoteManifest.chain_height,
                 cmuCount: remoteManifest.output_count,
-                root: remoteManifest.tree_root
+                root: remoteManifest.tree_root,
+                blockHash: remoteManifest.block_hash
             )
         }
 
@@ -1325,11 +1327,13 @@ actor CommitmentTreeUpdater {
             let manifest = try await fetchRemoteManifest()
 
             // Update UserDefaults with latest tree info
+            // FIX #1446c: Also store block_hash for dynamic header sync locator
             await MainActor.run {
                 ZipherXConstants.updateTreeInfo(
                     height: manifest.chain_height,
                     cmuCount: manifest.output_count,
-                    root: manifest.tree_root
+                    root: manifest.tree_root,
+                    blockHash: manifest.block_hash
                 )
             }
 
@@ -1652,6 +1656,7 @@ actor CommitmentTreeUpdater {
             try await downloadSingleFile(
                 asset: coreAsset,
                 targetPath: cachedCorePathZst,  // Save with .zst extension
+                expectedSHA256: coreFileInfo.sha256,
                 onProgress: onProgress
             )
 
@@ -1667,6 +1672,7 @@ actor CommitmentTreeUpdater {
                         try await downloadSingleFile(
                             asset: equihashAsset,
                             targetPath: cachedEquihashPath,
+                            expectedSHA256: equihashFileInfo.sha256,
                             onProgress: { _ in } // No progress for optional file
                         )
                         print("✅ Three-part format: Downloaded both core and equihash files")
@@ -1703,9 +1709,18 @@ actor CommitmentTreeUpdater {
                 ? cachedBoostPath.appendingPathExtension("zst")
                 : cachedBoostPath
 
+            // Get SHA-256 from manifest (compressed or uncompressed file)
+            let expectedHash: String?
+            if boostAsset.name.hasSuffix(".zst") {
+                expectedHash = manifest.files.compressed?.sha256
+            } else {
+                expectedHash = manifest.files.uncompressed.sha256
+            }
+
             try await downloadSingleFile(
                 asset: boostAsset,
                 targetPath: targetPath,
+                expectedSHA256: expectedHash,
                 onProgress: onProgress
             )
         }
@@ -1713,7 +1728,8 @@ actor CommitmentTreeUpdater {
 
     /// Download a single file with retry logic using Rust reqwest (60-100+ MB/s)
     /// FIX #342: Replaces slow Swift URLSession with fast Rust download
-    private func downloadSingleFile(asset: GitHubAsset, targetPath: URL, onProgress: ((Double) -> Void)?) async throws {
+    /// VUL-STOR-007: Added optional SHA-256 verification for cryptographic integrity
+    private func downloadSingleFile(asset: GitHubAsset, targetPath: URL, expectedSHA256: String? = nil, onProgress: ((Double) -> Void)?) async throws {
         let url = asset.browser_download_url
         let destPath = targetPath.path
         let expectedSize = UInt64(asset.size)
@@ -1832,6 +1848,17 @@ actor CommitmentTreeUpdater {
         }
 
         print("✅ Downloaded file: \(actualSize) bytes -> \(targetPath.lastPathComponent)")
+
+        // VUL-STOR-007: Verify SHA-256 checksum if provided
+        if let expectedHash = expectedSHA256, !expectedHash.isEmpty {
+            print("🔐 VUL-STOR-007: Verifying SHA-256 checksum...")
+            guard verifySHA256(file: URL(fileURLWithPath: destPath), expected: expectedHash) else {
+                print("❌ VUL-STOR-007: SHA-256 mismatch! Removing corrupted file.")
+                try? FileManager.default.removeItem(atPath: destPath)
+                throw BoostFileError.checksumMismatch
+            }
+            print("✅ VUL-STOR-007: SHA-256 verification passed")
+        }
 
         // Decompress if .zst using Rust FFI
         if destPath.hasSuffix(".zst") || asset.name.hasSuffix(".zst") {
@@ -2127,7 +2154,7 @@ enum BoostFileError: LocalizedError {
         case .networkError(let details):
             return "Network error: \(details)"
         case .checksumMismatch:
-            return "Downloaded file size does not match expected value"
+            return "File integrity check failed (SHA-256 mismatch)"
         case .fileNotFound:
             return "Boost file not found in cache"
         case .noManifest:

@@ -777,11 +777,12 @@ public final class Peer {
         defer { stateLock.unlock() }
 
         // FIX #1069 v2: If already in target state, return true without warning (idempotent)
+        // FIX #1451: For .running, must compare taskIDs — different taskID is NOT the same state
         let isAlreadyInTargetState: Bool = {
             switch (listenerState, newState) {
             case (.stopped, .stopped): return true
             case (.starting, .starting): return true
-            case (.running, .running): return true  // Different taskIDs would fail equality, but state is same
+            case (.running(let currentID), .running(let newID)): return currentID == newID
             case (.stopping, .stopping): return true
             default: return false
             }
@@ -799,7 +800,10 @@ public final class Peer {
                 switch (listenerState, exp) {
                 case (.stopped, .stopped): return true
                 case (.starting, .starting): return true
-                case (.running, .running): return true
+                // FIX #1451: Compare taskIDs! Without this, a stale listener (old taskID)
+                // exiting after 300s timeout overwrites the state of the CURRENT listener
+                // (new taskID) → sets state to .stopped → cascading listener death → peers drop to 1.
+                case (.running(let currentID), .running(let expectedID)): return currentID == expectedID
                 case (.stopping, .stopping): return true
                 default: return false
                 }
@@ -874,7 +878,10 @@ public final class Peer {
 
         if dispatcherActive {
             // FIX #887: Use dispatcher pattern - block listener will deliver response
-            print("📨 FIX #887: [\(host)] Sending '\(command)', waiting for '\(expectedResponse)' via dispatcher")
+            // FIX #1440: Suppress repetitive getheaders/getdata logs (fire 100+ times during sync)
+            if command != "getheaders" && command != "getdata" {
+                print("📨 FIX #887: [\(host)] Sending '\(command)', waiting for '\(expectedResponse)' via dispatcher")
+            }
 
             // Send the request
             try await sendMessage(command: command, payload: payload)
@@ -2253,7 +2260,7 @@ public final class Peer {
                     // 120s header receive timed out (peer sent nothing for 120s = dead peer).
                     // The connection was killed by receive(count:)'s GCD timeout.
                     // Exit the listener — health check will replace the peer.
-                    print("📡 FIX #1184b: [\(self.host)] Block listener timeout (120s no data) — peer is dead, exiting")
+                    print("📡 FIX #1184b: [\(self.host)] Block listener timeout (300s no data) — peer is dead, exiting")
                     break
                 } catch is CancellationError {
                     // FIX #120: Listener was stopped - exit cleanly without error message
@@ -2693,13 +2700,16 @@ public final class Peer {
         let length = header.loadUInt32(at: 16)
 
         // FIX #1365 / VUL-NET-004: Per-message payload size limits
+        // FIX #1446: Zclassic headers are ~544 bytes each (140-byte header + 403-byte Equihash(192,7)
+        // solution + 1-byte txcount), NOT 81 bytes like Bitcoin. Max 2000 headers/response = ~1,088,000.
         let maxSizeBL: UInt32 = {
             switch command {
             case "version", "verack": return 300
             case "ping", "pong": return 8
             case "addr": return 1_000 * 30 + 4
             case "inv", "getdata", "notfound": return 50_000 * 36 + 4
-            case "headers", "getheaders": return 162_000
+            case "headers": return 1_200_000   // FIX #1446: ~2200 Zclassic headers (544 bytes each)
+            case "getheaders": return 14_000    // FIX #1446: request with block locators (~10 hashes)
             case "tx": return 100_000
             case "block": return 4_000_000
             case "reject": return 1_000
@@ -2747,7 +2757,10 @@ public final class Peer {
         // This is the centralized message dispatcher pattern - block listener handles ALL responses
         let dispatched = await messageDispatcher.dispatch(command: command, payload: payload)
         if dispatched {
-            print("📨 FIX #883: [\(host)] Dispatched '\(command)' to waiting handler")
+            // FIX #1440: Suppress repetitive dispatch logs for headers (fires 30+ times during sync)
+            if command != "headers" {
+                print("📨 FIX #883: [\(host)] Dispatched '\(command)' to waiting handler")
+            }
             return  // Message was delivered to waiting operation
         }
 
@@ -3735,13 +3748,16 @@ public final class Peer {
         let length = header.loadUInt32(at: 16)
 
         // FIX #1365 / VUL-NET-004: Per-message payload size limits
+        // FIX #1446: Zclassic headers are ~544 bytes each (140-byte header + 403-byte Equihash(192,7)
+        // solution + 1-byte txcount), NOT 81 bytes like Bitcoin. Max 2000 headers/response = ~1,088,000.
         let maxSizeRM: UInt32 = {
             switch command {
             case "version", "verack": return 300
             case "ping", "pong": return 8
             case "addr": return 1_000 * 30 + 4
             case "inv", "getdata", "notfound": return 50_000 * 36 + 4
-            case "headers", "getheaders": return 162_000
+            case "headers": return 1_200_000   // FIX #1446: ~2200 Zclassic headers (544 bytes each)
+            case "getheaders": return 14_000    // FIX #1446: request with block locators (~10 hashes)
             case "tx": return 100_000
             case "block": return 4_000_000
             case "reject": return 1_000

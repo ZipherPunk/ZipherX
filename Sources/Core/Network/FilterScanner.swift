@@ -234,7 +234,9 @@ final class FilterScanner {
     private func reportPhase15Progress(_ localProgress: Double, current: Int, total: Int) {
         let overall = mapProgress(localProgress, in: phase15ProgressRange)
         onProgress?(overall, UInt64(current), UInt64(total))
-        onStatusUpdate?("phase1.5", "Computing Merkle witnesses (\(current)/\(total))...")
+        // FIX #1440: Show percentage instead of count for witness progress
+        let witnessPct = total > 0 ? Int(Double(current) / Double(total) * 100) : 0
+        onStatusUpdate?("phase1.5", "Computing Merkle witnesses (\(witnessPct)%)...")
     }
 
     /// Report progress for PHASE 1.6 (spend detection)
@@ -1520,9 +1522,29 @@ final class FilterScanner {
                 )
 
                 // FIX #464: Report header sync progress
+                // FIX #1440: Also update status text with live progress for UI display
+                // FIX #1444: Use remaining-based progress instead of absolute heights.
+                // FIX #1446b: Track PEAK remaining (not first), because header sync locator can
+                // start well below the expected start height (e.g., checkpoint at 2,988,797 when
+                // expected start is 3,011,252). First callback shows 5K remaining but second
+                // jumps to 28K as actual received headers are much lower. Using peak remaining
+                // as denominator ensures progress always goes 0% → 100%.
+                var peakRemaining: UInt64 = 0
                 headerSyncManager.onProgress = { [weak self] progress in
+                    let remaining = progress.totalHeight > progress.currentHeight ? progress.totalHeight - progress.currentHeight : 0
+                    if remaining > peakRemaining {
+                        peakRemaining = remaining
+                    }
+                    let pct: Int
+                    if peakRemaining > 0 {
+                        let done = peakRemaining > remaining ? peakRemaining - remaining : 0
+                        pct = min(Int(Double(done) / Double(peakRemaining) * 100), 100)
+                    } else {
+                        pct = 100
+                    }
                     Task { @MainActor in
                         self?.onProgress?(Double(progress.currentHeight) / Double(max(progress.totalHeight, 1)), progress.currentHeight, progress.totalHeight)
+                        self?.onStatusUpdate?("headers", "Syncing headers: \(pct)% (\(remaining) remaining)")
                     }
                 }
 
@@ -2266,10 +2288,8 @@ final class FilterScanner {
         // This happens when previous scans missed outputs due to P2P issues
         // Without this fix, tree and delta get out of sync → tree root mismatch at send time
         if !deltaOutputsFoundInCoveredRange.isEmpty {
-            print("⚠️ FIX #874: Found \(deltaOutputsFoundInCoveredRange.count) outputs that delta MISSED!")
-            print("⚠️ FIX #874: Adding missed outputs to delta bundle to keep tree/delta in sync...")
-
             if let treeRoot = ZipherXFFI.treeRoot() {
+                let countBefore = DeltaCMUManager.shared.getManifest()?.outputCount ?? 0
                 let lastScanned = (try? database.getLastScannedHeight()) ?? targetHeight
                 DeltaCMUManager.shared.appendOutputs(
                     deltaOutputsFoundInCoveredRange,
@@ -2277,7 +2297,14 @@ final class FilterScanner {
                     toHeight: lastScanned,
                     treeRoot: treeRoot
                 )
-                print("✅ FIX #874: Updated delta bundle with \(deltaOutputsFoundInCoveredRange.count) missed outputs")
+                let countAfter = DeltaCMUManager.shared.getManifest()?.outputCount ?? 0
+                let newOutputs = countAfter - countBefore
+                // FIX #1452: Only warn when outputs were genuinely missed (not all duplicates)
+                if newOutputs > 0 {
+                    print("⚠️ FIX #874: Found \(newOutputs) outputs that delta MISSED — added to delta bundle")
+                } else if verbose {
+                    print("✅ FIX #1452: \(deltaOutputsFoundInCoveredRange.count) outputs already in delta (all duplicates, no action needed)")
+                }
             }
             deltaOutputsFoundInCoveredRange.removeAll()
         }

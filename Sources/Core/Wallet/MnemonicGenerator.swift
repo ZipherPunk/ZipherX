@@ -44,6 +44,17 @@ final class MnemonicGenerator {
             throw MnemonicError.randomGenerationFailed
         }
 
+        // VUL-CRYPTO-009: Entropy health check — reject degenerate PRNG output
+        let onesCount = entropy.reduce(0) { $0 + $1.nonzeroBitCount }
+        let totalBits = entropyBytes * 8
+        guard !entropy.allSatisfy({ $0 == 0 }),          // all zeros
+              !entropy.allSatisfy({ $0 == 0xFF }),        // all ones
+              onesCount >= totalBits / 4,                  // >= 25% ones
+              onesCount <= (totalBits * 3) / 4             // <= 75% ones
+        else {
+            throw MnemonicError.randomGenerationFailed
+        }
+
         return try entropyToMnemonic(entropy)
     }
 

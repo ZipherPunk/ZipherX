@@ -122,9 +122,10 @@ final class ChatManager: ObservableObject {
     @Published private(set) var ourOnionAddress: String?
 
     /// Our nickname
+    /// VUL-STOR-003: Now stored in encrypted SQLCipher database instead of plaintext UserDefaults
     @Published var ourNickname: String {
         didSet {
-            UserDefaults.standard.set(ourNickname, forKey: "chatNickname")
+            WalletDatabase.shared.saveChatSetting(key: "chatNickname", value: ourNickname)
         }
     }
 
@@ -132,9 +133,14 @@ final class ChatManager: ObservableObject {
     @Published var profileImage: Data? = nil
 
     /// FIX #1436: Whether to share profile image with contacts
+    /// VUL-STOR-003: Now stored in encrypted SQLCipher database instead of plaintext UserDefaults
     var isProfileImageShared: Bool {
-        get { UserDefaults.standard.bool(forKey: "chatShareProfileImage") }
-        set { UserDefaults.standard.set(newValue, forKey: "chatShareProfileImage") }
+        get {
+            WalletDatabase.shared.getChatSetting(key: "chatShareProfileImage") == "true"
+        }
+        set {
+            WalletDatabase.shared.saveChatSetting(key: "chatShareProfileImage", value: newValue ? "true" : "false")
+        }
     }
 
     // MARK: - Private Properties
@@ -226,7 +232,27 @@ final class ChatManager: ObservableObject {
     // MARK: - Initialization
 
     private init() {
-        self.ourNickname = UserDefaults.standard.string(forKey: "chatNickname") ?? ""
+        // VUL-STOR-003: Migrate from UserDefaults to SQLCipher if needed
+        if let legacyNickname = UserDefaults.standard.string(forKey: "chatNickname"),
+           !legacyNickname.isEmpty,
+           WalletDatabase.shared.getChatSetting(key: "chatNickname") == nil {
+            WalletDatabase.shared.saveChatSetting(key: "chatNickname", value: legacyNickname)
+            UserDefaults.standard.removeObject(forKey: "chatNickname")
+            print("💬 VUL-STOR-003: Migrated chatNickname from UserDefaults to SQLCipher")
+        }
+
+        // VUL-STOR-003: Migrate profile sharing flag
+        if UserDefaults.standard.object(forKey: "chatShareProfileImage") != nil {
+            let legacyValue = UserDefaults.standard.bool(forKey: "chatShareProfileImage")
+            if WalletDatabase.shared.getChatSetting(key: "chatShareProfileImage") == nil {
+                WalletDatabase.shared.saveChatSetting(key: "chatShareProfileImage", value: legacyValue ? "true" : "false")
+                UserDefaults.standard.removeObject(forKey: "chatShareProfileImage")
+                print("💬 VUL-STOR-003: Migrated chatShareProfileImage from UserDefaults to SQLCipher")
+            }
+        }
+
+        // Load nickname from SQLCipher
+        self.ourNickname = WalletDatabase.shared.getChatSetting(key: "chatNickname") ?? ""
         self.database = ChatDatabase()
 
         // Load contacts and conversations from database
@@ -1687,30 +1713,28 @@ final class ChatManager: ObservableObject {
         print("💬 FIX #249: Message queued for \(onionAddress.prefix(16))... (queue size: \(messageQueue[onionAddress]?.count ?? 0))")
     }
 
-    /// FIX #249 v2: Load message queue from UserDefaults (encrypted + expiry filter)
+    /// FIX #249 v2 + VUL-STOR-003: Load message queue from SQLCipher (encrypted + expiry filter)
+    /// Previously used UserDefaults with ChaChaPoly - now uses SQLCipher with domain-separated encryption
     private func loadMessageQueue() async {
-        // Ensure we have encryption key
-        guard let key = getOrCreateQueueEncryptionKey() else {
-            print("💬 FIX #249: Failed to get queue encryption key")
-            return
+        // VUL-STOR-003: Migrate from legacy UserDefaults storage if needed
+        if let legacyEncryptedData = UserDefaults.standard.data(forKey: messageQueueKey),
+           WalletDatabase.shared.getChatMessageQueue() == nil,
+           let key = getOrCreateQueueEncryptionKey(),
+           let decryptedData = decryptQueueData(legacyEncryptedData, using: key) {
+            // Migrate to SQLCipher
+            WalletDatabase.shared.saveChatMessageQueue(data: decryptedData)
+            UserDefaults.standard.removeObject(forKey: messageQueueKey)
+            print("💬 VUL-STOR-003: Migrated message queue from UserDefaults to SQLCipher")
         }
 
-        // Load encrypted data
-        guard let encryptedData = UserDefaults.standard.data(forKey: messageQueueKey) else {
+        // Load from SQLCipher
+        guard let queueData = WalletDatabase.shared.getChatMessageQueue() else {
             print("💬 FIX #249: No message queue found")
             return
         }
 
-        // Decrypt
-        guard let decryptedData = decryptQueueData(encryptedData, using: key) else {
-            print("💬 FIX #249: Failed to decrypt message queue - may be corrupted or old format")
-            // Clear corrupted queue
-            UserDefaults.standard.removeObject(forKey: messageQueueKey)
-            return
-        }
-
         // Decode
-        guard let queue = try? JSONDecoder().decode([String: [ChatMessage]].self, from: decryptedData) else {
+        guard let queue = try? JSONDecoder().decode([String: [ChatMessage]].self, from: queueData) else {
             print("💬 FIX #249: Failed to decode message queue")
             return
         }
@@ -1745,27 +1769,17 @@ final class ChatManager: ObservableObject {
         print("💬 FIX #249: Loaded message queue (\(totalQueued) messages for \(filteredQueue.keys.count) contacts)")
     }
 
-    /// FIX #249 v2: Save message queue to UserDefaults (encrypted with ChaChaPoly)
+    /// FIX #249 v2 + VUL-STOR-003: Save message queue to SQLCipher database
+    /// Previously used UserDefaults with ChaChaPoly - now uses SQLCipher with domain-separated encryption
     private func saveMessageQueue() {
-        // Ensure we have encryption key
-        guard let key = getOrCreateQueueEncryptionKey() else {
-            print("💬 FIX #249: Failed to get queue encryption key - cannot save queue")
-            return
-        }
-
         // Encode to JSON
         guard let jsonData = try? JSONEncoder().encode(messageQueue) else {
             print("💬 FIX #249: Failed to encode message queue")
             return
         }
 
-        // Encrypt with ChaChaPoly
-        guard let encryptedData = encryptQueueData(jsonData, using: key) else {
-            print("💬 FIX #249: Failed to encrypt message queue")
-            return
-        }
-
-        UserDefaults.standard.set(encryptedData, forKey: messageQueueKey)
+        // Save to SQLCipher (automatically encrypted with .chat domain key)
+        WalletDatabase.shared.saveChatMessageQueue(data: jsonData)
     }
 
     // MARK: - FIX #249 v2: Queue Encryption Helpers

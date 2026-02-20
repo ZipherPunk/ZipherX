@@ -4447,11 +4447,13 @@ public final class NetworkManager: ObservableObject {
 
         print("🔮 Scanning \(mempoolTxs.count) mempool transactions...")
 
-        // Get spending key for trial decryption
-        guard let spendingKey = try? SecureKeyStorage().retrieveSpendingKey() else {
+        // VUL-U-002: Get spending key for trial decryption with secure zeroing
+        guard let secureKey = try? SecureKeyStorage().retrieveSpendingKeySecure() else {
             print("🔮 scanMempoolForIncoming: could not retrieve spending key, skipping")
             return
         }
+        defer { secureKey.zero() }
+        let spendingKey = secureKey.data
         print("🔮 scanMempoolForIncoming: got spending key, checking txs...")
 
         var incomingAmount: UInt64 = 0
@@ -4702,11 +4704,13 @@ public final class NetworkManager: ObservableObject {
             return
         }
 
-        // Get spending key for trial decryption
-        guard let spendingKey = try? SecureKeyStorage().retrieveSpendingKey() else {
+        // VUL-U-002: Get spending key for trial decryption with secure zeroing
+        guard let secureKey = try? SecureKeyStorage().retrieveSpendingKeySecure() else {
             print("🔮 FIX #1333: Could not retrieve spending key — skipping")
             return
         }
+        defer { secureKey.zero() }
+        let spendingKey = secureKey.data
 
         // txid from doubleSHA256().reversed() is DISPLAY format (big-endian, human-readable)
         let txidDisplayHex = txid.map { String(format: "%02x", $0) }.joined()

@@ -8,7 +8,7 @@ import Combine
 /// Face ID triggers ONLY at:
 /// 1. App launch (if enabled)
 /// 2. Send transaction confirmation
-/// 3. After inactivity timeout (configurable, default 30 seconds)
+/// 3. After inactivity timeout (configurable, default 5 minutes)
 final class BiometricAuthManager: ObservableObject {
     static let shared = BiometricAuthManager()
 
@@ -17,8 +17,8 @@ final class BiometricAuthManager: ObservableObject {
     /// UserDefaults key for inactivity timeout
     private static let timeoutKey = "biometricInactivityTimeout"
 
-    /// Default timeout: 30 seconds
-    private static let defaultTimeout: TimeInterval = 30
+    /// Default timeout: 5 minutes
+    private static let defaultTimeout: TimeInterval = 300
 
     /// Time interval before requiring re-authentication (user configurable)
     /// FIX #1438: 0 = "Never" (valid selection), not "unset". Use object check for default.
@@ -395,6 +395,13 @@ final class BiometricAuthManager: ObservableObject {
     /// ALWAYS requires auth (biometric or passcode) — never bypassed even when biometric is disabled.
     /// Uses same security level as send authentication (VUL-005).
     func authenticateForSensitiveOperation(reason: String, completion: @escaping (Bool, Error?) -> Void) {
+        // FIX #1433: Skip re-authentication if user authenticated within grace period (60s).
+        // Prevents frustrating double-auth when switching modes right after app unlock.
+        if let lastAuth = lastAuthTime, Date().timeIntervalSince(lastAuth) < 60 {
+            completion(true, nil)
+            return
+        }
+
         let biometricEnabled = UserDefaults.standard.bool(forKey: "useBiometricAuth")
         if biometricEnabled {
             authenticateFresh(reason: reason, completion: completion)

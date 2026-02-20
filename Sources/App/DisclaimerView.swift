@@ -10,6 +10,10 @@ struct DisclaimerView: View {
     // Timer to enable accept button after reading time
     @State private var readingTimeElapsed: Bool = false
 
+    // FIX #1447: Track scroll position via global coordinates instead of onAppear
+    // (onAppear fires immediately on macOS because ScrollView eagerly renders all content)
+    @State private var scrollViewBottomEdge: CGFloat = 0
+
     var body: some View {
         ZStack {
             // Background
@@ -20,23 +24,36 @@ struct DisclaimerView: View {
                 headerView
 
                 // Scrollable content
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 20) {
-                            disclaimerContent
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 20) {
+                        disclaimerContent
 
-                            // Bottom anchor for scroll detection
+                        // FIX #1447: Bottom anchor reports position via preference key
+                        // instead of onAppear (which fires immediately on macOS)
+                        GeometryReader { geo in
                             Color.clear
-                                .frame(height: 1)
-                                .id("bottom")
-                                .onAppear {
-                                    withAnimation(.easeIn(duration: 0.3)) {
-                                        hasScrolledToBottom = true
-                                    }
-                                }
+                                .preference(key: BottomAnchorYKey.self,
+                                           value: geo.frame(in: .global).maxY)
                         }
-                        .padding(.horizontal, 24)
-                        .padding(.vertical, 20)
+                        .frame(height: 1)
+                    }
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 20)
+                }
+                .overlay(
+                    // FIX #1447: Track the scroll view's visible bottom edge
+                    GeometryReader { geo in
+                        Color.clear.onAppear {
+                            scrollViewBottomEdge = geo.frame(in: .global).maxY
+                        }
+                    }
+                )
+                .onPreferenceChange(BottomAnchorYKey.self) { bottomY in
+                    // FIX #1447: Bottom anchor is visible when its global Y <= scroll view bottom edge
+                    if scrollViewBottomEdge > 0 && bottomY <= scrollViewBottomEdge + 30 && !hasScrolledToBottom {
+                        withAnimation(.easeIn(duration: 0.3)) {
+                            hasScrolledToBottom = true
+                        }
                     }
                 }
 
@@ -51,6 +68,14 @@ struct DisclaimerView: View {
                     readingTimeElapsed = true
                 }
             }
+        }
+    }
+
+    /// FIX #1447: Preference key for tracking bottom anchor's global Y position during scroll
+    private struct BottomAnchorYKey: PreferenceKey {
+        static var defaultValue: CGFloat = .greatestFiniteMagnitude
+        static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+            value = nextValue()
         }
     }
 

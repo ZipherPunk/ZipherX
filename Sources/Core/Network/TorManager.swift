@@ -128,6 +128,16 @@ public final class TorManager: ObservableObject {
     @Published public var strictPrivacyMode: Bool {
         didSet {
             UserDefaults.standard.set(strictPrivacyMode, forKey: "torStrictPrivacyMode")
+            // VUL-NET-005: Strict privacy = Tor + Hidden Service (onion)
+            // Enabling strict mode MUST also enable Hidden Service for chat/P2P privacy
+            if strictPrivacyMode {
+                Task { @MainActor in
+                    if !HiddenServiceManager.shared.isEnabled {
+                        HiddenServiceManager.shared.isEnabled = true
+                        print("🧅 VUL-NET-005: Strict privacy enabled — Hidden Service auto-enabled")
+                    }
+                }
+            }
         }
     }
 
@@ -170,6 +180,16 @@ public final class TorManager: ObservableObject {
             self.strictPrivacyMode = UserDefaults.standard.bool(forKey: "torStrictPrivacyMode")
         } else {
             self.strictPrivacyMode = true
+        }
+
+        // VUL-NET-005: Strict privacy mode = Tor + Hidden Service MUST both be enabled.
+        // On fresh install (no UserDefaults), ensure Hidden Service defaults to enabled.
+        if self.strictPrivacyMode {
+            let hsExplicitlySet = UserDefaults.standard.object(forKey: "hiddenServiceEnabled") != nil
+            if !hsExplicitlySet {
+                UserDefaults.standard.set(true, forKey: "hiddenServiceEnabled")
+                print("🧅 VUL-NET-005: Strict privacy mode — enabling Hidden Service by default")
+            }
         }
 
         // Check if Arti is available
