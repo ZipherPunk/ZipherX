@@ -33,6 +33,8 @@ struct FullNodeSettingsView: View {
     @State private var selectedExportAddress: WalletAddress?
     @State private var exportedPrivateKey: String = ""
     @State private var isExporting = false
+    @State private var showingExportedKeySheet = false
+    @State private var exportCopiedFeedback = false
     @State private var importKeyText: String = ""
     @State private var importWithRescan: Bool = true
     @State private var isImporting = false
@@ -842,42 +844,103 @@ struct FullNodeSettingsView: View {
                         .buttonStyle(.plain)
                         .disabled(isExporting)
                     }
-
-                    // Exported key display
-                    if !exportedPrivateKey.isEmpty {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Private Key:")
-                                .font(theme.captionFont)
-                                .foregroundColor(theme.textSecondary)
-
-                            let displayKey = String(exportedPrivateKey.prefix(8)) + "..." + String(exportedPrivateKey.suffix(8))
-                            Text(displayKey)
-                                .font(theme.monoFont)
-                                .foregroundColor(theme.textPrimary)
-                                .padding(10)
-                                .background(theme.surfaceColor)
-                                .cornerRadius(6)
-
-                            Button(action: {
-                                ClipboardManager.copyWithAutoExpiry(exportedPrivateKey, seconds: 10)
-                            }) {
-                                HStack {
-                                    Image(systemName: "doc.on.doc")
-                                    Text("Copy (auto-clears in 10s)")
-                                }
-                                .font(theme.captionFont)
-                                .foregroundColor(theme.primaryColor)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                        .padding()
-                        .background(theme.surfaceColor.opacity(0.5))
-                        .cornerRadius(8)
-                    }
                 }
                 .padding()
             }
         }
+        .background(theme.backgroundColor)
+        .sheet(isPresented: $showingExportedKeySheet) {
+            exportedKeyDisplaySheet
+                .onDisappear {
+                    exportedPrivateKey = ""
+                    exportCopiedFeedback = false
+                }
+        }
+    }
+
+    // MARK: - Exported Key Display Sheet
+
+    private var exportedKeyDisplaySheet: some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack {
+                Image(systemName: "key.fill")
+                    .foregroundColor(dangerRed)
+                Text("Private Key")
+                    .font(theme.titleFont)
+                    .foregroundColor(theme.textPrimary)
+                Spacer()
+                Button("Close") {
+                    showingExportedKeySheet = false
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(theme.primaryColor)
+            }
+            .padding()
+            .background(theme.surfaceColor)
+
+            Divider()
+
+            VStack(spacing: 20) {
+                Spacer()
+
+                // Warning
+                HStack {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(dangerRed)
+                    Text("Never share this key with anyone!")
+                        .font(theme.bodyFont)
+                        .foregroundColor(dangerRed)
+                }
+
+                // Key display — truncated for safety
+                let displayKey = String(exportedPrivateKey.prefix(8)) + "..." + String(exportedPrivateKey.suffix(8))
+                Text(displayKey)
+                    .font(.system(size: 18, weight: .medium, design: .monospaced))
+                    .foregroundColor(theme.textPrimary)
+                    .padding(16)
+                    .frame(maxWidth: .infinity)
+                    .background(theme.surfaceColor)
+                    .cornerRadius(8)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(theme.borderColor, lineWidth: 1)
+                    )
+
+                // Copy button with feedback
+                Button(action: {
+                    ClipboardManager.copyWithAutoExpiry(exportedPrivateKey, seconds: 10)
+                    exportCopiedFeedback = true
+                    // Auto-hide after 2 seconds
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                        exportCopiedFeedback = false
+                    }
+                }) {
+                    HStack(spacing: 8) {
+                        Image(systemName: exportCopiedFeedback ? "checkmark" : "doc.on.doc")
+                        Text(exportCopiedFeedback ? "Copied!" : "Copy to Clipboard")
+                    }
+                    .font(theme.bodyFont)
+                    .fontWeight(.medium)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 12)
+                    .background(exportCopiedFeedback ? Color(red: 0.0, green: 0.5, blue: 0.9) : theme.primaryColor)
+                    .cornerRadius(8)
+                }
+                .buttonStyle(.plain)
+
+                if exportCopiedFeedback {
+                    Text("Auto-clears from clipboard in 10 seconds")
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
+                }
+
+                Spacer()
+            }
+            .padding(24)
+        }
+        .frame(minWidth: 400, idealWidth: 450, minHeight: 300, idealHeight: 350)
         .background(theme.backgroundColor)
     }
 
@@ -920,9 +983,18 @@ struct FullNodeSettingsView: View {
                 }
 
                 if let success = importExportSuccess {
-                    Text(success)
-                        .font(theme.captionFont)
-                        .foregroundColor(.green)
+                    HStack(spacing: 8) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 18))
+                        Text(success)
+                            .font(theme.bodyFont)
+                            .fontWeight(.semibold)
+                    }
+                    .foregroundColor(.white)
+                    .padding(12)
+                    .frame(maxWidth: .infinity)
+                    .background(Color(red: 0.0, green: 0.5, blue: 0.9))
+                    .cornerRadius(8)
                 }
 
                 TextField("Paste private key here...", text: $importKeyText)
@@ -996,6 +1068,8 @@ struct FullNodeSettingsView: View {
             await MainActor.run {
                 exportedPrivateKey = pk
                 isExporting = false
+                exportCopiedFeedback = false
+                showingExportedKeySheet = true
             }
         } catch {
             await MainActor.run {
