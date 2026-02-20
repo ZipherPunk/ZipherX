@@ -53,7 +53,7 @@ public func print(_ items: Any..., separator: String = " ", terminator: String =
 /// On app start, previous log is backed up with timestamp
 ///
 /// Log locations:
-/// - macOS DEBUG: /Users/chris/ZipherX/zmac.log (project dir for agent access)
+/// - macOS DEBUG: ~/ZipherX/zmac.log (project dir for agent access)
 /// - macOS RELEASE: ~/Library/Application Support/ZipherX/Logs/zmac.log
 /// - iOS: Documents/Logs/z.log
 final class DebugLogger {
@@ -83,8 +83,7 @@ final class DebugLogger {
     var logsDirectory: URL {
         #if os(macOS) && DEBUG
         // Use project directory for easy agent access during development
-        // This path is known to Claude Code agents via CLAUDE.md
-        let projectLogDir = URL(fileURLWithPath: "/Users/chris/ZipherX")
+        let projectLogDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("ZipherX")
         if FileManager.default.isWritableFile(atPath: projectLogDir.path) {
             return projectLogDir
         }
@@ -118,7 +117,7 @@ final class DebugLogger {
         // FIX #1431: Use logsDirectory (which has DEBUG override) instead of AppDirectories.logs
         logFileURL = AppDirectories.logs.appendingPathComponent(currentLogName)
         #if os(macOS) && DEBUG
-        let projectLogDir = URL(fileURLWithPath: "/Users/chris/ZipherX")
+        let projectLogDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("ZipherX")
         if FileManager.default.isWritableFile(atPath: projectLogDir.path) {
             logFileURL = projectLogDir.appendingPathComponent(currentLogName)
         }

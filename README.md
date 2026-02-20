@@ -101,7 +101,7 @@ Parameters are stored in `~/Library/Application Support/ZipherX/SaplingParams/`.
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/VictorLux/ZipherX.git
+git clone https://github.com/ZipherPunk/ZipherX.git
 cd ZipherX
 
 # 2. Build the Rust FFI library
@@ -121,7 +121,7 @@ open ZipherX.xcodeproj
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/VictorLux/ZipherX.git
+git clone https://github.com/ZipherPunk/ZipherX.git
 cd ZipherX
 
 # 2. Build the Rust FFI library for iOS

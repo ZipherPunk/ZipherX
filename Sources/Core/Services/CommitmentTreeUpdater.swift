@@ -26,7 +26,7 @@ actor CommitmentTreeUpdater {
     private static let USE_LOCAL_BOOST_FILE_FOR_TESTING = false
 
     /// GitHub API URL for latest release (dynamically fetches newest boost file)
-    private static let latestReleaseURL = "https://api.github.com/repos/VictorLux/ZipherX_Boost/releases/latest"
+    private static let latestReleaseURL = "https://api.github.com/repos/ZipherPunk/ZipherX_Boost/releases/latest"
 
     /// Boost file name to look for in release assets
     private static let boostFileName = "zipherx_boost_v1.bin"

@@ -844,7 +844,7 @@ private class CertificatePinningDelegate: NSObject, URLSessionDelegate {
     private let remoteCacheDuration: TimeInterval = 3600
 
     /// GitHub URL for certificate pins (plain text, one hash per line)
-    private let remotePinsURL = "https://raw.githubusercontent.com/VictorLux/ZipherX_Boost/main/zelcore_pins.txt"
+    private let remotePinsURL = "https://raw.githubusercontent.com/ZipherPunk/ZipherX_Boost/main/zelcore_pins.txt"
 
     /// Track if we've shown a warning (to avoid spamming)
     private var hasShownWarning = false

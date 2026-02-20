@@ -5,12 +5,12 @@ import CommonCrypto
 #if os(macOS)
 
 /// Manages bootstrap download, extraction, and daemon setup for full node mode
-/// Supports split-file bootstrap format from VictorLux/zclassic-bootstrap
+/// Supports split-file bootstrap format from ZipherPunk/zclassic-bootstrap
 public class BootstrapManager: ObservableObject {
     public static let shared = BootstrapManager()
 
     // GitHub repository for bootstrap releases
-    private let githubRepo = "VictorLux/zclassic-bootstrap"
+    private let githubRepo = "ZipherPunk/zclassic-bootstrap"
     private let githubAPIBase = "https://api.github.com/repos"
 
     // Published state

@@ -671,7 +671,7 @@ Full Node mode uses the local zclassicd daemon and its wallet.dat for all wallet
 
 🚀 BOOTSTRAP:
 ZipherX downloads the latest blockchain bootstrap for fast sync:
-https://github.com/VictorLux/zclassic-bootstrap
+https://github.com/ZipherPunk/zclassic-bootstrap
 
 "By running a full node, you become part of the network's backbone. You verify every transaction independently, trusting no one. This is the cypherpunk way."
 """)

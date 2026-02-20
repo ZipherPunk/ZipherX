@@ -2341,7 +2341,7 @@ public final class NetworkManager: ObservableObject {
     // MARK: - GitHub Peer Download
 
     /// GitHub URL for reliable peers list
-    private static let GITHUB_PEERS_URL = "https://raw.githubusercontent.com/VictorLux/ZipherX_Boost/main/reliable_peers.json"
+    private static let GITHUB_PEERS_URL = "https://raw.githubusercontent.com/ZipherPunk/ZipherX_Boost/main/reliable_peers.json"
 
     /// Download and load reliable peers from GitHub
     /// Call this at startup to get the latest peer list

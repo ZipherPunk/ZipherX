@@ -600,7 +600,7 @@ struct NodeManagementView: View {
                 HStack(spacing: 4) {
                     Image(systemName: "link")
                         .font(.system(size: 10))
-                    Text("Source: github.com/VictorLux/zclassic-bootstrap")
+                    Text("Source: github.com/ZipherPunk/zclassic-bootstrap")
                         .font(.system(size: 10, design: .monospaced))
                 }
                 .foregroundColor(theme.textSecondary)

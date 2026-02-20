@@ -610,7 +610,7 @@ public class FullNodeManager: ObservableObject {
     public static let officialSourceURL = "https://github.com/ZclassicCommunity/zclassic"
 
     /// Bootstrap download URL for fast sync
-    public static let bootstrapURL = "https://github.com/VictorLux/zclassic-bootstrap"
+    public static let bootstrapURL = "https://github.com/ZipherPunk/zclassic-bootstrap"
 
     /// Path to bundled daemon in app bundle
     private static var bundledDaemonPath: URL? {

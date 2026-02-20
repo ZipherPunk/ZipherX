@@ -25,7 +25,7 @@ class AppUpdateChecker: ObservableObject {
         let url: String
     }
 
-    private let releasesURL = "https://api.github.com/repos/VictorLux/ZipherX/releases/latest"
+    private let releasesURL = "https://api.github.com/repos/ZipherPunk/ZipherX/releases/latest"
 
     private init() {}
 
