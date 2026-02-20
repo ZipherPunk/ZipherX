@@ -36,7 +36,7 @@ final class HeaderStore {
             return
         }
 
-        print("📂 Opening HeaderStore at: \(dbPath)")
+        print("📂 Opening HeaderStore")
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
         guard sqlite3_open_v2(dbPath, &db, flags, nil) == SQLITE_OK else {
             let errorMsg = db != nil ? String(cString: sqlite3_errmsg(db)) : "Unknown error"

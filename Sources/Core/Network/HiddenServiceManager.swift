@@ -173,12 +173,12 @@ public final class HiddenServiceManager: ObservableObject {
         if TorManager.shared.hasPersistentKeypair {
             // Load existing keypair from Keychain into FFI
             if let address = TorManager.shared.loadAndSetPersistentKeypair() {
-                print("🧅 FIX #208: Loaded persistent keypair - .onion will be: \(address.prefix(16))...")
+                print("🧅 FIX #208: Loaded persistent keypair - .onion ready")
             }
         } else {
             // Generate new keypair and save to Keychain
             if let address = TorManager.shared.generateAndSaveKeypair() {
-                print("🧅 FIX #208: Generated new persistent keypair - .onion will be: \(address.prefix(16))...")
+                print("🧅 FIX #208: Generated new persistent keypair - .onion ready")
             }
         }
 

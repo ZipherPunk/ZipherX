@@ -94,13 +94,17 @@ final class DebugLogger {
 
     /// FIX #1376: Debug logging can be disabled by the user from Settings.
     /// When disabled, log file writes are suppressed (console output still works).
-    /// FIX #1431: Default to ENABLED so diagnostic logs appear in zmac.log.
-    /// User can explicitly disable in Settings if desired.
+    /// FIX #1431: Default to ENABLED in DEBUG builds for development.
+    /// FIX #1455: Default to DISABLED in RELEASE builds for privacy (no sensitive data in logs).
+    /// User can explicitly enable/disable in Settings.
     var isEnabled: Bool {
         get {
-            // FIX #1431: Default true when key not explicitly set
             if UserDefaults.standard.object(forKey: "debugLoggingEnabled") == nil {
+                #if DEBUG
                 return true
+                #else
+                return false
+                #endif
             }
             return UserDefaults.standard.bool(forKey: "debugLoggingEnabled")
         }
@@ -228,15 +232,18 @@ final class DebugLogger {
         writeToFile("Platform: iOS")
         writeToFile("Device: \(device.model)")
         writeToFile("iOS Version: \(device.systemVersion)")
-        writeToFile("Device Name: \(device.name)")
         #elseif os(macOS)
         writeToFile("Platform: macOS")
         writeToFile("macOS Version: \(ProcessInfo.processInfo.operatingSystemVersionString)")
+        #if DEBUG
         writeToFile("Host Name: \(ProcessInfo.processInfo.hostName)")
         writeToFile("Process ID: \(ProcessInfo.processInfo.processIdentifier)")
         #endif
+        #endif
 
+        #if DEBUG
         writeToFile("Log File: \(logFileURL.path)")
+        #endif
         writeToFile(separator + "\n")
     }
 

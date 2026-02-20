@@ -3204,7 +3204,7 @@ Both binaries must be installed to /usr/local/bin:
             }
 
             showPeerExportSuccess = true
-            print("📡 Exported \(peerExportCount) reliable peers to \(exportURL.path)")
+            print("📡 Exported \(peerExportCount) reliable peers")
         } catch {
             errorMessage = "Failed to export peers: \(error.localizedDescription)"
             showError = true

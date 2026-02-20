@@ -636,7 +636,7 @@ struct SendView: View {
                 // Store scanned address and dismiss
                 if let code = scannedCode {
                     let address = extractAddressFromQR(code)
-                    print("📷 QR scanned: \(address)")
+                    print("📷 QR scanned: \(address.redactedAddress)")
                     scannedAddress = address
                 }
                 showQRScanner = false

@@ -366,7 +366,7 @@ struct FullNodeWalletView: View {
             RPCSendView(addresses: zAddresses + tAddresses, onSendSuccess: { sentAmountZatoshis in
                 // FIX #286 v17: Refresh wallet data after successful send
                 Task {
-                    print("📊 FIX #286 v17: Transaction sent (\(sentAmountZatoshis) zat) - refreshing wallet data")
+                    print("📊 FIX #286 v17: Transaction sent - refreshing wallet data")
                     // FIX #1399: Immediately show "awaiting block confirmation" banner
                     await MainActor.run {
                         awaitingBlockConfirmation = true
@@ -2308,10 +2308,10 @@ struct FullNodeWalletView: View {
         do {
             if shielded {
                 let address = try await rpcWallet.createZAddress()
-                print("Created z-address: \(address)")
+                print("Created z-address: \(address.redactedAddress)")
             } else {
                 let address = try await rpcWallet.createTAddress()
-                print("Created t-address: \(address)")
+                print("Created t-address: \(address.redactedAddress)")
             }
             await loadWalletData()
         } catch {
@@ -2675,7 +2675,7 @@ struct FullNodeWalletView: View {
                     let total = UInt64((b.total * 100_000_000).rounded())
                     let current = totalBalance
                     if total != current.total || transparent != current.transparent || privateBalance != current.private {
-                        print("📊 FIX #1272: Balance changed \(formatBalance(current.total)) → \(formatBalance(total)) — refreshing all wallet data")
+                        print("📊 FIX #1272: Balance changed — refreshing all wallet data")
                         // FIX #1399: Block confirmed — balance changed, clear awaiting state
                         await MainActor.run {
                             awaitingBlockConfirmation = false

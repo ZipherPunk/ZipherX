@@ -1120,7 +1120,7 @@ struct ContentView: View {
                                     // FIX #1283: Check if balance changed after verification
                                     let postVerifyBalance = try? WalletDatabase.shared.getTotalUnspentBalance(accountId: 1)
                                     if let pre = preVerifyBalance, let post = postVerifyBalance, pre != post {
-                                        print("⚠️ FIX #1283: Balance CHANGED after verification: \(pre) → \(post) zatoshis")
+                                        print("⚠️ FIX #1283: Balance CHANGED after verification")
                                         print("   Phantom-unspent notes detected and corrected")
                                         verificationDetectedSpends = true
                                     }
@@ -1947,7 +1947,7 @@ struct ContentView: View {
                                 }
                                 let postVerifyBalanceFast = try? WalletDatabase.shared.getTotalUnspentBalance(accountId: 1)
                                 if let pre = preVerifyBalanceFast, let post = postVerifyBalanceFast, pre != post {
-                                    print("⚠️ FIX #1283: Balance CHANGED after verification: \(pre) → \(post) zatoshis")
+                                    print("⚠️ FIX #1283: Balance CHANGED after verification")
                                     verificationDetectedSpendsFast = true
                                 }
                                 await MainActor.run {

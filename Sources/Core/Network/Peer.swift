@@ -5779,7 +5779,7 @@ public final class Peer {
 
         // Parse onion address - extract the 56-character base32 part
         guard onionAddress.hasSuffix(".onion") else {
-            print("🧅 Invalid onion address format: \(onionAddress)")
+            print("🧅 Invalid onion address format")
             return
         }
 

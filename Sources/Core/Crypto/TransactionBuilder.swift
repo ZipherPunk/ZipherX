@@ -55,17 +55,13 @@ final class TransactionBuilder {
         let spendPath = params.spendParamsPath
         let outputPath = params.outputParamsPath
 
-        print("📁 Loading Sapling params from Swift:")
-        print("   Spend:  \(spendPath.path)")
-        print("   Output: \(outputPath.path)")
+        print("📁 Loading Sapling params from Swift")
 
         let spendData: Data
         do {
             spendData = try Data(contentsOf: spendPath)
         } catch {
             print("❌ Failed to read spend params file: \(error.localizedDescription)")
-            print("   Path: \(spendPath.path)")
-            print("   Exists: \(FileManager.default.fileExists(atPath: spendPath.path))")
             throw TransactionError.proofGenerationFailed
         }
         guard let outputData = try? Data(contentsOf: outputPath) else {
@@ -405,8 +401,8 @@ final class TransactionBuilder {
         // VUL-CRYPTO-007: Diversifier is privacy-sensitive — only log in debug builds
         #if DEBUG
         print("🔍 FIX #982: Note components being sent to Rust FFI:")
-        print("   Diversifier: \(note.diversifier.map { String(format: "%02x", $0) }.joined())")
-        print("   RCM: \(note.rcm.prefix(8).map { String(format: "%02x", $0) }.joined())...")
+        print("   Diversifier: [redacted]")
+        print("   RCM: [redacted]")
         print("   Value: \(note.value.redactedAmount)")
         #endif
         if let cmu = noteCMU {
@@ -534,7 +530,7 @@ final class TransactionBuilder {
         }
 
         // Return both transaction and nullifier of spent note
-        print("📝 Spent note nullifier: \(note.nullifier.map { String(format: "%02x", $0) }.joined().prefix(16))...")
+        print("📝 Spent note nullifier: \(LogRedaction.redactNullifier(note.nullifier.map { String(format: "%02x", $0) }.joined()))")
         return (rawTx, note.nullifier)
     }
 

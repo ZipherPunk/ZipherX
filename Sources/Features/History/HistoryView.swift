@@ -294,7 +294,7 @@ struct HistoryView: View {
                     let noTimestamp = items.filter { $0.blockTime == nil || $0.blockTime == 0 }.count
                     print("🕐 DEBUG HistoryView.loadTransactions: \(items.count) total — sent=\(sentCount), received=\(receivedCount), selfSend=\(selfSendCount), noTimestamp=\(noTimestamp)")
                     for item in items.prefix(10) {
-                        print("🕐 DEBUG   type=\(item.type.rawValue), height=\(item.height), blockTime=\(item.blockTime ?? 0), value=\(item.value)")
+                        print("🕐 DEBUG   type=\(item.type.rawValue), height=\(item.height), blockTime=\(item.blockTime ?? 0), value=\(UInt64(item.value).redactedAmount)")
                     }
 
                     // NOTE: Deduplication is now handled in SQL query (WalletDatabase.getTransactionHistory)

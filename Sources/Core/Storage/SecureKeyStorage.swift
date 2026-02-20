@@ -503,7 +503,7 @@ final class SecureKeyStorage {
         // The file is already AES-GCM encrypted with a device-bound key
         try encryptedData.write(to: fileURL, options: [.atomic])
 
-        print("✓ macOS: Encrypted key stored at \(fileURL.path)")
+        print("✓ macOS: Encrypted key stored securely")
     }
 
     /// Get the file URL for storing encrypted keys on macOS
@@ -537,7 +537,7 @@ final class SecureKeyStorage {
         let fileURL = try getMacOSKeyFileURL(for: tag)
         if FileManager.default.fileExists(atPath: fileURL.path) {
             try FileManager.default.removeItem(at: fileURL)
-            print("🗑️ macOS: Deleted key file at \(fileURL.path)")
+            print("🗑️ macOS: Deleted key file")
         }
     }
 

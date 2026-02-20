@@ -657,7 +657,7 @@ public class FullNodeManager: ObservableObject {
         }
         try fm.copyItem(at: daemonSource, to: daemonDest)
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: daemonDest.path)
-        print("✅ Installed zclassicd to \(daemonDest.path)")
+        print("✅ Installed zclassicd")
 
         // Copy CLI binary (overwrite if exists)
         let cliDest = Self.cliPath
@@ -666,7 +666,7 @@ public class FullNodeManager: ObservableObject {
         }
         try fm.copyItem(at: cliSource, to: cliDest)
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cliDest.path)
-        print("✅ Installed zclassic-cli to \(cliDest.path)")
+        print("✅ Installed zclassic-cli")
 
         await MainActor.run {
             isNodeInstalled = true

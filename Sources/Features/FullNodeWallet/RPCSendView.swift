@@ -631,7 +631,7 @@ struct RPCSendView: View {
         } catch {
             // FIX #1404: Provide more descriptive error messages for common RPC failures
             let rawError = error.localizedDescription
-            print("⚠️ FIX #1404: Full node send failed — \(rawError) (amount: \(amountValue), from: \(from.address.prefix(16))...)")
+            print("⚠️ FIX #1404: Full node send failed — \(rawError)")
             let userMessage: String
             if rawError.lowercased().contains("invalid amount") {
                 userMessage = "Send failed: The daemon rejected the amount. This usually means the previous transaction's change hasn't confirmed yet (needs 1 confirmation). Wait for the next block and try again."

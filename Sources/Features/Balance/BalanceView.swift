@@ -1034,7 +1034,7 @@ struct BalanceView: View {
                 // Debug: print first item if exists
                 if let first = deduped.first {
                     let txidShort = String(first.txidString.prefix(12))
-                    print("📜 TXHIST: First tx: type=\(first.type), value=\(first.value)zat, height=\(first.height), txid=\(txidShort)")
+                    print("📜 TXHIST: First tx: type=\(first.type), value=\(UInt64(first.value).redactedAmount), height=\(first.height), txid=\(txidShort)")
                 } else {
                     print("📜 TXHIST: No transactions in history!")
                 }

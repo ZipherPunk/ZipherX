@@ -398,7 +398,7 @@ final class WalletDatabase {
             try migrateToEncryptedDatabase()
         }
 
-        print("📂 Opening database at: \(dbPath)")
+        print("📂 Opening database")
         // Use FULLMUTEX for thread safety
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
         guard sqlite3_open_v2(dbPath, &db, flags, nil) == SQLITE_OK else {
@@ -2815,7 +2815,7 @@ final class WalletDatabase {
             }
         }
 
-        print("✅ FIX #964: Recorded minimal sent TX at height \(confirmedHeight) (amount: \(amount), fee: \(fee))")
+        print("✅ FIX #964: Recorded minimal sent TX at height \(confirmedHeight) (amount: \(UInt64(amount).redactedAmount), fee: \(UInt64(fee).redactedAmount))")
     }
 
     /// FIX #965: Check if a transaction exists in transaction_history
@@ -5260,7 +5260,7 @@ final class WalletDatabase {
                         // Only use height-based change if it makes sense (change < input)
                         if heightBasedChange > 0 && heightBasedChange < spentTx.totalInput {
                             changeAmount = heightBasedChange
-                            print("🔧 FIX #450 v5: Using height-based change detection for tx at height \(spentTx.height): \(changeAmount) zatoshis")
+                            print("🔧 FIX #450 v5: Using height-based change detection for tx at height \(spentTx.height): \(UInt64(changeAmount).redactedAmount)")
                         }
                     }
                     sqlite3_finalize(changeStmt)
@@ -5303,7 +5303,7 @@ final class WalletDatabase {
 
             if sqlite3_step(insertSentStmt) == SQLITE_DONE {
                 sentCount += 1
-                print("🔧 FIX #450 v6: Added SENT tx at height \(spentTx.height): \(sentAmount) zatoshis (input: \(spentTx.totalInput), change: \(changeAmount), fee: \(actualFee), to_recipient: \(sentAmount - actualFee))")
+                print("🔧 FIX #450 v6: Added SENT tx at height \(spentTx.height): \(UInt64(sentAmount).redactedAmount) (input: \(UInt64(spentTx.totalInput).redactedAmount), change: \(UInt64(changeAmount).redactedAmount), fee: \(UInt64(actualFee).redactedAmount))")
             }
             sqlite3_reset(insertSentStmt)
         }
@@ -5316,9 +5316,9 @@ final class WalletDatabase {
         print("🔧 FIX #162 v3: Inserted \(receivedCount)/\(allNotes.count) received entries")
         print("🔧 FIX #162 v3: - Total ALL notes (spent+unspent): \(allNotes.count)")
         print("🔧 FIX #162 v3: - Spent notes: \(spentNotesCount), Unspent notes: \(unspentNotes.count)")
-        print("🔧 FIX #162 v3: - Total received: \(totalReceived) zatoshis")
+        print("🔧 FIX #162 v3: - Total received: \(UInt64(totalReceived).redactedAmount)")
         print("🔧 FIX #162 v3: Inserted \(sentCount) sent entries")
-        print("🔧 FIX #162 v3: Expected balance (unspent only) = \(unspentBalance) zatoshis")
+        print("🔧 FIX #162 v3: Expected balance (unspent only) = \(UInt64(unspentBalance).redactedAmount)")
     }
 
     /// FIX #120: Repair transaction history timestamps
@@ -6284,7 +6284,7 @@ final class WalletDatabase {
         let spentNotes = allNotes.filter { $0.isSpent }
         print("📜 populateHistoryFromNotes: \(spentNotes.count) notes are spent")
         for note in spentNotes {
-            print("📜   Spent note: value=\(note.value), spentTxid=\(note.spentTxid?.prefix(8).hexString ?? "nil"), spentHeight=\(note.spentHeight ?? 0)")
+            print("📜   Spent note: value=\(note.value.redactedAmount), spentTxid=\(note.spentTxid?.prefix(8).hexString ?? "nil"), spentHeight=\(note.spentHeight ?? 0)")
         }
 
         // Build a set of all spent_in_tx txids - these represent our SENT transactions
@@ -6423,7 +6423,14 @@ final class WalletDatabase {
                 sqlite3_bind_null(spentStmt, 7)
             }
             sqlite3_bind_null(spentStmt, 8)
-            sqlite3_bind_null(spentStmt, 9)
+            // FIX #1456: For self-sends, carry memo from the change/self output notes.
+            // Self-send outputs are decryptable (our key), so notes table has the memo.
+            // For regular sends, memo is only in the recipient's encrypted output (we can't read it).
+            if isSelfSend, let selfMemo = changeOutputs.compactMap({ $0.memo }).first {
+                sqlite3_bind_text(spentStmt, 9, selfMemo, -1, SQLITE_TRANSIENT)
+            } else {
+                sqlite3_bind_null(spentStmt, 9)
+            }
 
             let stepResult = sqlite3_step(spentStmt)
             if stepResult == SQLITE_DONE {
@@ -6717,7 +6724,7 @@ final class WalletDatabase {
                     }
                 }
 
-                print("📜 Recorded received transaction: height=\(height), value=\(value) zatoshis, time=\(actualBlockTime ?? 0)")
+                print("📜 Recorded received transaction: height=\(height), value=\(UInt64(value).redactedAmount), time=\(actualBlockTime ?? 0)")
             }
         }
         } // dbSync
@@ -7759,9 +7766,10 @@ final class WalletDatabase {
             guard correctSent != entry.storedValue else { continue }
 
             if correctSent <= 1000 {
-                // FIX #1367: Self-send — mark with to_address='self', value=fee, clear memo
+                // FIX #1367: Self-send — mark with to_address='self', value=fee
+                // FIX #1456: Do NOT clear memo — user may have attached a memo to self-send
                 // All outputs are change, only the network fee was spent
-                let updateSql = "UPDATE transaction_history SET value = ?, to_address = 'self', memo = NULL WHERE rowid = ?;"
+                let updateSql = "UPDATE transaction_history SET value = ?, to_address = 'self' WHERE rowid = ?;"
                 var updateStmt: OpaquePointer?
                 if sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK {
                     sqlite3_bind_int64(updateStmt, 1, Int64(fee))

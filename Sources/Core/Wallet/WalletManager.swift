@@ -6899,7 +6899,7 @@ final class WalletManager: ObservableObject {
         let address = try deriveZAddress(from: spendingKey)
 
         // Print address to console for debugging
-        print("🔐 Generated z-address: \(address)")
+        print("🔐 Generated z-address: \(address.redactedAddress)")
         print("🔐 Address length: \(address.count) characters")
 
         // CRITICAL: Reset database state for new wallet
@@ -11517,7 +11517,7 @@ final class WalletManager: ObservableObject {
         let address: String
         do {
             address = try deriveZAddress(from: spendingKey)
-            print("✓ Address derived: \(address.prefix(20))...")
+            print("✓ Address derived: \(address.redactedAddress)")
         } catch {
             print("❌ Failed to derive address: \(error.localizedDescription)")
             // Clean up stored key since we couldn't complete the import

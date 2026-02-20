@@ -201,7 +201,7 @@ public final class TorManager: ObservableObject {
         if let keypairData = loadKeypairFromKeychain() {
             if setKeypairInFFI(keypairData) {
                 persistentOnionAddress = getOnionAddressFromFFI()
-                print("🧅 FIX #169: Loaded persistent keypair - address: \(persistentOnionAddress ?? "nil")")
+                print("🧅 FIX #169: Loaded persistent keypair - .onion ready")
             }
         } else {
             print("🧅 FIX #169: No persistent keypair - will generate new one when hidden service starts")
@@ -1137,7 +1137,7 @@ public final class TorManager: ObservableObject {
         persistentOnionAddress = onionAddress
 
         print("🧅 FIX #169: Generated and saved persistent keypair")
-        print("🧅 FIX #169: Persistent .onion address: \(onionAddress ?? "nil")")
+        print("🧅 FIX #169: Persistent .onion address ready")
 
         return onionAddress
     }
@@ -1163,7 +1163,7 @@ public final class TorManager: ObservableObject {
         persistentOnionAddress = onionAddress
 
         print("🧅 FIX #169: Loaded persistent keypair from Keychain")
-        print("🧅 FIX #169: Persistent .onion address: \(onionAddress ?? "nil")")
+        print("🧅 FIX #169: Persistent .onion address ready")
 
         return onionAddress
     }

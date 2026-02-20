@@ -854,6 +854,9 @@ struct ConversationView: View {
     @State private var paymentRequestToPay: ChatMessage? = nil  // Payment request being paid
     @State private var showPayNowSheet = false
     @State private var copiedTxId: String? = nil  // FIX #405: Track copied txid for feedback
+    // FIX #1457: Screenshot/recording protection for chat messages
+    @State private var showScreenshotBanner = false
+    @State private var showRecordingBanner = false
     @FocusState private var isInputFocused: Bool
 
     private var theme: AppTheme { themeManager.currentTheme }
@@ -1002,6 +1005,66 @@ struct ConversationView: View {
                 .environmentObject(NetworkManager.shared)
                 .environmentObject(themeManager)
             }
+        }
+        // FIX #1457: Screenshot & recording detection for encrypted chat
+        #if os(iOS)
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.userDidTakeScreenshotNotification)) { _ in
+            withAnimation(.easeInOut(duration: 0.3)) {
+                showScreenshotBanner = true
+            }
+            // Auto-dismiss after 4 seconds
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+                withAnimation(.easeInOut(duration: 0.3)) {
+                    showScreenshotBanner = false
+                }
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIScreen.capturedDidChangeNotification)) { _ in
+            showRecordingBanner = UIScreen.main.isCaptured
+        }
+        .onAppear {
+            showRecordingBanner = UIScreen.main.isCaptured
+        }
+        #endif
+        .overlay(alignment: .top) {
+            VStack(spacing: 0) {
+                // FIX #1457: Screenshot warning banner
+                if showScreenshotBanner {
+                    HStack(spacing: 8) {
+                        Image(systemName: "camera.fill")
+                            .foregroundColor(.white)
+                            .font(.system(size: 14, weight: .bold))
+                        Text("Screenshot detected — encrypted messages may be compromised")
+                            .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                            .foregroundColor(.white)
+                            .lineLimit(2)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .background(Color.orange)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                }
+                // FIX #1457: Screen recording warning banner (persistent)
+                if showRecordingBanner {
+                    HStack(spacing: 8) {
+                        Image(systemName: "record.circle.fill")
+                            .foregroundColor(.white)
+                            .font(.system(size: 14, weight: .bold))
+                        Text("Screen recording active — encrypted messages are being captured")
+                            .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                            .foregroundColor(.white)
+                            .lineLimit(2)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .background(Color.red)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                }
+            }
+            .animation(.easeInOut(duration: 0.3), value: showScreenshotBanner)
+            .animation(.easeInOut(duration: 0.3), value: showRecordingBanner)
         }
     }
 
