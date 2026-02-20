@@ -21,6 +21,9 @@ struct ContentView: View {
     @State private var wasInBackground: Bool = false  // FIX #258: Track if we were in background
     @State private var hasAcceptedDisclaimer: Bool = UserDefaults.standard.bool(forKey: "hasAcceptedDisclaimer")
 
+    // Screenshot protection setting (enabled by default)
+    @AppStorage("screenshotProtectionEnabled") private var screenshotProtectionEnabled: Bool = true
+
     // Security audit TASK 17: Privacy overlay for app switcher + screenshot warning
     @State private var showPrivacyOverlay: Bool = false
     @State private var showScreenshotWarning: Bool = false
@@ -143,6 +146,24 @@ struct ContentView: View {
                             await MainActor.run {
                                 isInitialSync = false
                                 hasCompletedInitialSync = true
+                            }
+                            // FIX #1462: Full Node mode MUST wait for authentication too.
+                            // Without this, FullNodeWalletView loads wallet data behind lock screen
+                            // (which never appears because walletManager.isWalletCreated=false).
+                            if !biometricManager.hasAuthenticatedThisSession {
+                                if biometricManager.isBiometricEnabled {
+                                    print("🔐 FIX #1462: [FullNode] Waiting for authentication...")
+                                    while !biometricManager.hasAuthenticatedThisSession {
+                                        try? await Task.sleep(nanoseconds: 200_000_000)
+                                        if Task.isCancelled { return }
+                                    }
+                                    print("🔐 FIX #1462: [FullNode] Authentication confirmed")
+                                } else {
+                                    // Biometric not enabled — auto-authenticate
+                                    await MainActor.run {
+                                        biometricManager.unlockApp()
+                                    }
+                                }
                             }
                             return
                         }
@@ -2864,7 +2885,10 @@ struct ContentView: View {
             // the views underneath (buttons disabled, scroll broken, entire app unresponsive).
             // The lock screen is declared after mainWalletView in this ZStack, so it's naturally
             // rendered on top by declaration order. No explicit zIndex needed.
-            if isShowingLockScreen && !biometricManager.hasAuthenticatedThisSession && walletManager.isWalletCreated && hasCompletedInitialSync {
+            // FIX #1462: Show lock screen for BOTH P2P mode (isWalletCreated) AND Full Node mode (walletDat).
+            // Previously walletManager.isWalletCreated was always false in Full Node mode → lock screen never showed.
+            let walletExistsForLock = walletManager.isWalletCreated || modeManager.walletSource == .walletDat
+            if isShowingLockScreen && !biometricManager.hasAuthenticatedThisSession && walletExistsForLock && hasCompletedInitialSync {
                 LockScreenView(onUnlock: {
                     isShowingLockScreen = false
                     biometricManager.unlockApp()
@@ -2874,7 +2898,7 @@ struct ContentView: View {
 
             // Security audit TASK 17: Privacy overlay — covers wallet content in app switcher
             // VUL-U-006: Blur overlay with app name to protect sensitive data
-            if showPrivacyOverlay {
+            if showPrivacyOverlay && screenshotProtectionEnabled {
                 ZStack {
                     Color.black
                         .ignoresSafeArea()
@@ -2942,12 +2966,14 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.userDidTakeScreenshotNotification)) { _ in
             // Record activity on screenshot (user is interacting)
             recordUserActivity()
-            // Security audit TASK 17: Warn user about screenshots
-            showScreenshotWarning = true
+            // Security audit TASK 17: Warn user about screenshots (only when protection enabled)
+            if screenshotProtectionEnabled {
+                showScreenshotWarning = true
+            }
         }
-        // VUL-UI-003 Fix 1: Screen recording detection
+        // VUL-UI-003 Fix 1: Screen recording detection (only when protection enabled)
         .onReceive(NotificationCenter.default.publisher(for: UIScreen.capturedDidChangeNotification)) { _ in
-            if UIScreen.main.isCaptured {
+            if screenshotProtectionEnabled && UIScreen.main.isCaptured {
                 showScreenRecordingWarning = true
             } else {
                 showScreenRecordingWarning = false
@@ -2955,7 +2981,7 @@ struct ContentView: View {
         }
         .onAppear {
             // VUL-UI-003 Fix 1: Check if screen recording is already active on view appear
-            if UIScreen.main.isCaptured {
+            if screenshotProtectionEnabled && UIScreen.main.isCaptured {
                 showScreenRecordingWarning = true
             }
         }
@@ -2963,9 +2989,19 @@ struct ContentView: View {
         #if os(macOS)
         // VUL-UI-003 Fix 2: Prevent screen sharing on macOS (defense in depth)
         .onAppear {
+            if screenshotProtectionEnabled {
+                DispatchQueue.main.async {
+                    for window in NSApplication.shared.windows {
+                        window.sharingType = .none
+                    }
+                }
+            }
+        }
+        // Re-apply or remove screen sharing protection when setting changes
+        .onChange(of: screenshotProtectionEnabled) { enabled in
             DispatchQueue.main.async {
                 for window in NSApplication.shared.windows {
-                    window.sharingType = .none
+                    window.sharingType = enabled ? .none : .readOnly
                 }
             }
         }
@@ -2985,12 +3021,14 @@ struct ContentView: View {
             biometricManager.lockApp()
             isShowingLockScreen = true
             // VUL-U-006: Privacy overlay to protect sensitive data in app switcher
-            #if os(iOS)
-            // VUL-UI-003 Fix 3: Use UIKit privacy window (synchronous, no SwiftUI race)
-            (UIApplication.shared.delegate as? AppDelegate)?.showPrivacyOverlay()
-            #else
-            showPrivacyOverlay = true
-            #endif
+            if screenshotProtectionEnabled {
+                #if os(iOS)
+                // VUL-UI-003 Fix 3: Use UIKit privacy window (synchronous, no SwiftUI race)
+                (UIApplication.shared.delegate as? AppDelegate)?.showPrivacyOverlay()
+                #else
+                showPrivacyOverlay = true
+                #endif
+            }
 
         case .active:
             // Security audit TASK 17: Clear privacy overlay when returning to foreground
@@ -3040,12 +3078,14 @@ struct ContentView: View {
 
         case .inactive:
             // Security audit TASK 17: Blur wallet content in app switcher
-            #if os(iOS)
-            // VUL-UI-003 Fix 3: Use UIKit privacy window (synchronous, no SwiftUI race)
-            (UIApplication.shared.delegate as? AppDelegate)?.showPrivacyOverlay()
-            #else
-            showPrivacyOverlay = true
-            #endif
+            if screenshotProtectionEnabled {
+                #if os(iOS)
+                // VUL-UI-003 Fix 3: Use UIKit privacy window (synchronous, no SwiftUI race)
+                (UIApplication.shared.delegate as? AppDelegate)?.showPrivacyOverlay()
+                #else
+                showPrivacyOverlay = true
+                #endif
+            }
 
         @unknown default:
             break

@@ -1483,8 +1483,9 @@ struct SendView: View {
                 updateStepSync("proof", status: .inProgress, detail: "This may take 30-60 seconds...")
             }
         case "proof":
-            updateStepSync("proof", status: .completed)
-            updateStepSync("broadcast", status: .inProgress)
+            // FIX #1460: "proof" callback = proof STARTING (not done!)
+            // Groth16 takes 30-60s. Proof completion signaled by "broadcast" callback.
+            updateStepSync("proof", status: .inProgress, detail: detail.map { "\($0) — generating zk-SNARK..." } ?? "Generating zk-SNARK proof...")
         case "peers":
             // CRITICAL FIX: Do NOT show success immediately on peer accept!
             // Peers may accept into local mempool but reject during validation.
@@ -1538,6 +1539,8 @@ struct SendView: View {
             showError = true
             isSending = false
         case "broadcast":
+            // FIX #1460: "broadcast" callback means proof generation is DONE — mark it completed
+            updateStepSync("proof", status: .completed)
             // Broadcast step has sub-progress for peer propagation and verification
             if let p = progress, p < 1.0 {
                 updateStepSync("broadcast", status: .inProgress, detail: detail, progress: p)

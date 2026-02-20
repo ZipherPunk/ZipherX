@@ -26,6 +26,9 @@ public class BootstrapManager: ObservableObject {
     // Internal state
     private var downloadTask: URLSessionDownloadTask?
     private var sharedSession: URLSession?  // FIX #322: Reuse session for all downloads
+    // FIX #1459: Track all active download sessions for proper cancellation
+    private var activeDownloadSessions: [URLSession] = []
+    private let sessionLock = NSLock()
     private var isCancelled = false
     private var lastProgressUpdate = Date()
     private var lastBytesDownloaded: Int64 = 0
@@ -41,6 +44,9 @@ public class BootstrapManager: ObservableObject {
     // FIX #314: Prevent concurrent bootstrap operations
     private var isBootstrapRunning = false
     private let bootstrapLock = NSLock()
+
+    // FIX #1458: Track last step before error for task list display
+    @Published public private(set) var lastStepBeforeError: BootstrapStatus?
 
     // FIX #315: Reduce logging verbosity - only log errors and key milestones
     private let verboseLogging = false
@@ -155,6 +161,10 @@ public class BootstrapManager: ObservableObject {
         isCancelled = false
         totalBytesDownloadedAllParts = 0
 
+        // FIX #1458: Clean up stale temp files from previous failed attempt
+        cleanupPartialDownloads()
+        await MainActor.run { self.lastStepBeforeError = nil }
+
         // FIX #313: Reset parallel download progress tracking
         progressLock.lock()
         partBytesDownloaded.removeAll()
@@ -266,6 +276,10 @@ public class BootstrapManager: ObservableObject {
                 }
 
                 downloadedCount += batch.count
+                // FIX #1459: Clear completed download sessions after each batch
+                sessionLock.lock()
+                activeDownloadSessions.removeAll()
+                sessionLock.unlock()
                 await MainActor.run {
                     self.currentPart = downloadedCount
                 }
@@ -370,6 +384,16 @@ public class BootstrapManager: ObservableObject {
     public func cancel() {
         isCancelled = true
         downloadTask?.cancel()
+        // FIX #1459: Cancel ALL active download sessions (not just the legacy single task)
+        sessionLock.lock()
+        let sessions = activeDownloadSessions
+        activeDownloadSessions.removeAll()
+        sessionLock.unlock()
+        for session in sessions {
+            session.invalidateAndCancel()
+        }
+        sharedSession?.invalidateAndCancel()
+        sharedSession = nil
         stopElapsedTimeTimer()  // FIX #312
         Task { @MainActor in
             status = .cancelled
@@ -389,6 +413,15 @@ public class BootstrapManager: ObservableObject {
             elapsedTime = ""  // FIX #312
             currentPart = 0
             totalParts = 0
+        }
+    }
+
+    /// FIX #1458: Clean up partial downloads from failed bootstrap attempt
+    private func cleanupPartialDownloads() {
+        let downloadDir = FileManager.default.temporaryDirectory.appendingPathComponent("zclassic-bootstrap")
+        if FileManager.default.fileExists(atPath: downloadDir.path) {
+            try? FileManager.default.removeItem(at: downloadDir)
+            print("🧹 FIX #1458: Cleaned up partial downloads from previous attempt")
         }
     }
 
@@ -935,8 +968,17 @@ public class BootstrapManager: ObservableObject {
             request.setValue("bytes=\(resumeOffset)-", forHTTPHeaderField: "Range")
         }
 
+        // FIX #1459: Check cancellation before starting download
+        if isCancelled { throw BootstrapError.cancelled }
+
         // Use continuation to bridge delegate callbacks to async/await
         _ = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, Error>) in
+            // FIX #1459: Check cancellation inside continuation
+            guard !self.isCancelled else {
+                continuation.resume(throwing: BootstrapError.cancelled)
+                return
+            }
+
             let delegate = StreamingDownloadDelegate(
                 manager: self,
                 partSize: part.size,
@@ -952,6 +994,11 @@ public class BootstrapManager: ObservableObject {
             config.timeoutIntervalForRequest = 300
             config.timeoutIntervalForResource = 3600
             let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
+
+            // FIX #1459: Track session for cancellation
+            self.sessionLock.lock()
+            self.activeDownloadSessions.append(session)
+            self.sessionLock.unlock()
 
             let task = session.downloadTask(with: request)
             task.resume()
@@ -1907,6 +1954,14 @@ public class BootstrapManager: ObservableObject {
 
         // FIX #317: Start timing for new task
         startTaskTimingForStatus(status)
+
+        // FIX #1458: Track last active step before error/cancel for task list display
+        switch status {
+        case .error, .cancelled:
+            await MainActor.run { self.lastStepBeforeError = previousStatus }
+        default:
+            break
+        }
 
         // FIX #312: Stop timer on completion/error states
         switch status {

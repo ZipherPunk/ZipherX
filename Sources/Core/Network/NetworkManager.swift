@@ -2651,9 +2651,11 @@ public final class NetworkManager: ObservableObject {
         // After initial connection, background processes will continue adding peers
         let connectStartTime = Date()
         // FIX #1112: Reduced timeouts - good peers connect fast, don't wait for slow ones
-        let maxConnectDuration: TimeInterval = 8.0 // Was 20s, now 8s for early return with peers
-        let minPeersForEarlyReturn = 3 // Return early if we have at least 3 peers
-        let absMaxConnectDuration: TimeInterval = 5.0 // FIX #1112 v4: Was 15s, now 5s absolute max
+        // FIX #1461: Raised early return from 3→6 — 3 peers was too few for reliable P2P sync.
+        // Background connect continues to MIN_PEERS (8) but we need at least 6 before releasing startup.
+        let maxConnectDuration: TimeInterval = 12.0 // Was 8s, now 12s to give more time for 6 peers
+        let minPeersForEarlyReturn = 6 // FIX #1461: Was 3 — too aggressive, peers capped at 3
+        let absMaxConnectDuration: TimeInterval = 10.0 // FIX #1461: Was 5s, now 10s — give Tor connections time
         var shouldExitEarly = false // FIX #1112 v4: Flag to exit outer loop
 
         while connectedCount < targetPeers && peerIndex < validPeers.count && !shouldExitEarly {
@@ -2861,9 +2863,9 @@ public final class NetworkManager: ObservableObject {
             }
 
             // FIX #547: Check for early return AFTER batch completes too
-            // FIX #1112: Reduced from 3.0s to 1.5s - don't wait for slow peers when we have enough
+            // FIX #1461: Raised from 1.5s to 4.0s — give more batches a chance to connect
             let elapsedAfterBatch = Date().timeIntervalSince(connectStartTime)
-            if elapsedAfterBatch > 1.5 && connectedCount >= minPeersForEarlyReturn {
+            if elapsedAfterBatch > 4.0 && connectedCount >= minPeersForEarlyReturn {
                 if verbose {
                     print("⏱️ FIX #1112: Early return after batch (\(String(format: "%.1f", elapsedAfterBatch))s) - \(connectedCount) peers connected (will continue in background)")
                 }
@@ -5381,6 +5383,86 @@ public final class NetworkManager: ObservableObject {
 
         if connectedCount > currentConnected {
             print("✅ FIX #429: Background connection added \(connectedCount - currentConnected) more peers (total: \(connectedCount))")
+            PeerManager.shared.syncPeers(self.peers)
+        }
+    }
+
+    /// FIX #1461: Proactive peer growth — called from keepalive when below MIN_PEERS.
+    /// Unlike attemptPeerRecovery (which is for emergencies when peers < 3), this is gentle
+    /// growth to reach MIN_PEERS for optimal P2P performance. Tries a small batch each cycle.
+    private func growPeerCount(currentReady: Int) async {
+        // Don't overlap with active recovery
+        guard !isRecoveringPeers else { return }
+
+        let needed = MIN_PEERS - currentReady
+        guard needed > 0 else { return }
+
+        // Collect candidates: known addresses not already connected, not banned, not on cooldown
+        let connectedHosts = Set(peers.map { $0.host })
+        var candidates: [PeerAddress] = []
+
+        // Hardcoded seeds first
+        for seedHost in HARDCODED_SEEDS {
+            if !connectedHosts.contains(seedHost) && !isBanned(seedHost) && !isOnCooldown(seedHost, port: defaultPort) {
+                candidates.append(PeerAddress(host: seedHost, port: defaultPort))
+            }
+        }
+
+        // Then known addresses
+        addressLock.lock()
+        let known = knownAddresses.values.map { $0.address }
+        addressLock.unlock()
+        for address in known {
+            if candidates.count >= needed + 3 { break } // Try a few extra for failures
+            if !connectedHosts.contains(address.host) && !isBanned(address.host) &&
+               !isOnCooldown(address.host, port: address.port) &&
+               !candidates.contains(where: { $0.host == address.host }) {
+                candidates.append(address)
+            }
+        }
+
+        guard !candidates.isEmpty else {
+            debugLog(.network, "🫀 FIX #1461: No candidates for peer growth")
+            return
+        }
+
+        // Try a small batch (up to 5) in parallel — gentle, won't overwhelm network
+        let batchSize = min(5, candidates.count)
+        var grown = 0
+
+        await withTaskGroup(of: (Peer?, PeerAddress).self) { group in
+            for address in candidates.prefix(batchSize) {
+                group.addTask {
+                    do {
+                        let peer = try await self.connectToPeer(address)
+                        return (peer, address)
+                    } catch {
+                        return (nil, address)
+                    }
+                }
+            }
+
+            for await (peer, address) in group {
+                if let peer = peer {
+                    if !peers.contains(where: { $0.host == peer.host && $0.port == peer.port }) {
+                        peers.append(peer)
+                        PeerManager.shared.addPeer(peer)
+                        setupBlockListener(for: peer)
+                        unparkPeer(address.host, port: address.port)
+                        grown += 1
+
+                        await MainActor.run {
+                            self.connectedPeers = self.peers.filter { $0.isConnectionReady }.count
+                        }
+                    } else {
+                        peer.disconnect()
+                    }
+                }
+            }
+        }
+
+        if grown > 0 {
+            print("✅ FIX #1461: Peer growth added \(grown) peer(s) — now \(peers.filter { $0.isConnectionReady }.count)/\(MIN_PEERS)")
             PeerManager.shared.syncPeers(self.peers)
         }
     }
@@ -8646,7 +8728,7 @@ public final class NetworkManager: ObservableObject {
 
         // Connect to all candidates in parallel
         var recovered = 0
-        let maxPeers = 5  // Limit to avoid overwhelming network
+        let maxPeers = 8  // FIX #1461: Was 5, raised to MIN_PEERS for full recovery
 
         // FIX #1428: Try up to 16 candidates in parallel (was 8) — Tor circuits are unreliable
         // on cellular, so more parallel attempts = better chance of getting 3+ peers
@@ -9213,15 +9295,26 @@ public final class NetworkManager: ObservableObject {
             return
         }
 
-        // FIX #246: Don't run during header sync or active operations
-        if isHeaderSyncing || WalletManager.shared.isSyncing {
-            return
-        }
+        // FIX #1461: Allow peer growth even during sync — only skip ping when syncing
+        let isBusySyncing = isHeaderSyncing || WalletManager.shared.isSyncing
 
         let readyPeers = peers.filter { $0.isConnectionReady }
         if readyPeers.isEmpty {
             debugLog(.network, "🫀 FIX #246: No peers to ping - triggering recovery")
             await attemptPeerRecovery()
+            return
+        }
+
+        // FIX #1461: Proactive peer growth — connect to more peers if below MIN_PEERS
+        // This runs even during sync, because having more peers improves P2P fetch reliability.
+        // The main connect() exits early at 3-6 peers for fast startup; this fills to 8+.
+        if readyPeers.count < MIN_PEERS && !isRecoveringPeers {
+            debugLog(.network, "🫀 FIX #1461: Only \(readyPeers.count)/\(MIN_PEERS) peers — growing peer count in background")
+            await growPeerCount(currentReady: readyPeers.count)
+        }
+
+        // FIX #246: Skip ping checks during header sync or active operations
+        if isBusySyncing {
             return
         }
 

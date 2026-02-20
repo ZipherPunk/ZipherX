@@ -56,10 +56,14 @@ struct BootstrapProgressView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(theme.backgroundColor)
         .onAppear {
-            if case .idle = bootstrapManager.status {
+            // FIX #1458: Auto-start on idle, and auto-retry on error/cancelled (when sheet re-opens)
+            switch bootstrapManager.status {
+            case .idle, .error, .cancelled:
                 Task {
                     await bootstrapManager.startBootstrap()
                 }
+            default:
+                break
             }
         }
     }
@@ -168,22 +172,9 @@ struct BootstrapProgressView: View {
     }
 
     private var progressBar: some View {
-        GeometryReader { geometry in
-            ZStack(alignment: .leading) {
-                // Background
-                RoundedRectangle(cornerRadius: 4)
-                    .fill(theme.borderColor)
-                    .frame(height: 8)
-
-                // Progress
-                RoundedRectangle(cornerRadius: 4)
-                    .fill(theme.primaryColor)
-                    .frame(width: geometry.size.width * bootstrapManager.progress, height: 8)
-                    .animation(.linear(duration: 0.3), value: bootstrapManager.progress)
-            }
-        }
-        .frame(height: 8)
-        .padding(.horizontal, 40)
+        // FIX #1459: Use ThemedProgressBar for consistent theme colors across all themes
+        ThemedProgressBar(progress: bootstrapManager.progress)
+            .padding(.horizontal, 40)
     }
 
     private var taskList: some View {
@@ -291,6 +282,18 @@ struct BootstrapProgressView: View {
             .checkingRelease, .downloading, .verifying, .combining, .extracting, .configuringDaemon, .downloadingParams, .startingDaemon
         ]
 
+        // FIX #1458: Handle error/cancelled states using lastStepBeforeError
+        if case .error = bootstrapManager.status,
+           let lastStep = bootstrapManager.lastStepBeforeError {
+            guard let checkIndex = order.firstIndex(where: { $0 == checkStatus }),
+                  let failedIndex = order.firstIndex(where: { statusMatches($0, lastStep) }) else {
+                return .pending
+            }
+            if checkIndex < failedIndex { return .completed }
+            if checkIndex == failedIndex { return .failed }
+            return .pending
+        }
+
         guard let checkIndex = order.firstIndex(where: { $0 == checkStatus }),
               let currentIndex = order.firstIndex(where: { statusMatches($0, bootstrapManager.status) }) else {
             // FIX #285: Handle completion states - all tasks before them are complete
@@ -302,9 +305,6 @@ struct BootstrapProgressView: View {
         }
 
         if statusMatches(checkStatus, bootstrapManager.status) {
-            if case .error = bootstrapManager.status {
-                return .failed
-            }
             return .inProgress
         } else if checkIndex < currentIndex {
             return .completed

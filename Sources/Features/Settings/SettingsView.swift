@@ -283,6 +283,8 @@ struct SettingsView: View {
     @State private var confirmPIN = ""
     @State private var showPINText = false  // Toggle to show/hide PIN text
     @State private var biometricAvailable = false
+    @AppStorage("screenshotProtectionEnabled") private var screenshotProtectionEnabled: Bool = true
+    @State private var showDisableScreenshotWarning = false
     @State private var showRescanWarning = false
     @State private var showRescanProgress = false
     @State private var rescanProgress: Double = 0
@@ -1253,6 +1255,55 @@ Both binaries must be installed to /usr/local/bin:
                 Rectangle()
                     .stroke(theme.textPrimary, lineWidth: 1)
             )
+
+            // Screenshot & Screen Recording Protection
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Image(systemName: "camera.fill")
+                        .font(.system(size: 14))
+                        .foregroundColor(theme.textPrimary)
+
+                    Text("Screenshot Protection")
+                        .font(theme.bodyFont)
+                        .foregroundColor(theme.textPrimary)
+
+                    Spacer()
+
+                    Toggle("", isOn: Binding(
+                        get: { screenshotProtectionEnabled },
+                        set: { newValue in
+                            if !newValue {
+                                // Show warning before disabling
+                                showDisableScreenshotWarning = true
+                            } else {
+                                screenshotProtectionEnabled = true
+                            }
+                        }
+                    ))
+                    .labelsHidden()
+                }
+
+                Text(screenshotProtectionEnabled
+                    ? "Screenshots and screen recording are blocked. App content is hidden in app switcher."
+                    : "Protection disabled — screenshots and screen recording are allowed.")
+                    .font(theme.captionFont)
+                    .foregroundColor(screenshotProtectionEnabled ? theme.textSecondary : .orange)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(theme.surfaceColor)
+            .overlay(
+                Rectangle()
+                    .stroke(theme.textPrimary, lineWidth: 1)
+            )
+            .alert("Disable Screenshot Protection?", isPresented: $showDisableScreenshotWarning) {
+                Button("Disable", role: .destructive) {
+                    screenshotProtectionEnabled = false
+                }
+                Button("Keep Enabled", role: .cancel) { }
+            } message: {
+                Text("WARNING: Disabling screenshot protection allows screenshots and screen recordings to capture your wallet balances, addresses, and transaction history.\n\nThis is a security risk. Only disable temporarily if you need to take a screenshot.")
+            }
 
             // VUL-014: Key Rotation Policy
             VStack(alignment: .leading, spacing: 4) {

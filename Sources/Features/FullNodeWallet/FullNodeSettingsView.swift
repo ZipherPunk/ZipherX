@@ -26,6 +26,25 @@ struct FullNodeSettingsView: View {
     @State private var isCreatingBackup = false
     @State private var backupSuccess: String?
 
+    // Export / Import Private Key state
+    @State private var showingExportSheet = false
+    @State private var showingImportSheet = false
+    @State private var exportAddresses: [WalletAddress] = []
+    @State private var selectedExportAddress: WalletAddress?
+    @State private var exportedPrivateKey: String = ""
+    @State private var isExporting = false
+    @State private var importKeyText: String = ""
+    @State private var importWithRescan: Bool = true
+    @State private var isImporting = false
+    @State private var importProgress: Double = 0
+    @State private var importStatusMessage: String = ""
+    @State private var importExportError: String?
+    @State private var importExportSuccess: String?
+
+    // Screenshot protection
+    @AppStorage("screenshotProtectionEnabled") private var screenshotProtectionEnabled: Bool = true
+    @State private var showDisableScreenshotWarning = false
+
     // FIX #1273: Auth settings state
     @State private var useFaceID = false
     @State private var usePINCode = false
@@ -142,7 +161,10 @@ struct FullNodeSettingsView: View {
                     // 6. Wallet Security
                     walletSecuritySection
 
-                    // 7. Debug & Logs
+                    // 7. Danger Zone (Export / Import Private Keys)
+                    dangerZoneSection
+
+                    // 8. Debug & Logs
                     debugSection
                 }
                 .padding()
@@ -172,6 +194,26 @@ struct FullNodeSettingsView: View {
         .sheet(isPresented: $showPINSetup) {
             pinSetupSheet
                 .frame(minWidth: 400, idealWidth: 450, minHeight: 350, idealHeight: 400)
+        }
+        .sheet(isPresented: $showingExportSheet) {
+            exportPrivateKeySheet
+                .frame(minWidth: 450, idealWidth: 500, minHeight: 400, idealHeight: 500)
+                .onDisappear {
+                    exportedPrivateKey = ""
+                    selectedExportAddress = nil
+                    importExportError = nil
+                }
+        }
+        .sheet(isPresented: $showingImportSheet) {
+            importPrivateKeySheet
+                .frame(minWidth: 450, idealWidth: 500, minHeight: 350, idealHeight: 400)
+                .onDisappear {
+                    importKeyText = ""
+                    importExportError = nil
+                    importExportSuccess = nil
+                    importProgress = 0
+                    importStatusMessage = ""
+                }
         }
     }
 
@@ -596,8 +638,413 @@ struct FullNodeSettingsView: View {
                     }
                     .font(theme.captionFont)
                 }
+
+                Divider()
+
+                // Screenshot Protection Toggle
+                HStack {
+                    Image(systemName: "camera.fill")
+                        .foregroundColor(theme.textPrimary)
+
+                    Text("Screenshot Protection")
+                        .font(theme.bodyFont)
+                        .foregroundColor(theme.textPrimary)
+
+                    Spacer()
+
+                    Toggle("", isOn: Binding(
+                        get: { screenshotProtectionEnabled },
+                        set: { newValue in
+                            if !newValue {
+                                showDisableScreenshotWarning = true
+                            } else {
+                                screenshotProtectionEnabled = true
+                            }
+                        }
+                    ))
+                    .labelsHidden()
+                }
+
+                Text(screenshotProtectionEnabled
+                    ? "Screenshots and screen sharing are blocked."
+                    : "Protection disabled — screenshots and screen sharing are allowed.")
+                    .font(theme.captionFont)
+                    .foregroundColor(screenshotProtectionEnabled ? theme.textSecondary : .orange)
             }
         }
+        .alert("Disable Screenshot Protection?", isPresented: $showDisableScreenshotWarning) {
+            Button("Disable", role: .destructive) {
+                screenshotProtectionEnabled = false
+            }
+            Button("Keep Enabled", role: .cancel) { }
+        } message: {
+            Text("WARNING: Disabling screenshot protection allows screenshots and screen sharing to capture your wallet balances, addresses, and transaction history.\n\nThis is a security risk. Only disable temporarily if you need to take a screenshot.")
+        }
+    }
+
+    // MARK: - Danger Zone (Export / Import Private Keys)
+
+    private let dangerRed = Color(red: 0.8, green: 0.1, blue: 0.1)
+
+    private var dangerZoneSection: some View {
+        settingsCard(title: "Danger Zone", icon: "exclamationmark.triangle.fill") {
+            VStack(alignment: .leading, spacing: 12) {
+                // Export Private Key
+                Button(action: {
+                    Task { await loadExportAddresses() }
+                    showingExportSheet = true
+                }) {
+                    HStack {
+                        Image(systemName: "key.fill")
+                            .foregroundColor(dangerRed)
+                        Text("Export Private Key")
+                            .foregroundColor(dangerRed)
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .foregroundColor(theme.textSecondary)
+                    }
+                    .font(theme.bodyFont)
+                }
+                .buttonStyle(.plain)
+
+                Divider()
+
+                // Import Private Key
+                Button(action: {
+                    showingImportSheet = true
+                }) {
+                    HStack {
+                        Image(systemName: "square.and.arrow.down")
+                            .foregroundColor(dangerRed)
+                        Text("Import Private Key")
+                            .foregroundColor(dangerRed)
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .foregroundColor(theme.textSecondary)
+                    }
+                    .font(theme.bodyFont)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private func loadExportAddresses() async {
+        do {
+            let rpc = RPCWalletOperations.shared
+            try await rpc.connect()
+            async let z = rpc.listZAddresses()
+            async let t = rpc.listTAddresses()
+            let (zResult, tResult) = try await (z, t)
+            await MainActor.run {
+                exportAddresses = (zResult + tResult).sorted { $0.balance > $1.balance }
+            }
+        } catch {
+            await MainActor.run {
+                importExportError = "Failed to load addresses: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    // MARK: - Export Private Key Sheet
+
+    private var exportPrivateKeySheet: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Export Private Key")
+                    .font(theme.titleFont)
+                    .foregroundColor(theme.textPrimary)
+                Spacer()
+                Button("Close") {
+                    showingExportSheet = false
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(theme.primaryColor)
+            }
+            .padding()
+            .background(theme.surfaceColor)
+
+            Divider()
+
+            ScrollView {
+                VStack(spacing: 16) {
+                    // Warning
+                    HStack {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(dangerRed)
+                        Text("Never share your private key with anyone!")
+                            .font(theme.bodyFont)
+                            .foregroundColor(dangerRed)
+                    }
+                    .padding()
+                    .background(dangerRed.opacity(0.1))
+                    .cornerRadius(8)
+
+                    if let error = importExportError {
+                        Text(error)
+                            .font(theme.captionFont)
+                            .foregroundColor(dangerRed)
+                    }
+
+                    // Address selection
+                    Text("Select address to export:")
+                        .font(theme.bodyFont)
+                        .foregroundColor(theme.textPrimary)
+
+                    ForEach(exportAddresses) { address in
+                        Button(action: { selectedExportAddress = address }) {
+                            HStack {
+                                Image(systemName: address.isShielded ? "shield.fill" : "eye.fill")
+                                    .foregroundColor(address.isShielded ? theme.primaryColor : dangerRed)
+                                VStack(alignment: .leading) {
+                                    Text(truncateAddr(address.address))
+                                        .font(theme.monoFont)
+                                        .foregroundColor(theme.textPrimary)
+                                    Text(formatZatoshis(address.balance))
+                                        .font(theme.captionFont)
+                                        .foregroundColor(theme.textSecondary)
+                                }
+                                Spacer()
+                                if selectedExportAddress?.id == address.id {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .foregroundColor(.green)
+                                }
+                            }
+                            .padding(10)
+                            .background(selectedExportAddress?.id == address.id ? theme.primaryColor.opacity(0.1) : theme.surfaceColor)
+                            .cornerRadius(8)
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    if exportAddresses.isEmpty {
+                        Text("No addresses found")
+                            .font(theme.bodyFont)
+                            .foregroundColor(theme.textSecondary)
+                    }
+
+                    // Export button
+                    if selectedExportAddress != nil {
+                        Button(action: { Task { await performExport() } }) {
+                            HStack {
+                                if isExporting {
+                                    ProgressView()
+                                        .scaleEffect(0.8)
+                                }
+                                Text("Export Private Key")
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                            .background(dangerRed)
+                            .foregroundColor(.white)
+                            .cornerRadius(8)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(isExporting)
+                    }
+
+                    // Exported key display
+                    if !exportedPrivateKey.isEmpty {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Private Key:")
+                                .font(theme.captionFont)
+                                .foregroundColor(theme.textSecondary)
+
+                            let displayKey = String(exportedPrivateKey.prefix(8)) + "..." + String(exportedPrivateKey.suffix(8))
+                            Text(displayKey)
+                                .font(theme.monoFont)
+                                .foregroundColor(theme.textPrimary)
+                                .padding(10)
+                                .background(theme.surfaceColor)
+                                .cornerRadius(6)
+
+                            Button(action: {
+                                ClipboardManager.copyWithAutoExpiry(exportedPrivateKey, seconds: 10)
+                            }) {
+                                HStack {
+                                    Image(systemName: "doc.on.doc")
+                                    Text("Copy (auto-clears in 10s)")
+                                }
+                                .font(theme.captionFont)
+                                .foregroundColor(theme.primaryColor)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        .padding()
+                        .background(theme.surfaceColor.opacity(0.5))
+                        .cornerRadius(8)
+                    }
+                }
+                .padding()
+            }
+        }
+        .background(theme.backgroundColor)
+    }
+
+    // MARK: - Import Private Key Sheet
+
+    private var importPrivateKeySheet: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Import Private Key")
+                    .font(theme.titleFont)
+                    .foregroundColor(theme.textPrimary)
+                Spacer()
+                Button("Close") {
+                    showingImportSheet = false
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(theme.primaryColor)
+            }
+            .padding()
+            .background(theme.surfaceColor)
+
+            Divider()
+
+            VStack(spacing: 16) {
+                HStack {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(dangerRed)
+                    Text("Importing a key will add it to your wallet.dat")
+                        .font(theme.bodyFont)
+                        .foregroundColor(dangerRed)
+                }
+                .padding()
+                .background(dangerRed.opacity(0.1))
+                .cornerRadius(8)
+
+                if let error = importExportError {
+                    Text(error)
+                        .font(theme.captionFont)
+                        .foregroundColor(dangerRed)
+                }
+
+                if let success = importExportSuccess {
+                    Text(success)
+                        .font(theme.captionFont)
+                        .foregroundColor(.green)
+                }
+
+                TextField("Paste private key here...", text: $importKeyText)
+                    .textFieldStyle(RoundedBorderTextFieldStyle())
+                    .font(theme.monoFont)
+
+                Toggle("Rescan blockchain after import", isOn: $importWithRescan)
+                    .font(theme.bodyFont)
+                    .foregroundColor(theme.textPrimary)
+
+                if importWithRescan {
+                    Text("Rescan will find all transactions for this key. This may take several minutes.")
+                        .font(theme.captionFont)
+                        .foregroundColor(theme.textSecondary)
+                }
+
+                if isImporting {
+                    VStack(spacing: 8) {
+                        ProgressView(value: importProgress)
+                        Text(importStatusMessage)
+                            .font(theme.captionFont)
+                            .foregroundColor(theme.textSecondary)
+                    }
+                }
+
+                Button(action: { Task { await performImport() } }) {
+                    HStack {
+                        if isImporting {
+                            ProgressView()
+                                .scaleEffect(0.8)
+                        }
+                        Text("Import Private Key")
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding()
+                    .background(importKeyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isImporting ? Color.gray : dangerRed)
+                    .foregroundColor(.white)
+                    .cornerRadius(8)
+                }
+                .buttonStyle(.plain)
+                .disabled(importKeyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isImporting)
+
+                Spacer()
+            }
+            .padding()
+        }
+        .background(theme.backgroundColor)
+    }
+
+    // MARK: - Export / Import Actions
+
+    private func performExport() async {
+        guard let address = selectedExportAddress else { return }
+
+        // Biometric auth gate
+        let authResult = await withCheckedContinuation { continuation in
+            BiometricAuthManager.shared.authenticateForKeyExport { success, _ in
+                continuation.resume(returning: success)
+            }
+        }
+        guard authResult else { return }
+
+        await MainActor.run {
+            isExporting = true
+            importExportError = nil
+            exportedPrivateKey = ""
+        }
+
+        do {
+            let pk = try await RPCClient.shared.exportPrivateKey(address.address)
+            await MainActor.run {
+                exportedPrivateKey = pk
+                isExporting = false
+            }
+        } catch {
+            await MainActor.run {
+                importExportError = error.localizedDescription
+                isExporting = false
+            }
+        }
+    }
+
+    private func performImport() async {
+        let key = importKeyText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return }
+
+        await MainActor.run {
+            isImporting = true
+            importExportError = nil
+            importExportSuccess = nil
+            importProgress = 0
+            importStatusMessage = "Starting import..."
+        }
+
+        do {
+            let address = try await RPCClient.shared.importPrivateKey(key, rescan: importWithRescan) { progress, message in
+                Task { @MainActor in
+                    self.importProgress = progress
+                    self.importStatusMessage = message
+                }
+            }
+            await MainActor.run {
+                importExportSuccess = "Imported: \(address)"
+                importKeyText = ""
+                isImporting = false
+            }
+        } catch {
+            await MainActor.run {
+                importExportError = error.localizedDescription
+                isImporting = false
+            }
+        }
+    }
+
+    private func truncateAddr(_ addr: String) -> String {
+        guard addr.count > 20 else { return addr }
+        return String(addr.prefix(10)) + "..." + String(addr.suffix(8))
+    }
+
+    private func formatZatoshis(_ zatoshis: UInt64) -> String {
+        let zcl = Double(zatoshis) / 100_000_000.0
+        return String(format: "%.8f ZCL", zcl)
     }
 
     // MARK: - Debug Section

@@ -389,32 +389,8 @@ struct NodeManagementView: View {
                             .foregroundColor(theme.accentColor)
                     }
 
-                    // Progress bar
-                    GeometryReader { geometry in
-                        ZStack(alignment: .leading) {
-                            // Background
-                            RoundedRectangle(cornerRadius: 4)
-                                .fill(theme.surfaceColor)
-                                .frame(height: 8)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 4)
-                                        .stroke(theme.textPrimary.opacity(0.3), lineWidth: 1)
-                                )
-
-                            // Progress fill
-                            RoundedRectangle(cornerRadius: 4)
-                                .fill(
-                                    LinearGradient(
-                                        colors: [theme.accentColor, theme.accentColor.opacity(0.7)],
-                                        startPoint: .leading,
-                                        endPoint: .trailing
-                                    )
-                                )
-                                .frame(width: geometry.size.width * currentOperationProgress, height: 8)
-                                .animation(.easeInOut(duration: 0.3), value: currentOperationProgress)
-                        }
-                    }
-                    .frame(height: 8)
+                    // FIX #1459: Use ThemedProgressBar for consistent theme colors
+                    ThemedProgressBar(progress: currentOperationProgress)
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
@@ -572,27 +548,64 @@ struct NodeManagementView: View {
                     .foregroundColor(theme.textSecondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
 
-                HStack(spacing: 12) {
-                    // FIX #1379: Disable bootstrap when daemon is running OR starting
-                    Button(action: { viewModel.showBootstrapConfirm = true }) {
-                        HStack {
-                            Image(systemName: "arrow.down.doc.fill")
-                            Text("Install Fresh Bootstrap")
-                        }
-                        .font(theme.bodyFont)
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 8)
-                        .background(isDaemonRunning || isDaemonBusy ? Color.gray : theme.primaryColor)
-                        .cornerRadius(theme.cornerRadius)
-                    }
-                    .buttonStyle(PlainButtonStyle())
-                    .disabled(isDaemonRunning || isDaemonBusy)
-
-                    if isDaemonRunning || isDaemonBusy {
-                        Text("Stop daemon first — wallet.dat cannot be backed up while running")
+                // FIX #1458: Show previous failure state with direct retry
+                if case .error(let errorMsg) = bootstrapManager.status {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(theme.errorColor)
+                        Text("Previous bootstrap failed: \(errorMsg.prefix(60))")
                             .font(theme.captionFont)
-                            .foregroundColor(.orange)
+                            .foregroundColor(theme.errorColor)
+                            .lineLimit(2)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                    HStack(spacing: 12) {
+                        Button(action: { viewModel.showBootstrapProgress = true }) {
+                            HStack {
+                                Image(systemName: "arrow.clockwise")
+                                Text("Retry Bootstrap")
+                            }
+                            .font(theme.bodyFont)
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 8)
+                            .background(isDaemonRunning || isDaemonBusy ? Color.gray : theme.primaryColor)
+                            .cornerRadius(theme.cornerRadius)
+                        }
+                        .buttonStyle(PlainButtonStyle())
+                        .disabled(isDaemonRunning || isDaemonBusy)
+
+                        Button(action: { viewModel.showBootstrapConfirm = true }) {
+                            Text("Install Fresh")
+                                .font(theme.captionFont)
+                                .foregroundColor(theme.textSecondary)
+                        }
+                        .buttonStyle(PlainButtonStyle())
+                    }
+                } else {
+                    HStack(spacing: 12) {
+                        // FIX #1379: Disable bootstrap when daemon is running OR starting
+                        Button(action: { viewModel.showBootstrapConfirm = true }) {
+                            HStack {
+                                Image(systemName: "arrow.down.doc.fill")
+                                Text("Install Fresh Bootstrap")
+                            }
+                            .font(theme.bodyFont)
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 8)
+                            .background(isDaemonRunning || isDaemonBusy ? Color.gray : theme.primaryColor)
+                            .cornerRadius(theme.cornerRadius)
+                        }
+                        .buttonStyle(PlainButtonStyle())
+                        .disabled(isDaemonRunning || isDaemonBusy)
+
+                        if isDaemonRunning || isDaemonBusy {
+                            Text("Stop daemon first — wallet.dat cannot be backed up while running")
+                                .font(theme.captionFont)
+                                .foregroundColor(.orange)
+                        }
                     }
                 }
 
@@ -1929,16 +1942,15 @@ class NodeManagementViewModel: ObservableObject {
                     // Backed up wallet.dat
                 }
 
-                // 3. Start bootstrap download via BootstrapManager
+                // 3. Show bootstrap progress view — onAppear will start the download
+                // FIX #1458: Reset to idle so onAppear auto-starts cleanly
+                BootstrapManager.shared.reset()
                 await MainActor.run {
                     operationStatus = "Starting bootstrap download..."
                     isOperationInProgress = false
                     // FIX #276: Show the bootstrap progress view
                     showBootstrapProgress = true
                 }
-
-                // FIX #276: Actually start the bootstrap download
-                await BootstrapManager.shared.startBootstrap()
 
             } catch {
                 await MainActor.run {
