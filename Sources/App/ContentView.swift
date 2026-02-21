@@ -2880,75 +2880,8 @@ struct ContentView: View {
                 WalletSetupView()
             }
 
-            // FIX #1276: Lock screen is OUTSIDE the walletManager conditional.
-            // FIX #1437: Only show lock screen when wallet exists AND not during initial sync.
-            // During first import: wallet just created → user is obviously present → skip lock.
-            // Lock screen appears on SUBSEQUENT launches only.
-            // FIX #1442: Remove withAnimation wrapper — state changes happen immediately.
-            // FIX #1443: Remove .zIndex(999) — on macOS SwiftUI, explicit zIndex on a conditional
-            // view can leave a phantom hit-testing layer after removal, blocking ALL touches on
-            // the views underneath (buttons disabled, scroll broken, entire app unresponsive).
-            // The lock screen is declared after mainWalletView in this ZStack, so it's naturally
-            // rendered on top by declaration order. No explicit zIndex needed.
-            // FIX #1462: Show lock screen for BOTH P2P mode (isWalletCreated) AND Full Node mode (walletDat).
-            // Previously walletManager.isWalletCreated was always false in Full Node mode → lock screen never showed.
-            // FIX #1463: Removed hasCompletedInitialSync guard — lock screen must show IMMEDIATELY on cold start.
-            // hasCompletedInitialSync is @State (resets to false on every view creation) so it was preventing
-            // the lock screen from ever appearing. walletExistsForLock is the correct guard.
-            let walletExistsForLock = walletManager.isWalletCreated || modeManager.walletSource == .walletDat
-            if isShowingLockScreen && !biometricManager.hasAuthenticatedThisSession && walletExistsForLock {
-                LockScreenView(onUnlock: {
-                    isShowingLockScreen = false
-                    biometricManager.unlockApp()
-                    lastActivityTime = Date()
-                })
-            }
-
-            // Security audit TASK 17: Privacy overlay — covers wallet content in app switcher
-            // VUL-U-006: Blur overlay with app name to protect sensitive data
-            if showPrivacyOverlay && screenshotProtectionEnabled {
-                ZStack {
-                    Color.black
-                        .ignoresSafeArea()
-                    #if os(iOS)
-                    VisualEffectBlur(blurStyle: .systemUltraThinMaterialDark)
-                        .ignoresSafeArea()
-                    #else
-                    Color.black.opacity(0.95)
-                        .ignoresSafeArea()
-                    #endif
-                    VStack(spacing: 20) {
-                        Text("ZipherX")
-                            .font(.system(size: 48, weight: .bold, design: .monospaced))
-                            .foregroundColor(.white)
-                        Text("Privacy Protected")
-                            .font(.system(size: 16, weight: .medium, design: .monospaced))
-                            .foregroundColor(.white.opacity(0.7))
-                    }
-                }
-                .transition(.opacity)
-            }
-
-            // VUL-UI-003 Fix 1: Screen recording warning banner (iOS)
-            #if os(iOS)
-            if showScreenRecordingWarning {
-                VStack {
-                    HStack {
-                        Image(systemName: "record.circle.fill")
-                            .foregroundColor(.white)
-                        Text("Screen Recording Active - Wallet data may be captured")
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundColor(.white)
-                        Spacer()
-                    }
-                    .padding()
-                    .background(Color.red)
-                    Spacer()
-                }
-                .ignoresSafeArea(edges: .top)
-                .allowsHitTesting(false)
-            }
-            #endif
+            // Overlays extracted to separate view to reduce type-check complexity
+            securityOverlays
         }
         .alert("Screenshot Detected", isPresented: $showScreenshotWarning) {
             Button("OK", role: .cancel) { }
@@ -2959,10 +2892,6 @@ struct ContentView: View {
             handleScenePhaseChange(newPhase)
         }
         // FIX #1443: Safety net — when authentication succeeds, ALWAYS dismiss lock screen.
-        // Races between authenticateForAppUnlock (nested DispatchQueue.main.async) and
-        // handleScenePhaseChange(.active) can leave isShowingLockScreen stuck on true.
-        // This .onChange fires whenever @Published hasAuthenticatedThisSession changes,
-        // guaranteeing the lock screen is dismissed even if onUnlock() races with scene phase.
         .onChange(of: biometricManager.hasAuthenticatedThisSession) { authenticated in
             if authenticated && isShowingLockScreen {
                 print("🔐 FIX #1443: hasAuthenticatedThisSession=true — force-dismissing lock screen")
@@ -2972,14 +2901,11 @@ struct ContentView: View {
         }
         #if os(iOS)
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.userDidTakeScreenshotNotification)) { _ in
-            // Record activity on screenshot (user is interacting)
             recordUserActivity()
-            // Security audit TASK 17: Warn user about screenshots (only when protection enabled)
             if screenshotProtectionEnabled {
                 showScreenshotWarning = true
             }
         }
-        // VUL-UI-003 Fix 1: Screen recording detection (only when protection enabled)
         .onReceive(NotificationCenter.default.publisher(for: UIScreen.capturedDidChangeNotification)) { _ in
             if screenshotProtectionEnabled && UIScreen.main.isCaptured {
                 showScreenRecordingWarning = true
@@ -2988,14 +2914,12 @@ struct ContentView: View {
             }
         }
         .onAppear {
-            // VUL-UI-003 Fix 1: Check if screen recording is already active on view appear
             if screenshotProtectionEnabled && UIScreen.main.isCaptured {
                 showScreenRecordingWarning = true
             }
         }
         #endif
         #if os(macOS)
-        // VUL-UI-003 Fix 2: Prevent screen sharing on macOS (defense in depth)
         .onAppear {
             if screenshotProtectionEnabled {
                 DispatchQueue.main.async {
@@ -3005,13 +2929,79 @@ struct ContentView: View {
                 }
             }
         }
-        // Re-apply or remove screen sharing protection when setting changes
         .onChange(of: screenshotProtectionEnabled) { enabled in
             DispatchQueue.main.async {
                 for window in NSApplication.shared.windows {
                     window.sharingType = enabled ? .none : .readOnly
                 }
             }
+        }
+        #endif
+    }
+
+    // MARK: - Security Overlays (extracted to reduce type-check complexity)
+
+    @ViewBuilder
+    private var securityOverlays: some View {
+        // FIX #1276: Lock screen is OUTSIDE the walletManager conditional.
+        // FIX #1462: Show lock screen for BOTH P2P mode (isWalletCreated) AND Full Node mode (walletDat).
+        // FIX #1463: lock screen must show IMMEDIATELY on cold start.
+        #if os(macOS)
+        let walletExistsForLock = walletManager.isWalletCreated || modeManager.walletSource == .walletDat
+        #else
+        let walletExistsForLock = walletManager.isWalletCreated
+        #endif
+        if isShowingLockScreen && !biometricManager.hasAuthenticatedThisSession && walletExistsForLock {
+            LockScreenView(onUnlock: {
+                isShowingLockScreen = false
+                biometricManager.unlockApp()
+                lastActivityTime = Date()
+            })
+        }
+
+        // Security audit TASK 17: Privacy overlay — covers wallet content in app switcher
+        // VUL-U-006: Blur overlay with app name to protect sensitive data
+        if showPrivacyOverlay && screenshotProtectionEnabled {
+            ZStack {
+                Color.black
+                    .ignoresSafeArea()
+                #if os(iOS)
+                VisualEffectBlur(blurStyle: .systemUltraThinMaterialDark)
+                    .ignoresSafeArea()
+                #else
+                Color.black.opacity(0.95)
+                    .ignoresSafeArea()
+                #endif
+                VStack(spacing: 20) {
+                    Text("ZipherX")
+                        .font(.system(size: 48, weight: .bold, design: .monospaced))
+                        .foregroundColor(.white)
+                    Text("Privacy Protected")
+                        .font(.system(size: 16, weight: .medium, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.7))
+                }
+            }
+            .transition(.opacity)
+        }
+
+        // VUL-UI-003 Fix 1: Screen recording warning banner (iOS)
+        #if os(iOS)
+        if showScreenRecordingWarning {
+            VStack {
+                HStack {
+                    Image(systemName: "record.circle.fill")
+                        .foregroundColor(.white)
+                    Text("Screen Recording Active - Wallet data may be captured")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundColor(.white)
+                    Spacer()
+                }
+                .padding()
+                .background(Color.red)
+                Spacer()
+            }
+            .ignoresSafeArea(edges: .top)
+            .allowsHitTesting(false)
         }
         #endif
     }

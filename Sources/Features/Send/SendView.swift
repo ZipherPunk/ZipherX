@@ -852,9 +852,15 @@ struct SendView: View {
                         Text("AMOUNT")
                             .font(theme.captionFont)
                             .foregroundColor(theme.textSecondary)
+                        #if os(iOS)
+                        Text("\(amount) ZCL")
+                            .font(.system(size: 20, weight: .bold, design: .monospaced))
+                            .foregroundColor(theme.primaryColor)
+                        #else
                         Text("\(amount) ZCL")
                             .font(.system(size: 24, weight: .bold, design: .monospaced))
                             .foregroundColor(theme.primaryColor)
+                        #endif
                     }
 
                     Divider()
@@ -871,10 +877,15 @@ struct SendView: View {
                                 .font(.system(size: 12))
                         }
                         Text(recipientAddress)
+                            #if os(iOS)
+                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+                            #else
                             .font(.system(size: 13, weight: .medium, design: .monospaced))
+                            #endif
                             .foregroundColor(theme.textPrimary)
                             .textSelection(.enabled)
                             .fixedSize(horizontal: false, vertical: true)
+                            .lineLimit(nil)
                             .padding(10)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .background(theme.backgroundColor)
@@ -940,7 +951,9 @@ struct SendView: View {
             .padding()
             .background(theme.surfaceColor)
         }
+        #if os(macOS)
         .frame(minWidth: 550, idealWidth: 650, minHeight: 400)
+        #endif
         .background(theme.backgroundColor)
     }
 
