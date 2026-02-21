@@ -37,7 +37,11 @@ struct DisclaimerView: View {
                         }
                         .frame(height: 1)
                     }
+                    #if os(iOS)
+                    .padding(.horizontal, 12)
+                    #else
                     .padding(.horizontal, 24)
+                    #endif
                     .padding(.vertical, 20)
                 }
                 .overlay(
@@ -98,8 +102,13 @@ struct DisclaimerView: View {
                 .foregroundColor(NeonColors.primary.opacity(0.8))
                 .padding(.top, 4)
         }
+        #if os(iOS)
+        .padding(.top, 20)
+        .padding(.bottom, 12)
+        #else
         .padding(.top, 40)
         .padding(.bottom, 20)
+        #endif
     }
 
     // MARK: - Disclaimer Content
@@ -328,17 +337,29 @@ struct DisclaimerView: View {
                         .font(.system(size: 14))
                 }
                 Text(title)
+                    #if os(iOS)
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    #else
                     .font(.system(size: 13, weight: .bold, design: .monospaced))
+                    #endif
                     .foregroundColor(NeonColors.primary)
             }
 
             Text(content)
+                #if os(iOS)
+                .font(.system(size: 10, weight: .regular, design: .monospaced))
+                #else
                 .font(.system(size: 12, weight: .regular, design: .monospaced))
+                #endif
                 .foregroundColor(Color.white.opacity(0.85))
                 .lineSpacing(4)
                 .fixedSize(horizontal: false, vertical: true)
         }
+        #if os(iOS)
+        .padding(10)
+        #else
         .padding(16)
+        #endif
         .background(
             RoundedRectangle(cornerRadius: 8)
                 .fill(NeonColors.primary.opacity(0.05))
@@ -352,16 +373,28 @@ struct DisclaimerView: View {
     private var quoteView: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("\"Privacy is necessary for an open society in the electronic age. Privacy is not secrecy. A private matter is something one doesn't want the whole world to know, but a secret matter is something one doesn't want anybody to know. Privacy is the power to selectively reveal oneself to the world.\"")
+                #if os(iOS)
+                .font(.system(size: 10, weight: .regular, design: .monospaced))
+                #else
                 .font(.system(size: 12, weight: .regular, design: .monospaced))
+                #endif
                 .italic()
                 .foregroundColor(NeonColors.primary.opacity(0.9))
                 .lineSpacing(4)
 
             Text("- Eric Hughes, A Cypherpunk's Manifesto (1993)")
+                #if os(iOS)
+                .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                #else
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                #endif
                 .foregroundColor(NeonColors.primary.opacity(0.7))
         }
+        #if os(iOS)
+        .padding(10)
+        #else
         .padding(16)
+        #endif
         .background(
             RoundedRectangle(cornerRadius: 8)
                 .fill(NeonColors.primary.opacity(0.08))
@@ -371,7 +404,11 @@ struct DisclaimerView: View {
     private var acknowledgmentView: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("BY PROCEEDING, YOU ACKNOWLEDGE THAT:")
+                #if os(iOS)
+                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                #else
                 .font(.system(size: 12, weight: .bold, design: .monospaced))
+                #endif
                 .foregroundColor(.white)
 
             VStack(alignment: .leading, spacing: 8) {
@@ -385,7 +422,11 @@ struct DisclaimerView: View {
                 acknowledgmentItem("You have backed up all existing wallet files and keys before using this software")
             }
         }
+        #if os(iOS)
+        .padding(10)
+        #else
         .padding(16)
+        #endif
         .background(
             RoundedRectangle(cornerRadius: 8)
                 .fill(Color.white.opacity(0.05))
@@ -402,7 +443,11 @@ struct DisclaimerView: View {
                 .foregroundColor(NeonColors.primary)
                 .font(.system(size: 12))
             Text(text)
+                #if os(iOS)
+                .font(.system(size: 9, weight: .regular, design: .monospaced))
+                #else
                 .font(.system(size: 11, weight: .regular, design: .monospaced))
+                #endif
                 .foregroundColor(Color.white.opacity(0.8))
         }
     }
@@ -446,8 +491,13 @@ struct DisclaimerView: View {
                 )
             }
             .disabled(!canAccept)
+            #if os(iOS)
+            .padding(.horizontal, 12)
+            .padding(.bottom, 20)
+            #else
             .padding(.horizontal, 24)
             .padding(.bottom, 30)
+            #endif
         }
         .background(Color.black)
     }

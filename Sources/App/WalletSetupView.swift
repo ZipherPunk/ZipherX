@@ -164,7 +164,11 @@ struct WalletSetupView: View {
                     .disabled(isProcessing)
                     .buttonStyle(PlainButtonStyle())
                 }
+                #if os(iOS)
+                .padding(.horizontal, 16)
+                #else
                 .padding(.horizontal, 32)
+                #endif
                 .padding(.bottom, 40)
             }
         }
@@ -229,7 +233,11 @@ struct WalletSetupView: View {
             RoundedRectangle(cornerRadius: theme.cornerRadius)
                 .stroke(theme.borderColor, lineWidth: 1)
         )
+        #if os(iOS)
+        .padding(.horizontal, 16)
+        #else
         .padding(.horizontal, 32)
+        #endif
     }
 
     private func featureRow(icon: String, text: String) -> some View {
