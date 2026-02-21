@@ -195,8 +195,10 @@ final class ChatManager: ObservableObject {
     /// With 30s max backoff + 30s maintenance loop = constant retries = hundreds of "Connection reset by peer".
     private let maxBackoffSeconds: Double = 300.0
 
-    /// Base backoff delay (2 seconds)
-    private let baseBackoffSeconds: Double = 2.0
+    /// FIX #1473: Base backoff delay increased from 2s to 35s.
+    /// With 30s maintenance loop, first backoff (35s) must exceed loop interval
+    /// or shouldSkipConnection() never blocks retries (30s > 4s/8s/16s = always retry).
+    private let baseBackoffSeconds: Double = 35.0
 
     /// FIX #1458: Track last attempt time to prevent overlapping connection attempts
     private var lastConnectionAttempt: [String: Date] = [:]
@@ -1570,6 +1572,9 @@ final class ChatManager: ObservableObject {
                     try await connect(to: contact)
                     print("💬 FIX #1440: Initial connect to \(contact.displayName) succeeded — online")
                 } catch {
+                    // FIX #1473: Record failure here too — was missing, so UI-triggered checks
+                    // never accumulated backoff, causing retry storms on view appear
+                    recordConnectionFailure(for: contact.onionAddress)
                     if contact.isOnline {
                         updateContactOnlineStatus(contact.onionAddress, isOnline: false)
                     }
@@ -1629,7 +1634,10 @@ final class ChatManager: ObservableObject {
                             try await connect(to: contact)
                             print("💬 FIX #1435: Proactive connect to \(contact.displayName) succeeded — now online")
                         } catch {
-                            // Silently fail — contact is genuinely offline
+                            // FIX #1468: Record ALL connection failures for backoff, not just key exchange
+                            // Without this, SOCKS5 failures ("Onion Service not found") never trigger backoff
+                            // → retry storm every 30 seconds with no delay
+                            recordConnectionFailure(for: contact.onionAddress)
                             if contact.isOnline {
                                 updateContactOnlineStatus(contact.onionAddress, isOnline: false)
                             }

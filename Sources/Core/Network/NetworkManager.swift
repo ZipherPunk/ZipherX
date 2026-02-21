@@ -2691,7 +2691,10 @@ public final class NetworkManager: ObservableObject {
         // Background connect continues to MIN_PEERS (8) but we need at least 6 before releasing startup.
         let maxConnectDuration: TimeInterval = 12.0 // Was 8s, now 12s to give more time for 6 peers
         let minPeersForEarlyReturn = 6 // FIX #1461: Was 3 — too aggressive, peers capped at 3
-        let absMaxConnectDuration: TimeInterval = 10.0 // FIX #1461: Was 5s, now 10s — give Tor connections time
+        // FIX #1471: Tor SOCKS5 adds ~3-5s per peer. 10s only allows ~2-3 peers through Tor.
+        // Increase to 25s when Tor active to allow 5-6 peers before timeout.
+        let isTorActive = torMode == .enabled && !torBypassed
+        let absMaxConnectDuration: TimeInterval = isTorActive ? 25.0 : 10.0
         var shouldExitEarly = false // FIX #1112 v4: Flag to exit outer loop
 
         while connectedCount < targetPeers && peerIndex < validPeers.count && !shouldExitEarly {
@@ -5148,7 +5151,8 @@ public final class NetworkManager: ObservableObject {
     private var lastPriceFetchTime: Date?
 
     /// Fetch ZCL price from API (with fallback, rate limited to every hour)
-    private func fetchZCLPrice() async {
+    /// FIX #1472: Made internal (was private) so Full Node mode can trigger price fetch
+    func fetchZCLPrice() async {
         // Rate limit: only fetch every hour (3600 seconds)
         if let lastFetch = lastPriceFetchTime, Date().timeIntervalSince(lastFetch) < 3600 {
             print("💰 Price fetch skipped (rate limited - hourly)")
@@ -5479,8 +5483,27 @@ public final class NetworkManager: ObservableObject {
             }
         }
 
+        // FIX #1469: Re-resolve DNS seeds when no candidates available
+        if candidates.isEmpty {
+            let dnsEnabled = UserDefaults.standard.bool(forKey: "useDNSSeeds")
+            if dnsEnabled {
+                let freshPeers = await discoverPeers()
+                for address in freshPeers {
+                    if !connectedHosts.contains(address.host) && !isBanned(address.host) &&
+                       !isOnCooldown(address.host, port: address.port) &&
+                       !candidates.contains(where: { $0.host == address.host }) {
+                        addAddress(address, source: "dns")
+                        candidates.append(address)
+                    }
+                }
+                if !candidates.isEmpty {
+                    debugLog(.network, "🫀 FIX #1469: DNS re-resolution found \(candidates.count) new candidates")
+                }
+            }
+        }
+
         guard !candidates.isEmpty else {
-            debugLog(.network, "🫀 FIX #1461: No candidates for peer growth")
+            debugLog(.network, "🫀 FIX #1461: No candidates for peer growth (even after DNS)")
             return
         }
 

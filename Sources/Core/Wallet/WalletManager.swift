@@ -668,10 +668,17 @@ final class WalletManager: ObservableObject {
                         let blockchainRootReversed = Data(blockchainRoot.reversed())
                         let rootMatches = treeRoot == blockchainRoot || treeRoot == blockchainRootReversed
                         if !rootMatches {
-                            print("⚠️ FIX #1220: Delta is current but tree root MISMATCHES blockchain — internal gaps detected")
-                            print("🔧 FIX #1220: Triggering background gap-fill — SENDING DISABLED until tree is valid")
-                            Task {
-                                await self.gapFillDeltaBundle(manifest: manifest, bundledEndHeight: bundledEndHeight)
+                            // FIX #1474: Skip if gap-fill already running or delta already verified
+                            let gapFillRunning = await MainActor.run { self.isGapFillingDelta }
+                            let deltaVerifiedNow = UserDefaults.standard.bool(forKey: "DeltaBundleVerified")
+                            if gapFillRunning || deltaVerifiedNow {
+                                print("⏩ FIX #1474: Skipping gap-fill trigger (gapFillRunning=\(gapFillRunning), verified=\(deltaVerifiedNow))")
+                            } else {
+                                print("⚠️ FIX #1220: Delta is current but tree root MISMATCHES blockchain — internal gaps detected")
+                                print("🔧 FIX #1220: Triggering background gap-fill — SENDING DISABLED until tree is valid")
+                                Task {
+                                    await self.gapFillDeltaBundle(manifest: manifest, bundledEndHeight: bundledEndHeight)
+                                }
                             }
                         } else {
                             // FIX #1252: Root matches at current height — mark as verified
@@ -1006,6 +1013,15 @@ final class WalletManager: ObservableObject {
     /// On success: tree root matches blockchain, witnesses valid, next startup is INSTANT.
     /// On failure: falls back to clearing delta (truly corrupt, not just incomplete).
     private func gapFillDeltaBundle(manifest: DeltaCMUManager.DeltaManifest, bundledEndHeight: UInt64) async {
+        // FIX #1474: Re-entry guard — prevent multiple gap-fills running simultaneously.
+        // Without this: syncDeltaBundleIfNeeded fires background Task at line 673, while another
+        // gap-fill is still running → both re-fetch from manifest.startHeight → reset loop.
+        let alreadyRunning = await MainActor.run { self.isGapFillingDelta }
+        if alreadyRunning {
+            print("⏩ FIX #1474: Gap-fill already in progress — skipping duplicate call")
+            return
+        }
+
         // FIX #1220: Set flag to block ALL other P2P activity (backgroundSyncToHeight, FilterScanner, etc.)
         // during gap-fill. Concurrent P2P fetches steal bandwidth and cause missing blocks.
         await MainActor.run { self.isGapFillingDelta = true }

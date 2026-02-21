@@ -2319,10 +2319,13 @@ struct CypherpunkMainView: View {
                     .shadow(color: Color.yellow.opacity(0.5), radius: 4)
                 }
 
-                // USD value (placeholder - would need price feed)
-                Text("≈ $\(formatUSDValue()) USD")
-                    .font(.system(size: 14, design: .monospaced))
-                    .foregroundColor(matrixGreenDarker)
+                // FIX #1472: Total USD value = balance × real ZCL price
+                if networkManager.zclPriceUSD > 0 && !networkManager.zclPriceFailed {
+                    let fiatValue = Double(walletManager.shieldedBalance) / 100_000_000.0 * networkManager.zclPriceUSD
+                    Text(String(format: "$%.2f USD (1 ZCL = $%.4f)", fiatValue, networkManager.zclPriceUSD))
+                        .font(.system(size: 14, design: .monospaced))
+                        .foregroundColor(matrixGreenDarker)
+                }
             }
 
             // Privacy badge
@@ -2682,12 +2685,7 @@ struct CypherpunkMainView: View {
 
             Spacer()
 
-            // ZCL Price (right)
-            if networkManager.zclPriceUSD > 0 {
-                Text(String(format: "$%.2f", networkManager.zclPriceUSD))
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundColor(matrixGreenDark)
-            }
+            // FIX #1472: Per-coin price moved to balance area — no longer shown separately here
 
             // Block height (right)
             HStack(spacing: 2) {
@@ -2714,13 +2712,7 @@ struct CypherpunkMainView: View {
         }
     }
 
-    private func formatUSDValue() -> String {
-        // Placeholder - would need actual price feed
-        // For now, show approximate value (ZCL ~ $0.02)
-        let zcl = Double(walletManager.shieldedBalance) / 100_000_000.0
-        let usd = zcl * 0.02 // Approximate price
-        return String(format: "%.2f", usd)
-    }
+    // FIX #1472: formatUSDValue() removed — fiat calculation now inline with real price
 
     private func loadTransactionHistory() {
         isLoadingHistory = true

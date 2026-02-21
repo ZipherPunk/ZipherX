@@ -23,29 +23,8 @@ struct DisclaimerView: View {
                 // Header
                 headerView
 
-                // Scrollable content (vertical only — prevent horizontal overflow on iOS)
-                ScrollView(.vertical, showsIndicators: true) {
-                    VStack(alignment: .leading, spacing: 20) {
-                        disclaimerContent
-
-                        // FIX #1447: Bottom anchor reports position via preference key
-                        // instead of onAppear (which fires immediately on macOS)
-                        GeometryReader { geo in
-                            Color.clear
-                                .preference(key: BottomAnchorYKey.self,
-                                           value: geo.frame(in: .global).maxY)
-                        }
-                        .frame(height: 1)
-                    }
-                    #if os(iOS)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 12)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    #else
-                    .padding(.horizontal, 24)
-                    .padding(.vertical, 20)
-                    #endif
-                }
+                // Scrollable content
+                scrollableContent
                 .overlay(
                     // FIX #1447: Track the scroll view's visible bottom edge
                     GeometryReader { geo in
@@ -83,6 +62,47 @@ struct DisclaimerView: View {
         static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
             value = nextValue()
         }
+    }
+
+    // MARK: - Scrollable Content Wrapper
+
+    private var scrollableContent: some View {
+        #if os(iOS)
+        // FIX #1470: GeometryReader forces content width = screen width
+        // ScrollView(.vertical) alone does NOT constrain horizontal width on iOS
+        GeometryReader { geometry in
+            ScrollView(.vertical, showsIndicators: true) {
+                VStack(alignment: .leading, spacing: 16) {
+                    disclaimerContent
+
+                    GeometryReader { geo in
+                        Color.clear
+                            .preference(key: BottomAnchorYKey.self,
+                                       value: geo.frame(in: .global).maxY)
+                    }
+                    .frame(height: 1)
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 12)
+                .frame(width: geometry.size.width)
+            }
+        }
+        #else
+        ScrollView(.vertical, showsIndicators: true) {
+            VStack(alignment: .leading, spacing: 20) {
+                disclaimerContent
+
+                GeometryReader { geo in
+                    Color.clear
+                        .preference(key: BottomAnchorYKey.self,
+                                   value: geo.frame(in: .global).maxY)
+                }
+                .frame(height: 1)
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 20)
+        }
+        #endif
     }
 
     // MARK: - Header

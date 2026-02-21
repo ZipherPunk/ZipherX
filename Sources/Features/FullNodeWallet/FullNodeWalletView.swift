@@ -8,6 +8,7 @@ struct FullNodeWalletView: View {
     @StateObject private var rpcWallet = RPCWalletOperations.shared
     @ObservedObject private var fullNodeManager = FullNodeManager.shared  // FIX #1380: Observe daemon status
     @ObservedObject private var appUpdateChecker = AppUpdateChecker.shared  // FIX #1383
+    @ObservedObject private var networkManager = NetworkManager.shared  // FIX #1472: Observe ZCL price for fiat display
 
     @State private var selectedTab: WalletTab = .addresses
     @State private var isLoading = true
@@ -313,6 +314,9 @@ struct FullNodeWalletView: View {
                 await MainActor.run { daemonVersion = firstLine }
             }
 
+            // FIX #1472: Fetch ZCL price for fiat display (rate-limited, won't spam)
+            await networkManager.fetchZCLPrice()
+
             // Only load wallet data if prerequisites are met
             if !prereqCheck.missing {
                 await loadWalletData()
@@ -457,6 +461,14 @@ struct FullNodeWalletView: View {
                         Text(formatBalance(totalBalance.total))
                             .font(.system(size: 28, weight: .bold, design: .monospaced))
                             .foregroundColor(theme.textPrimary)
+
+                        // FIX #1472: Show fiat equivalent below balance (balance × ZCL price)
+                        if networkManager.zclPriceUSD > 0 && !networkManager.zclPriceFailed {
+                            let fiatValue = Double(totalBalance.total) / 100_000_000.0 * networkManager.zclPriceUSD
+                            Text(String(format: "$%.2f USD (1 ZCL = $%.4f)", fiatValue, networkManager.zclPriceUSD))
+                                .font(.system(size: 14, design: .monospaced))
+                                .foregroundColor(theme.textSecondary)
+                        }
                     }
                 }
 
