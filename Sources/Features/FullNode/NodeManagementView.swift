@@ -859,6 +859,138 @@ Continue?
 
     // MARK: - Privacy Section
 
+    @ViewBuilder
+    private var torStatusView: some View {
+        let tor = viewModel.detectTorStatus()
+
+        if !tor.isInstalled {
+            // Tor not installed
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "xmark.shield.fill")
+                    .font(.system(size: 14))
+                    .foregroundColor(.red)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Tor not installed")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(.red)
+                    Text("Install system Tor:")
+                        .font(.system(size: 10))
+                        .foregroundColor(theme.textSecondary)
+                    Text("brew install tor && brew services start tor")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(theme.primaryColor)
+                        .textSelection(.enabled)
+                        .padding(8)
+                        .background(theme.backgroundColor)
+                        .cornerRadius(4)
+                }
+            }
+            .padding(10)
+            .background(Color.red.opacity(0.1))
+            .cornerRadius(6)
+        } else if !tor.isSocksListening {
+            // Installed but not running
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "xmark.shield.fill")
+                    .font(.system(size: 14))
+                    .foregroundColor(.red)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Tor installed but not running")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(.red)
+                    HStack(spacing: 4) {
+                        Text("Binary:")
+                            .font(.system(size: 10))
+                            .foregroundColor(theme.textSecondary)
+                        Text(tor.binaryPath ?? "tor")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundColor(theme.textPrimary)
+                    }
+                    Text("SOCKS port \(tor.socksPort) not listening. Start Tor:")
+                        .font(.system(size: 10))
+                        .foregroundColor(theme.textSecondary)
+                    Text("brew services start tor")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(theme.primaryColor)
+                        .textSelection(.enabled)
+                        .padding(8)
+                        .background(theme.backgroundColor)
+                        .cornerRadius(4)
+                }
+            }
+            .padding(10)
+            .background(Color.red.opacity(0.1))
+            .cornerRadius(6)
+        } else if !tor.isControlListening {
+            // SOCKS works, control port missing
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 6) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundColor(.green)
+                        .font(.system(size: 12))
+                    Text("SOCKS5 proxy active (port \(tor.socksPort))")
+                        .font(.system(size: 10))
+                        .foregroundColor(.green)
+                }
+                HStack(spacing: 6) {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundColor(.orange)
+                        .font(.system(size: 12))
+                    Text("Control port \(tor.controlPort) not available — hidden service disabled")
+                        .font(.system(size: 10))
+                        .foregroundColor(.orange)
+                }
+                if let torrc = tor.torrcPath {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Add to \(torrc):")
+                            .font(.system(size: 10))
+                            .foregroundColor(theme.textSecondary)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("ControlPort \(tor.controlPort)")
+                            Text("CookieAuthentication 1")
+                        }
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(theme.primaryColor)
+                        .textSelection(.enabled)
+                        .padding(8)
+                        .background(theme.backgroundColor)
+                        .cornerRadius(4)
+                    }
+                }
+            }
+            .padding(10)
+            .background(Color.orange.opacity(0.1))
+            .cornerRadius(6)
+        } else {
+            // Everything working
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Image(systemName: "checkmark.shield.fill")
+                        .foregroundColor(.green)
+                        .font(.system(size: 12))
+                    Text("System Tor fully operational")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(.green)
+                }
+                HStack(spacing: 12) {
+                    Label("SOCKS \(tor.socksPort)", systemImage: "network")
+                    Label("Control \(tor.controlPort)", systemImage: "gearshape")
+                    Label("Hidden Service", systemImage: "eye.slash")
+                }
+                .font(.system(size: 10))
+                .foregroundColor(theme.textSecondary)
+                if let torrc = tor.torrcPath {
+                    Text("Config: \(torrc)")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundColor(theme.textSecondary.opacity(0.7))
+                }
+            }
+            .padding(10)
+            .background(Color.green.opacity(0.1))
+            .cornerRadius(6)
+        }
+    }
+
     private var privacySection: some View {
         VStack(spacing: 12) {
             sectionHeader(icon: "lock.shield", title: "PRIVACY SETTINGS")
@@ -896,40 +1028,9 @@ Continue?
                         }
                 }
 
-                // System Tor not detected warning
-                if viewModel.isTorEnabled && !viewModel.isSystemTorRunning {
-                    HStack(alignment: .top, spacing: 8) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .font(.system(size: 14))
-                            .foregroundColor(.red)
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("System Tor not detected on port 9050")
-                                .font(.system(size: 11, weight: .bold))
-                                .foregroundColor(.red)
-                            Text("The full node requires system Tor (not embedded Arti). Install and start it:")
-                                .font(.system(size: 10))
-                                .foregroundColor(theme.textSecondary)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("brew install tor")
-                                    .font(.system(size: 11, design: .monospaced))
-                                    .foregroundColor(theme.primaryColor)
-                                    .textSelection(.enabled)
-                                Text("brew services start tor")
-                                    .font(.system(size: 11, design: .monospaced))
-                                    .foregroundColor(theme.primaryColor)
-                                    .textSelection(.enabled)
-                            }
-                            .padding(8)
-                            .background(theme.backgroundColor)
-                            .cornerRadius(4)
-                            Text("Then restart the daemon for Tor to take effect.")
-                                .font(.system(size: 10))
-                                .foregroundColor(theme.textSecondary)
-                        }
-                    }
-                    .padding(10)
-                    .background(Color.red.opacity(0.1))
-                    .cornerRadius(6)
+                // System Tor status — detect installation, ports, and services
+                if viewModel.isTorEnabled {
+                    torStatusView
                 }
 
                 Divider()
@@ -2200,15 +2301,94 @@ class NodeManagementViewModel: ObservableObject {
         NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: backupDir.path)
     }
 
-    /// Check if system Tor is running on port 9050
-    var isSystemTorRunning: Bool {
+    // MARK: - Tor Detection
+
+    /// Tor installation and configuration status
+    struct TorStatus {
+        var isInstalled: Bool = false
+        var binaryPath: String? = nil
+        var torrcPath: String? = nil
+        var socksPort: UInt16 = 9050    // Default
+        var controlPort: UInt16 = 9051  // Default
+        var isSocksListening: Bool = false
+        var isControlListening: Bool = false
+        var hasCookieAuth: Bool = false
+    }
+
+    /// Detect system Tor: binary, torrc config, actual ports, listening status
+    func detectTorStatus() -> TorStatus {
+        var status = TorStatus()
+
+        // 1. Check if tor binary is installed
+        let torPaths = [
+            "/opt/homebrew/bin/tor",       // Homebrew Apple Silicon
+            "/usr/local/bin/tor",          // Homebrew Intel
+            "/usr/bin/tor",                // System
+        ]
+        for path in torPaths {
+            if FileManager.default.fileExists(atPath: path) {
+                status.isInstalled = true
+                status.binaryPath = path
+                break
+            }
+        }
+
+        // 2. Find and parse torrc for configured ports
+        let torrcPaths = [
+            "/opt/homebrew/etc/tor/torrc",   // Homebrew Apple Silicon
+            "/usr/local/etc/tor/torrc",      // Homebrew Intel
+            "/etc/tor/torrc",                // System
+        ]
+        for path in torrcPaths {
+            if FileManager.default.fileExists(atPath: path) {
+                status.torrcPath = path
+                if let content = try? String(contentsOfFile: path, encoding: .utf8) {
+                    for line in content.components(separatedBy: "\n") {
+                        let trimmed = line.trimmingCharacters(in: .whitespaces)
+                        // Skip comments
+                        if trimmed.hasPrefix("#") { continue }
+
+                        if trimmed.lowercased().hasPrefix("socksport") {
+                            // Parse: SocksPort 9050 or SocksPort 127.0.0.1:9050
+                            let parts = trimmed.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
+                            if parts.count >= 2 {
+                                let portStr = parts[1].contains(":") ? String(parts[1].split(separator: ":").last ?? "") : parts[1]
+                                if let p = UInt16(portStr) { status.socksPort = p }
+                            }
+                        } else if trimmed.lowercased().hasPrefix("controlport") {
+                            let parts = trimmed.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
+                            if parts.count >= 2 {
+                                let portStr = parts[1].contains(":") ? String(parts[1].split(separator: ":").last ?? "") : parts[1]
+                                if let p = UInt16(portStr) { status.controlPort = p }
+                            }
+                        } else if trimmed.lowercased().hasPrefix("cookieauthentication") {
+                            let parts = trimmed.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
+                            if parts.count >= 2 {
+                                status.hasCookieAuth = (parts[1] == "1")
+                            }
+                        }
+                    }
+                }
+                break
+            }
+        }
+
+        // 3. Check if configured ports are actually listening
+        status.isSocksListening = isPortOpen(status.socksPort)
+        status.isControlListening = isPortOpen(status.controlPort)
+
+        return status
+    }
+
+    /// Check if a local TCP port is open (service listening)
+    private func isPortOpen(_ port: UInt16) -> Bool {
         let sock = socket(AF_INET, SOCK_STREAM, 0)
         guard sock >= 0 else { return false }
         defer { close(sock) }
 
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = UInt16(9050).bigEndian
+        addr.sin_port = port.bigEndian
         addr.sin_addr.s_addr = inet_addr("127.0.0.1")
 
         let result = withUnsafePointer(to: &addr) { ptr in
@@ -2219,24 +2399,53 @@ class NodeManagementViewModel: ObservableObject {
         return result == 0
     }
 
+    /// Convenience: check if Tor SOCKS proxy is running (reads actual port from torrc)
+    var isSystemTorRunning: Bool { detectTorStatus().isSocksListening }
+
+    /// Convenience: check if Tor control port is available (reads actual port from torrc)
+    var isTorControlAvailable: Bool { detectTorStatus().isControlListening }
+
     func setTorEnabled(_ enabled: Bool) {
         if enabled {
-            // Check if system Tor is running before enabling
-            if !isSystemTorRunning {
-                // Revert toggle — Tor not available
-                DispatchQueue.main.async {
-                    self.isTorEnabled = false
-                }
-                let alert = NSAlert()
-                alert.messageText = "System Tor Not Detected"
-                alert.informativeText = """
-                The full node requires system Tor running on port 9050.
+            let tor = detectTorStatus()
 
-                Install and start Tor:
+            // Check 1: Is Tor even installed?
+            if !tor.isInstalled {
+                DispatchQueue.main.async { self.isTorEnabled = false }
+                let alert = NSAlert()
+                alert.messageText = "Tor Not Installed"
+                alert.informativeText = """
+                Tor is not installed on this system.
+
+                Install Tor:
                   brew install tor
+
+                Configure torrc (at \(tor.torrcPath ?? "/opt/homebrew/etc/tor/torrc")):
+                  SocksPort 9050
+                  ControlPort 9051
+                  CookieAuthentication 1
+
+                Start Tor:
+                  brew services start tor
+                """
+                alert.alertStyle = .critical
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
+                return
+            }
+
+            // Check 2: Is SOCKS proxy listening?
+            if !tor.isSocksListening {
+                DispatchQueue.main.async { self.isTorEnabled = false }
+                let alert = NSAlert()
+                alert.messageText = "Tor Not Running"
+                alert.informativeText = """
+                Tor is installed (\(tor.binaryPath ?? "tor")) but SOCKS proxy is not listening on port \(tor.socksPort).
+
+                Start Tor:
                   brew services start tor
 
-                The embedded Arti Tor (used by ZipherX P2P mode) cannot be used for the full node because it stops when the app closes.
+                Config: \(tor.torrcPath ?? "not found")
                 """
                 alert.alertStyle = .warning
                 alert.addButton(withTitle: "OK")
@@ -2244,23 +2453,53 @@ class NodeManagementViewModel: ObservableObject {
                 return
             }
 
-            // System Tor detected — configure proxy on port 9050
+            // Check 3: Is control port available for hidden services?
+            if !tor.isControlListening {
+                let alert = NSAlert()
+                alert.messageText = "Tor Control Port Not Available"
+                alert.informativeText = """
+                Tor SOCKS proxy active on port \(tor.socksPort) — outgoing Tor connections will work.
+
+                However, the control port (\(tor.controlPort)) is not listening. Hidden service (onion) will not work.
+
+                Add to \(tor.torrcPath ?? "torrc"):
+                  ControlPort \(tor.controlPort)
+                  CookieAuthentication 1
+
+                Then restart:
+                  brew services restart tor
+                """
+                alert.alertStyle = .informational
+                alert.addButton(withTitle: "Continue Anyway")
+                alert.addButton(withTitle: "Cancel")
+                if alert.runModal() == .alertSecondButtonReturn {
+                    DispatchQueue.main.async { self.isTorEnabled = false }
+                    return
+                }
+            }
+
+            // All checks passed — configure with actual detected ports
             UserDefaults.standard.set(true, forKey: "fullNodeTorEnabled")
-            updateConfigSetting("proxy", value: "127.0.0.1:9050")
+            updateConfigSetting("proxy", value: "127.0.0.1:\(tor.socksPort)")
+            updateConfigSetting("onion", value: "127.0.0.1:\(tor.socksPort)")
+            updateConfigSetting("torcontrol", value: "127.0.0.1:\(tor.controlPort)")
+            updateConfigSetting("listenonion", value: tor.isControlListening ? "1" : "0")
             updateConfigSetting("listen", value: "0")
-            updateConfigSetting("listenonion", value: "1")
         } else {
             UserDefaults.standard.set(false, forKey: "fullNodeTorEnabled")
             updateConfigSetting("proxy", value: nil)
+            updateConfigSetting("onion", value: nil)
+            updateConfigSetting("torcontrol", value: nil)
             updateConfigSetting("listenonion", value: nil)
             updateConfigSetting("listen", value: "1")
         }
 
         if isDaemonRunning {
+            let tor = detectTorStatus()
             let alert = NSAlert()
             alert.messageText = "Restart Required"
             alert.informativeText = enabled ?
-                "Tor proxy configured (system Tor on port 9050). Please restart the daemon for Tor settings to take effect." :
+                "Tor configured (SOCKS \(tor.socksPort), Control \(tor.controlPort)). Please restart the daemon for Tor settings to take effect." :
                 "Tor proxy removed. Please restart the daemon for network settings to take effect."
             alert.addButton(withTitle: "OK")
             alert.runModal()
@@ -2288,23 +2527,51 @@ class NodeManagementViewModel: ObservableObject {
             var config = try String(contentsOf: configPath, encoding: .utf8)
             var lines = config.components(separatedBy: "\n")
 
-            // Find and update/remove the setting
-            var found = false
+            // Search for the setting — both uncommented and commented forms
+            var foundIndex: Int? = nil
+            var foundCommentedIndex: Int? = nil
+
             for i in 0..<lines.count {
-                if lines[i].hasPrefix("\(key)=") {
-                    if let value = value {
-                        lines[i] = "\(key)=\(value)"
-                    } else {
-                        lines[i] = "# \(lines[i])" // Comment out
-                    }
-                    found = true
+                let trimmed = lines[i].trimmingCharacters(in: .whitespaces)
+                if trimmed.hasPrefix("\(key)=") {
+                    // Active (uncommented) line — prefer this
+                    foundIndex = i
                     break
+                } else if trimmed.hasPrefix("# \(key)=") || trimmed.hasPrefix("#\(key)=") {
+                    // Commented line — remember first occurrence
+                    if foundCommentedIndex == nil {
+                        foundCommentedIndex = i
+                    }
                 }
             }
 
-            // Add if not found
-            if !found, let value = value {
+            if let idx = foundIndex {
+                // Found active line
+                if let value = value {
+                    lines[idx] = "\(key)=\(value)"
+                } else {
+                    lines[idx] = "# \(key)=\(lines[idx].components(separatedBy: "=").dropFirst().joined(separator: "="))"
+                }
+            } else if let idx = foundCommentedIndex {
+                // Found commented line — uncomment with new value, or leave commented
+                if let value = value {
+                    lines[idx] = "\(key)=\(value)"
+                }
+                // If value is nil, it's already commented — nothing to do
+            } else if let value = value {
+                // Not found at all — append
                 lines.append("\(key)=\(value)")
+            }
+
+            // Clean up: remove any duplicate active lines for this key (keep only first)
+            var seenActive = false
+            lines = lines.filter { line in
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                if trimmed.hasPrefix("\(key)=") {
+                    if seenActive { return false } // Remove duplicate
+                    seenActive = true
+                }
+                return true
             }
 
             config = lines.joined(separator: "\n")
