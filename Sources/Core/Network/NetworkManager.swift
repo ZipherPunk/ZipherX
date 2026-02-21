@@ -1344,7 +1344,7 @@ public final class NetworkManager: ObservableObject {
                     let ownOnionBase = ownOnion.replacingOccurrences(of: ".onion", with: "")
                     let addrOnionBase = normalizedHost.replacingOccurrences(of: ".onion", with: "")
                     if ownOnionBase == addrOnionBase {
-                        print("🧅 Skipping our own onion address: \(normalizedHost.prefix(16))...")
+                        print("🧅 Skipping our own onion address: \(LogRedaction.redactHost(normalizedHost))")
                     }
                 }
             }
@@ -5230,18 +5230,19 @@ public final class NetworkManager: ObservableObject {
         let addedCount = isFullNodeMode ? ZclassicCheckpoints.seedNodes.count : ZclassicCheckpoints.seedNodes.count - 1
         print("🌱 FIX #234: Added \(addedCount) hardcoded Zclassic seed nodes\(isFullNodeMode ? "" : " (localhost skipped - ZipherX mode)")")
 
-        // FIX #1401 (NET-003): Skip DNS seeds when Tor is enabled.
+        // FIX #1401 (NET-003): DNS seeds controlled by user setting (disabled by default).
         // DNS resolution uses system DNS (clearnet) — leaks to ISP that user is
-        // looking up Zclassic seed nodes. Hardcoded seeds + P2P addr gossip are sufficient.
-        let torEnabled = await TorManager.shared.mode == .enabled
-        if torEnabled {
-            print("🧅 FIX #1401: Skipping DNS seed resolution (Tor enabled — prevents DNS leak to ISP)")
-        } else {
-            // Then try DNS seeds (may return Zcash nodes which will be filtered by version check)
+        // looking up Zclassic seed nodes. User can enable in Settings → Network → DNS Seeds.
+        let dnsEnabled = UserDefaults.standard.bool(forKey: "useDNSSeeds")
+        if dnsEnabled {
+            // User explicitly enabled DNS seeds — resolve them
             for seed in dnsSeedsZCL {
                 let resolved = await resolveDNSSeed(seed)
                 addresses.append(contentsOf: resolved)
             }
+            print("🌐 DNS Seeds: Resolved \(addresses.count) addresses from DNS seeds")
+        } else {
+            print("🌐 DNS Seeds: Disabled (Settings → Network → DNS Seeds to enable)")
         }
 
         // Add .onion seed nodes if Tor is available
@@ -5250,11 +5251,32 @@ public final class NetworkManager: ObservableObject {
         if torMode == .enabled && torConnected {
             for onionSeed in ZclassicCheckpoints.onionSeedNodes {
                 addresses.append(PeerAddress(host: onionSeed, port: defaultPort))
-                print("🧅 Added .onion seed: \(onionSeed)")
+                print("🧅 Added .onion seed: \(LogRedaction.redactHost(onionSeed))")
             }
         }
 
         return addresses
+    }
+
+    /// Resolve DNS seeds on demand (called when user enables DNS Seeds toggle in Settings).
+    /// Discovers new peer addresses and connects to them immediately — no restart needed.
+    func resolveDNSSeedsNow() async {
+        print("🌐 DNS Seeds: Resolving on demand...")
+        var newAddresses: [PeerAddress] = []
+        for seed in dnsSeedsZCL {
+            let resolved = await resolveDNSSeed(seed)
+            newAddresses.append(contentsOf: resolved)
+        }
+        print("🌐 DNS Seeds: Resolved \(newAddresses.count) addresses")
+
+        // Add to known addresses
+        for address in newAddresses {
+            addAddress(address, source: "dns-seed")
+        }
+
+        // Connect to new peers
+        let currentReady = peers.filter { $0.isConnectionReady }.count
+        await growPeerCount(currentReady: currentReady)
     }
 
     private func resolveDNSSeed(_ hostname: String) async -> [PeerAddress] {

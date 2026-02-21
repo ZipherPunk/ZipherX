@@ -1187,7 +1187,7 @@ public final class PeerManager: ObservableObject {
         if let newKey = usableNewAddresses.randomElement(),
            let info = knownAddresses[newKey] {
             if isOnion(info.address.host) {
-                print("🧅 Selected new .onion peer: \(info.address.host)")
+                print("🧅 Selected new .onion peer: \(LogRedaction.redactHost(info.address.host))")
             }
             return info.address
         }
@@ -1217,7 +1217,7 @@ public final class PeerManager: ObservableObject {
                 if random <= 0 {
                     if let address = knownAddresses[key]?.address {
                         if isOnion(address.host) {
-                            print("🧅 Selected tried .onion peer: \(address.host)")
+                            print("🧅 Selected tried .onion peer: \(LogRedaction.redactHost(address.host))")
                         }
                         return address
                     }

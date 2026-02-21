@@ -10950,8 +10950,7 @@ final class WalletManager: ObservableObject {
         for note in spentNotes {
             try database.markNoteUnspent(nullifier: note.nullifier)
             recoveredCount += 1
-            let nfHex = note.nullifier.map { String(format: "%02x", $0) }.joined().prefix(16)
-            print("Recovered note: \(nfHex)...")
+            print("Recovered note: [nullifier redacted]")
         }
 
         if recoveredCount > 0 {
@@ -12687,7 +12686,7 @@ final class WalletManager: ObservableObject {
         let peerCount = await MainActor.run { networkManager.peers.filter { $0.isConnectionReady }.count }
         let maxBlocksPerPeer = 128
         let batchSize: UInt64 = UInt64(min(max(peerCount, 1), 3) * maxBlocksPerPeer)
-        print("🔍 FIX #1095: Checking \(blocksToScan) blocks for nullifier \(nullifier.prefix(16))... (batch=\(batchSize))")
+        print("🔍 FIX #1095: Checking \(blocksToScan) blocks for nullifier [redacted] (batch=\(batchSize))")
 
         var batchStart = startHeight
         var verificationFailed = false  // Track if ANY batch failed
@@ -13380,11 +13379,9 @@ final class WalletManager: ObservableObject {
             // Compare with stored nullifier
             if newHashedNullifier != note.nullifier {
                 // Nullifiers are different - stored one was computed with wrong position!
-                let oldPrefix = note.nullifier.prefix(8).map { String(format: "%02x", $0) }.joined()
-                let newPrefix = newHashedNullifier.prefix(8).map { String(format: "%02x", $0) }.joined()
                 print("🔧 FIX #1090: Note \(note.id) at height \(note.height) has WRONG nullifier!")
-                print("   Old (wrong): \(oldPrefix)... (position was placeholder)")
-                print("   New (correct): \(newPrefix)... (position=\(note.witnessIndex))")
+                print("   Old (wrong): [redacted] (position was placeholder)")
+                print("   New (correct): [redacted] (position=\(note.witnessIndex))")
                 print("   Value: \(note.value.redactedAmount)")
 
                 // Update the database with correct nullifier
@@ -14564,7 +14561,7 @@ final class WalletManager: ObservableObject {
 
                 // Find the note by hashed nullifier - getNoteByNullifier returns (id, value)?
                 guard let (noteId, noteValue) = try? database.getNoteByNullifier(nullifier: hashedNullifier) else {
-                    print("⚠️ FIX #680: Note not found for nullifier \(nullifier.hexString.prefix(16))...")
+                    print("⚠️ FIX #680: Note not found for nullifier [redacted]")
                     continue
                 }
 

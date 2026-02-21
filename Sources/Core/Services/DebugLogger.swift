@@ -93,17 +93,12 @@ final class DebugLogger {
 
     /// FIX #1376: Debug logging can be disabled by the user from Settings.
     /// When disabled, log file writes are suppressed (console output still works).
-    /// FIX #1431: Default to ENABLED in DEBUG builds for development.
-    /// FIX #1455: Default to DISABLED in RELEASE builds for privacy (no sensitive data in logs).
-    /// User can explicitly enable/disable in Settings.
+    /// FIX #1455: Default to DISABLED on fresh install for privacy (no sensitive data in logs).
+    /// User can explicitly enable in Settings for troubleshooting.
     var isEnabled: Bool {
         get {
             if UserDefaults.standard.object(forKey: "debugLoggingEnabled") == nil {
-                #if DEBUG
-                return true
-                #else
-                return false
-                #endif
+                return false  // Fresh install: always off
             }
             return UserDefaults.standard.bool(forKey: "debugLoggingEnabled")
         }
@@ -536,6 +531,16 @@ struct LogRedaction {
         let parts = ip.split(separator: ".")
         guard parts.count == 4 else { return ip }
         return "\(parts[0]).\(parts[1]).x.x"
+    }
+
+    /// Redact host (IP or .onion) for privacy
+    /// "abc123...xyz.onion" -> "abc123...onion"
+    /// "192.168.1.100" -> "192.168.x.x"
+    static func redactHost(_ host: String) -> String {
+        if host.hasSuffix(".onion") {
+            return String(host.prefix(8)) + "...onion"
+        }
+        return redactIP(host)
     }
 
     /// Redact memo content - shows only length

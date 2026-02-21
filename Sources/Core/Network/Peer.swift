@@ -2178,7 +2178,7 @@ public final class Peer {
             let transitionSucceeded = self.transitionTo(.running(taskID: taskID), from: [.starting])
             guard transitionSucceeded else {
                 // State was changed (likely to .stopping) - exit cleanly
-                print("📡 FIX #1069: [\(self.host)] Block listener task exiting - state changed during startup")
+                print("📡 FIX #1069: [\(LogRedaction.redactHost(self.host))] Block listener task exiting - state changed during startup")
                 _ = self.transitionTo(.stopped, from: nil)
                 return
             }
@@ -2191,7 +2191,7 @@ public final class Peer {
             // which caused block listeners to die within 4ms of starting
             do {
                 if self.isOnion {
-                    print("📡 [\(self.host)] .onion peer - waiting 2s for Tor connection to stabilize...")
+                    print("📡 [\(LogRedaction.redactHost(self.host))] .onion peer - waiting 2s for Tor connection to stabilize...")
                     try await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds
                 } else {
                     // Short delay for regular peers to let any pending handshake data clear
@@ -2199,7 +2199,7 @@ public final class Peer {
                 }
             } catch is CancellationError {
                 // FIX #1179: Task was cancelled during stabilization — exit cleanly
-                print("📡 FIX #1179: [\(self.host)] Block listener cancelled during stabilization delay")
+                print("📡 FIX #1179: [\(LogRedaction.redactHost(self.host))] Block listener cancelled during stabilization delay")
                 _ = self.transitionTo(.stopped, from: nil)
                 return
             } catch {
@@ -2213,7 +2213,7 @@ public final class Peer {
             // This tells other operations to use the dispatcher pattern instead of direct reads
             // Without this, dispatcher.isActive is always false and the pattern is never used!
             await self.messageDispatcher.setActive(true)
-            print("📡 FIX #1094: [\(self.host)] Dispatcher activated - block listener is sole reader")
+            print("📡 FIX #1094: [\(LogRedaction.redactHost(self.host))] Dispatcher activated - block listener is sole reader")
 
             var consecutiveErrors = 0
             let maxConsecutiveErrors = 5
@@ -2260,7 +2260,7 @@ public final class Peer {
                     // 120s header receive timed out (peer sent nothing for 120s = dead peer).
                     // The connection was killed by receive(count:)'s GCD timeout.
                     // Exit the listener — health check will replace the peer.
-                    print("📡 FIX #1184b: [\(self.host)] Block listener timeout (300s no data) — peer is dead, exiting")
+                    print("📡 FIX #1184b: [\(LogRedaction.redactHost(self.host))] Block listener timeout (300s no data) — peer is dead, exiting")
                     break
                 } catch is CancellationError {
                     // FIX #120: Listener was stopped - exit cleanly without error message
@@ -2275,19 +2275,19 @@ public final class Peer {
                     self.connectionLock.unlock()
                     if let conn = conn {
                         self.safeCancelConnection(conn, force: true)
-                        print("🔌 FIX #1184b: [\(self.host)] Killed connection after cancellation (orphan prevention)")
+                        print("🔌 FIX #1184b: [\(LogRedaction.redactHost(self.host))] Killed connection after cancellation (orphan prevention)")
                     }
                     break
                 } catch NetworkError.invalidMagicBytes {
                     // FIX #1175: Invalid magic bytes = stream is corrupted, stop immediately
                     // Retrying on a desynced stream just reads more garbage
                     // The peer will be replaced by health check recovery
-                    print("🔌 FIX #1175: [\(self.host)] Invalid magic bytes in block listener - stopping (stream corrupted)")
+                    print("🔌 FIX #1175: [\(LogRedaction.redactHost(self.host))] Invalid magic bytes in block listener - stopping (stream corrupted)")
                     break
                 } catch {
                     // Connection closed or error - stop listening
                     if case .running = self.getCurrentState() {
-                        print("📡 [\(self.host)] Block listener stopped: \(error.localizedDescription)")
+                        print("📡 [\(LogRedaction.redactHost(self.host))] Block listener stopped: \(error.localizedDescription)")
                     }
                     break
                 }
@@ -2296,11 +2296,11 @@ public final class Peer {
             // FIX #1094: Deactivate dispatcher BEFORE transitioning state
             // This tells other operations to use direct reads since block listener is stopping
             await self.messageDispatcher.setActive(false)
-            print("📡 FIX #1094: [\(self.host)] Dispatcher deactivated - block listener exiting")
+            print("📡 FIX #1094: [\(LogRedaction.redactHost(self.host))] Dispatcher deactivated - block listener exiting")
 
             // FIX #1069: Transition to stopped state when task ends
             _ = self.transitionTo(.stopped, from: [.running(taskID: taskID), .stopping])
-            print("📡 [\(self.host)] Block listener ended")
+            print("📡 [\(LogRedaction.redactHost(self.host))] Block listener ended")
         }
     }
 
@@ -4664,7 +4664,7 @@ public final class Peer {
                 if cmd == "headers" {
                     return resp
                 }
-                print("⏭️ FIX #1236: [\(self.host)] Skipping '\(cmd)' while waiting for headers (attempt \(attempts+1)/10)")
+                print("⏭️ FIX #1236: [\(LogRedaction.redactHost(self.host))] Skipping '\(cmd)' while waiting for headers (attempt \(attempts+1)/10)")
                 attempts += 1
             }
             throw NetworkError.timeout

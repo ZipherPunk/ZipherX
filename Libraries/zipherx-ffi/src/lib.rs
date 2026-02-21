@@ -1819,11 +1819,11 @@ pub unsafe extern "C" fn zipherx_init_prover(
     let output_path = Path::new(output);
 
     if !spend_path.exists() {
-        eprintln!("❌ Spend params file does not exist: {}", spend);
+        eprintln!("❌ Spend params file does not exist: {}", spend_path.file_name().unwrap_or_default().to_string_lossy());
         return false;
     }
     if !output_path.exists() {
-        eprintln!("❌ Output params file does not exist: {}", output);
+        eprintln!("❌ Output params file does not exist: {}", output_path.file_name().unwrap_or_default().to_string_lossy());
         return false;
     }
 

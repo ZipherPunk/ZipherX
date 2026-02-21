@@ -137,16 +137,12 @@ struct ZipherXApp: App {
                 // Only check once at startup
                 guard !hasCheckedDaemon else { return }
 
-                // Check if daemon is running
-                let daemonDetected = await modeManager.checkForRunningDaemon()
-
                 await MainActor.run {
                     hasCheckedDaemon = true
-                    // If no daemon and user hasn't chosen, auto-select light mode
-                    if !daemonDetected && !modeManager.hasSelectedMode {
+                    // Beta: Always auto-select P2P mode at fresh install.
+                    // Full Node mode is accessible from Settings for advanced users.
+                    if !modeManager.hasSelectedMode {
                         modeManager.setMode(.light)
-                    } else if daemonDetected && !modeManager.hasSelectedMode {
-                        showModeSelection = true
                     }
                 }
             }

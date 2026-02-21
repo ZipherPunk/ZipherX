@@ -302,7 +302,8 @@ struct PrivacyScoreView: View {
             isKeyEncrypted: isKeyEncrypted,
             peerCount: networkManager.connectedPeers,
             isDebugLoggingEnabled: isDebugEnabled,
-            hasBackup: hasBackup
+            hasBackup: hasBackup,
+            isTorEnabled: TorManager.shared.connectionState.isConnected
         )
     }
 }

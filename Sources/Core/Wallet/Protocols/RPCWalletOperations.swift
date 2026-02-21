@@ -132,7 +132,7 @@ public class RPCWalletOperations: WalletOperationsProtocol, ObservableObject {
     public func getTransactionHistory(address: String?, limit: Int) async throws -> [WalletTransaction] {
         // FIX #286: Use the new comprehensive transaction fetching method
         // This includes both incoming AND outgoing transactions for all address types
-        print("📜 FIX #286: Getting transaction history (limit: \(limit), address: \(address ?? "all"))")
+        print("📜 FIX #286: Getting transaction history (limit: \(limit), address: \(address?.redactedAddress ?? "all"))")
 
         if let specificAddress = address {
             // Filter by specific address

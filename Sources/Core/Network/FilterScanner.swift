@@ -562,8 +562,8 @@ final class FilterScanner {
         if verbose {
             print("🔍 FIX #288: Loaded \(knownNullifiers.count) nullifiers from DB for spend detection")
             for (idx, nf) in knownNullifiers.enumerated().prefix(5) {
-                let shortNf = nf.prefix(8).map { String(format: "%02x", $0) }.joined()
-                print("🔍 FIX #288: knownNullifier[\(idx)] = \(shortNf)...")
+                let shortNf = LogRedaction.redactNullifier(nf.prefix(8).map { String(format: "%02x", $0) }.joined())
+                print("🔍 FIX #288: knownNullifier[\(idx)] = \(shortNf)")
             }
         }
 
@@ -3433,7 +3433,7 @@ final class FilterScanner {
                 // knownNullifiers contains HASHED nullifiers (from getAllNullifiers() and insertions)
                 // VUL-009 stores hashed nullifiers to prevent spending pattern analysis
                 let hashedNullifier = database.hashNullifier(nullifierWire)
-                let shortNf = nullifierWire.prefix(8).map { String(format: "%02x", $0) }.joined()
+                let shortNf = LogRedaction.redactNullifier(nullifierWire.prefix(8).map { String(format: "%02x", $0) }.joined())
 
                 // FIX #952: CRITICAL - Try both byte orderings for nullifier matching
                 // The boost file Rust scan returns nullifiers in canonical format, but there may be
@@ -3472,7 +3472,7 @@ final class FilterScanner {
                 }
 
                 if nullifierMatched {
-                    let shortNf = nullifierWire.prefix(8).map { String(format: "%02x", $0) }.joined()
+                    let shortNf = LogRedaction.redactNullifier(nullifierWire.prefix(8).map { String(format: "%02x", $0) }.joined())
                     if verbose {
                         print("💸 FIX #1079: MATCH! Nullifier \(shortNf)... found (\(matchFormat)) - marking note as spent")
                     }
@@ -3683,10 +3683,9 @@ final class FilterScanner {
             // FIX #953: DEBUG - Log nullifier details when adding to knownNullifiers
             let hashedNf = database.hashNullifier(nullifier)
             if verbose {
-                let nfShort = nullifier.prefix(8).map { String(format: "%02x", $0) }.joined()
                 print("🔑 FIX #953: Adding nullifier to knownNullifiers at height \(height)")
                 print("   Position: \(treePosition), Value: \(value.redactedAmount)")
-                print("   Nullifier (wire): \(nfShort)...")
+                print("   Nullifier (wire): [redacted]")
                 let hashedNfShort = hashedNf.prefix(8).map { String(format: "%02x", $0) }.joined()
                 print("   Hashed nullifier: \(hashedNfShort)...")
             }

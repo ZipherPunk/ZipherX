@@ -189,15 +189,20 @@ struct ContentView: View {
                         // FIX #1437: No lock screen until balance view is displayed.
                         // During setup/import/sync, user is obviously present — auto-authenticate.
                         // Lock screen only gates on SUBSEQUENT launches (FAST/INSTANT START).
+                        // FIX #1463: Use walletManager.isWalletCreated instead of hasCompletedInitialSync.
+                        // hasCompletedInitialSync is @State (resets to false on every cold start), so the
+                        // auth gate was NEVER triggered — every launch auto-authenticated without lock screen.
+                        // isWalletCreated is loaded from UserDefaults+Keychain in WalletManager.init() and
+                        // is true for returning users, false for first-time setup.
                         if !biometricManager.hasAuthenticatedThisSession {
-                            if hasCompletedInitialSync {
-                                // Subsequent launch — wait for user to authenticate via lock screen
-                                print("🔐 FIX #1273: Waiting for authentication before starting wallet operations...")
+                            if walletManager.isWalletCreated {
+                                // Returning user — wait for user to authenticate via lock screen
+                                print("🔐 FIX #1463: Waiting for authentication before starting wallet operations...")
                                 while !biometricManager.hasAuthenticatedThisSession {
                                     try? await Task.sleep(nanoseconds: 200_000_000) // 200ms
                                     if Task.isCancelled { return }
                                 }
-                                print("🔐 FIX #1273: Authentication confirmed — proceeding with startup")
+                                print("🔐 FIX #1463: Authentication confirmed — proceeding with startup")
                             } else {
                                 // First launch / import — auto-authenticate (no lock screen during setup)
                                 await MainActor.run {
@@ -2887,8 +2892,11 @@ struct ContentView: View {
             // rendered on top by declaration order. No explicit zIndex needed.
             // FIX #1462: Show lock screen for BOTH P2P mode (isWalletCreated) AND Full Node mode (walletDat).
             // Previously walletManager.isWalletCreated was always false in Full Node mode → lock screen never showed.
+            // FIX #1463: Removed hasCompletedInitialSync guard — lock screen must show IMMEDIATELY on cold start.
+            // hasCompletedInitialSync is @State (resets to false on every view creation) so it was preventing
+            // the lock screen from ever appearing. walletExistsForLock is the correct guard.
             let walletExistsForLock = walletManager.isWalletCreated || modeManager.walletSource == .walletDat
-            if isShowingLockScreen && !biometricManager.hasAuthenticatedThisSession && walletExistsForLock && hasCompletedInitialSync {
+            if isShowingLockScreen && !biometricManager.hasAuthenticatedThisSession && walletExistsForLock {
                 LockScreenView(onUnlock: {
                     isShowingLockScreen = false
                     biometricManager.unlockApp()

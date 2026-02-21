@@ -30,6 +30,7 @@ struct FullNodeSettingsView: View {
     @State private var showingExportSheet = false
     @State private var showingImportSheet = false
     @State private var exportAddresses: [WalletAddress] = []
+    @State private var isLoadingExportAddresses = false
     @State private var selectedExportAddress: WalletAddress?
     @State private var exportedPrivateKey: String = ""
     @State private var isExporting = false
@@ -446,6 +447,10 @@ struct FullNodeSettingsView: View {
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
                 .background(theme.surfaceColor)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(Color.black.opacity(0.6), lineWidth: 1)
+                )
                 .cornerRadius(6)
                 .foregroundColor(theme.primaryColor)
 
@@ -693,23 +698,37 @@ struct FullNodeSettingsView: View {
             VStack(alignment: .leading, spacing: 12) {
                 // Export Private Key
                 Button(action: {
-                    Task { await loadExportAddresses() }
-                    showingExportSheet = true
+                    isLoadingExportAddresses = true
+                    Task {
+                        await loadExportAddresses()
+                        isLoadingExportAddresses = false
+                        showingExportSheet = true
+                    }
                 }) {
                     HStack {
-                        Image(systemName: "key.fill")
-                            .foregroundColor(dangerRed)
-                        Text("Export Private Key")
-                            .foregroundColor(dangerRed)
+                        if isLoadingExportAddresses {
+                            ProgressView()
+                                .scaleEffect(0.7)
+                            Text("Loading addresses...")
+                        } else {
+                            Image(systemName: "key.fill")
+                            Text("Export Private Key")
+                        }
                         Spacer()
-                        Image(systemName: "chevron.right")
-                            .foregroundColor(theme.textSecondary)
+                        if !isLoadingExportAddresses {
+                            Image(systemName: "chevron.right")
+                                .foregroundColor(.black.opacity(0.5))
+                        }
                     }
                     .font(theme.bodyFont)
+                    .foregroundColor(.black)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .background(isLoadingExportAddresses ? dangerRed.opacity(0.4) : dangerRed.opacity(0.8))
+                    .cornerRadius(8)
                 }
                 .buttonStyle(.plain)
-
-                Divider()
+                .disabled(isLoadingExportAddresses)
 
                 // Import Private Key
                 Button(action: {
@@ -717,14 +736,17 @@ struct FullNodeSettingsView: View {
                 }) {
                     HStack {
                         Image(systemName: "square.and.arrow.down")
-                            .foregroundColor(dangerRed)
                         Text("Import Private Key")
-                            .foregroundColor(dangerRed)
                         Spacer()
                         Image(systemName: "chevron.right")
-                            .foregroundColor(theme.textSecondary)
+                            .foregroundColor(.black.opacity(0.5))
                     }
                     .font(theme.bodyFont)
+                    .foregroundColor(.black)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .background(dangerRed.opacity(0.8))
+                    .cornerRadius(8)
                 }
                 .buttonStyle(.plain)
             }
@@ -920,8 +942,7 @@ struct FullNodeSettingsView: View {
                         Image(systemName: exportCopiedFeedback ? "checkmark" : "doc.on.doc")
                         Text(exportCopiedFeedback ? "Copied!" : "Copy to Clipboard")
                     }
-                    .font(theme.bodyFont)
-                    .fontWeight(.medium)
+                    .font(theme.bodyFont.weight(.medium))
                     .foregroundColor(.white)
                     .padding(.horizontal, 24)
                     .padding(.vertical, 12)

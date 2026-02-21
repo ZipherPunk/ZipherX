@@ -11,6 +11,7 @@ struct NodeManagementView: View {
     @ObservedObject private var fullNodeManager = FullNodeManager.shared
     @ObservedObject private var bootstrapManager = BootstrapManager.shared  // FIX #316: Watch bootstrap status
     @Environment(\.dismiss) private var dismiss
+    @State private var showPrivacyDetails = false
 
     private var theme: AppTheme { themeManager.currentTheme }
 
@@ -491,14 +492,20 @@ struct NodeManagementView: View {
                 infoRow(label: "Data Directory", value: FullNodeManager.dataDir.path)
                 infoRow(label: "Blockchain Size", value: viewModel.blockchainSize)
 
-                // Privacy Score
-                HStack {
-                    Text("Privacy Score")
-                        .font(theme.bodyFont)
-                        .foregroundColor(theme.textSecondary)
-                    Spacer()
-                    privacyScoreBadge
+                // Privacy Score (clickable)
+                Button(action: { showPrivacyDetails = true }) {
+                    HStack {
+                        Text("Privacy Score")
+                            .font(theme.bodyFont)
+                            .foregroundColor(theme.textSecondary)
+                        Spacer()
+                        privacyScoreBadge
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 10))
+                            .foregroundColor(theme.textSecondary)
+                    }
                 }
+                .buttonStyle(PlainButtonStyle())
                 .padding(.vertical, 4)
             }
             .padding(12)
@@ -515,6 +522,102 @@ struct NodeManagementView: View {
                 .foregroundColor(theme.primaryColor)
             }
             .buttonStyle(PlainButtonStyle())
+        }
+        .sheet(isPresented: $showPrivacyDetails) {
+            privacyDetailsSheet
+        }
+    }
+
+    private var privacyDetailsSheet: some View {
+        let score = viewModel.privacyScore
+        let color: Color = score >= 80 ? .green : score >= 50 ? .orange : .red
+
+        return VStack(spacing: 0) {
+            // Header
+            HStack {
+                Text("Privacy Score Breakdown")
+                    .font(.system(size: 16, weight: .bold, design: .monospaced))
+                    .foregroundColor(theme.textPrimary)
+                Spacer()
+                Button(action: { showPrivacyDetails = false }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 20))
+                        .foregroundColor(theme.textSecondary)
+                }
+                .buttonStyle(PlainButtonStyle())
+            }
+            .padding()
+
+            Divider().background(theme.textSecondary.opacity(0.3))
+
+            // Score display
+            VStack(spacing: 8) {
+                Text("\(score)%")
+                    .font(.system(size: 48, weight: .bold, design: .monospaced))
+                    .foregroundColor(color)
+                Text(score >= 80 ? "HIGH PRIVACY" : score >= 50 ? "MODERATE PRIVACY" : "LOW PRIVACY")
+                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    .foregroundColor(color)
+            }
+            .padding(.vertical, 20)
+
+            Divider().background(theme.textSecondary.opacity(0.3))
+
+            // Breakdown
+            VStack(spacing: 12) {
+                privacyDetailRow(label: "Running Full Node", points: 50, maxPoints: 50, active: true)
+                privacyDetailRow(label: "Tor Routing", points: viewModel.isTorEnabled ? 30 : 0, maxPoints: 30, active: viewModel.isTorEnabled)
+                privacyDetailRow(label: "Not Accepting Inbound", points: !viewModel.isListening ? 10 : 0, maxPoints: 10, active: !viewModel.isListening)
+                privacyDetailRow(label: "Shielded Transactions", points: 10, maxPoints: 10, active: true)
+            }
+            .padding()
+
+            // Recommendations
+            if score < 100 {
+                Divider().background(theme.textSecondary.opacity(0.3))
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("RECOMMENDATIONS")
+                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                        .foregroundColor(theme.textSecondary)
+                    if !viewModel.isTorEnabled {
+                        recommendationRow(text: "Enable Tor routing for anonymous connections (+30)")
+                    }
+                    if viewModel.isListening {
+                        recommendationRow(text: "Disable inbound connections to reduce exposure (+10)")
+                    }
+                }
+                .padding()
+            }
+
+            Spacer()
+        }
+        .frame(minWidth: 400, minHeight: 450)
+        .background(theme.backgroundColor)
+    }
+
+    private func privacyDetailRow(label: String, points: Int, maxPoints: Int, active: Bool) -> some View {
+        HStack {
+            Image(systemName: active ? "checkmark.circle.fill" : "xmark.circle")
+                .foregroundColor(active ? .green : theme.textSecondary.opacity(0.5))
+                .font(.system(size: 14))
+            Text(label)
+                .font(.system(size: 13, design: .monospaced))
+                .foregroundColor(theme.textPrimary)
+            Spacer()
+            Text("+\(points)/\(maxPoints)")
+                .font(.system(size: 13, weight: .bold, design: .monospaced))
+                .foregroundColor(active ? .green : theme.textSecondary.opacity(0.5))
+        }
+    }
+
+    private func recommendationRow(text: String) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Text(">")
+                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                .foregroundColor(.orange)
+            Text(text)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundColor(theme.textSecondary)
         }
     }
 
@@ -561,7 +664,10 @@ struct NodeManagementView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
 
                     HStack(spacing: 12) {
-                        Button(action: { viewModel.showBootstrapProgress = true }) {
+                        Button(action: {
+                            BootstrapManager.shared.reset()
+                            viewModel.showBootstrapProgress = true
+                        }) {
                             HStack {
                                 Image(systemName: "arrow.clockwise")
                                 Text("Retry Bootstrap")

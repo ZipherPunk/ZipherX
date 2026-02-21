@@ -128,9 +128,12 @@ async fn start_tor_async() -> Result<u16, Box<dyn std::error::Error + Send + Syn
     std::fs::create_dir_all(&state_dir)?;
     std::fs::create_dir_all(&cache_dir)?;
 
-    eprintln!("🧅 Tor data directory: {:?}", data_dir);
-    eprintln!("🧅 State directory: {:?}", state_dir);
-    eprintln!("🧅 Cache directory: {:?}", cache_dir);
+    #[cfg(debug_assertions)]
+    {
+        eprintln!("🧅 Tor data directory: {:?}", data_dir);
+        eprintln!("🧅 State directory: {:?}", state_dir);
+        eprintln!("🧅 Cache directory: {:?}", cache_dir);
+    }
 
     // FIX #209: Disable filesystem permission checks on iOS/macOS
     // Unix-style file permissions don't apply the same way in app sandboxes
@@ -369,6 +372,7 @@ pub extern "C" fn zipherx_tor_clear_cache() -> i32 {
     let guards_file = data_dir.join("state").join("state").join("guards.json");
     let timeouts_file = data_dir.join("state").join("state").join("circuit_timeouts.json");
 
+    #[cfg(debug_assertions)]
     eprintln!("🧹 FIX #1419: Clearing Tor cache at {:?}", cache_dir);
 
     // 1. Clear cache directory (consensus + microdesc blobs)

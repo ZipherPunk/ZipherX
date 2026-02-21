@@ -5272,7 +5272,7 @@ final class WalletDatabase {
             // Example: Send 0.1 ZCL + 0.0001 fee = 0.1001 total sent
             // If totalInput < change, something is wrong, skip
             guard spentTx.totalInput > changeAmount else {
-                print("🔧 FIX #162: Skipping tx with totalInput \(spentTx.totalInput) <= change \(changeAmount)")
+                print("🔧 FIX #162: Skipping tx with totalInput \(UInt64(spentTx.totalInput).redactedAmount) <= change \(UInt64(changeAmount).redactedAmount)")
                 continue
             }
 
@@ -6551,7 +6551,7 @@ final class WalletDatabase {
             let result = sqlite3_step(insertStmt)
             if result == SQLITE_DONE {
                 count += 1
-                print("📜 Inserted \(txType.rawValue) tx: height=\(note.receivedHeight), value=\(note.value)")
+                print("📜 Inserted \(txType.rawValue) tx: height=\(note.receivedHeight), value=\(note.value.redactedAmount)")
             } else {
                 print("📜 Insert failed: \(String(cString: sqlite3_errmsg(db)))")
             }
@@ -8701,7 +8701,7 @@ final class WalletDatabase {
             throw DatabaseError.insertFailed(String(cString: sqlite3_errmsg(db)))
         }
 
-        print("⭐ FIX #284: Promoted \(host):\(port) to preferred seed")
+        print("⭐ FIX #284: Promoted \(LogRedaction.redactHost(host)):\(port) to preferred seed")
     }
 
     /// Demote a peer from preferred to regular (before parking)
@@ -8724,7 +8724,7 @@ final class WalletDatabase {
         sqlite3_bind_int(stmt, 2, Int32(port))
 
         _ = sqlite3_step(stmt)
-        print("📉 FIX #284: Demoted \(host):\(port) from preferred seed")
+        print("📉 FIX #284: Demoted \(LogRedaction.redactHost(host)):\(port) from preferred seed")
     }
 
     /// Set preferred status for a peer

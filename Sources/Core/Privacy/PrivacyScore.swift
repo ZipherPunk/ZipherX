@@ -38,7 +38,8 @@ public class PrivacyScoreManager: ObservableObject {
         isKeyEncrypted: Bool,
         peerCount: Int,
         isDebugLoggingEnabled: Bool,
-        hasBackup: Bool
+        hasBackup: Bool,
+        isTorEnabled: Bool = false
     ) {
         let total = shieldedBalance + transparentBalance
 
@@ -69,10 +70,12 @@ public class PrivacyScoreManager: ObservableObject {
 
         // 3. Network Score (0-20 points)
         // P2P connections: up to 10 points (1 point per peer, max 10)
-        // Tor support: 10 points (future)
+        // Tor routing: 10 points
         var netScore = 0
         netScore += min(peerCount, 10) // Up to 10 points for peer count
-        // Tor not implemented yet, so max is 10/20
+        if isTorEnabled {
+            netScore += 10 // Tor routing active
+        }
         networkScore = netScore
 
         // 4. Operational Score (0-15 points)

@@ -310,6 +310,7 @@ struct SettingsView: View {
     @State private var showRecoverySuccess = false
     @State private var recoveryMessage = ""
     @State private var useP2POnly = UserDefaults.standard.bool(forKey: "useP2POnly")
+    @State private var useDNSSeeds = UserDefaults.standard.object(forKey: "useDNSSeeds") != nil ? UserDefaults.standard.bool(forKey: "useDNSSeeds") : false  // Disabled by default
     @State private var debugLoggingEnabled = DebugLogger.shared.isEnabled
     @State private var showDebugLogShare = false
     @State private var showLogExportWarning = false  // Privacy warning before export
@@ -1049,6 +1050,7 @@ Both binaries must be installed to /usr/local/bin:
                 .padding(.vertical, 10)
                 .background(theme.surfaceColor)
                 .cornerRadius(8)
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(theme.textPrimary.opacity(0.3), lineWidth: 1))
             }
             .buttonStyle(PlainButtonStyle())
 
@@ -1784,6 +1786,54 @@ Both binaries must be installed to /usr/local/bin:
                         .stroke(theme.textPrimary, lineWidth: 1)
                 )
             }
+
+            // DNS Seeds toggle
+            VStack(alignment: .leading, spacing: 8) {
+                Toggle(isOn: $useDNSSeeds) {
+                    HStack {
+                        Text("DNS Seeds")
+                            .font(theme.bodyFont)
+                        Spacer()
+                    }
+                }
+                .toggleStyle(SwitchToggleStyle(tint: .blue))
+                .onChange(of: useDNSSeeds) { newValue in
+                    UserDefaults.standard.set(newValue, forKey: "useDNSSeeds")
+                    print("🌐 DNS Seeds: \(newValue ? "ENABLED" : "disabled")")
+                    if newValue {
+                        Task { await networkManager.resolveDNSSeedsNow() }
+                    }
+                }
+
+                Text(useDNSSeeds ?
+                    "DNS seed nodes resolved at startup for more peers. Your ISP can see you query Zclassic DNS seeds." :
+                    "DNS seeds disabled. Only hardcoded seeds + cached peers used. Better privacy, fewer initial peers.")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                // Privacy warning: DNS Seeds + Tor conflict
+                if useDNSSeeds && TorManager.shared.mode == .enabled {
+                    HStack(alignment: .top, spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 12))
+                            .foregroundColor(.orange)
+                        Text("DNS queries bypass Tor and go through clearnet. Your ISP can see you are resolving Zclassic seed domains, reducing Tor privacy. Disable DNS Seeds for maximum anonymity.")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundColor(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(8)
+                    .background(Color.orange.opacity(0.1))
+                    .cornerRadius(6)
+                }
+            }
+            .padding(12)
+            .background(theme.surfaceColor)
+            .overlay(
+                Rectangle()
+                    .stroke(theme.textPrimary, lineWidth: 1)
+            )
 
             // Start/Stop button (only for non-disabled modes)
             if TorManager.shared.mode != .disabled {

@@ -1950,7 +1950,7 @@ public class RPCClient: ObservableObject {
                 height: height
             ))
 
-            print("📤 FIX #1269: Discovered sent z-TX: \(txid.prefix(16))... change=\(changeAmount), sent≈\(sentAmount)\(txAddress == "self" ? " (SELF-SEND)" : "")")
+            print("📤 FIX #1269: Discovered sent z-TX: \(txid.prefix(16))... change=\(UInt64(changeAmount).redactedAmount), sent≈\(UInt64(max(0, sentAmount)).redactedAmount)\(txAddress == "self" ? " (SELF-SEND)" : "")")
         }
 
         // Step 5: Detect exact-amount sends (no change note — note disappeared without change)
