@@ -415,13 +415,8 @@ struct SendView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(theme.backgroundColor)
-        .alert("Confirm Transaction", isPresented: $showConfirmation) {
-            Button("Cancel", role: .cancel) {}
-            Button("Send") {
-                sendTransaction()
-            }
-        } message: {
-            Text("Send \(amount) ZCL to:\n\(recipientAddress.prefix(20))...?")
+        .sheet(isPresented: $showConfirmation) {
+            confirmationSheet
         }
         // FIX #218: Enhanced error alert with Copy TXID button for mempool rejections
         // FIX #232: Error messages now include "Why" and "What to do" explanations
@@ -832,6 +827,121 @@ struct SendView: View {
                 .stroke(theme.borderColor, lineWidth: theme.borderWidth)
         )
         .cornerRadius(theme.cornerRadius)
+    }
+
+    // MARK: - Confirmation Sheet (Full Address Display)
+
+    private var confirmationSheet: some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack {
+                Text("Confirm Transaction")
+                    .font(theme.titleFont)
+                    .foregroundColor(theme.warningColor)
+                Spacer()
+            }
+            .padding()
+            .background(theme.surfaceColor)
+
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    // Amount
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("AMOUNT")
+                            .font(theme.captionFont)
+                            .foregroundColor(theme.textSecondary)
+                        Text("\(amount) ZCL")
+                            .font(.system(size: 24, weight: .bold, design: .monospaced))
+                            .foregroundColor(theme.primaryColor)
+                    }
+
+                    Divider()
+
+                    // To address — FULL address shown (SECURITY: never truncate, never scroll)
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text("TO")
+                                .font(theme.captionFont)
+                                .foregroundColor(theme.textSecondary)
+                            Spacer()
+                            Image(systemName: "shield.fill")
+                                .foregroundColor(theme.primaryColor)
+                                .font(.system(size: 12))
+                        }
+                        Text(recipientAddress)
+                            .font(.system(size: 13, weight: .medium, design: .monospaced))
+                            .foregroundColor(theme.textPrimary)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(10)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(theme.backgroundColor)
+                            .cornerRadius(4)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 4)
+                                    .stroke(theme.primaryColor.opacity(0.3), lineWidth: 1)
+                            )
+                    }
+
+                    Divider()
+
+                    // Fee
+                    HStack {
+                        Text("Network Fee")
+                            .font(theme.bodyFont)
+                            .foregroundColor(theme.textSecondary)
+                        Spacer()
+                        Text("0.0001 ZCL")
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundColor(theme.textPrimary)
+                    }
+
+                    // Warning
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(theme.warningColor)
+                        Text("This transaction cannot be reversed. Verify the address carefully.")
+                            .font(theme.captionFont)
+                            .foregroundColor(theme.warningColor)
+                    }
+                    .padding()
+                    .background(theme.warningColor.opacity(0.1))
+                    .cornerRadius(8)
+                }
+                .padding()
+            }
+
+            Divider()
+
+            // Action buttons
+            HStack(spacing: 16) {
+                Button("Cancel") {
+                    showConfirmation = false
+                }
+                .keyboardShortcut(.cancelAction)
+
+                Spacer()
+
+                Button(action: {
+                    showConfirmation = false
+                    sendTransaction()
+                }) {
+                    HStack {
+                        Image(systemName: "arrow.up.circle.fill")
+                        Text("Confirm Send")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(theme.primaryColor)
+                .keyboardShortcut(.defaultAction)
+            }
+            .padding()
+            .background(theme.surfaceColor)
+        }
+        .frame(minWidth: 550, idealWidth: 650, minHeight: 400)
+        .background(theme.backgroundColor)
     }
 
     // MARK: - Validation

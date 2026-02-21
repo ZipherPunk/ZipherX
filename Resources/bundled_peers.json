@@ -1,0 +1,10 @@
+[
+  {"host": "140.174.189.3", "port": 8033, "reliability": 0.9, "lastSeen": "2026-02-19T00:00:00Z"},
+  {"host": "140.174.189.17", "port": 8033, "reliability": 0.9, "lastSeen": "2026-02-19T00:00:00Z"},
+  {"host": "205.209.104.118", "port": 8033, "reliability": 0.9, "lastSeen": "2026-02-19T00:00:00Z"},
+  {"host": "95.179.131.117", "port": 8033, "reliability": 0.8, "lastSeen": "2026-02-19T00:00:00Z"},
+  {"host": "45.77.216.198", "port": 8033, "reliability": 0.8, "lastSeen": "2026-02-19T00:00:00Z"},
+  {"host": "212.23.222.231", "port": 8033, "reliability": 0.8, "lastSeen": "2026-02-19T00:00:00Z"},
+  {"host": "157.90.223.151", "port": 8033, "reliability": 0.8, "lastSeen": "2026-02-19T00:00:00Z"},
+  {"host": "185.205.246.161", "port": 8033, "reliability": 0.85, "lastSeen": "2026-02-19T00:00:00Z"}
+]

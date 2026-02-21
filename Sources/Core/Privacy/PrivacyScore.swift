@@ -39,7 +39,8 @@ public class PrivacyScoreManager: ObservableObject {
         peerCount: Int,
         isDebugLoggingEnabled: Bool,
         hasBackup: Bool,
-        isTorEnabled: Bool = false
+        isTorEnabled: Bool = false,
+        useDNSSeeds: Bool = false
     ) {
         let total = shieldedBalance + transparentBalance
 
@@ -69,14 +70,18 @@ public class PrivacyScoreManager: ObservableObject {
         encryptionScore = encScore
 
         // 3. Network Score (0-20 points)
-        // P2P connections: up to 10 points (1 point per peer, max 10)
+        // P2P connections: up to 8 points (1 point per peer, max 8)
         // Tor routing: 10 points
+        // DNS seeds disabled: 2 points (no DNS leakage)
         var netScore = 0
-        netScore += min(peerCount, 10) // Up to 10 points for peer count
+        netScore += min(peerCount, 8) // Up to 8 points for peer count
         if isTorEnabled {
             netScore += 10 // Tor routing active
         }
-        networkScore = netScore
+        if !useDNSSeeds {
+            netScore += 2 // No DNS leakage to ISP
+        }
+        networkScore = min(netScore, 20)
 
         // 4. Operational Score (0-15 points)
         // Debug logging disabled: 10 points
@@ -167,8 +172,8 @@ public class PrivacyScoreManager: ObservableObject {
         if networkScore < 10 {
             recs.append(PrivacyRecommendation(
                 category: "Network Privacy",
-                issue: "Limited peer connections",
-                recommendation: "Connect to more peers for better network privacy",
+                issue: "Limited peer connections or missing Tor",
+                recommendation: "Enable Tor and disable DNS Seeds for maximum network privacy",
                 priority: .medium
             ))
         }

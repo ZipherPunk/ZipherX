@@ -864,7 +864,7 @@ Continue?
             sectionHeader(icon: "lock.shield", title: "PRIVACY SETTINGS")
 
             VStack(spacing: 12) {
-                // Tor/Onion toggle
+                // Tor/Onion toggle (requires system Tor — not embedded Arti)
                 HStack {
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
@@ -882,7 +882,7 @@ Continue?
                                     .cornerRadius(4)
                             }
                         }
-                        Text("Route all connections through Tor for maximum privacy")
+                        Text("Route all connections through system Tor (port 9050)")
                             .font(theme.captionFont)
                             .foregroundColor(theme.textSecondary)
                     }
@@ -894,6 +894,42 @@ Continue?
                         .onChange(of: viewModel.isTorEnabled) { newValue in
                             viewModel.setTorEnabled(newValue)
                         }
+                }
+
+                // System Tor not detected warning
+                if viewModel.isTorEnabled && !viewModel.isSystemTorRunning {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 14))
+                            .foregroundColor(.red)
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("System Tor not detected on port 9050")
+                                .font(.system(size: 11, weight: .bold))
+                                .foregroundColor(.red)
+                            Text("The full node requires system Tor (not embedded Arti). Install and start it:")
+                                .font(.system(size: 10))
+                                .foregroundColor(theme.textSecondary)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("brew install tor")
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundColor(theme.primaryColor)
+                                    .textSelection(.enabled)
+                                Text("brew services start tor")
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundColor(theme.primaryColor)
+                                    .textSelection(.enabled)
+                            }
+                            .padding(8)
+                            .background(theme.backgroundColor)
+                            .cornerRadius(4)
+                            Text("Then restart the daemon for Tor to take effect.")
+                                .font(.system(size: 10))
+                                .foregroundColor(theme.textSecondary)
+                        }
+                    }
+                    .padding(10)
+                    .background(Color.red.opacity(0.1))
+                    .cornerRadius(6)
                 }
 
                 Divider()
@@ -1297,36 +1333,121 @@ Continue?
             .background(theme.surfaceColor)
             .overlay(Rectangle().stroke(theme.textPrimary.opacity(0.3), lineWidth: 1))
         }
-        .alert("⚠️ Wallet Encryption - Experimental", isPresented: $viewModel.showEncryptWalletAlert) {
-            Button("I Understand", role: .cancel) {}
-        } message: {
-            Text("""
-            ╔═══════════════════════════════════════════════╗
-            ║  "Privacy is necessary for an open society   ║
-            ║   in the electronic age."                    ║
-            ║        — A Cypherpunk's Manifesto, 1993      ║
-            ╚═══════════════════════════════════════════════╝
-
-            🔧 DEVELOPMENT STATUS:
-
-            Wallet encryption via encryptwallet RPC is currently experimental and NOT fully tested with Zclassic shielded (z-addresses).
-
-            Known limitations:
-            • z_sendmany may fail with encrypted wallets
-            • z-address key encryption is complex
-            • Passphrase recovery is IMPOSSIBLE
-
-            RECOMMENDATION:
-            For now, protect your wallet.dat by:
-            1. Storing it on an encrypted disk
-            2. Using FileVault (macOS)
-            3. Keeping secure offline backups
-
-            Full wallet encryption support for z-addresses is planned for a future release.
-
-            "We the Cypherpunks are dedicated to building anonymous systems."
-            """)
+        .sheet(isPresented: $viewModel.showEncryptWalletAlert) {
+            encryptWalletSheet
         }
+    }
+
+    private var encryptWalletSheet: some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundColor(.orange)
+                    .font(.system(size: 18))
+                Text("Wallet Encryption — Experimental")
+                    .font(theme.titleFont)
+                    .foregroundColor(theme.warningColor)
+                Spacer()
+            }
+            .padding()
+            .background(theme.surfaceColor)
+
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    // Quote
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("\"Privacy is necessary for an open society in the electronic age.\"")
+                            .font(.system(size: 13, design: .serif))
+                            .italic()
+                            .foregroundColor(theme.textPrimary)
+                        Text("— A Cypherpunk's Manifesto, 1993")
+                            .font(.system(size: 11, design: .serif))
+                            .foregroundColor(theme.textSecondary)
+                    }
+                    .padding()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(theme.primaryColor.opacity(0.05))
+                    .cornerRadius(8)
+
+                    // Status
+                    VStack(alignment: .leading, spacing: 8) {
+                        Label("Development Status", systemImage: "wrench.and.screwdriver")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundColor(theme.textPrimary)
+
+                        Text("Wallet encryption via encryptwallet RPC is currently experimental and NOT fully tested with Zclassic shielded (z-addresses).")
+                            .font(.system(size: 12))
+                            .foregroundColor(theme.textSecondary)
+                    }
+
+                    // Limitations
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Known Limitations")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundColor(.orange)
+
+                        VStack(alignment: .leading, spacing: 4) {
+                            Label("z_sendmany may fail with encrypted wallets", systemImage: "xmark.circle")
+                            Label("z-address key encryption is complex", systemImage: "xmark.circle")
+                            Label("Passphrase recovery is IMPOSSIBLE", systemImage: "exclamationmark.triangle")
+                        }
+                        .font(.system(size: 12))
+                        .foregroundColor(theme.textSecondary)
+                    }
+
+                    // Recommendation
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Recommendation")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundColor(theme.primaryColor)
+
+                        Text("For now, protect your wallet.dat by:")
+                            .font(.system(size: 12))
+                            .foregroundColor(theme.textSecondary)
+
+                        VStack(alignment: .leading, spacing: 4) {
+                            Label("Store it on an encrypted disk", systemImage: "1.circle")
+                            Label("Use FileVault (macOS)", systemImage: "2.circle")
+                            Label("Keep secure offline backups", systemImage: "3.circle")
+                        }
+                        .font(.system(size: 12))
+                        .foregroundColor(theme.textSecondary)
+                    }
+
+                    Text("Full wallet encryption support for z-addresses is planned for a future release.")
+                        .font(.system(size: 12))
+                        .foregroundColor(theme.textSecondary)
+                        .padding(.top, 4)
+
+                    // Footer quote
+                    Text("\"We the Cypherpunks are dedicated to building anonymous systems.\"")
+                        .font(.system(size: 11, design: .serif))
+                        .italic()
+                        .foregroundColor(theme.textSecondary)
+                }
+                .padding()
+            }
+
+            Divider()
+
+            // Dismiss button
+            HStack {
+                Spacer()
+                Button("I Understand") {
+                    viewModel.showEncryptWalletAlert = false
+                }
+                .keyboardShortcut(.defaultAction)
+                .buttonStyle(.borderedProminent)
+                .tint(theme.primaryColor)
+            }
+            .padding()
+            .background(theme.surfaceColor)
+        }
+        .frame(minWidth: 450, idealWidth: 500, minHeight: 400, idealHeight: 500)
+        .background(theme.backgroundColor)
     }
 
     private func securityCheckItem(passed: Bool, text: String) -> some View {
@@ -2079,18 +2200,68 @@ class NodeManagementViewModel: ObservableObject {
         NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: backupDir.path)
     }
 
-    func setTorEnabled(_ enabled: Bool) {
-        UserDefaults.standard.set(enabled, forKey: "fullNodeTorEnabled")
+    /// Check if system Tor is running on port 9050
+    var isSystemTorRunning: Bool {
+        let sock = socket(AF_INET, SOCK_STREAM, 0)
+        guard sock >= 0 else { return false }
+        defer { close(sock) }
 
-        // Update zclassic.conf
-        updateConfigSetting("proxy", value: enabled ? "127.0.0.1:9050" : nil)
-        updateConfigSetting("listen", value: enabled ? "0" : "1")
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = UInt16(9050).bigEndian
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+
+        let result = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                Darwin.connect(sock, sockPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        return result == 0
+    }
+
+    func setTorEnabled(_ enabled: Bool) {
+        if enabled {
+            // Check if system Tor is running before enabling
+            if !isSystemTorRunning {
+                // Revert toggle — Tor not available
+                DispatchQueue.main.async {
+                    self.isTorEnabled = false
+                }
+                let alert = NSAlert()
+                alert.messageText = "System Tor Not Detected"
+                alert.informativeText = """
+                The full node requires system Tor running on port 9050.
+
+                Install and start Tor:
+                  brew install tor
+                  brew services start tor
+
+                The embedded Arti Tor (used by ZipherX P2P mode) cannot be used for the full node because it stops when the app closes.
+                """
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
+                return
+            }
+
+            // System Tor detected — configure proxy on port 9050
+            UserDefaults.standard.set(true, forKey: "fullNodeTorEnabled")
+            updateConfigSetting("proxy", value: "127.0.0.1:9050")
+            updateConfigSetting("listen", value: "0")
+            updateConfigSetting("listenonion", value: "1")
+        } else {
+            UserDefaults.standard.set(false, forKey: "fullNodeTorEnabled")
+            updateConfigSetting("proxy", value: nil)
+            updateConfigSetting("listenonion", value: nil)
+            updateConfigSetting("listen", value: "1")
+        }
 
         if isDaemonRunning {
-            // Notify user to restart
             let alert = NSAlert()
             alert.messageText = "Restart Required"
-            alert.informativeText = "Please restart the daemon for Tor settings to take effect."
+            alert.informativeText = enabled ?
+                "Tor proxy configured (system Tor on port 9050). Please restart the daemon for Tor settings to take effect." :
+                "Tor proxy removed. Please restart the daemon for network settings to take effect."
             alert.addButton(withTitle: "OK")
             alert.runModal()
         }

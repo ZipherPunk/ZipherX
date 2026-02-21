@@ -929,6 +929,7 @@ public final class NetworkManager: ObservableObject {
     private var newAddresses: Set<String> = [] // Addresses we haven't tried yet
     private let addressLock = NSLock() // Thread safety for address collections
     private var isConnecting = false // Prevent concurrent connection attempts
+    private var hasDownloadedGitHubPeers = false // Once-per-session guard for GitHub peers
 
     // FIX #173: Sybil attack detection - track consecutive fake 170020 rejections
     private var consecutiveSybilRejections: Int = 0
@@ -2544,6 +2545,16 @@ public final class NetworkManager: ObservableObject {
         // Add all discovered to address manager
         for addr in discoveredPeers {
             addAddress(addr, source: "dns")
+        }
+
+        // Download reliable peers from GitHub (once per session)
+        // This ensures ALL connect() paths benefit — ContentView first-launch, WalletManager, reconnect
+        if !hasDownloadedGitHubPeers {
+            hasDownloadedGitHubPeers = true
+            let added = await downloadReliablePeersFromGitHub()
+            if added > 0 {
+                print("📡 Added \(added) GitHub peers before connecting")
+            }
         }
 
         // Calculate target: 15% of known addresses (min 8, max 30)

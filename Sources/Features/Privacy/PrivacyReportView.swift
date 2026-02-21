@@ -147,6 +147,7 @@ class PrivacyReportGenerator: ObservableObject {
             ("Checking peer diversity...", checkPeerDiversity),
             ("Analyzing API usage...", checkAPIPrivacy),
             ("Checking DNS leakage...", checkDNSLeakage),
+            ("Checking debug logging...", checkDebugLogging),
             ("Verifying address reuse...", checkAddressReuse),
             ("Checking key rotation...", checkKeyRotation),
         ]
@@ -516,25 +517,76 @@ class PrivacyReportGenerator: ObservableObject {
 
     private func checkDNSLeakage() async -> PrivacyCheckItem {
         let torEnabled = TorManager.shared.mode == .enabled
+        let useDNSSeeds = UserDefaults.standard.bool(forKey: "useDNSSeeds")
 
-        if torEnabled {
+        if torEnabled && useDNSSeeds {
+            // Tor enabled but DNS seeds bypass Tor — privacy conflict
+            return PrivacyCheckItem(
+                category: "NETWORK",
+                name: "DNS Privacy",
+                status: .warning,
+                description: "Tor enabled but DNS seeds active. DNS queries bypass Tor and leak to your ISP.",
+                recommendation: "Disable DNS Seeds in Settings. DNS queries go through clearnet even with Tor.",
+                points: 2,
+                maxPoints: 5
+            )
+        } else if torEnabled && !useDNSSeeds {
+            // Best: Tor + no DNS seeds
             return PrivacyCheckItem(
                 category: "NETWORK",
                 name: "DNS Privacy",
                 status: .secure,
-                description: "Peer discovery via Tor. DNS seed queries do not leak to your ISP.",
+                description: "Tor active + DNS seeds disabled. Peer discovery fully anonymous via cached/bundled peers.",
+                recommendation: nil,
+                points: 5,
+                maxPoints: 5
+            )
+        } else if !torEnabled && !useDNSSeeds {
+            // Good: No DNS leakage (uses hardcoded/cached peers only)
+            return PrivacyCheckItem(
+                category: "NETWORK",
+                name: "DNS Privacy",
+                status: .info,
+                description: "DNS seeds disabled. Using hardcoded seeds and cached peers only. No DNS queries leak to ISP.",
+                recommendation: "Enable Tor for stronger overall network anonymity.",
+                points: 4,
+                maxPoints: 5
+            )
+        } else {
+            // Worst: No Tor + DNS seeds enabled
+            return PrivacyCheckItem(
+                category: "NETWORK",
+                name: "DNS Privacy",
+                status: .critical,
+                description: "DNS seeds enabled without Tor. Your ISP can see DNS queries to Zclassic seed nodes.",
+                recommendation: "Disable DNS Seeds or enable Tor to prevent ISP tracking.",
+                points: 0,
+                maxPoints: 5
+            )
+        }
+    }
+
+    private func checkDebugLogging() async -> PrivacyCheckItem {
+        let isDebugEnabled = UserDefaults.standard.bool(forKey: "debugLoggingEnabled")
+
+        if !isDebugEnabled {
+            return PrivacyCheckItem(
+                category: "SECURITY",
+                name: "Debug Logging",
+                status: .secure,
+                description: "Debug logging disabled. No sensitive data written to log files.",
                 recommendation: nil,
                 points: 5,
                 maxPoints: 5
             )
         } else {
             return PrivacyCheckItem(
-                category: "NETWORK",
-                name: "DNS Privacy",
+                category: "SECURITY",
+                name: "Debug Logging",
                 status: .warning,
-                description: "Initial peer discovery uses DNS seeds. Your ISP can see you are connecting to Zclassic.",
-                recommendation: "Enable Tor to hide peer discovery from your ISP.",
-                points: 2,
+                description: "Debug logging enabled. Log files may contain peer IPs, transaction details, and addresses.",
+                recommendation: "Disable debug logging in Settings unless actively troubleshooting.",
+                points: 0,
                 maxPoints: 5
             )
         }

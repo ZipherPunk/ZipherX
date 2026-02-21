@@ -77,7 +77,7 @@ struct PrivacyScoreView: View {
                     label: "Network",
                     score: privacyManager.networkScore,
                     maxScore: PrivacyScoreManager.ScoreWeights.network,
-                    description: "P2P connections (Tor future)"
+                    description: "P2P connections, Tor & DNS privacy"
                 )
 
                 privacyCategoryRow(
@@ -227,7 +227,7 @@ struct PrivacyScoreView: View {
 
                         helpSection(
                             title: "Network (0-20 points)",
-                            description: "P2P peer connections (up to 10 points). Tor support planned for future (additional 10 points)."
+                            description: "P2P peer connections (up to 8 points). Tor routing (10 points). DNS seeds disabled (2 points)."
                         )
 
                         helpSection(
@@ -303,7 +303,8 @@ struct PrivacyScoreView: View {
             peerCount: networkManager.connectedPeers,
             isDebugLoggingEnabled: isDebugEnabled,
             hasBackup: hasBackup,
-            isTorEnabled: TorManager.shared.connectionState.isConnected
+            isTorEnabled: TorManager.shared.connectionState.isConnected,
+            useDNSSeeds: UserDefaults.standard.bool(forKey: "useDNSSeeds")
         )
     }
 }

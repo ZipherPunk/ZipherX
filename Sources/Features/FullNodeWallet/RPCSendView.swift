@@ -434,7 +434,7 @@ struct RPCSendView: View {
 
                     Divider()
 
-                    // From address - FULL address shown
+                    // From address — FULL address displayed (SECURITY: no scroll, no truncation)
                     if let from = selectedFromAddress {
                         VStack(alignment: .leading, spacing: 4) {
                             HStack {
@@ -446,16 +446,19 @@ struct RPCSendView: View {
                                     .foregroundColor(theme.primaryColor)
                                     .font(.system(size: 12))
                             }
-                            // FIX #1274: Horizontal scroll prevents wrapping on long z-addresses
-                            ScrollView(.horizontal, showsIndicators: false) {
-                                Text(from.address)
-                                    .font(.system(size: 12, design: .monospaced))
-                                    .foregroundColor(theme.textPrimary)
-                                    .textSelection(.enabled)
-                            }
-                            .padding(8)
-                            .background(theme.backgroundColor)
-                            .cornerRadius(4)
+                            Text(from.address)
+                                .font(.system(size: 13, weight: .medium, design: .monospaced))
+                                .foregroundColor(theme.textPrimary)
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .padding(10)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(theme.backgroundColor)
+                                .cornerRadius(4)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 4)
+                                        .stroke(theme.primaryColor.opacity(0.3), lineWidth: 1)
+                                )
 
                             Text("Balance: \(formatBalance(from.balance))")
                                 .font(theme.captionFont)
@@ -465,7 +468,7 @@ struct RPCSendView: View {
 
                     Divider()
 
-                    // To address - FULL address shown
+                    // To address — FULL address displayed (SECURITY: no scroll, no truncation)
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
                             Text("TO")
@@ -477,16 +480,19 @@ struct RPCSendView: View {
                                 .foregroundColor(theme.primaryColor)
                                 .font(.system(size: 12))
                         }
-                        // FIX #1274: Horizontal scroll prevents wrapping on long z-addresses
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            Text(toAddress)
-                                .font(.system(size: 12, design: .monospaced))
-                                .foregroundColor(theme.textPrimary)
-                                .textSelection(.enabled)
-                        }
-                        .padding(8)
-                        .background(theme.backgroundColor)
-                        .cornerRadius(4)
+                        Text(toAddress)
+                            .font(.system(size: 13, weight: .medium, design: .monospaced))
+                            .foregroundColor(theme.textPrimary)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(10)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(theme.backgroundColor)
+                            .cornerRadius(4)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 4)
+                                    .stroke(theme.primaryColor.opacity(0.3), lineWidth: 1)
+                            )
                     }
 
                     Divider()
@@ -559,8 +565,8 @@ struct RPCSendView: View {
             .padding()
             .background(theme.surfaceColor)
         }
-        // FIX #1274: Wider confirmation sheet so z-addresses don't wrap
-        .frame(minWidth: 600, idealWidth: 650, minHeight: 500)
+        // FIX #1274: Wide enough for full z-address display without scrolling
+        .frame(minWidth: 650, idealWidth: 700, minHeight: 550)
         .background(theme.backgroundColor)
     }
 

@@ -8,6 +8,8 @@
 
 /* Begin PBXBuildFile section */
 		002097046620424C5DEFD964 /* SQLCipherManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9068ED711254490CAD1CD553 /* SQLCipherManager.swift */; };
+		5B8E3F1B2D4C7E0039AB1235 /* bundled_peers.json in Resources */ = {isa = PBXBuildFile; fileRef = 5B8E3F1A2D4C7E0039AB1234 /* bundled_peers.json */; };
+		5B8E3F1C2D4C7E0039AB1236 /* bundled_peers.json in Resources */ = {isa = PBXBuildFile; fileRef = 5B8E3F1A2D4C7E0039AB1234 /* bundled_peers.json */; };
 		00F53085F3953FDC9CEEC6A9 /* InsightAPI.swift in Sources */ = {isa = PBXBuildFile; fileRef = 710E39D55C6AFE9BB6AEA11D /* InsightAPI.swift */; };
 		027C0FBFA0CD3C9E21C357CD /* ClipboardManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C76A4256B2657D68B859C13 /* ClipboardManager.swift */; };
 		060287BCEAF96F0B259A3B7B /* Constants.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9C06A2912C98B98AD2E5D87 /* Constants.swift */; };
@@ -242,6 +244,7 @@
 		4F54464087D684EC795896B7 /* SaplingParams.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SaplingParams.swift; sourceTree = "<group>"; };
 		58A977985B736ECAC0C4E425 /* ZipherXFFI.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = ZipherXFFI.xcframework; path = Libraries/ZipherXFFI.xcframework; sourceTree = "<group>"; };
 		5A73F74D89DB53D27B28AF26 /* FilterScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilterScanner.swift; sourceTree = "<group>"; };
+		5B8E3F1A2D4C7E0039AB1234 /* bundled_peers.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "bundled_peers.json"; sourceTree = "<group>"; };
 		5CACD4E0F762EEB5883FE0BD /* sapling-spend.params */ = {isa = PBXFileReference; path = "sapling-spend.params"; sourceTree = "<group>"; };
 		5E41B773BA9C02028BF61946 /* WalletHealthCheck.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletHealthCheck.swift; sourceTree = "<group>"; };
 		630CFD90F45505D02500501A /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
@@ -470,6 +473,7 @@
 		3C9672879189166065228DE8 /* Resources */ = {
 			isa = PBXGroup;
 			children = (
+				5B8E3F1A2D4C7E0039AB1234 /* bundled_peers.json */,
 				D0494671402CB598446E82E3 /* sapling-output.params */,
 				5CACD4E0F762EEB5883FE0BD /* sapling-spend.params */,
 			);
@@ -850,6 +854,7 @@
 				0CAFBAD232C1E0EF8C6C439A /* WalletManager.swift.backup in Resources */,
 				DC2BD92A806CDC15A655E824 /* sapling-output.params in Resources */,
 				ABA38D5CAFEEDA1A5A17FD4D /* sapling-spend.params in Resources */,
+				5B8E3F1B2D4C7E0039AB1235 /* bundled_peers.json in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -863,6 +868,7 @@
 				4B2BE27396314554C5B3D2D8 /* WalletManager.swift.backup in Resources */,
 				93CC0BDEF087B6BF7C16235B /* sapling-output.params in Resources */,
 				C94BC882A943F71E0F919ED4 /* sapling-spend.params in Resources */,
+				5B8E3F1C2D4C7E0039AB1236 /* bundled_peers.json in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
