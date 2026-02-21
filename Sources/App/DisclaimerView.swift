@@ -38,7 +38,7 @@ struct DisclaimerView: View {
                         .frame(height: 1)
                     }
                     #if os(iOS)
-                    .padding(.horizontal, 12)
+                    .padding(.horizontal, 8)
                     #else
                     .padding(.horizontal, 24)
                     #endif
@@ -339,6 +339,8 @@ struct DisclaimerView: View {
                 Text(title)
                     #if os(iOS)
                     .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    .lineLimit(nil)
+                    .fixedSize(horizontal: false, vertical: true)
                     #else
                     .font(.system(size: 13, weight: .bold, design: .monospaced))
                     #endif
@@ -347,7 +349,7 @@ struct DisclaimerView: View {
 
             Text(content)
                 #if os(iOS)
-                .font(.system(size: 10, weight: .regular, design: .monospaced))
+                .font(.system(size: 11, weight: .regular))
                 #else
                 .font(.system(size: 12, weight: .regular, design: .monospaced))
                 #endif
@@ -356,7 +358,8 @@ struct DisclaimerView: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         #if os(iOS)
-        .padding(10)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 10)
         #else
         .padding(16)
         #endif
@@ -374,7 +377,7 @@ struct DisclaimerView: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("\"Privacy is necessary for an open society in the electronic age. Privacy is not secrecy. A private matter is something one doesn't want the whole world to know, but a secret matter is something one doesn't want anybody to know. Privacy is the power to selectively reveal oneself to the world.\"")
                 #if os(iOS)
-                .font(.system(size: 10, weight: .regular, design: .monospaced))
+                .font(.system(size: 11, weight: .regular))
                 #else
                 .font(.system(size: 12, weight: .regular, design: .monospaced))
                 #endif
@@ -384,14 +387,15 @@ struct DisclaimerView: View {
 
             Text("- Eric Hughes, A Cypherpunk's Manifesto (1993)")
                 #if os(iOS)
-                .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                .font(.system(size: 10, weight: .semibold))
                 #else
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
                 #endif
                 .foregroundColor(NeonColors.primary.opacity(0.7))
         }
         #if os(iOS)
-        .padding(10)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 10)
         #else
         .padding(16)
         #endif
@@ -405,7 +409,7 @@ struct DisclaimerView: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("BY PROCEEDING, YOU ACKNOWLEDGE THAT:")
                 #if os(iOS)
-                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                .font(.system(size: 11, weight: .bold))
                 #else
                 .font(.system(size: 12, weight: .bold, design: .monospaced))
                 #endif
@@ -423,7 +427,8 @@ struct DisclaimerView: View {
             }
         }
         #if os(iOS)
-        .padding(10)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 10)
         #else
         .padding(16)
         #endif
@@ -444,7 +449,7 @@ struct DisclaimerView: View {
                 .font(.system(size: 12))
             Text(text)
                 #if os(iOS)
-                .font(.system(size: 9, weight: .regular, design: .monospaced))
+                .font(.system(size: 10, weight: .regular))
                 #else
                 .font(.system(size: 11, weight: .regular, design: .monospaced))
                 #endif
