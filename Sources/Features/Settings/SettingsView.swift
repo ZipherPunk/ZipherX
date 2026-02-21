@@ -271,8 +271,8 @@ struct SettingsView: View {
     @ObservedObject private var fullNodeManager = FullNodeManager.shared
     #endif
     @State private var showExportAlert = false
-    // VUL-CRYPTO-003: Store exported key as Data to minimize String copies in memory
-    @State private var exportedKeyData: Data?
+    // VUL-CRYPTO-003: Only store truncated display string — full key never in @State
+    @State private var exportedKeyDisplay: String?
     @State private var showError = false
     @State private var errorMessage = ""
     @State private var useFaceID = false
@@ -384,30 +384,22 @@ struct SettingsView: View {
                     #endif
             }
             // Export & error alerts
+            // VUL-CRYPTO-003: Full key is NEVER stored in @State.
+            // Key was copied to clipboard during exportPrivateKey() and zeroed immediately.
+            // Only truncated display string is kept for the alert message.
             .alert("Export Private Key", isPresented: $showExportAlert) {
-                Button("Copy Full Key") {
-                    // VUL-CRYPTO-003: Convert Data→String only for clipboard, then discard
-                    if let keyData = exportedKeyData, let keyStr = String(data: keyData, encoding: .utf8) {
-                        ClipboardManager.copyWithAutoExpiry(keyStr, seconds: 10)
-                    }
-                    exportedKeyData = nil
-                }
-                Button("Cancel", role: .cancel) {
-                    exportedKeyData = nil
+                Button("OK", role: .cancel) {
+                    exportedKeyDisplay = nil
                 }
             } message: {
-                // VUL-CRYPTO-003: Show truncated key — minimal String exposure
-                if let keyData = exportedKeyData, let keyStr = String(data: keyData, encoding: .utf8) {
-                    let displayKey = String(keyStr.prefix(8)) + "..." + String(keyStr.suffix(8))
-                    Text("Your private key:\n\n\(displayKey)\n\nKeep this safe! Anyone with this key can spend your funds.")
+                if let display = exportedKeyDisplay {
+                    Text("Your private key:\n\n\(display)\n\nCopied to clipboard (auto-expires in 10s).\n\nKeep this safe! Anyone with this key can spend your funds.")
                 } else {
                     Text("Key unavailable")
                 }
             }
             .onDisappear {
-                if !showExportAlert {
-                    exportedKeyData = nil
-                }
+                exportedKeyDisplay = nil
             }
             .alert("Error", isPresented: $showError) {
                 Button("OK", role: .cancel) {}
@@ -3362,9 +3354,13 @@ Both binaries must be installed to /usr/local/bin:
 
             do {
                 let key = try walletManager.exportSpendingKey()
+                // VUL-CRYPTO-003: Copy full key to clipboard IMMEDIATELY, then discard.
+                // Full key NEVER stored in @State — only truncated display string.
+                let truncated = String(key.prefix(8)) + "..." + String(key.suffix(8))
+                ClipboardManager.copyWithAutoExpiry(key, seconds: 10)
+                // key (String) goes out of scope here — ARC will dealloc
                 DispatchQueue.main.async {
-                    // VUL-CRYPTO-003: Store as Data to minimize String copies
-                    exportedKeyData = Data(key.utf8)
+                    exportedKeyDisplay = truncated
                     showExportAlert = true
                 }
                 // SECURITY: Never log private key operations

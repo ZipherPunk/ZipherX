@@ -260,33 +260,6 @@ final class WalletDatabase {
         return WalletDatabase.txTypeEncryptionMap[type] ?? type.rawValue
     }
 
-    // MARK: - Security audit TASK 19: Encrypted TX Type Shadow Column
-
-    /// Encrypt transaction type as BLOB for tx_type_enc column
-    /// Security audit TASK 19: Integer code encrypted with AES-GCM
-    private func encryptTxTypeBlob(_ type: TransactionType) -> Data? {
-        let typeInt: UInt8 = switch type {
-            case .sent: 0
-            case .received: 1
-            case .change: 2
-            case .selfSend: 3
-        }
-        return try? encryptBlob(Data([typeInt]))
-    }
-
-    /// Decrypt transaction type from tx_type_enc BLOB column
-    /// Security audit TASK 19: Returns nil if decryption fails (fallback to text column)
-    private func decryptTxTypeBlob(_ encrypted: Data) -> TransactionType? {
-        guard let decrypted = try? decryptBlob(encrypted),
-              let byte = decrypted.first else { return nil }
-        switch byte {
-            case 0: return .sent
-            case 1: return .received
-            case 2: return .change
-            case 3: return .selfSend
-            default: return nil
-        }
-    }
 
     /// Decrypt transaction type from database storage
     /// FIX #503: Use byte comparison FIRST - String comparison fails due to Unicode normalization
@@ -1406,40 +1379,7 @@ final class WalletDatabase {
         if !historyColumns.contains("tx_type_enc") {
             let alterSql = "ALTER TABLE transaction_history ADD COLUMN tx_type_enc BLOB;"
             if sqlite3_exec(db, alterSql, nil, nil, nil) == SQLITE_OK {
-                print("📂 Migration 16: Added tx_type_enc column to transaction_history (TASK 19)")
-
-                // Security audit TASK 19: Backfill tx_type_enc for existing rows
-                // Read existing rows and encrypt their tx_type values
-                var backfillStmt: OpaquePointer?
-                if sqlite3_prepare_v2(db, "SELECT id, tx_type FROM transaction_history WHERE tx_type_enc IS NULL;", -1, &backfillStmt, nil) == SQLITE_OK {
-                    var rows: [(Int64, String)] = []
-                    while sqlite3_step(backfillStmt) == SQLITE_ROW {
-                        let rowId = sqlite3_column_int64(backfillStmt, 0)
-                        if let typeStr = sqlite3_column_text(backfillStmt, 1) {
-                            rows.append((rowId, String(cString: typeStr)))
-                        }
-                    }
-                    sqlite3_finalize(backfillStmt)
-
-                    for (rowId, typeStr) in rows {
-                        let txType = decryptTxType(typeStr)
-                        if let encType = encryptTxTypeBlob(txType) {
-                            let updateSql = "UPDATE transaction_history SET tx_type_enc = ? WHERE id = ?;"
-                            var updateStmt: OpaquePointer?
-                            if sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK {
-                                _ = encType.withUnsafeBytes { ptr in
-                                    sqlite3_bind_blob(updateStmt, 1, ptr.baseAddress, Int32(encType.count), nil)
-                                }
-                                sqlite3_bind_int64(updateStmt, 2, rowId)
-                                sqlite3_step(updateStmt)
-                                sqlite3_finalize(updateStmt)
-                            }
-                        }
-                    }
-                    if !rows.isEmpty {
-                        print("🔐 Migration 16: Backfilled tx_type_enc for \(rows.count) existing rows (TASK 19)")
-                    }
-                }
+                print("📂 Migration 16: Added tx_type_enc column to transaction_history (TASK 19 — column kept for schema compatibility, no longer written)")
             }
         }
 
@@ -2691,20 +2631,6 @@ final class WalletDatabase {
 
             let historyId = sqlite3_last_insert_rowid(db)
 
-            // Security audit TASK 19: Write encrypted TX type
-            if let encType = encryptTxTypeBlob(.sent) {
-                let updateSql = "UPDATE transaction_history SET tx_type_enc = ? WHERE id = ?;"
-                var updateStmt: OpaquePointer?
-                if sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK {
-                    _ = encType.withUnsafeBytes { ptr in
-                        sqlite3_bind_blob(updateStmt, 1, ptr.baseAddress, Int32(encType.count), nil)
-                    }
-                    sqlite3_bind_int64(updateStmt, 2, historyId)
-                    sqlite3_step(updateStmt)
-                    sqlite3_finalize(updateStmt)
-                }
-            }
-
             // COMMIT - both operations succeeded
             let commitResult = sqlite3_exec(db, "COMMIT;", nil, nil, nil)
             guard commitResult == SQLITE_OK else {
@@ -2800,20 +2726,6 @@ final class WalletDatabase {
         }
 
         let historyId = sqlite3_last_insert_rowid(db)
-
-        // Security audit TASK 19: Write encrypted TX type
-        if let encType = encryptTxTypeBlob(.sent) {
-            let updateSql = "UPDATE transaction_history SET tx_type_enc = ? WHERE id = ?;"
-            var updateStmt: OpaquePointer?
-            if sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK {
-                _ = encType.withUnsafeBytes { ptr in
-                    sqlite3_bind_blob(updateStmt, 1, ptr.baseAddress, Int32(encType.count), nil)
-                }
-                sqlite3_bind_int64(updateStmt, 2, historyId)
-                sqlite3_step(updateStmt)
-                sqlite3_finalize(updateStmt)
-            }
-        }
 
         print("✅ FIX #964: Recorded minimal sent TX at height \(confirmedHeight) (amount: \(UInt64(amount).redactedAmount), fee: \(UInt64(fee).redactedAmount))")
     }
@@ -5823,20 +5735,6 @@ final class WalletDatabase {
         let rowsChanged = sqlite3_changes(db)
         let rowId = sqlite3_last_insert_rowid(db)
 
-        // Security audit TASK 19: Write encrypted TX type
-        if let encType = encryptTxTypeBlob(type) {
-            let updateSql = "UPDATE transaction_history SET tx_type_enc = ? WHERE id = ?;"
-            var updateStmt: OpaquePointer?
-            if sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK {
-                _ = encType.withUnsafeBytes { ptr in
-                    sqlite3_bind_blob(updateStmt, 1, ptr.baseAddress, Int32(encType.count), nil)
-                }
-                sqlite3_bind_int64(updateStmt, 2, rowId)
-                sqlite3_step(updateStmt)
-                sqlite3_finalize(updateStmt)
-            }
-        }
-
         print("📜 DB: Insert result - rowId=\(rowId), rowsChanged=\(rowsChanged), txid=\(txid.prefix(8).map { String(format: "%02x", $0) }.joined())..., type=\(type.rawValue)")
 
         return rowId
@@ -6710,20 +6608,6 @@ final class WalletDatabase {
             if changes > 0 {
                 let historyId = sqlite3_last_insert_rowid(db)
 
-                // Security audit TASK 19: Write encrypted TX type
-                if let encType = encryptTxTypeBlob(.received) {
-                    let updateSql = "UPDATE transaction_history SET tx_type_enc = ? WHERE id = ?;"
-                    var updateStmt: OpaquePointer?
-                    if sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK {
-                        _ = encType.withUnsafeBytes { ptr in
-                            sqlite3_bind_blob(updateStmt, 1, ptr.baseAddress, Int32(encType.count), nil)
-                        }
-                        sqlite3_bind_int64(updateStmt, 2, historyId)
-                        sqlite3_step(updateStmt)
-                        sqlite3_finalize(updateStmt)
-                    }
-                }
-
                 print("📜 Recorded received transaction: height=\(height), value=\(UInt64(value).redactedAmount), time=\(actualBlockTime ?? 0)")
             }
         }
@@ -6802,20 +6686,6 @@ final class WalletDatabase {
 
         let historyId = sqlite3_last_insert_rowid(db)
 
-        // Security audit TASK 19: Write encrypted TX type
-        if let encType = encryptTxTypeBlob(.sent) {
-            let updateSql = "UPDATE transaction_history SET tx_type_enc = ? WHERE id = ?;"
-            var updateStmt: OpaquePointer?
-            if sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK {
-                _ = encType.withUnsafeBytes { ptr in
-                    sqlite3_bind_blob(updateStmt, 1, ptr.baseAddress, Int32(encType.count), nil)
-                }
-                sqlite3_bind_int64(updateStmt, 2, historyId)
-                sqlite3_step(updateStmt)
-                sqlite3_finalize(updateStmt)
-            }
-        }
-
         print("📜 Recorded sent transaction: height=\(height), amounts=[REDACTED], status=\(status.rawValue)")
     }
 
@@ -6864,20 +6734,6 @@ final class WalletDatabase {
         }
 
         let historyId = sqlite3_last_insert_rowid(db)
-
-        // Security audit TASK 19: Write encrypted TX type
-        if let encType = encryptTxTypeBlob(type) {
-            let updateSql = "UPDATE transaction_history SET tx_type_enc = ? WHERE id = ?;"
-            var updateStmt: OpaquePointer?
-            if sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK {
-                _ = encType.withUnsafeBytes { ptr in
-                    sqlite3_bind_blob(updateStmt, 1, ptr.baseAddress, Int32(encType.count), nil)
-                }
-                sqlite3_bind_int64(updateStmt, 2, historyId)
-                sqlite3_step(updateStmt)
-                sqlite3_finalize(updateStmt)
-            }
-        }
 
         let txidHex = txid.map { String(format: "%02x", $0) }.joined()
         print("📜 Recorded pending transaction: txid=\(txidHex.prefix(16))..., type=\(type.rawValue), value=\(value)")
@@ -7626,20 +7482,7 @@ final class WalletDatabase {
                         sqlite3_bind_int64(insertStmt, 5, tx.timestamp)  // block_time uses timestamp value
 
                         if sqlite3_step(insertStmt) == SQLITE_DONE {
-                            // FIX #1390 / Security audit TASK 19: Write encrypted TX type
                             let newHistId = sqlite3_last_insert_rowid(db)
-                            if let encType = encryptTxTypeBlob(.sent) {
-                                let encSql = "UPDATE transaction_history SET tx_type_enc = ? WHERE id = ?;"
-                                var encStmt: OpaquePointer?
-                                if sqlite3_prepare_v2(db, encSql, -1, &encStmt, nil) == SQLITE_OK {
-                                    _ = encType.withUnsafeBytes { ptr in
-                                        sqlite3_bind_blob(encStmt, 1, ptr.baseAddress, Int32(encType.count), nil)
-                                    }
-                                    sqlite3_bind_int64(encStmt, 2, newHistId)
-                                    sqlite3_step(encStmt)
-                                    sqlite3_finalize(encStmt)
-                                }
-                            }
 
                             // Display in display format (reversed from wire)
                             let displayTxid = Data(tx.spentTxid.reversed())
@@ -8039,20 +7882,7 @@ final class WalletDatabase {
                     sqlite3_bind_int64(insertStmt, 2, rx.blockHeight)
                     sqlite3_bind_int64(insertStmt, 3, sentAmount)
                     if sqlite3_step(insertStmt) == SQLITE_DONE {
-                        // FIX #1390 / Security audit TASK 19: Write encrypted TX type
                         let newHistId = sqlite3_last_insert_rowid(db)
-                        if let encType = encryptTxTypeBlob(.sent) {
-                            let encSql = "UPDATE transaction_history SET tx_type_enc = ? WHERE id = ?;"
-                            var encStmt: OpaquePointer?
-                            if sqlite3_prepare_v2(db, encSql, -1, &encStmt, nil) == SQLITE_OK {
-                                _ = encType.withUnsafeBytes { ptr in
-                                    sqlite3_bind_blob(encStmt, 1, ptr.baseAddress, Int32(encType.count), nil)
-                                }
-                                sqlite3_bind_int64(encStmt, 2, newHistId)
-                                sqlite3_step(encStmt)
-                                sqlite3_finalize(encStmt)
-                            }
-                        }
 
                         print("   ✅ Added 'sent' history entry for \(UInt64(max(0, sentAmount)).redactedAmount) at height \(rx.blockHeight)")
                     }

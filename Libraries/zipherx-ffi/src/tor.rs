@@ -767,38 +767,20 @@ async fn start_hidden_service_async() -> Result<String, Box<dyn std::error::Erro
         eprintln!("🧅 Hidden service handle stored - service will remain active");
     }
 
-    // FIX #1457: Scrub .onion identity key from disk after launch
-    // Arti writes the key as plaintext OpenSSH file to its keystore.
+    // FIX #1457: Scrub ONLY the .onion identity key from disk after launch.
     // The authoritative copy lives in macOS Keychain — no need to keep on disk.
-    // Arti holds the key in memory for the running service; disk file is not needed.
+    // Arti holds the identity key in memory for the running service.
+    //
+    // IMPORTANT: Do NOT scrub blind ID, descriptor signing, or intro point keys!
+    // Arti needs these DURING the session to:
+    //   1. Sign and publish the hidden service descriptor to HSDir nodes
+    //   2. Maintain introduction point circuits for client rendezvous
+    // Scrubbing them breaks descriptor publication → "Onion Service not found"
     let keystore_dir = data_dir.join("state").join("keystore").join("hss").join("zipherx");
     let hs_id_keyfile = keystore_dir.join("ks_hs_id.ed25519_expanded_private");
     if hs_id_keyfile.exists() {
         let _ = std::fs::remove_file(&hs_id_keyfile);
-        eprintln!("🧅 FIX #1457: Scrubbed .onion key from disk (kept in memory only)");
-    }
-    // Also scrub any blind ID / desc signing keys Arti may have written
-    if let Ok(entries) = std::fs::read_dir(&keystore_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "ed25519_expanded_private" || ext == "ed25519_private") {
-                let _ = std::fs::remove_file(&path);
-            }
-        }
-    }
-    // FIX #1457v2: Also scrub intro point keys in ipts/ subdirectory
-    let ipts_dir = keystore_dir.join("ipts");
-    if ipts_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&ipts_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().map_or(false, |ext| {
-                    ext == "ed25519_private" || ext == "ed25519_expanded_private" || ext == "x25519_private"
-                }) {
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
-        }
+        eprintln!("🧅 FIX #1457: Scrubbed .onion identity key from disk (kept in memory only)");
     }
 
     // Get the .onion address using the new API
