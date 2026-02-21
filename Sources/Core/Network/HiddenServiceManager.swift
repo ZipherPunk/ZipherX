@@ -195,10 +195,43 @@ public final class HiddenServiceManager: ObservableObject {
         if result == 0 {
             // Success - start polling for status updates
             startStatusPolling()
-            // Advertise our .onion address to connected peers
+            // FIX #1465: Wait for descriptor publication before advertising
+            // Tor v3 hidden service descriptors take 30-60 seconds to publish:
+            //   1. Build introduction point circuits (3 hops × 3-6 intro points)
+            //   2. Generate and sign the descriptor
+            //   3. Upload to 6+ HSDir nodes
+            //   4. Wait for consensus propagation
+            // Advertising before publication = "Onion Service not found" for peers
             Task {
-                // Wait for address to become available
-                try? await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds
+                let maxWait: TimeInterval = 90 // seconds
+                let startTime = Date()
+                var published = false
+
+                print("🧅 FIX #1465: Waiting for descriptor publication (up to \(Int(maxWait))s)...")
+
+                while Date().timeIntervalSince(startTime) < maxWait {
+                    // Check if Arti now knows the real address (= descriptor published)
+                    if let addrPtr = zipherx_tor_hidden_service_get_address() {
+                        let address = String(cString: addrPtr)
+                        zipherx_tor_free_string(addrPtr)
+                        if !address.isEmpty {
+                            let elapsed = Int(Date().timeIntervalSince(startTime))
+                            print("🧅 FIX #1465: Descriptor published after \(elapsed)s — advertising to peers")
+                            await MainActor.run {
+                                self.onionAddress = address
+                                HiddenServiceManager.cachedOnionAddress = address
+                            }
+                            published = true
+                            break
+                        }
+                    }
+                    try? await Task.sleep(nanoseconds: 2_000_000_000) // Poll every 2s
+                }
+
+                if !published {
+                    print("⚠️ FIX #1465: Descriptor publication timeout (\(Int(maxWait))s) — advertising derived address")
+                }
+
                 await NetworkManager.shared.advertiseOnionAddressToPeers()
             }
             return true

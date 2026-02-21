@@ -11350,6 +11350,8 @@ final class WalletManager: ObservableObject {
         defaults.removeObject(forKey: "FIX1089_NullifierVerificationCheckpoint")
         // FIX #1126: Invalidate verified state on wallet deletion
         WalletHealthCheck.shared.invalidateVerifiedState()
+        // FIX #1466: Clear hidden service preference so fresh install starts clean
+        defaults.removeObject(forKey: "hiddenServiceEnabled")
         defaults.synchronize()
         print("🗑️ Cleared UserDefaults (including migration flags and verification checkpoints)")
 
@@ -11410,6 +11412,14 @@ final class WalletManager: ObservableObject {
             print("🗑️ Deleted macOS encrypted key file")
         }
         #endif
+
+        // 11. Clear Tor hidden service keypair from Keychain
+        // FIX #1466: On macOS, Keychain items survive app deletion — must explicitly clear
+        // so a fresh install gets a new .onion identity instead of reusing the old one
+        DispatchQueue.main.async {
+            TorManager.shared.clearPersistentKeypair()
+            print("🗑️ Cleared Tor hidden service keypair")
+        }
 
         print("✅ DELETE WALLET: Complete! App should be restarted.")
 
