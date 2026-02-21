@@ -36,7 +36,7 @@ targets:
       properties:
         CFBundleDisplayName: ZipherX
         CFBundleShortVersionString: "1.0.1"
-        CFBundleVersion: "4"
+        CFBundleVersion: "5"
         UILaunchScreen:
           UIColorName: LaunchScreenColor
         NSFaceIDUsageDescription: ZipherX uses Face ID to protect your wallet and authorize transactions.
@@ -109,7 +109,7 @@ targets:
       properties:
         CFBundleDisplayName: ZipherX
         CFBundleShortVersionString: "1.0.1"
-        CFBundleVersion: "4"
+        CFBundleVersion: "5"
         CFBundleName: ZipherX
         LSMinimumSystemVersion: "12.0"
         NSLocalNetworkUsageDescription: ZipherX connects to Zclassic network peers to sync your wallet.

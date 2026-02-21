@@ -185,6 +185,13 @@ public final class NetworkManager: ObservableObject {
     // FIX #1348: Suppress verbose logging for pre-production build
     private let verbose = false
 
+    // FIX #1467: iOS thermal throttle — skip non-critical background timers when device is warm
+    #if os(iOS)
+    private var isDeviceOverheating: Bool {
+        ProcessInfo.processInfo.thermalState.rawValue >= ProcessInfo.ThermalState.serious.rawValue
+    }
+    #endif
+
     // MARK: - Published Properties
     // CPU OPTIMIZATION: @Published fires Combine objectWillChange on EVERY assignment,
     // even when value is unchanged. Use updateIfChanged() to suppress duplicate notifications.
@@ -514,6 +521,10 @@ public final class NetworkManager: ObservableObject {
     func performHealthCheck() async {
         // Don't check during initial sync
         guard backgroundProcessesEnabled else { return }
+        // FIX #1467: Skip health check when iOS device is overheating
+        #if os(iOS)
+        if isDeviceOverheating { return }
+        #endif
 
         // FIX #543: Check if we're in snooze period (user recently dismissed alert)
         if let dismissTime = healthAlertDismissTime {
@@ -915,9 +926,14 @@ public final class NetworkManager: ObservableObject {
     private var pathMonitor: NWPathMonitor?
     private let pathMonitorQueue = DispatchQueue(label: "com.zipherx.pathmonitor", qos: .utility)
 
-    /// Debounce network change recovery (3 second cooldown like BitChat)
+    /// Debounce network change recovery
     private var lastPathChangeTime: Date?
+    // FIX #1467: iOS cellular fires NWPathMonitor every 3-6s during tower handoffs — 10s debounce
+    #if os(iOS)
+    private let PATH_CHANGE_DEBOUNCE: TimeInterval = 10.0
+    #else
     private let PATH_CHANGE_DEBOUNCE: TimeInterval = 3.0
+    #endif
     /// FIX #1352: Track if we already logged the suppression message
     private var hasLoggedPathChangeSuppression = false
 
@@ -1848,6 +1864,10 @@ public final class NetworkManager: ObservableObject {
     private func discoverMoreAddresses() async {
         // FIX #1273: Don't discover addresses before authentication
         guard BiometricAuthManager.shared.hasAuthenticatedThisSession else { return }
+        // FIX #1467: Skip address discovery when iOS device is overheating
+        #if os(iOS)
+        if isDeviceOverheating { return }
+        #endif
 
         var discoveredCount = 0
         var onionDiscoveredCount = 0
@@ -1915,6 +1935,11 @@ public final class NetworkManager: ObservableObject {
         guard BiometricAuthManager.shared.hasAuthenticatedThisSession else { return }
 
         guard isConnected else { return }
+
+        // FIX #1467: Skip when iOS device is overheating
+        #if os(iOS)
+        if isDeviceOverheating { return }
+        #endif
 
         // FIX #145: Skip if background processes are disabled (initial sync in progress)
         guard backgroundProcessesEnabled else {
@@ -8569,6 +8594,10 @@ public final class NetworkManager: ObservableObject {
         if !BiometricAuthManager.shared.hasAuthenticatedThisSession {
             return
         }
+        // FIX #1467: Skip peer recovery when iOS device is overheating
+        #if os(iOS)
+        if isDeviceOverheating { return }
+        #endif
 
         // FIX #227: Don't run during sync/repair/connection operations - they manage their own connections
         if WalletManager.shared.isSyncing || WalletManager.shared.isRepairingHistory || isConnecting {
@@ -9327,6 +9356,10 @@ public final class NetworkManager: ObservableObject {
         if !BiometricAuthManager.shared.hasAuthenticatedThisSession {
             return
         }
+        // FIX #1467: Skip keepalive ping when iOS device is overheating
+        #if os(iOS)
+        if isDeviceOverheating { return }
+        #endif
 
         // FIX #1461: Allow peer growth even during sync — only skip ping when syncing
         let isBusySyncing = isHeaderSyncing || WalletManager.shared.isSyncing

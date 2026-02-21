@@ -23,8 +23,8 @@ struct DisclaimerView: View {
                 // Header
                 headerView
 
-                // Scrollable content
-                ScrollView {
+                // Scrollable content (vertical only — prevent horizontal overflow on iOS)
+                ScrollView(.vertical, showsIndicators: true) {
                     VStack(alignment: .leading, spacing: 20) {
                         disclaimerContent
 
@@ -38,11 +38,13 @@ struct DisclaimerView: View {
                         .frame(height: 1)
                     }
                     #if os(iOS)
-                    .padding(.horizontal, 8)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     #else
                     .padding(.horizontal, 24)
-                    #endif
                     .padding(.vertical, 20)
+                    #endif
                 }
                 .overlay(
                     // FIX #1447: Track the scroll view's visible bottom edge
@@ -91,20 +93,32 @@ struct DisclaimerView: View {
             Image("ZipherpunkLogo")
                 .resizable()
                 .aspectRatio(contentMode: .fit)
+                #if os(iOS)
+                .frame(width: 48, height: 48)
+                #else
                 .frame(width: 60, height: 60)
+                #endif
 
             Text("ZIPHERX")
+                #if os(iOS)
+                .font(.system(size: 22, weight: .bold, design: .monospaced))
+                #else
                 .font(.system(size: 28, weight: .bold, design: .monospaced))
+                #endif
                 .foregroundColor(NeonColors.primary)
 
             Text("IMPORTANT LEGAL NOTICE")
+                #if os(iOS)
+                .font(.system(size: 12, weight: .semibold))
+                #else
                 .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                #endif
                 .foregroundColor(NeonColors.primary.opacity(0.8))
                 .padding(.top, 4)
         }
         #if os(iOS)
-        .padding(.top, 20)
-        .padding(.bottom, 12)
+        .padding(.top, 16)
+        .padding(.bottom, 8)
         #else
         .padding(.top, 40)
         .padding(.bottom, 20)
@@ -113,8 +127,14 @@ struct DisclaimerView: View {
 
     // MARK: - Disclaimer Content
 
+    #if os(iOS)
+    private let sectionSpacing: CGFloat = 14
+    #else
+    private let sectionSpacing: CGFloat = 24
+    #endif
+
     private var disclaimerContent: some View {
-        VStack(alignment: .leading, spacing: 24) {
+        VStack(alignment: .leading, spacing: sectionSpacing) {
             // Section 1: Nature of Software
             sectionView(
                 title: "1. OPEN SOURCE SOFTWARE",
@@ -330,15 +350,19 @@ struct DisclaimerView: View {
 
     private func sectionView(title: String, icon: String? = nil, content: String) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
+            HStack(alignment: .top, spacing: 6) {
                 if let iconName = icon {
                     Image(systemName: iconName)
                         .foregroundColor(NeonColors.primary)
+                        #if os(iOS)
+                        .font(.system(size: 12))
+                        #else
                         .font(.system(size: 14))
+                        #endif
                 }
                 Text(title)
                     #if os(iOS)
-                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    .font(.system(size: 12, weight: .bold))
                     .lineLimit(nil)
                     .fixedSize(horizontal: false, vertical: true)
                     #else
@@ -358,8 +382,8 @@ struct DisclaimerView: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         #if os(iOS)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 10)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 8)
         #else
         .padding(16)
         #endif
@@ -394,8 +418,8 @@ struct DisclaimerView: View {
                 .foregroundColor(NeonColors.primary.opacity(0.7))
         }
         #if os(iOS)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 10)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 8)
         #else
         .padding(16)
         #endif
@@ -427,8 +451,8 @@ struct DisclaimerView: View {
             }
         }
         #if os(iOS)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 10)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 8)
         #else
         .padding(16)
         #endif
@@ -466,7 +490,11 @@ struct DisclaimerView: View {
 
             if !hasScrolledToBottom {
                 Text("Please scroll down to read the entire disclaimer")
+                    #if os(iOS)
+                    .font(.system(size: 11, weight: .medium))
+                    #else
                     .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    #endif
                     .foregroundColor(NeonColors.primary.opacity(0.6))
                     .padding(.top, 8)
             }
@@ -485,7 +513,11 @@ struct DisclaimerView: View {
                     Image(systemName: "checkmark.shield.fill")
                         .font(.system(size: 16))
                     Text("I ACCEPT AND UNDERSTAND")
+                        #if os(iOS)
+                        .font(.system(size: 13, weight: .bold))
+                        #else
                         .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        #endif
                 }
                 .foregroundColor(canAccept ? .black : .gray)
                 .frame(maxWidth: .infinity)

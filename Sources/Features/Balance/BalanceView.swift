@@ -1751,9 +1751,14 @@ struct BalanceView: View {
         // Immediate refresh on appear
         autoRefreshTick()
 
-        // Schedule refresh every 3 seconds
+        // FIX #1467: iOS uses 6s interval to reduce CPU/thermal load (was 3s)
+        #if os(iOS)
+        let refreshInterval: TimeInterval = 6.0
+        #else
+        let refreshInterval: TimeInterval = 3.0
+        #endif
         DispatchQueue.main.async {
-            self.refreshTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak walletManager, weak networkManager] _ in
+            self.refreshTimer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak walletManager, weak networkManager] _ in
                 guard walletManager != nil, networkManager != nil else { return }
                 self.autoRefreshTick()
             }
@@ -1771,6 +1776,10 @@ struct BalanceView: View {
         guard !isRefreshing else { return }
         guard !FilterScanner.isScanInProgress else { return }
         guard !walletManager.isSyncing else { return }
+        // FIX #1467: Skip auto-refresh when iOS device is overheating
+        #if os(iOS)
+        if ProcessInfo.processInfo.thermalState.rawValue >= ProcessInfo.ThermalState.serious.rawValue { return }
+        #endif
 
         Task { @MainActor in
             // Prevent concurrent refresh
