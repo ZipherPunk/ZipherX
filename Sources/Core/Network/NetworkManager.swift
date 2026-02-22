@@ -929,9 +929,12 @@ public final class NetworkManager: ObservableObject {
 
     /// Debounce network change recovery
     private var lastPathChangeTime: Date?
-    // FIX #1467: iOS cellular fires NWPathMonitor every 3-6s during tower handoffs — 10s debounce
+    // FIX #1497: iOS cellular fires NWPathMonitor every 30-60s during tower handoffs.
+    // Previous 10s debounce was insufficient — events are 25-60s apart, causing 11+ full
+    // reconnection cycles in 7 minutes = massive CPU/radio drain = phone overheats.
+    // 120s debounce: most tower handoffs don't affect existing TCP connections.
     #if os(iOS)
-    private let PATH_CHANGE_DEBOUNCE: TimeInterval = 10.0
+    private let PATH_CHANGE_DEBOUNCE: TimeInterval = 120.0
     #else
     private let PATH_CHANGE_DEBOUNCE: TimeInterval = 3.0
     #endif
@@ -9104,9 +9107,16 @@ public final class NetworkManager: ObservableObject {
 
     // MARK: - FIX #246: Peer Keepalive System
 
-    /// Keepalive timer (every 30 seconds on mobile)
+    /// Keepalive timer
     private var keepaliveTimer: Timer?
-    private let KEEPALIVE_INTERVAL: TimeInterval = 30  // 30 seconds for mobile
+    // FIX #1502: Increase keepalive from 30s to 90s on iOS to reduce overheating.
+    // z8.log: 293 ping/pong messages in 21 min at 30s interval. Bitcoin Core uses 120s.
+    // ZCL blocks arrive every ~75s, so 90s is safe — dead peers detected within 1 block.
+    #if os(iOS)
+    private let KEEPALIVE_INTERVAL: TimeInterval = 90
+    #else
+    private let KEEPALIVE_INTERVAL: TimeInterval = 30
+    #endif
 
     // FIX #326: Track long periods with no peers for Tor circuit refresh
     private var lastSuccessfulPeerContact: Date = Date()
@@ -9339,8 +9349,17 @@ public final class NetworkManager: ObservableObject {
             return
         }
 
-        // Network is back - trigger recovery
-        debugLog(.network, "📶 FIX #268: Network path satisfied - triggering peer recovery")
+        // FIX #1497: Skip full reconnection if peers are already healthy.
+        // iOS cellular tower handoffs trigger path changes without breaking existing TCP connections.
+        // Disconnecting all peers and reconnecting wastes CPU/radio and causes the phone to overheat.
+        let healthyPeerCount = peers.filter { $0.isConnectionReady }.count
+        if healthyPeerCount >= CONSENSUS_THRESHOLD {
+            debugLog(.network, "📶 FIX #1497: Path changed but \(healthyPeerCount) healthy peers — skipping reconnection")
+            return
+        }
+
+        // Network is back - trigger recovery (only when peers are actually unhealthy)
+        debugLog(.network, "📶 FIX #268: Network path satisfied - triggering peer recovery (\(healthyPeerCount) healthy peers)")
 
         // Disconnect all existing peers (their sockets may be stale)
         for peer in peers {
@@ -9470,8 +9489,16 @@ public final class NetworkManager: ObservableObject {
         // FIX #1461: Proactive peer growth — connect to more peers if below MIN_PEERS
         // This runs even during sync, because having more peers improves P2P fetch reliability.
         // The main connect() exits early at 3-6 peers for fast startup; this fills to 8+.
-        if readyPeers.count < MIN_PEERS && !isRecoveringPeers {
-            debugLog(.network, "🫀 FIX #1461: Only \(readyPeers.count)/\(MIN_PEERS) peers — growing peer count in background")
+        // FIX #1501: On iOS, skip peer growth when >= CONSENSUS_THRESHOLD peers.
+        // z8.log: 14 growth attempts in 21 min, each trying 5 SOCKS5 connections, ALL failing.
+        // 3 peers is sufficient for iOS consensus. Growing to 8 wastes CPU/radio.
+        #if os(iOS)
+        let peerGrowthThreshold = CONSENSUS_THRESHOLD
+        #else
+        let peerGrowthThreshold = MIN_PEERS
+        #endif
+        if readyPeers.count < peerGrowthThreshold && !isRecoveringPeers {
+            debugLog(.network, "🫀 FIX #1461: Only \(readyPeers.count)/\(peerGrowthThreshold) peers — growing peer count in background")
             await growPeerCount(currentReady: readyPeers.count)
         }
 

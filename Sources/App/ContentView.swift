@@ -2919,6 +2919,11 @@ struct ContentView: View {
             }
         }
         #endif
+        // FIX #1504: Record activity from sheets (chat typing, etc.)
+        // Sheets are separate view hierarchies — ContentView gestures don't fire there.
+        .onReceive(NotificationCenter.default.publisher(for: .userActivityInSheet)) { _ in
+            recordUserActivity()
+        }
         #if os(macOS)
         .onAppear {
             if screenshotProtectionEnabled {
@@ -3121,18 +3126,32 @@ struct ContentView: View {
 
     private func checkInactivityTimeout() {
         // FIX #1273: Check inactivity regardless of biometric setting (auth always mandatory)
-        // FIX #1479: Don't trigger lock screen when chat is active.
-        // LockScreenView's .onAppear triggers biometric prompt which interrupts the chat sheet.
-        // When chat closes, the next timer tick (within 5s) will detect the inactivity and lock.
+        // FIX #1504: REMOVED FIX #1479 guard (!showCypherpunkChat).
+        // FIX #1479 skipped locking entirely when chat was open — user reported lock never triggers
+        // during chat even after inactivity. Now: dismiss chat BEFORE showing lock so lock screen
+        // is visible (sheet sits above overlay in SwiftUI hierarchy — lock was appearing behind).
         guard !isShowingLockScreen,
               !isInitialSync,
-              !showCypherpunkChat,
               biometricManager.isInactivityTimeoutExceeded else {
             return
         }
 
         // Inactivity timeout exceeded - show lock screen
         DispatchQueue.main.async {
+            // FIX #1504: Dismiss any active sheet (chat, settings, etc.) so lock screen is visible.
+            // Without this, the lock screen renders behind the sheet overlay.
+            if showCypherpunkChat {
+                showCypherpunkChat = false
+            }
+            if showCypherpunkSettings {
+                showCypherpunkSettings = false
+            }
+            if showCypherpunkSend {
+                showCypherpunkSend = false
+            }
+            if showCypherpunkReceive {
+                showCypherpunkReceive = false
+            }
             isShowingLockScreen = true
             biometricManager.lockApp()
         }
@@ -3605,13 +3624,9 @@ struct ContentView: View {
             .environmentObject(themeManager)
         }
         .sheet(isPresented: $showCypherpunkChat, onDismiss: {
-            // FIX #1479: Check lock immediately when chat is dismissed.
-            // The inactivity timer was suppressed while chat was active,
-            // so check now if the timeout has been exceeded.
-            if biometricManager.isBiometricEnabled && biometricManager.isInactivityTimeoutExceeded {
-                isShowingLockScreen = true
-                biometricManager.lockApp()
-            }
+            // FIX #1504: Lock check now handled in checkInactivityTimeout() which also
+            // dismisses sheets. Just record that chat closed so next timer tick can lock.
+            recordUserActivity()
         }) {
             // FIX #252: Pass callback to navigate to main app settings when Tor is disabled
             ChatView(onShowAppSettings: {

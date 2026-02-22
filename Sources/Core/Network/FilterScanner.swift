@@ -2423,20 +2423,41 @@ final class FilterScanner {
             // Set FIX #1089 checkpoint so future startups don't trigger the full 86K scan either
             UserDefaults.standard.set(true, forKey: "FIX1089_FullVerificationComplete")
         } else {
-            print("🔍 FIX #945: Running post-scan spend verification...")
-            do {
-                let externalSpends = try await WalletManager.shared.verifyAllUnspentNotesOnChain(forceFullVerification: fixedNullifiers > 0)
-                if externalSpends > 0 {
-                    print("✅ FIX #945: Detected and fixed \(externalSpends) missed spend(s)")
-                    // Refresh balance after fixing missed spends
-                    try? await WalletManager.shared.refreshBalance()
-                } else {
-                    print("✅ FIX #945: All unspent notes verified - no missed spends")
+            // FIX #1500: On iOS, throttle post-scan verification to once every 10 minutes.
+            // z8.log showed 23 runs in 21 minutes, ALL with 0% scan coverage (delta range
+            // covers all blocks). Each run wastes ~1s CPU + P2P fetch for zero benefit.
+            // macOS keeps original behavior (runs after every block sync).
+            #if os(iOS)
+            let lastVerifyKey = "FIX1500_LastPostScanVerifyTime"
+            let lastVerifyTime = UserDefaults.standard.double(forKey: lastVerifyKey)
+            let timeSinceLastVerify = Date().timeIntervalSince1970 - lastVerifyTime
+            let postScanVerifyCooldown: TimeInterval = 600 // 10 minutes
+            let shouldSkipVerification = timeSinceLastVerify < postScanVerifyCooldown && fixedNullifiers == 0
+            if shouldSkipVerification {
+                print("⏩ FIX #1500: Skipping FIX #945 on iOS — last run \(Int(timeSinceLastVerify))s ago (cooldown: \(Int(postScanVerifyCooldown))s)")
+            }
+            #else
+            let shouldSkipVerification = false
+            #endif
+            if !shouldSkipVerification {
+                print("🔍 FIX #945: Running post-scan spend verification...")
+                do {
+                    let externalSpends = try await WalletManager.shared.verifyAllUnspentNotesOnChain(forceFullVerification: fixedNullifiers > 0)
+                    if externalSpends > 0 {
+                        print("✅ FIX #945: Detected and fixed \(externalSpends) missed spend(s)")
+                        // Refresh balance after fixing missed spends
+                        try? await WalletManager.shared.refreshBalance()
+                    } else {
+                        print("✅ FIX #945: All unspent notes verified - no missed spends")
+                    }
+                    #if os(iOS)
+                    UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: lastVerifyKey)
+                    #endif
+                } catch {
+                    print("⚠️ FIX #945: Post-scan verification failed: \(error)")
+                    print("   Balance may be incorrect if spends occurred in missed blocks")
+                    print("   Use 'Full Resync' in Settings if balance seems wrong")
                 }
-            } catch {
-                print("⚠️ FIX #945: Post-scan verification failed: \(error)")
-                print("   Balance may be incorrect if spends occurred in missed blocks")
-                print("   Use 'Full Resync' in Settings if balance seems wrong")
             }
         }
 

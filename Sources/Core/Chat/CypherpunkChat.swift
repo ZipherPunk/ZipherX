@@ -134,6 +134,37 @@ struct ChatMessage: Codable, Identifiable {
         self.readAt = nil
     }
 
+    /// FIX #1498: Restore initializer for loading messages from database.
+    /// Previous init generated new UUID + Date() on every load, causing:
+    /// - Messages to appear empty/unsorted after restart (all timestamps = startup time)
+    /// - Duplicate IDs in ForEach ("the ID occurs multiple times" SwiftUI error)
+    /// - Gradually duplicating messages on INSERT ... ON CONFLICT with new UUIDs
+    init(
+        id: String,
+        type: ChatMessageType,
+        fromOnion: String,
+        toOnion: String,
+        timestamp: Date,
+        content: String,
+        replyTo: String? = nil,
+        status: MessageStatus = .sending
+    ) {
+        self.id = id
+        self.type = type
+        self.fromOnion = fromOnion
+        self.toOnion = toOnion
+        self.timestamp = timestamp
+        self.content = content
+        self.nickname = nil
+        self.paymentAddress = nil
+        self.paymentAmount = nil
+        self.ttl = nil
+        self.replyTo = replyTo
+        self.status = status
+        self.deliveredAt = nil
+        self.readAt = nil
+    }
+
     /// Check if message has expired (TTL)
     var isExpired: Bool {
         guard let ttl = ttl else { return false }

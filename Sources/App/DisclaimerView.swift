@@ -68,18 +68,25 @@ struct DisclaimerView: View {
 
     private var scrollableContent: some View {
         #if os(iOS)
-        ScrollView(.vertical, showsIndicators: true) {
-            VStack(alignment: .leading, spacing: 16) {
-                disclaimerContent
+        // FIX #1496: Use GeometryReader to explicitly constrain content width.
+        // .padding() alone was insufficient — ScrollView content extended beyond screen edges,
+        // causing text to be clipped on both left and right sides.
+        GeometryReader { geometry in
+            ScrollView(.vertical, showsIndicators: true) {
+                VStack(alignment: .leading, spacing: 16) {
+                    disclaimerContent
 
-                GeometryReader { geo in
-                    Color.clear
-                        .preference(key: BottomAnchorYKey.self,
-                                   value: geo.frame(in: .global).maxY)
+                    GeometryReader { geo in
+                        Color.clear
+                            .preference(key: BottomAnchorYKey.self,
+                                       value: geo.frame(in: .global).maxY)
+                    }
+                    .frame(height: 1)
                 }
-                .frame(height: 1)
+                .frame(width: geometry.size.width - 32)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 16)
             }
-            .padding()
         }
         #else
         ScrollView(.vertical, showsIndicators: true) {

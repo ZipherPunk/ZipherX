@@ -341,6 +341,7 @@ struct SettingsView: View {
     @State private var showDeleteWalletWarning = false
     @State private var showDeleteWalletConfirm = false
     @State private var deleteConfirmText = ""
+    @State private var isDeletingWallet = false  // FIX #1503: Progress indicator during deletion
 
     // Peer export management
     @State private var showPeerExportSuccess = false
@@ -364,7 +365,9 @@ struct SettingsView: View {
     // iOS main thread stack is 1MB (vs 8MB macOS) → stack overflow at networkSection.
     // Fix: all alerts/sheets applied at body level → 2 levels instead of 8.
     var body: some View {
+        ZStack {
         deletableContent
+            .disabled(isDeletingWallet)  // FIX #1503: Prevent interaction during deletion
             .onAppear {
                 checkBiometricAvailability()
                 networkManager.updatePeerCountsForSettings()
@@ -496,7 +499,8 @@ struct SettingsView: View {
                 TextField("Type DELETE to confirm", text: $deleteConfirmText)
                 Button("CANCEL - KEEP MY WALLET", role: .cancel) { deleteConfirmText = "" }
                 Button("DELETE FOREVER", role: .destructive) {
-                    if deleteConfirmText == "DELETE" {
+                    // FIX #1503: Trim whitespace — "DELETE " (trailing space) was rejected
+                    if deleteConfirmText.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() == "DELETE" {
                         performDeleteWallet()
                     }
                     deleteConfirmText = ""
@@ -509,11 +513,34 @@ struct SettingsView: View {
             } message: {
                 Text("\"Privacy is necessary for an open society.\"\n\nFor maximum security, your 24-word seed phrase was shown ONLY during wallet creation and is NOT stored on this device.\n\nIf you didn't write it down, use \"Export Private Key\" above as your backup.\n\nYour private key can fully restore your wallet.")
             }
+
+            // FIX #1503: Deletion progress overlay
+            if isDeletingWallet {
+                Color.black.opacity(0.7)
+                    .ignoresSafeArea()
+                VStack(spacing: 20) {
+                    ProgressView()
+                        .scaleEffect(1.5)
+                        #if os(iOS)
+                        .tint(.white)
+                        #endif
+                    Text("DELETING WALLET...")
+                        .font(.system(size: 18, weight: .bold, design: .monospaced))
+                        .foregroundColor(.white)
+                    Text("This cannot be undone")
+                        .font(.system(size: 13, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.7))
+                }
+            }
+        } // ZStack
     }
 
+    // FIX #1495: Use LazyVStack to prevent stack overflow on iOS.
+    // SettingsView has 4387 lines of deeply nested views. VStack evaluates ALL children
+    // at once — exceeds iOS's 1MB main thread stack. LazyVStack evaluates only visible sections.
     private var deletableContent: some View {
         ScrollView {
-            VStack(spacing: 16) {
+            LazyVStack(spacing: 16) {
                 #if os(macOS)
                 walletModeSection
                 #endif
@@ -2665,27 +2692,33 @@ Both binaries must be installed to /usr/local/bin:
 
     // Note: Delete Wallet functionality is now part of exportSection (Danger Zone)
 
+    /// FIX #1503: Delete wallet with progress indicator.
+    /// - Runs in background Task to avoid blocking main thread (Thread.sleep in deleteWallet)
+    /// - Shows "DELETING..." overlay during operation
+    /// - Stops network before deletion to release DB locks
+    /// - Trims trailing whitespace from DELETE confirmation
     private func performDeleteWallet() {
-        do {
-            // Delete the database file
-            try WalletDatabase.shared.deleteDatabase()
+        isDeletingWallet = true
+        Task {
+            do {
+                // Stop network/Tor to release DB locks and prevent races
+                await NetworkManager.shared.stopKeepaliveTimer()
+                print("🗑️ FIX #1503: Network stopped, starting wallet deletion...")
 
-            // Delete the wallet (clears keychain + UserDefaults)
-            try walletManager.deleteWallet()
+                // deleteWallet() handles: keychain, DB, headers, UserDefaults, FFI, caches
+                try walletManager.deleteWallet()
 
-            // Clear additional UserDefaults
-            let defaults = UserDefaults.standard
-            defaults.removeObject(forKey: "wallet_created")
-            defaults.removeObject(forKey: "wallet_imported")
-            defaults.removeObject(forKey: "z_address")
-            defaults.removeObject(forKey: "lastScannedHeight")
-            defaults.removeObject(forKey: "lastScannedHash")
-            defaults.synchronize()
-
-            print("Wallet deleted successfully")
-        } catch {
-            errorMessage = "Failed to delete wallet: \(error.localizedDescription)"
-            showError = true
+                await MainActor.run {
+                    isDeletingWallet = false
+                    print("🗑️ FIX #1503: Wallet deleted successfully — navigating to setup")
+                }
+            } catch {
+                await MainActor.run {
+                    isDeletingWallet = false
+                    errorMessage = "Failed to delete wallet: \(error.localizedDescription)"
+                    showError = true
+                }
+            }
         }
     }
 

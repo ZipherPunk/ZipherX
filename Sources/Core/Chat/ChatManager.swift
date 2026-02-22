@@ -2202,8 +2202,20 @@ class ChatDatabase {
             timestamp: Int64(message.timestamp.timeIntervalSince1970),
             replyToId: message.replyTo
         )
+
+        // FIX #1499: Update contact's last_message_time so contacts sort correctly after restart.
+        // COALESCE in the SQL ensures only non-NULL values overwrite, so passing nil for
+        // nickname/unreadCount won't wipe existing values... but we need a separate UPDATE here
+        // to avoid changing nickname/unreadCount. Use direct SQL for surgical update.
+        WalletDatabase.shared.updateChatContactLastMessageTime(
+            onionAddress: onion,
+            lastMessageTime: Int64(message.timestamp.timeIntervalSince1970)
+        )
     }
 
+    // FIX #1498: Use restore initializer with stored id + timestamp from database.
+    // Previous code used the short init which generated new UUID + Date() on every load,
+    // causing duplicate IDs, wrong timestamps, and messages appearing empty after restart.
     func loadMessages(for onionAddress: String) -> [ChatMessage] {
         let rows = WalletDatabase.shared.loadChatMessages(for: onionAddress)
         return rows.compactMap { row in
@@ -2216,9 +2228,11 @@ class ChatDatabase {
             else { status = .sending }
 
             return ChatMessage(
+                id: row.id,
                 type: type,
                 fromOnion: row.fromOnion,
                 toOnion: row.toOnion,
+                timestamp: Date(timeIntervalSince1970: TimeInterval(row.timestamp)),
                 content: row.content,
                 replyTo: row.replyToId,
                 status: status
@@ -2235,4 +2249,7 @@ extension Notification.Name {
     static let chatMessageRead = Notification.Name("chatMessageRead")
     /// FIX #1487: Posted by NetworkManager when .onion circuits become ready
     static let onionCircuitsReady = Notification.Name("onionCircuitsReady")
+    /// FIX #1504: Posted from chat/sheets when user interacts — resets inactivity timer.
+    /// Sheets are separate view hierarchies, so ContentView gesture recognizers don't fire.
+    static let userActivityInSheet = Notification.Name("userActivityInSheet")
 }

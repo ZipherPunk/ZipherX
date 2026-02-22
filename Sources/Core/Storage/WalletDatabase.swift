@@ -8840,6 +8840,10 @@ final class WalletDatabase {
 
     // MARK: - VUL-STOR-003: Chat Storage (SQLCipher encrypted)
 
+    // FIX #1499: Use COALESCE to preserve last_message_time when caller passes nil.
+    // Previous SQL unconditionally overwrote last_message_time to NULL on every saveContact() call
+    // (including FIX #1369 startup loop that resets isOnline for every contact).
+    // This caused contacts to lose their sort order and last message time after restart.
     func saveChatContact(onionAddress: String, nickname: String?, unreadCount: Int, lastMessageTime: Int64?) {
         guard db != nil else { return }
         let sql = """
@@ -8848,7 +8852,7 @@ final class WalletDatabase {
             ON CONFLICT(onion_address) DO UPDATE SET
                 nickname = excluded.nickname,
                 unread_count = excluded.unread_count,
-                last_message_time = excluded.last_message_time;
+                last_message_time = COALESCE(excluded.last_message_time, last_message_time);
         """
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
@@ -8865,6 +8869,19 @@ final class WalletDatabase {
         } else {
             sqlite3_bind_null(stmt, 4)
         }
+        sqlite3_step(stmt)
+    }
+
+    /// FIX #1499: Surgical update of last_message_time without touching nickname/unreadCount.
+    /// Called by ChatDatabase.saveMessage() to keep contacts sorted by most recent message.
+    func updateChatContactLastMessageTime(onionAddress: String, lastMessageTime: Int64) {
+        guard db != nil else { return }
+        let sql = "UPDATE chat_contacts SET last_message_time = ? WHERE onion_address = ?;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, lastMessageTime)
+        sqlite3_bind_text(stmt, 2, onionAddress, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
         sqlite3_step(stmt)
     }
 

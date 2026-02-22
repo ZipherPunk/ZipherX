@@ -939,6 +939,11 @@ struct ConversationView: View {
                     endPoint: .bottom
                 )
             )
+            // FIX #1504: Record activity when scrolling/tapping in chat conversation.
+            // Resets inactivity timer so lock screen doesn't trigger while user is reading.
+            .onTapGesture {
+                NotificationCenter.default.post(name: .userActivityInSheet, object: nil)
+            }
 
             Divider()
                 .background(theme.accentColor.opacity(0.2))
@@ -1228,6 +1233,9 @@ struct ConversationView: View {
                         .foregroundColor(.white)
                         .focused($isInputFocused)
                         .onChange(of: messageText) { _ in
+                            // FIX #1504: Reset inactivity timer when typing in chat.
+                            // Chat is in a sheet — ContentView gesture recognizers don't fire.
+                            NotificationCenter.default.post(name: .userActivityInSheet, object: nil)
                             Task {
                                 try? await chatManager.sendTypingIndicator(to: contact)
                             }
