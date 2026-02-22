@@ -202,6 +202,10 @@ final class ChatManager: ObservableObject {
 
     /// FIX #1458: Track last attempt time to prevent overlapping connection attempts
     private var lastConnectionAttempt: [String: Date] = [:]
+    /// FIX #1476: Prevent concurrent connection attempts to the same contact.
+    /// Multiple callers (maintenance loop, checkAllContactsOnline, flushMessageQueue, UI)
+    /// can race past the "already connected" check before any connection is established.
+    private var connectionsInFlight: Set<String> = []
 
     /// Calculate backoff delay using exponential formula: min(base * 2^failures, max)
     private func calculateBackoff(for onionAddress: String) -> Double {
@@ -253,6 +257,12 @@ final class ChatManager: ObservableObject {
             }
         }
 
+        // FIX #1482: Migrate contacts and messages from old UserDefaults+ChaChaPoly to SQLCipher
+        // Old ChatDatabase stored contacts in "chat_contacts_encrypted" and messages in
+        // "chat_messages_encrypted_<onionAddress>" — both encrypted with ChaChaPoly using
+        // key from Keychain ("com.zipherx.chat-database-key").
+        ChatManager.migrateLegacyChatData()
+
         // Load nickname from SQLCipher
         self.ourNickname = WalletDatabase.shared.getChatSetting(key: "chatNickname") ?? ""
         self.database = ChatDatabase()
@@ -265,6 +275,121 @@ final class ChatManager: ObservableObject {
         }
 
         print("💬 ChatManager initialized")
+    }
+
+    // MARK: - FIX #1482: Legacy Data Migration
+
+    /// Migrate contacts and messages from old UserDefaults+ChaChaPoly to SQLCipher.
+    /// The old ChatDatabase (pre-VUL-STOR-003) stored:
+    ///   - Contacts: "chat_contacts_encrypted" in UserDefaults
+    ///   - Messages: "chat_messages_encrypted_<onionAddress>" in UserDefaults
+    ///   - Encryption key: "com.zipherx.chat-database-key" in Keychain
+    private static func migrateLegacyChatData() {
+        let legacyContactsKey = "chat_contacts_encrypted"
+        let legacyMessagesPrefix = "chat_messages_encrypted_"
+        let legacyKeychainKey = "com.zipherx.chat-database-key"
+
+        // Check if there's old data to migrate
+        guard let encryptedContacts = UserDefaults.standard.data(forKey: legacyContactsKey) else {
+            return  // No legacy data — nothing to migrate
+        }
+
+        // Only migrate if SQLCipher has no contacts yet (avoid duplicate migration)
+        let existingContacts = WalletDatabase.shared.loadChatContacts()
+        if !existingContacts.isEmpty {
+            // Already have contacts in SQLCipher — just clean up old data
+            UserDefaults.standard.removeObject(forKey: legacyContactsKey)
+            print("💬 FIX #1482: Cleaned up legacy contacts (already in SQLCipher)")
+            return
+        }
+
+        // Load the old ChaChaPoly encryption key from Keychain
+        guard let encryptionKey = loadLegacyChatDatabaseKey(keychainKey: legacyKeychainKey) else {
+            print("💬 FIX #1482: Cannot migrate — old encryption key not found in Keychain")
+            return
+        }
+
+        // Decrypt contacts
+        guard let decryptedData = decryptLegacyData(encryptedContacts, using: encryptionKey),
+              let contacts = try? JSONDecoder().decode([ChatContact].self, from: decryptedData) else {
+            print("💬 FIX #1482: Cannot migrate — failed to decrypt/decode legacy contacts")
+            return
+        }
+
+        // Save contacts to SQLCipher
+        var migratedContacts = 0
+        var migratedMessages = 0
+        for contact in contacts {
+            WalletDatabase.shared.saveChatContact(
+                onionAddress: contact.onionAddress,
+                nickname: contact.nickname.isEmpty ? nil : contact.nickname,
+                unreadCount: contact.unreadCount,
+                lastMessageTime: nil
+            )
+            migratedContacts += 1
+
+            // Migrate messages for this contact
+            let messagesKey = legacyMessagesPrefix + contact.onionAddress
+            if let encryptedMessages = UserDefaults.standard.data(forKey: messagesKey),
+               let decryptedMessages = decryptLegacyData(encryptedMessages, using: encryptionKey),
+               let messages = try? JSONDecoder().decode([ChatMessage].self, from: decryptedMessages) {
+                for message in messages {
+                    let isSent = message.status == .sent || message.status == .delivered || message.status == .read
+                    let isDelivered = message.status == .delivered || message.status == .read
+                    let isRead = message.status == .read
+
+                    WalletDatabase.shared.saveChatMessage(
+                        id: message.id,
+                        conversationAddress: contact.onionAddress,
+                        fromOnion: message.fromOnion,
+                        toOnion: message.toOnion,
+                        content: message.content,
+                        messageType: message.type.rawValue,
+                        isSent: isSent,
+                        isDelivered: isDelivered,
+                        isRead: isRead,
+                        timestamp: Int64(message.timestamp.timeIntervalSince1970),
+                        replyToId: message.replyTo
+                    )
+                    migratedMessages += 1
+                }
+                UserDefaults.standard.removeObject(forKey: messagesKey)
+            }
+        }
+
+        // Clean up old contacts data
+        UserDefaults.standard.removeObject(forKey: legacyContactsKey)
+        print("💬 FIX #1482: Migrated \(migratedContacts) contacts and \(migratedMessages) messages from UserDefaults to SQLCipher")
+    }
+
+    /// Load the old ChatDatabase encryption key from Keychain
+    private static func loadLegacyChatDatabaseKey(keychainKey: String) -> SymmetricKey? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "ZipherX",
+            kSecAttrAccount as String: keychainKey,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+        if status == errSecSuccess, let data = result as? Data, data.count == 32 {
+            return SymmetricKey(data: data)
+        }
+        return nil
+    }
+
+    /// Decrypt data using ChaChaPoly (matches old ChatDatabase format)
+    private static func decryptLegacyData(_ data: Data, using key: SymmetricKey) -> Data? {
+        do {
+            let sealedBox = try ChaChaPoly.SealedBox(combined: data)
+            return try ChaChaPoly.open(sealedBox, using: key)
+        } catch {
+            print("💬 FIX #1482: Legacy decryption error: \(error)")
+            return nil
+        }
     }
 
     // MARK: - Public API
@@ -397,6 +522,15 @@ final class ChatManager: ObservableObject {
         if let peer = peers[contact.onionAddress], await peer.state.isConnected {
             return
         }
+
+        // FIX #1476: Prevent concurrent connection attempts to same contact.
+        // Without this: 6 callers race past "already connected" check → 6 parallel TCP handshakes → resource waste.
+        guard !connectionsInFlight.contains(contact.onionAddress) else {
+            print("💬 FIX #1476: Connection to \(contact.displayName) already in flight — skipping duplicate")
+            return
+        }
+        connectionsInFlight.insert(contact.onionAddress)
+        defer { connectionsInFlight.remove(contact.onionAddress) }
 
         // ==========================================================================
         // FIX #330: Circuit health check before operations
@@ -1931,15 +2065,34 @@ final class ChatManager: ObservableObject {
     private func retryQueuedMessages() async {
         guard !messageQueue.isEmpty else { return }
 
-        print("💬 FIX #249: Retrying queued messages for \(messageQueue.keys.count) contact(s)")
-
+        // FIX #1478: Apply backoff gate to queue retries.
+        // Without this, retryQueuedMessages() bypasses shouldSkipConnection() entirely.
+        // Result: every 30s maintenance loop builds a full Tor circuit → iOS overheating.
+        var contactsToRetry: [ChatContact] = []
         for onionAddress in messageQueue.keys {
-            // Find the contact
             guard let contact = contacts.first(where: { $0.onionAddress == onionAddress }) else {
                 continue
             }
+            // Check if we're within backoff window — skip if so
+            if shouldSkipConnection(for: onionAddress) {
+                continue
+            }
+            // Check if already connected — only flush if connected (no new circuit)
+            let isConnected: Bool
+            if let peer = peers[contact.onionAddress] {
+                isConnected = await peer.state.isConnected
+            } else {
+                isConnected = false
+            }
+            if isConnected {
+                contactsToRetry.append(contact)
+            }
+        }
 
-            // Try to flush queue for this contact
+        guard !contactsToRetry.isEmpty else { return }
+        print("💬 FIX #249: Retrying queued messages for \(contactsToRetry.count) connected contact(s)")
+
+        for contact in contactsToRetry {
             await flushQueue(for: contact)
         }
     }

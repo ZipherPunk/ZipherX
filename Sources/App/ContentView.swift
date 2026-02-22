@@ -3121,8 +3121,12 @@ struct ContentView: View {
 
     private func checkInactivityTimeout() {
         // FIX #1273: Check inactivity regardless of biometric setting (auth always mandatory)
+        // FIX #1479: Don't trigger lock screen when chat is active.
+        // LockScreenView's .onAppear triggers biometric prompt which interrupts the chat sheet.
+        // When chat closes, the next timer tick (within 5s) will detect the inactivity and lock.
         guard !isShowingLockScreen,
               !isInitialSync,
+              !showCypherpunkChat,
               biometricManager.isInactivityTimeoutExceeded else {
             return
         }
@@ -3600,7 +3604,15 @@ struct ContentView: View {
             .environmentObject(networkManager)
             .environmentObject(themeManager)
         }
-        .sheet(isPresented: $showCypherpunkChat) {
+        .sheet(isPresented: $showCypherpunkChat, onDismiss: {
+            // FIX #1479: Check lock immediately when chat is dismissed.
+            // The inactivity timer was suppressed while chat was active,
+            // so check now if the timeout has been exceeded.
+            if biometricManager.isBiometricEnabled && biometricManager.isInactivityTimeoutExceeded {
+                isShowingLockScreen = true
+                biometricManager.lockApp()
+            }
+        }) {
             // FIX #252: Pass callback to navigate to main app settings when Tor is disabled
             ChatView(onShowAppSettings: {
                 showCypherpunkChat = false

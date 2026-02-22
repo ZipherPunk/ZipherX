@@ -168,6 +168,13 @@ public final class HiddenServiceManager: ObservableObject {
 
         print("🧅 Starting hidden service (onion hosting)...")
 
+        // FIX #1483: Remove stale Arti lockfile before starting hidden service.
+        // When Tor restarts within the same process (e.g., after SOCKS health check failure),
+        // the old Arti runtime may still hold flock() on the state directory lockfile.
+        // Deleting the file removes the old inode — the new Arti instance creates a fresh one.
+        // Without this: AlreadyLocked → hidden service can't start → chat offline.
+        removeStaleHiddenServiceLockfile()
+
         // FIX #208: Ensure persistent keypair is loaded or generated BEFORE starting
         // This guarantees the same .onion address across app restarts
         if TorManager.shared.hasPersistentKeypair {
@@ -365,6 +372,27 @@ public final class HiddenServiceManager: ObservableObject {
             } else if newState == .stopped {
                 self.onionAddress = nil
                 HiddenServiceManager.cachedOnionAddress = nil
+            }
+        }
+    }
+
+    // MARK: - FIX #1483: Stale Lockfile Cleanup
+
+    /// Remove stale Arti lockfile for the hidden service state directory.
+    /// Arti uses flock() on `.../Tor/state/hss/zipherx.lock`. When the app crashes or
+    /// Tor restarts within the same process, the old file descriptor may still hold the lock.
+    /// Deleting the file creates a new inode — the new Arti instance can lock it fresh.
+    private func removeStaleHiddenServiceLockfile() {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+        guard let torStateDir = appSupport?.appendingPathComponent("ZipherX/Tor/state/hss") else { return }
+
+        let lockfile = torStateDir.appendingPathComponent("zipherx.lock")
+        if FileManager.default.fileExists(atPath: lockfile.path) {
+            do {
+                try FileManager.default.removeItem(at: lockfile)
+                print("🧅 FIX #1483: Removed stale hidden service lockfile")
+            } catch {
+                print("🧅 FIX #1483: Could not remove lockfile: \(error.localizedDescription)")
             }
         }
     }

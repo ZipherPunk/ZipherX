@@ -1217,29 +1217,35 @@ public final class TorManager: ObservableObject {
     }
 
     private func loadKeypairFromKeychain() -> Data? {
-        // First try without auth UI to detect if old item requires .devicePasscode
-        let checkQuery: [String: Any] = [
+        // FIX #1481: Read without kSecUseAuthenticationUIFail to allow macOS Keychain
+        // "Allow access?" dialog after code signing changes. Previous code suppressed
+        // this dialog → errSecInteractionNotAllowed → DELETED keypair → new .onion address.
+        // The keypair is stored with kSecAttrAccessibleWhenUnlockedThisDeviceOnly (NOT
+        // .devicePasscode), so no Touch ID/passcode prompt is expected.
+        let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "ZipherX",
             kSecAttrAccount as String: hsKeypairKeychainKey,
             kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-            kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail
+            kSecMatchLimit as String: kSecMatchLimitOne
         ]
 
         var result: AnyObject?
-        let status = SecItemCopyMatching(checkQuery as CFDictionary, &result)
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
 
         if status == errSecSuccess, let data = result as? Data, data.count == 64 {
             return data
         }
 
         if status == errSecInteractionNotAllowed {
-            // Old item stored with .devicePasscode — delete and regenerate
-            // (.onion address will change, but avoids Touch ID on every startup)
-            print("🧅 VUL-NET-007: Migrating .onion key from .devicePasscode to accessibility-only")
-            deleteKeypairFromKeychain()
+            // Device locked or Keychain requires UI — do NOT delete, try again later.
+            // Deleting here would destroy the .onion address permanently.
+            print("🧅 FIX #1481: Keychain access deferred — device may be locked, will retry")
             return nil
+        }
+
+        if status != errSecItemNotFound {
+            print("🧅 FIX #169: Keychain load error: \(status)")
         }
 
         return nil

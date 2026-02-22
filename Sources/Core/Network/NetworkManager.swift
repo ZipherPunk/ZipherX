@@ -3185,30 +3185,39 @@ public final class NetworkManager: ObservableObject {
             }
         } else if torMode == .enabled && strictPrivacy {
             // FIX #1445: Strict privacy mode — wait for Tor (existing behavior)
-            print("🔒 FIX #1445: Strict privacy — waiting for Tor before connecting")
-            debugLog(.network, "🔒 FIX #1445: Strict privacy mode - waiting for Tor")
-
-            await TorManager.shared.stop()
-            try? await Task.sleep(nanoseconds: 500_000_000)
-            await TorManager.shared.start()
-
-            var torConnected = await TorManager.shared.connectionState.isConnected
-            var waitCount = 0
-            let maxWait = 150  // 15 seconds
-            while !torConnected && waitCount < maxWait {
-                try? await Task.sleep(nanoseconds: 100_000_000)
-                waitCount += 1
-                torConnected = await TorManager.shared.connectionState.isConnected
-                if waitCount % 50 == 0 {
-                    let state = await TorManager.shared.connectionState
-                    print("🧅 FIX #258: Waiting for Tor... (\(waitCount/10)s) state: \(state.displayText)")
-                }
-            }
-
-            if torConnected {
-                print("✅ FIX #258: Tor reconnected with fresh circuits")
+            // FIX #1476: Don't stop+restart Tor if SOCKS proxy is already working!
+            // Stopping Tor kills hidden service descriptor → macOS can't find our .onion.
+            // Only restart if Tor is genuinely broken (not connected, SOCKS proxy dead).
+            let torAlreadyConnected = await TorManager.shared.connectionState.isConnected
+            if torAlreadyConnected {
+                print("🔒 FIX #1476: Strict privacy — Tor already connected, reusing existing circuits (hidden service preserved)")
+                debugLog(.network, "🔒 FIX #1476: Tor already connected - skipping restart to preserve hidden service")
             } else {
-                print("⚠️ FIX #258: Tor did not reconnect in 15s - trying direct connections")
+                print("🔒 FIX #1445: Strict privacy — Tor not connected, restarting")
+                debugLog(.network, "🔒 FIX #1445: Strict privacy mode - restarting Tor")
+
+                await TorManager.shared.stop()
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                await TorManager.shared.start()
+
+                var torConnected = await TorManager.shared.connectionState.isConnected
+                var waitCount = 0
+                let maxWait = 150  // 15 seconds
+                while !torConnected && waitCount < maxWait {
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    waitCount += 1
+                    torConnected = await TorManager.shared.connectionState.isConnected
+                    if waitCount % 50 == 0 {
+                        let state = await TorManager.shared.connectionState
+                        print("🧅 FIX #258: Waiting for Tor... (\(waitCount/10)s) state: \(state.displayText)")
+                    }
+                }
+
+                if torConnected {
+                    print("✅ FIX #258: Tor reconnected with fresh circuits")
+                } else {
+                    print("⚠️ FIX #258: Tor did not reconnect in 15s - trying direct connections")
+                }
             }
 
             do {
@@ -3229,33 +3238,40 @@ public final class NetworkManager: ObservableObject {
         }
         #else
         // macOS: FIX #258 v2 — wait for Tor, then connect (existing behavior)
+        // FIX #1476: Don't restart Tor if already connected — kills hidden service descriptor
         if torMode == .enabled {
-            print("🧅 FIX #258: Restarting Tor to refresh circuits after background...")
-            debugLog(.network, "🧅 FIX #258: Restarting Tor - background killed circuits")
-
-            await TorManager.shared.stop()
-            try? await Task.sleep(nanoseconds: 500_000_000)
-            await TorManager.shared.start()
-
-            var torConnected = await TorManager.shared.connectionState.isConnected
-            var waitCount = 0
-            let maxWait = 150
-            while !torConnected && waitCount < maxWait {
-                try? await Task.sleep(nanoseconds: 100_000_000)
-                waitCount += 1
-                torConnected = await TorManager.shared.connectionState.isConnected
-                if waitCount % 50 == 0 {
-                    let state = await TorManager.shared.connectionState
-                    print("🧅 FIX #258: Waiting for Tor... (\(waitCount/10)s) state: \(state.displayText)")
-                }
-            }
-
-            if torConnected {
-                print("✅ FIX #258: Tor reconnected with fresh circuits")
-                debugLog(.network, "✅ FIX #258: Tor reconnected after \(waitCount/10)s")
+            let torAlreadyConnected = await TorManager.shared.connectionState.isConnected
+            if torAlreadyConnected {
+                print("🧅 FIX #1476: Tor already connected — reusing existing circuits (hidden service preserved)")
+                debugLog(.network, "🧅 FIX #1476: Skipping Tor restart - already connected, preserving hidden service")
             } else {
-                print("⚠️ FIX #258: Tor did not reconnect in 15s - trying direct connections")
-                debugLog(.network, "⚠️ FIX #258: Tor timeout - will try direct connections")
+                print("🧅 FIX #258: Tor not connected — restarting to establish circuits...")
+                debugLog(.network, "🧅 FIX #258: Restarting Tor - not connected")
+
+                await TorManager.shared.stop()
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                await TorManager.shared.start()
+
+                var torConnected = await TorManager.shared.connectionState.isConnected
+                var waitCount = 0
+                let maxWait = 150
+                while !torConnected && waitCount < maxWait {
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    waitCount += 1
+                    torConnected = await TorManager.shared.connectionState.isConnected
+                    if waitCount % 50 == 0 {
+                        let state = await TorManager.shared.connectionState
+                        print("🧅 FIX #258: Waiting for Tor... (\(waitCount/10)s) state: \(state.displayText)")
+                    }
+                }
+
+                if torConnected {
+                    print("✅ FIX #258: Tor reconnected with fresh circuits")
+                    debugLog(.network, "✅ FIX #258: Tor reconnected after \(waitCount/10)s")
+                } else {
+                    print("⚠️ FIX #258: Tor did not reconnect in 15s - trying direct connections")
+                    debugLog(.network, "⚠️ FIX #258: Tor timeout - will try direct connections")
+                }
             }
         } else {
             try? await Task.sleep(nanoseconds: 500_000_000)

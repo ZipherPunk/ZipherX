@@ -65,6 +65,9 @@ final class WalletManager: ObservableObject {
     @Published var isDownloadingBoostUpdate: Bool = false
     // FIX #1220: True when gap-fill is running in background — sending disabled until tree is valid
     @Published private(set) var isGapFillingDelta: Bool = false
+    // FIX #1475: Cooldown timer — prevents sequential gap-fill restart loop.
+    // After gap-fill completes, don't re-trigger for 5 minutes (gives header sync time to catch up).
+    private var lastGapFillCompletionTime: Date?
     @Published private(set) var isConnecting: Bool = false
     @Published private(set) var syncStatus: String = ""
 
@@ -145,6 +148,12 @@ final class WalletManager: ObservableObject {
     // FIX #1327: Skip redundant witness re-verification when recently verified
     private var lastWitnessVerificationAllPassed: Date? = nil
     private var lastWitnessVerificationTreeSize: UInt64 = 0
+
+    // FIX #1480: Cooldown for heavy P2P fetch in witness rebuild (prevents infinite loop)
+    // Previous code stopped listeners + disconnected all peers every 30-60s → killed dispatchers
+    // → fetch failed → endHeight stuck → repeated forever (7+ hours in zmac.log)
+    private var lastWitnessP2PFetchTime: Date? = nil
+    private let witnessP2PFetchCooldown: TimeInterval = 300.0  // 5 minutes between heavy P2P fetches
 
     // MARK: - FIX #451: Recovery mechanism for stuck repair flag
     /// Force reset the isRepairingDatabase flag if it gets stuck
@@ -1022,10 +1031,32 @@ final class WalletManager: ObservableObject {
             return
         }
 
+        // FIX #1475: Cooldown — prevent sequential gap-fill restart loop.
+        // After gap-fill completes (even with root mismatch), don't re-trigger for 5 minutes.
+        // This gives header sync time to catch up, and avoids wasting bandwidth re-fetching
+        // the same ~4000 blocks every few minutes when root can't match due to missing headers.
+        // NOTE: Read directly (not via MainActor) — property is set synchronously in defer.
+        let cooldownSeconds: TimeInterval = 300  // 5 minutes
+        if let lastCompletion = self.lastGapFillCompletionTime {
+            let elapsed = Date().timeIntervalSince(lastCompletion)
+            if elapsed < cooldownSeconds {
+                print("⏩ FIX #1475: Gap-fill cooldown active (\(Int(elapsed))s elapsed, need \(Int(cooldownSeconds))s) — skipping")
+                return
+            }
+        }
+
         // FIX #1220: Set flag to block ALL other P2P activity (backgroundSyncToHeight, FilterScanner, etc.)
         // during gap-fill. Concurrent P2P fetches steal bandwidth and cause missing blocks.
         await MainActor.run { self.isGapFillingDelta = true }
-        defer { Task { @MainActor in self.isGapFillingDelta = false } }
+        defer {
+            // FIX #1475: Set cooldown time SYNCHRONOUSLY — not inside the MainActor Task.
+            // If set inside Task { @MainActor }, the task may execute AFTER the next
+            // cooldown check (race condition), allowing immediate restart → infinite loop.
+            self.lastGapFillCompletionTime = Date()
+            Task { @MainActor in
+                self.isGapFillingDelta = false
+            }
+        }
 
         let existingCount = manifest.outputCount
         print("🔧 FIX #1220: Gap-filling delta bundle (existing: \(existingCount) outputs, range \(manifest.startHeight)-\(manifest.endHeight))")
@@ -5881,81 +5912,55 @@ final class WalletManager: ObservableObject {
             // PART 2: P2P fetch ONLY for the few remaining blocks
             // This is typically <100 blocks, not 400k!
             // FIX #1215: Skip heavy P2P fetch for tiny gaps (< 50 blocks)
-            // The stop-listeners → disconnect → reconnect → start-listeners cycle adds ~2-35s overhead
-            // (including potential 30s peer timeouts). For small gaps, PHASE 2 will fetch these blocks
-            // much faster through the dispatcher (already running). New CMUs from those blocks will
-            // be collected by PHASE 2's delta collection. Witnesses will still work — the few missing
-            // CMUs don't affect witness validity for existing notes.
             let blocksToFetchP2P = chainHeight > fetchStartHeight ? chainHeight - fetchStartHeight : 0
             if blocksToFetchP2P > 0 && blocksToFetchP2P <= 50 {
                 print("⚡ FIX #1215: Skipping FIX #571 P2P fetch for tiny gap (\(blocksToFetchP2P) blocks) — PHASE 2 will handle it")
-                print("   This avoids the heavy stop-listeners/reconnect cycle (saves 2-35s)")
             }
 
-            if chainHeight > fetchStartHeight && blocksToFetchP2P > 50 {
+            // FIX #1480: 5-minute cooldown on heavy P2P fetch to prevent infinite loop.
+            // ROOT CAUSE: Previous code stopped ALL block listeners + disconnected/reconnected ALL peers
+            // on EVERY call (~every 30-60s). This killed dispatchers → getBlocksDataP2P returned empty
+            // → appendOutputs never called → deltaBundleEndHeight stuck → same fetch repeated for 7+ hours.
+            // With NULL witnesses bypassing both 30s cooldown and 60s verification cache, this ran indefinitely.
+            var p2pFetchCooledDown = false
+            if let lastFetch = lastWitnessP2PFetchTime {
+                let elapsed = Date().timeIntervalSince(lastFetch)
+                if elapsed < witnessP2PFetchCooldown {
+                    p2pFetchCooledDown = true
+                    if blocksToFetchP2P > 50 {
+                        print("⏩ FIX #1480: Skipping heavy P2P fetch — last attempt \(Int(elapsed))s ago (cooldown: \(Int(witnessP2PFetchCooldown))s)")
+                    }
+                }
+            }
+
+            if chainHeight > fetchStartHeight && blocksToFetchP2P > 50 && !p2pFetchCooledDown {
                 await progress?("Fetching remaining blocks via P2P...", 80)
+                lastWitnessP2PFetchTime = Date()  // Set cooldown BEFORE fetch (prevents rapid re-entry)
 
                 let blocksToFetch = blocksToFetchP2P
-                if verbose {
-                    print("🔧 FIX #571: Fetching \(blocksToFetch) blocks via P2P (from height \(fetchStartHeight + 1))")
-                }
+                print("🔧 FIX #571: Fetching \(blocksToFetch) blocks via P2P (from height \(fetchStartHeight + 1))")
+
                 // FIX #1214+1310: Initialize shared cache only if not already populated by first pass
                 if FilterScanner.sharedPrefetchCache == nil {
                     FilterScanner.sharedPrefetchCache = [:]
                 }
-                if verbose {
-                    print("📦 FIX #1214: Caching P2P block data for FilterScanner PHASE 2 reuse")
-                }
 
-                // FIX #1056 v2: Stop block listeners before P2P fetch to prevent TCP stream desync
-                // Block listeners can consume P2P responses causing "Invalid magic bytes" errors
-                // This is the same issue as FIX #383, #1037, #1054
-                // v2: Use ensureAllBlockListenersStopped() which force-disconnects stuck listeners (FIX #1058)
-                print("🛑 FIX #1056 v2: Ensuring ALL block listeners stopped before delta CMU P2P fetch...")
-                let allStopped = await PeerManager.shared.ensureAllBlockListenersStopped(maxRetries: 3, retryDelay: 1.0)
-                if !allStopped {
-                    print("⚠️ FIX #1056 v2: Some listeners may still be running, but force-disconnect was attempted")
-                }
-
-                // FIX #877 + FIX #1087: Drain socket buffers after stopping block listeners
-                // FIX #1087: CRITICAL - Use PeerManager.shared.getReadyPeers() to get the SAME peers
-                // that will be used for P2P fetch. Previous code used NetworkManager.shared.peers
-                // which is a different list, so draining happened on wrong peers!
-                let peersForDraining = await PeerManager.shared.getReadyPeers()
-                print("🚿 FIX #1087: Draining socket buffers on \(peersForDraining.count) peers before delta CMU P2P fetch...")
-
-                // FIX #1087: Force reconnect ALL peers to ensure clean TCP connections
-                // This is more reliable than draining which may miss in-flight data
-                await withTaskGroup(of: Void.self) { group in
-                    for peer in peersForDraining {
-                        group.addTask {
-                            // Disconnect and reconnect for clean state
-                            await peer.disconnect()
-                            try? await peer.ensureConnected()
-                        }
-                    }
-                }
-
-                // Wait a moment for connections to stabilize
-                try? await Task.sleep(nanoseconds: 500_000_000) // 500ms
-                print("✅ FIX #1087: All peers reconnected with clean TCP state")
-
-                defer {
-                    // FIX #1056 v2: Restart block listeners after P2P fetch completes
-                    Task {
-                        print("▶️ FIX #1056 v2: Restarting block listeners after delta CMU P2P fetch...")
-                        await NetworkManager.shared.startBlockListenersOnMainScreen()
-                    }
-                }
+                // FIX #1480: REMOVED stop-listeners + disconnect/reconnect ALL peers pattern (was FIX #1056 v2 + FIX #1087).
+                // Since FIX #1184, ALL P2P block fetches go through dispatcher (no direct reads).
+                // getBlocksDataP2P() manages its own dispatcher activation at lines 7799-7852:
+                //   - Checks how many dispatchers are active
+                //   - Starts block listeners for peers without active dispatchers
+                //   - Waits up to 5s for multiple dispatchers to activate
+                //   - Filters to dispatcher-active peers before fetching
+                // The old pattern KILLED the dispatchers it needed → empty fetch → endHeight stuck → infinite loop.
 
                 // FIX #710 v2: Proper timeout using task group race pattern
-                // Previous implementation used fetchTask.cancel() which doesn't interrupt network I/O
-                // FIX #1098: Dynamic batch size based on peer capacity (was fixed 500)
-                let peerCount2 = await MainActor.run { NetworkManager.shared.peers.filter { $0.isConnectionReady }.count }
-                // FIX #1287: Dynamic batch = 2 chunks per peer (scales with connected peers)
-                let batchSize: UInt64 = UInt64(max(peerCount2, 3) * 256)
+                // FIX #1480: Reduced batch size from max(peers, 3)*256=1024 to 384.
+                // 1024-block batches + 30s timeout was borderline after 5s dispatcher activation.
+                // 384 blocks completes reliably in <15s even with 2 peers.
+                let batchSize: UInt64 = 384
                 let maxRetries = 2
-                let batchTimeoutSeconds: UInt64 = 30  // 30 seconds per batch
+                let batchTimeoutSeconds: UInt64 = 45  // 45 seconds (was 30 — too tight after dispatcher wait)
                 var currentHeight = fetchStartHeight + 1
                 var consecutiveFailures = 0
                 let maxConsecutiveFailures = 3
@@ -5967,13 +5972,10 @@ final class WalletManager: ObservableObject {
 
                     for attempt in 1...maxRetries {
                         do {
-                            // FIX #710 v2: Use task group to race fetch vs timeout
-                            // This ensures we abort waiting after timeout even if network is stuck
                             let fetchHeight = currentHeight
                             let fetchCount = count
 
                             let blocks: [(UInt64, String, UInt32, [(String, [ShieldedOutput], [ShieldedSpend]?)])]? = try await withThrowingTaskGroup(of: [(UInt64, String, UInt32, [(String, [ShieldedOutput], [ShieldedSpend]?)])]?.self) { group in
-                                // Task 1: The actual fetch
                                 group.addTask {
                                     try await NetworkManager.shared.getBlocksDataP2P(
                                         from: fetchHeight,
@@ -5981,18 +5983,13 @@ final class WalletManager: ObservableObject {
                                     )
                                 }
 
-                                // Task 2: Timeout - returns nil after delay
                                 group.addTask {
                                     try await Task.sleep(nanoseconds: batchTimeoutSeconds * 1_000_000_000)
-                                    if self.verbose {
-                                        print("⚠️ FIX #710 v2: Batch \(fetchHeight)-\(fetchHeight + UInt64(fetchCount) - 1) timed out after \(batchTimeoutSeconds)s")
-                                    }
                                     return nil
                                 }
 
-                                // Return whichever completes first
                                 if let result = try await group.next() {
-                                    group.cancelAll()  // Cancel the other task
+                                    group.cancelAll()
                                     return result
                                 }
                                 return nil
@@ -6002,18 +5999,16 @@ final class WalletManager: ObservableObject {
                                 throw NSError(domain: "WalletManager", code: -1, userInfo: [NSLocalizedDescriptionKey: "Timeout"])
                             }
 
-                            // FIX #1190: Also collect full delta outputs for local caching
+                            // FIX #1190: Collect full delta outputs for local caching
                             var batchDeltaOutputs: [DeltaCMUManager.DeltaOutput] = []
                             for (height, _, _, txData) in fetchedBlocks {
                                 var blockOutputIndex: UInt32 = 0
-                                for (txid, outputs, _) in txData {
+                                for (_, outputs, _) in txData {
                                     for output in outputs {
-                                        // FIX #735: Reverse display → wire format for FFI
                                         if let cmuDisplay = Data(hexString: output.cmu) {
                                             let cmuWire = Data(cmuDisplay.reversed())
                                             deltaCMUs.append(cmuWire)
                                             p2pCMUs += 1
-                                            // FIX #1311: ALWAYS store delta entry when CMU is valid
                                             let epk = Data(hexString: output.ephemeralKey).map { Data($0.reversed()) } ?? Data(count: 32)
                                             let ciphertext = Data(hexString: output.encCiphertext) ?? Data(count: 580)
                                             let deltaOutput = DeltaCMUManager.DeltaOutput(
@@ -6030,24 +6025,15 @@ final class WalletManager: ObservableObject {
                                 }
                             }
 
-                            // FIX #1190: Append P2P batch outputs to delta
-                            // FIX #1211: MUST pass fromHeight so new delta manifest gets correct startHeight
-                            // Without fromHeight, startHeight defaults to first output's height (e.g., 2988804)
-                            // instead of boost_end+1 (2988798). FIX #791 then sees mismatch → clears delta → infinite loop.
+                            // FIX #1480: ALWAYS advance delta endHeight after successful fetch.
+                            // Previous code only called appendOutputs when batchDeltaOutputs was non-empty
+                            // OR fetchedBlocks.count > 0. When getBlocksDataP2P returned empty array [],
+                            // NEITHER condition was true → endHeight stuck → infinite loop.
                             let deltaFromHeight = UInt64(boostHeight + 1)
-                            if !batchDeltaOutputs.isEmpty {
-                                let existingRoot = DeltaCMUManager.shared.getDeltaTreeRoot() ?? Data(count: 32)
-                                DeltaCMUManager.shared.appendOutputs(batchDeltaOutputs, fromHeight: deltaFromHeight, toHeight: endHeight, treeRoot: existingRoot)
-                                if verbose {
-                                    print("📦 FIX #1190: Appended \(batchDeltaOutputs.count) delta outputs from FIX #571 P2P batch")
-                                }
-                            } else if fetchedBlocks.count > 0 {
-                                let existingRoot = DeltaCMUManager.shared.getDeltaTreeRoot() ?? Data(count: 32)
-                                DeltaCMUManager.shared.appendOutputs([], fromHeight: deltaFromHeight, toHeight: endHeight, treeRoot: existingRoot)
-                            }
+                            let existingRoot = DeltaCMUManager.shared.getDeltaTreeRoot() ?? Data(count: 32)
+                            DeltaCMUManager.shared.appendOutputs(batchDeltaOutputs, fromHeight: deltaFromHeight, toHeight: endHeight, treeRoot: existingRoot)
 
-                            // FIX #1214: Cache block data for FilterScanner PHASE 2 to reuse
-                            // This avoids the double-fetch where both FIX #571 and PHASE 2 download same blocks
+                            // FIX #1214: Cache block data for FilterScanner PHASE 2 reuse
                             if FilterScanner.sharedPrefetchCache == nil {
                                 FilterScanner.sharedPrefetchCache = [:]
                             }
@@ -6056,21 +6042,17 @@ final class WalletManager: ObservableObject {
                             }
 
                             if verbose {
-                                print("🔧 FIX #571: Fetched blocks \(currentHeight)-\(endHeight) via P2P")
+                                print("🔧 FIX #571: Fetched blocks \(currentHeight)-\(endHeight) via P2P (\(batchDeltaOutputs.count) outputs)")
                             }
                             batchSuccess = true
                             consecutiveFailures = 0
-                            break  // Success, exit retry loop
+                            break
                         } catch {
                             if attempt < maxRetries {
-                                if verbose {
-                                    print("⚠️ FIX #710 v2: Batch \(currentHeight)-\(endHeight) failed (attempt \(attempt)/\(maxRetries)): \(error.localizedDescription)")
-                                }
-                                try? await Task.sleep(nanoseconds: 2_000_000_000)  // 2s backoff
+                                print("⚠️ FIX #710 v2: Batch \(currentHeight)-\(endHeight) failed (attempt \(attempt)/\(maxRetries)): \(error.localizedDescription)")
+                                try? await Task.sleep(nanoseconds: 2_000_000_000)
                             } else {
-                                if verbose {
-                                    print("⚠️ FIX #710 v2: Batch \(currentHeight)-\(endHeight) failed after \(maxRetries) attempts")
-                                }
+                                print("⚠️ FIX #710 v2: Batch \(currentHeight)-\(endHeight) failed after \(maxRetries) attempts: \(error.localizedDescription)")
                             }
                         }
                     }
@@ -6078,8 +6060,7 @@ final class WalletManager: ObservableObject {
                     if !batchSuccess {
                         consecutiveFailures += 1
                         if consecutiveFailures >= maxConsecutiveFailures {
-                            print("⚠️ FIX #710 v2: \(maxConsecutiveFailures) consecutive failures - aborting P2P fetch")
-                            print("⚠️ FIX #710 v2: Witnesses will be rebuilt on next app restart")
+                            print("⚠️ FIX #1480: \(maxConsecutiveFailures) consecutive failures - aborting P2P fetch (will retry in \(Int(witnessP2PFetchCooldown))s)")
                             break
                         }
                     }
@@ -6087,13 +6068,7 @@ final class WalletManager: ObservableObject {
                     currentHeight = endHeight + 1
                 }
 
-                if verbose {
-                    print("🔧 FIX #571: Fetched \(p2pCMUs) CMUs via P2P")
-                }
-                let cacheSize = FilterScanner.sharedPrefetchCache?.count ?? 0
-                if verbose {
-                    print("📦 FIX #1214: Cached \(cacheSize) blocks for FilterScanner PHASE 2 (saves ~\(cacheSize / 5)s of P2P fetch)")
-                }
+                print("🔧 FIX #571: P2P fetch complete — \(p2pCMUs) CMUs fetched")
             }
 
             // PART 3: Append all delta CMUs to update tree AND witnesses
