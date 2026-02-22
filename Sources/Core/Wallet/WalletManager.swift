@@ -71,6 +71,10 @@ final class WalletManager: ObservableObject {
     // FIX #1484: Cooldown after delta sync validation failure — prevents re-fetching 1024 blocks
     // every 30s when tree root mismatches. Wait for gap-fill to complete first.
     private var lastDeltaSyncValidationFailure: Date?
+    // FIX #1485: Concurrency guard — prevents multiple simultaneous delta sync executions.
+    // Background timer fires every 30s but a full sync cycle takes ~5 minutes (4 batches × 3 retries).
+    // Without guard: 10+ concurrent instances pile up, each fetching the same blocks.
+    private var isSyncingDeltaBundle: Bool = false
     @Published private(set) var isConnecting: Bool = false
     @Published private(set) var syncStatus: String = ""
 
@@ -635,6 +639,17 @@ final class WalletManager: ObservableObject {
     /// Sync delta bundle if it's behind the current chain height
     /// Fetches missing shielded outputs via P2P and appends to delta
     private func syncDeltaBundleIfNeeded(manifest: DeltaCMUManager.DeltaManifest, bundledEndHeight: UInt64) async {
+        // FIX #1485: Concurrency guard — prevent multiple simultaneous delta sync executions.
+        // Background sync timer fires every ~30s, but a full delta sync cycle takes ~5 minutes
+        // (4 batches × 3 retries each). Without this guard, 10+ concurrent instances pile up,
+        // each fetching the same 1024-block batches simultaneously → massive P2P waste.
+        guard !isSyncingDeltaBundle else {
+            print("⏩ FIX #1485: Delta sync already running — skipping concurrent call")
+            return
+        }
+        isSyncingDeltaBundle = true
+        defer { isSyncingDeltaBundle = false }
+
         // FIX #1290: Skip delta sync during Full Rescan — FilterScanner handles everything
         let isRepairing = await MainActor.run { WalletManager.shared.isRepairingDatabase }
         if isRepairing {
@@ -729,6 +744,24 @@ final class WalletManager: ObservableObject {
             }
         }
 
+        // FIX #1485: Pre-flight tree integrity check — don't fetch if tree is structurally wrong.
+        // If the tree size doesn't match boost + delta manifest CMU count, the tree has structural
+        // gaps (missing delta CMUs from previous incomplete P2P fetches). Appending MORE blocks
+        // on top of a gap-ridden tree will NEVER produce a valid root — it just wastes P2P bandwidth.
+        // Let gap-fill fix the tree first.
+        let preFlightTreeSize = ZipherXFFI.treeSize()
+        let expectedCMUs = ZipherXConstants.effectiveTreeCMUCount + UInt64(DeltaCMUManager.shared.getOutputCount())
+        if preFlightTreeSize + 10 < expectedCMUs {
+            let missing = Int(expectedCMUs) - Int(preFlightTreeSize)
+            print("⚠️ FIX #1485: Tree missing \(missing) CMUs (has \(preFlightTreeSize), expected \(expectedCMUs))")
+            print("   Fetching more blocks on a gap-ridden tree is pointless — triggering gap-fill")
+            let gapFillRunning = await MainActor.run { self.isGapFillingDelta }
+            if !gapFillRunning {
+                Task { await self.gapFillDeltaBundle(manifest: manifest, bundledEndHeight: bundledEndHeight) }
+            }
+            return
+        }
+
         // FIX #1186: Increased limit from 100 to 50000 blocks
         // Previous bug: 100-block limit meant delta could NEVER catch up after being cleared.
         // With ~16K blocks between boost file end and chain tip, it would take 160+ app restarts
@@ -782,6 +815,38 @@ final class WalletManager: ObservableObject {
                 }
             }
 
+            // FIX #1485: Also check if HeaderStore has headers at the FETCH START height.
+            // getLatestHeight() returns the MAX height, but headers in the MIDDLE may be missing.
+            // Without headers at the fetch range: getBlocksDataP2P falls back to bundled hashes
+            // (works for fetching), but tree root validation at the end fails because the header
+            // at validationHeight is also missing → validationPassed=false → infinite rollback loop.
+            let fetchStartHeaderExists = (try? HeaderStore.shared.getHeader(at: startHeight)) != nil
+            if !fetchStartHeaderExists {
+                let headerGapSize = startHeight > bundledEndHeight ? startHeight - bundledEndHeight : 0
+                print("⚠️ FIX #1485: HeaderStore missing header at fetch start \(startHeight) (gap: \(headerGapSize) from boost end)")
+                // Only attempt gap sync if reasonable size (≤5000 headers).
+                // Larger gaps are handled by background header sync process.
+                if headerGapSize > 0 && headerGapSize <= 5000 {
+                    if (try? HeaderStore.shared.getHeader(at: bundledEndHeight)) != nil {
+                        print("🔄 FIX #1485: Syncing \(headerGapSize) headers from boost end \(bundledEndHeight)")
+                        do {
+                            let syncManager = HeaderSyncManager(
+                                headerStore: HeaderStore.shared,
+                                networkManager: NetworkManager.shared
+                            )
+                            try await syncManager.syncHeaders(from: bundledEndHeight + 1, maxHeaders: headerGapSize + 100)
+                            headerStoreHeight = (try? HeaderStore.shared.getLatestHeight()) ?? headerStoreHeight
+                            print("✅ FIX #1485: Gap header sync complete — HeaderStore now at \(headerStoreHeight)")
+                        } catch {
+                            print("⚠️ FIX #1485: Gap header sync failed: \(error)")
+                        }
+                    }
+                } else if headerGapSize > 5000 {
+                    print("⏩ FIX #1485: Header gap too large (\(headerGapSize)) — waiting for background header sync")
+                    return
+                }
+            }
+
             // FIX #1262: Don't try to fetch blocks that HeaderStore doesn't have headers for.
             if chainHeight > headerStoreHeight && headerStoreHeight > deltaEndHeight {
                 print("📊 FIX #1262: Capping delta sync to HeaderStore height \(headerStoreHeight) (chain tip: \(chainHeight))")
@@ -794,6 +859,11 @@ final class WalletManager: ObservableObject {
             var totalExpectedBlocks: UInt64 = 0
             var totalReceivedBlocks: UInt64 = 0
             var consecutiveBatchFailures = 0
+            // FIX #1485: Track the actual maximum height of received blocks.
+            // When the fetch loop breaks early (failures/incomplete), validate at this
+            // height instead of chainHeight. Prevents permanent root mismatch when
+            // only a fraction of the requested blocks are successfully fetched.
+            var actualMaxReceivedHeight: UInt64 = deltaEndHeight
             let maxConsecutiveBatchFailures = 3
 
             while currentStart <= chainHeight {
@@ -878,6 +948,8 @@ final class WalletManager: ObservableObject {
                 } else {
                     consecutiveBatchFailures = 0
                     let maxReceivedHeight = batchReceivedHeights.max()!
+                    // FIX #1485: Track actual maximum height for validation
+                    actualMaxReceivedHeight = max(actualMaxReceivedHeight, maxReceivedHeight)
                     let coverage = Double(batchReceivedHeights.count) / Double(count) * 100.0
 
                     if batchReceivedHeights.count < count / 2 {
@@ -939,16 +1011,21 @@ final class WalletManager: ObservableObject {
             let deltaOutputCount = DeltaCMUManager.shared.getOutputCount()
             let treeShouldIncludeDelta = currentTreeSize > boostCMUCount
             var validationPassed = true  // Default true for cases where validation is skipped
+            // FIX #1485: Validate at the ACTUAL last received height, not chainHeight.
+            // When the fetch loop breaks early (failures, header gaps), the tree only has
+            // CMUs up to actualMaxReceivedHeight. Validating at chainHeight (which may be
+            // thousands of blocks higher) guarantees mismatch → rollback → infinite loop.
+            let validationHeight = actualMaxReceivedHeight
 
             if !treeShouldIncludeDelta && deltaOutputCount > 0 {
                 print("⏭️ FIX #1193: Skipping tree root validation - delta CMUs (\(deltaOutputCount)) not yet in FFI tree (size=\(currentTreeSize), boost=\(boostCMUCount))")
                 print("   Will validate after delta CMUs are appended during witness rebuild")
             } else if let treeRoot = ZipherXFFI.treeRoot() {
-                print("🔒 FIX #1187: Validating tree root against blockchain at height \(chainHeight)...")
+                print("🔒 FIX #1187: Validating tree root against blockchain at height \(validationHeight) (chain: \(chainHeight))...")
                 // FIX #1220: Use HeaderStore instead of getBlocksOnDemandP2P (direct reads).
                 // HeaderStore has finalsaplingroot saved by FIX #1204 during header sync and P2P fetches.
                 // Direct reads conflict with block listeners running concurrently.
-                if let header = try? HeaderStore.shared.getHeader(at: chainHeight) {
+                if let header = try? HeaderStore.shared.getHeader(at: validationHeight) {
                     let blockchainRoot = header.hashFinalSaplingRoot
                     if !blockchainRoot.isEmpty && !blockchainRoot.allSatisfy({ $0 == 0 }) {
                         let blockchainRootReversed = Data(blockchainRoot.reversed())
@@ -983,10 +1060,10 @@ final class WalletManager: ObservableObject {
                             await self.gapFillDeltaBundle(manifest: manifest, bundledEndHeight: bundledEndHeight)
                         }
                     } else {
-                        print("⚠️ FIX #1191: No sapling root at height \(chainHeight) in HeaderStore — skipping validation")
+                        print("⚠️ FIX #1191: No sapling root at height \(validationHeight) in HeaderStore — skipping validation")
                     }
                 } else {
-                    print("⚠️ FIX #1187: No header at height \(chainHeight) — skipping tree root validation")
+                    print("⚠️ FIX #1187: No header at height \(validationHeight) — skipping tree root validation")
                     // FIX #1262: Don't persist with unvalidated height — validation MUST pass before advancing
                     validationPassed = false
                 }
@@ -999,30 +1076,39 @@ final class WalletManager: ObservableObject {
                 self.lastDeltaSyncValidationFailure = nil
                 let treeRoot = ZipherXFFI.treeRoot() ?? Data(count: 32)
 
+                // FIX #1485: Persist at validationHeight (actual received), not chainHeight.
+                // If only 1024 of 4000 blocks were fetched, advance deltaEndHeight to the
+                // actual height reached. Next sync picks up from there incrementally.
+                let persistHeight = validationHeight
                 if !collectedOutputs.isEmpty {
-                    DeltaCMUManager.shared.appendOutputs(collectedOutputs, fromHeight: startHeight, toHeight: chainHeight, treeRoot: treeRoot)
-                    print("✅ Delta bundle synced to height \(startHeight)-\(chainHeight) (+\(collectedOutputs.count) outputs)")
+                    DeltaCMUManager.shared.appendOutputs(collectedOutputs, fromHeight: startHeight, toHeight: persistHeight, treeRoot: treeRoot)
+                    print("✅ Delta bundle synced to height \(startHeight)-\(persistHeight) (+\(collectedOutputs.count) outputs)")
 
                     // FIX #1182: Save tree state with updated height to prevent double-append
                     if let treeData = ZipherXFFI.treeSerialize() {
-                        try? WalletDatabase.shared.saveTreeState(treeData, height: chainHeight)
-                        print("💾 FIX #1182: Saved tree state at height \(chainHeight)")
+                        try? WalletDatabase.shared.saveTreeState(treeData, height: persistHeight)
+                        print("💾 FIX #1182: Saved tree state at height \(persistHeight)")
                     } else {
-                        try? WalletDatabase.shared.updateTreeHeight(chainHeight)
-                        print("💾 FIX #1182: Updated tree height to \(chainHeight) (serialization failed)")
+                        try? WalletDatabase.shared.updateTreeHeight(persistHeight)
+                        print("💾 FIX #1182: Updated tree height to \(persistHeight) (serialization failed)")
                     }
                 } else {
                     // No outputs but still need to update height in manifest
-                    DeltaCMUManager.shared.appendOutputs([], fromHeight: startHeight, toHeight: chainHeight, treeRoot: treeRoot)
-                    print("✅ Delta bundle synced to height \(startHeight)-\(chainHeight) (no new outputs)")
+                    DeltaCMUManager.shared.appendOutputs([], fromHeight: startHeight, toHeight: persistHeight, treeRoot: treeRoot)
+                    print("✅ Delta bundle synced to height \(startHeight)-\(persistHeight) (no new outputs)")
 
                     // FIX #1182: Also update height when no new outputs
-                    try? WalletDatabase.shared.updateTreeHeight(chainHeight)
+                    try? WalletDatabase.shared.updateTreeHeight(persistHeight)
                 }
 
-                // FIX #1252: Delta synced and validated — mark as verified (immutable)
-                UserDefaults.standard.set(true, forKey: "DeltaBundleVerified")
-                print("✅ FIX #1252: Delta synced & validated — marked as VERIFIED (immutable)")
+                // FIX #1252: Only mark as verified when we've synced ALL the way to chainHeight.
+                // Partial syncs should advance deltaEndHeight but NOT mark immutable.
+                if persistHeight >= chainHeight {
+                    UserDefaults.standard.set(true, forKey: "DeltaBundleVerified")
+                    print("✅ FIX #1252: Delta synced & validated to chain tip — marked as VERIFIED (immutable)")
+                } else {
+                    print("📦 FIX #1485: Partial sync to \(persistHeight) (chain: \(chainHeight)) — not marking verified yet")
+                }
 
                 // Update status to synced
                 await MainActor.run { deltaSyncStatus = .synced }
