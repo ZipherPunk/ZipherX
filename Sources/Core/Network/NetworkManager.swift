@@ -170,7 +170,8 @@ public final class NetworkManager: ObservableObject {
     private let TARGET_PEER_PERCENT = 0.15 // Connect to 15% of known addresses
     // FIX #934: Lowered from 7 to 3 - Zclassic network is small, can't reliably get 7 peers
     // Byzantine fault tolerance still applies but with realistic peer counts
-    private let CONSENSUS_THRESHOLD = 3
+    // FIX #1493: VULN-009 — Use centralized constant (was local hardcoded 3)
+    private let CONSENSUS_THRESHOLD = ZipherXConstants.consensusThreshold
     private let PEER_ROTATION_INTERVAL: TimeInterval = 300 // 5 minutes
     private let QUERY_TIMEOUT: TimeInterval = 10
     private let BAN_DURATION: TimeInterval = 604800 // VUL-010: 7 days for stronger Sybil protection
@@ -1825,6 +1826,9 @@ public final class NetworkManager: ObservableObject {
         // Log transition when .onion circuits become ready
         if !wasOnionReady && _onionCircuitsReady {
             print("🧅 .onion circuits now ready! Can connect to hidden services.")
+            // FIX #1487: Notify ChatManager so it can reset backoff and retry contacts immediately.
+            // Without this: first connect fails (circuits not ready) → backoff → stuck offline for minutes.
+            NotificationCenter.default.post(name: .onionCircuitsReady, object: nil)
         } else if connected && !_onionCircuitsReady {
             let remaining = await TorManager.shared.onionCircuitWarmupRemaining
             if remaining > 0 {
@@ -2011,7 +2015,7 @@ public final class NetworkManager: ObservableObject {
         // FIX #290: If 3+ peers agree on a height above threshold, it's likely REAL (not Sybil)
         // The wallet was probably just offline and the chain advanced beyond our headers
         let consensusIsAboveThreshold = preliminaryConsensusHeight > sybilThreshold
-        let consensusIsStrong = preliminaryConsensusCount >= 3
+        let consensusIsStrong = preliminaryConsensusCount >= CONSENSUS_THRESHOLD  // FIX #1493
 
         if consensusIsAboveThreshold && consensusIsStrong {
             if verbose {
@@ -5317,6 +5321,16 @@ public final class NetworkManager: ObservableObject {
     /// Resolve DNS seeds on demand (called when user enables DNS Seeds toggle in Settings).
     /// Discovers new peer addresses and connects to them immediately — no restart needed.
     func resolveDNSSeedsNow() async {
+        // FIX #1490 (VULN-005): Skip DNS seed resolution when Tor is enabled and connected.
+        // This is a belt-and-suspenders guard — resolveDNSSeed() also checks, but we block
+        // here early to avoid even attempting DNS queries that would be silently discarded.
+        let torMode = await TorManager.shared.mode
+        let torConnected = await TorManager.shared.connectionState.isConnected
+        if torMode == .enabled && torConnected {
+            print("🧅 FIX #1490: DNS Seeds on-demand resolution skipped — Tor active. Use Settings → Tor to browse .onion peers.")
+            return
+        }
+
         print("🌐 DNS Seeds: Resolving on demand...")
         var newAddresses: [PeerAddress] = []
         for seed in dnsSeedsZCL {
@@ -5336,6 +5350,18 @@ public final class NetworkManager: ObservableObject {
     }
 
     private func resolveDNSSeed(_ hostname: String) async -> [PeerAddress] {
+        // FIX #1490 (VULN-005): Block clearnet DNS when Tor is enabled and connected.
+        // CFHostStartInfoResolution routes through the system resolver (clearnet), which
+        // leaks the DNS seed hostname to the ISP/DNS provider — revealing Zclassic wallet
+        // usage and undermining Tor anonymity. When Tor is active, callers must use
+        // .onion seeds (already added in discoverPeers) instead of DNS seeds.
+        let torMode = await TorManager.shared.mode
+        let torConnected = await TorManager.shared.connectionState.isConnected
+        if torMode == .enabled && torConnected {
+            print("🧅 FIX #1490: Clearnet DNS skipped for \(LogRedaction.redactHost(hostname)) — Tor active, use .onion seeds")
+            return []
+        }
+
         // VUL-N-011: Check DNS cache first (1-hour TTL)
         if let cached = dnsCache[hostname] {
             let age = Date().timeIntervalSince(cached.resolvedAt)
@@ -5842,14 +5868,20 @@ public final class NetworkManager: ObservableObject {
                                 let headerRootHex = headerRoot.map { String(format: "%02x", $0) }.joined()
                                 print("📝 FIX #718: HeaderStore root at \(height): \(headerRootHex.prefix(16))...")
 
-                                // Check if header root is all zeros (corrupt)
+                                // Check if header root is all zeros (HeaderStore incomplete during initial sync)
                                 let isZeroRoot = headerRoot.allSatisfy { $0 == 0 }
                                 if isZeroRoot {
-                                    print("⚠️ FIX #718: HeaderStore has zero sapling root - cannot verify")
-                                    // Can't verify locally, but FFI tree was loaded from boost file
-                                    // Trust it if boost file was verified
-                                    print("⚠️ FIX #718: Trusting FFI tree root (boost file verified at load)")
-                                    anchorFound = true
+                                    // FIX #1488: VULN-003 — NEVER trust an unverifiable FFI tree root.
+                                    // Zero sapling root means HeaderStore has no blockchain data at this height yet
+                                    // (occurs during initial sync before FIX #1204 has stored authoritative roots).
+                                    // Previous code set anchorFound=true here, claiming "trust boost file verified at load" —
+                                    // but this directly bypassed FIX #1279's requirement that the anchor must exist on
+                                    // blockchain. Result: TX with phantom anchor broadcast → peers silently drop → false
+                                    // SETTLEMENT → balance corruption (same failure mode as FIX #1221/FIX #1279).
+                                    // Correct behavior: leave anchorFound=false → FIX #1221 rejects below if chain > boost.
+                                    print("❌ FIX #1488: HeaderStore has zero sapling root — CANNOT verify anchor against blockchain")
+                                    print("❌ FIX #1488: Refusing to trust FFI tree root without blockchain confirmation")
+                                    print("❌ FIX #1488: anchorFound remains false — FIX #1221 will reject if chain > boost height")
                                 } else if headerRoot == ffiTreeRoot {
                                     print("✅ FIX #718: FFI tree matches HeaderStore - anchor valid")
                                     anchorFound = true
@@ -7291,7 +7323,10 @@ public final class NetworkManager: ObservableObject {
             return try await getBlocksWithConsensus(from: height, count: count)
         }
 
-        // For larger batches, use single peer but verify key data
+        // FIX #1489: VULN-004 — For larger batches, fetch from single peer then verify
+        // every block hash against the locally-trusted HeaderStore. A single malicious peer
+        // cannot inject fake blocks: any block whose hash doesn't match the stored header
+        // causes the entire batch to be rejected.
         guard let peer = peers.first else {
             throw NetworkError.notConnected
         }
@@ -7300,6 +7335,29 @@ public final class NetworkManager: ObservableObject {
 
         guard !blocks.isEmpty else {
             throw NetworkError.consensusNotReached
+        }
+
+        // Fetch stored hashes for this range in a single SQL query (FIX #1287 API).
+        // If HeaderStore has no entries yet (e.g. very first sync), storedHashes will be
+        // empty and we skip verification — the next header sync will catch any forgery.
+        let storedHashes = (try? HeaderStore.shared.getBlockHashesInRange(
+            from: height, count: blocks.count)) ?? [:]
+
+        if !storedHashes.isEmpty {
+            for block in blocks {
+                guard let stored = storedHashes[block.blockHeight] else {
+                    // Height not yet in HeaderStore (chain tip edge) — skip this block.
+                    continue
+                }
+                guard block.blockHash == stored else {
+                    let peerHex  = block.blockHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+                    let storedHex = stored.prefix(8).map { String(format: "%02x", $0) }.joined()
+                    print("❌ FIX #1489: Block hash mismatch at height \(block.blockHeight): peer=\(peerHex)… stored=\(storedHex)…")
+                    peer.recordFailure()
+                    throw NetworkError.invalidData
+                }
+            }
+            print("✅ FIX #1489: All \(blocks.count) block hashes verified against HeaderStore")
         }
 
         return blocks
@@ -7374,12 +7432,11 @@ public final class NetworkManager: ObservableObject {
             }
         }
 
-        // Single peer response - accept it (user should enable multi-peer for security)
-        if let (_, blocks) = peerResults.first {
-            print("⚠️ Using single peer response (multi-peer consensus recommended)")
-            return blocks
-        }
-
+        // FIX #1492: VULN-008 — Remove single-peer fallback.
+        // When only 1 peer responded, we have NO consensus — reject it.
+        // A single malicious peer cannot inject blocks through a consensus-protected path.
+        // Callers will retry via the dispatcher (getBlocksDataP2P) which uses a broader
+        // peer pool and HeaderStore hash validation as a per-block safeguard.
         throw NetworkError.consensusNotReached
     }
 

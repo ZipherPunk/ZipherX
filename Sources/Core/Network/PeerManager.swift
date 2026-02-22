@@ -141,7 +141,8 @@ public final class PeerManager: ObservableObject {
 
     public let MIN_PEERS = 8
     public let MAX_PEERS = 30
-    public let CONSENSUS_THRESHOLD = 5  // Byzantine fault tolerance
+    // FIX #1493: VULN-009 — Use centralized constant (was local hardcoded 5, mismatched with operational code)
+    public let CONSENSUS_THRESHOLD = ZipherXConstants.consensusThreshold
     public let BAN_DURATION: TimeInterval = 604800  // 7 days
     public let CONNECTION_COOLDOWN: TimeInterval = 2.0
     public let MAX_KNOWN_ADDRESSES = 1000

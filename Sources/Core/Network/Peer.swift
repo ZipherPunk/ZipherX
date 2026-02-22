@@ -1705,6 +1705,10 @@ public final class Peer {
             // Domain name (ATYP = 0x03)
             request.append(0x03)
             let hostData = host.data(using: .utf8)!
+            // FIX #1496: Guard against hostname >255 bytes — UInt8(_:) traps on overflow
+            guard hostData.count <= 255 else {
+                throw NetworkError.connectionFailed("SOCKS5 hostname too long (\(hostData.count) bytes, max 255): \(host)")
+            }
             request.append(UInt8(hostData.count))
             request.append(hostData)
         } else {
@@ -2226,12 +2230,16 @@ public final class Peer {
                 do {
                     // RACE CONDITION FIX: Acquire lock before receiving to prevent
                     // concurrent socket reads with other P2P operations.
-                    // Uses tryAcquire() which returns immediately if lock is held,
-                    // avoiding blocking other operations.
-                    let acquired = await self.messageLock.tryAcquire()
+                    // FIX #1495: Use acquireWithTimeout() instead of tryAcquire() + 500ms busy-wait.
+                    // 8 iOS peers × 500ms polling = heavy cooperative thread pool saturation,
+                    // CPU drain, and thermal throttling. acquireWithTimeout() parks the listener
+                    // in a continuation-based waiter queue (zero polling overhead) and wakes
+                    // immediately when the lock is released. GCD-backed 5s timeout ensures the
+                    // state machine is rechecked even if task cancellation doesn't interrupt the wait.
+                    let acquired = await self.messageLock.acquireWithTimeout(seconds: 5)
                     if !acquired {
-                        // Peer is busy with another operation, wait and retry
-                        try await Task.sleep(nanoseconds: 500_000_000) // 500ms
+                        // Lock still held after 5s — check for cancellation, then recheck state machine
+                        try Task.checkCancellation()
                         continue
                     }
 

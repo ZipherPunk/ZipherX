@@ -1378,7 +1378,11 @@ struct WalletSetupView: View {
             do {
                 let words = try walletManager.createNewWallet()
                 print("📝 CREATE WALLET: Generated \(words.count) words")
+                // FIX #1494: VULN-011 — First mnemonic word MUST NOT be logged in release builds.
+                // words.first reveals seed entropy and reduces brute-force search space by 2048x.
+                #if DEBUG
                 print("📝 CREATE WALLET: First word: \(words.first ?? "NONE")")
+                #endif
 
                 await MainActor.run {
                     mnemonic = words

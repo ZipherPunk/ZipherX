@@ -3792,7 +3792,8 @@ final class WalletManager: ObservableObject {
         }
 
         // Wait for at least 3 peers for consensus
-        let minPeersForConsensus = 3
+        // FIX #1493: VULN-009 — Use centralized constant (was local hardcoded 3)
+        let minPeersForConsensus = ZipherXConstants.consensusThreshold
         var peerWaitAttempts = 0
         let maxPeerWaitAttempts = 30 // 30 seconds max
 
@@ -15082,7 +15083,8 @@ final class WalletManager: ObservableObject {
 
         // FIX #231 v2: For Equihash, 3+ verified ZCL peers (170011/170012) = full consensus
         // Zclassic network is smaller than Zcash - 3 agreeing peers is trustworthy
-        let EQUIHASH_CONSENSUS_THRESHOLD = 3
+        // FIX #1493: VULN-009 — Use centralized constant (was local hardcoded 3)
+        let EQUIHASH_CONSENSUS_THRESHOLD = ZipherXConstants.consensusThreshold
 
         // FIX #233: Get headers with 15-second timeout to prevent hanging
         var allHeaders: [BlockHeader] = []

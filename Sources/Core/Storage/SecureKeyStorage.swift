@@ -357,8 +357,10 @@ final class SecureKeyStorage {
             kSecValueData as String: key
         ]
 
-        // macOS: Keychain is protected by login password + SIP — no extra auth needed
-        // iOS: Add biometric protection (.userPresence) for spending key reads
+        // macOS: Keychain is protected by login password + SIP — no extra auth needed.
+        // Adding .userPresence on macOS causes issues on unsigned dev builds (errSecParam)
+        // and triggers constant auth prompts during normal operation (key read for sync, balance).
+        // iOS: Add biometric protection (.userPresence) for spending key reads.
         #if os(iOS)
         if let access = SecAccessControlCreateWithFlags(
             nil,
@@ -381,11 +383,14 @@ final class SecureKeyStorage {
         print("🔐 Security audit TASK 25: Key stored in macOS Keychain")
     }
 
-    /// Retrieve key from macOS Keychain
-    /// Security audit TASK 25: Replaces Hardware UUID file-based retrieval
+    /// Retrieve key from Keychain
+    /// FIX #1487: macOS uses silent probe first (kSecUseAuthenticationUIFail) to detect
+    /// items that can be read without UI, then falls back to full auth if needed.
+    /// This is required because macOS Keychain may prompt for app-level access even for
+    /// items without .userPresence — the silent probe avoids unnecessary prompts.
     private func retrieveKeyFromKeychain(tag: String) throws -> Data {
         #if os(macOS)
-        // macOS: Try without auth UI first to detect old .userPresence items
+        // macOS: Try silent read first to avoid unnecessary Keychain access prompts
         let checkQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "com.zipherx.wallet",
@@ -397,9 +402,14 @@ final class SecureKeyStorage {
         var result: AnyObject?
         let status = SecItemCopyMatching(checkQuery as CFDictionary, &result)
 
+        if status == errSecSuccess, let data = result as? Data {
+            // Item readable without auth prompt — return directly
+            return data
+        }
+
         if status == errSecInteractionNotAllowed {
-            // Old item stored with .userPresence — read WITH auth, then re-save without
-            print("🔐 TASK 25: Migrating key from .userPresence to accessibility-only")
+            // Item exists but requires auth (e.g. .userPresence) — read WITH auth prompt
+            print("🔐 retrieveKeyFromKeychain: Item requires authentication, prompting...")
             let authQuery: [String: Any] = [
                 kSecClass as String: kSecClassGenericPassword,
                 kSecAttrService as String: "com.zipherx.wallet",
@@ -410,18 +420,16 @@ final class SecureKeyStorage {
             var authResult: AnyObject?
             let authStatus = SecItemCopyMatching(authQuery as CFDictionary, &authResult)
             if authStatus == errSecSuccess, let data = authResult as? Data {
-                // Re-save without .userPresence
-                try? storeKeyInKeychain(data, tag: tag)
                 return data
             }
+            print("🔐 retrieveKeyFromKeychain: Auth read failed with status: \(authStatus)")
             throw SecureStorageError.keyNotFound
         }
 
-        guard status == errSecSuccess, let data = result as? Data else {
-            throw SecureStorageError.keyNotFound
-        }
-        return data
+        print("🔐 retrieveKeyFromKeychain: macOS query failed with status: \(status)")
+        throw SecureStorageError.keyNotFound
         #else
+        // iOS: Simple read — system handles .userPresence auth dialog automatically
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "com.zipherx.wallet",
@@ -817,10 +825,14 @@ final class SecureKeyStorage {
                 print("🖥️ macOS: Migrated key to Keychain, reading from Keychain")
                 return try retrieveKeyFromKeychain(tag: spendingKeyTag)
             }
-            // Last resort: try file-based storage directly
-            print("🖥️ macOS: Falling back to file-based storage")
-            let encryptedData = try readMacOSKeyFile(for: spendingKeyTag)
-            return try decryptMacOSData(encryptedData)
+            // Last resort: try file-based storage directly (guard against missing file)
+            if macOSKeyFileExists(for: spendingKeyTag) {
+                print("🖥️ macOS: Falling back to file-based storage")
+                let encryptedData = try readMacOSKeyFile(for: spendingKeyTag)
+                return try decryptMacOSData(encryptedData)
+            }
+            print("⚠️ macOS: No key found in Keychain or file — key not stored")
+            throw SecureStorageError.keyNotFound
         }
 
         // Get data from keychain (iOS device / simulator)
@@ -1341,7 +1353,14 @@ extension SecureKeyStorage {
                     throw SecureStorageError.decryptionFailed(errorMsg)
                 }
 
-                let decryptedKey = decryptedData as Data
+                var decryptedKey = decryptedData as Data
+                // FIX #1497: Zero raw spending key bytes from heap immediately after use (VULN-015)
+                defer {
+                    decryptedKey.withUnsafeMutableBytes { ptr in
+                        guard let base = ptr.baseAddress else { return }
+                        _ = Darwin.memset_s(base, ptr.count, 0, ptr.count)
+                    }
+                }
                 print("📱 Simulator: Decrypted key (\(decryptedKey.count) bytes), re-encrypting with AES-GCM")
 
                 // Re-encrypt with AES-GCM for Rust FFI
@@ -1364,9 +1383,16 @@ extension SecureKeyStorage {
 
             // Try Keychain first (new TASK 25 / VUL-CRYPTO-001 path)
             if keychainKeyExists(tag: spendingKeyTag) {
-                let rawKey = try retrieveKeyFromKeychain(tag: spendingKeyTag)
+                var rawKey = try retrieveKeyFromKeychain(tag: spendingKeyTag)
                 if rawKey.count == 169 {
                     // Raw key in Keychain — encrypt with AES-GCM for Rust FFI
+                    // FIX #1497: Zero raw spending key bytes from heap immediately after use (VULN-015)
+                    defer {
+                        rawKey.withUnsafeMutableBytes { ptr in
+                            guard let base = ptr.baseAddress else { return }
+                            _ = Darwin.memset_s(base, ptr.count, 0, ptr.count)
+                        }
+                    }
                     let encryptionKey = try getMacOSEncryptionKey()
                     let sealedBox = try AES.GCM.seal(rawKey, using: encryptionKey)
                     guard let encrypted = sealedBox.combined else {
@@ -1448,7 +1474,14 @@ extension SecureKeyStorage {
                 throw SecureStorageError.decryptionFailed(errorMsg)
             }
 
-            let decryptedKey = decryptedData as Data
+            var decryptedKey = decryptedData as Data
+            // FIX #1497: Zero raw spending key bytes from heap immediately after use (VULN-015)
+            defer {
+                decryptedKey.withUnsafeMutableBytes { ptr in
+                    guard let base = ptr.baseAddress else { return }
+                    _ = Darwin.memset_s(base, ptr.count, 0, ptr.count)
+                }
+            }
             print("📱 FIX #1347: Decrypted key (\(decryptedKey.count) bytes), re-encrypting with AES-GCM")
 
             // Re-encrypt with AES-GCM for Rust FFI

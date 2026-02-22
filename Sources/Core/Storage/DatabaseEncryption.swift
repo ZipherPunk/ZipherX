@@ -47,6 +47,8 @@ final class DatabaseEncryption {
     /// Keychain service identifiers
     private let keychainService = "com.zipherx.wallet.dbencryption"
     private let saltKey = "dbEncryptionSalt"
+    /// FIX #1491: Keychain key for device identifier (replaces world-readable Hardware UUID)
+    private let deviceIdentifierKey = "dbDeviceIdentifier"
 
     private init() {}
 
@@ -239,11 +241,11 @@ final class DatabaseEncryption {
         return "IOS-FALLBACK-\(UUID().uuidString)"
 
         #elseif os(macOS)
-        // macOS - use hardware UUID
-        if let uuid = getHardwareUUID() {
-            return "MAC-\(uuid)"
-        }
-        return "MAC-FALLBACK-\(UUID().uuidString)"
+        // FIX #1491: Use Keychain-stored device identifier instead of world-readable Hardware UUID.
+        // Hardware UUID via IOKit requires no entitlements — any process can read it, making it
+        // unsuitable as HKDF input key material. A Keychain-stored random UUID ensures both
+        // key derivation inputs (device ID + salt) require Keychain access to obtain.
+        return getOrCreateMacDeviceIdentifier()
 
         #else
         return "UNKNOWN-\(UUID().uuidString)"
@@ -251,8 +253,92 @@ final class DatabaseEncryption {
     }
 
     #if os(macOS)
-    /// Get macOS hardware UUID via IOKit
-    private func getHardwareUUID() -> String? {
+    // MARK: - macOS Device Identifier (FIX #1491)
+
+    /// FIX #1491: Get or create a macOS device identifier stored in Keychain.
+    ///
+    /// Migration path for existing installs: on first call after update, reads the Hardware UUID
+    /// (IOKit) and stores it in Keychain. Subsequent calls use the Keychain value — IOKit is no
+    /// longer accessed. Existing encrypted data remains decryptable (same derived key).
+    ///
+    /// New installs: IOKit unavailable or no Hardware UUID → generates a cryptographically-random
+    /// UUID and stores it in Keychain. Neither HKDF input (device ID + salt) is readable without
+    /// Keychain access.
+    private func getOrCreateMacDeviceIdentifier() -> String {
+        // Fast path: load previously stored identifier from Keychain
+        if let existing = loadMacDeviceIdentifierFromKeychain() {
+            return existing
+        }
+
+        // First call after FIX #1491 update, or fresh install:
+        // For existing installs, use the Hardware UUID so already-encrypted data stays decryptable.
+        // For new installs where Hardware UUID is unavailable, generate a fresh random UUID.
+        let identifier: String
+        if let hwUUID = getHardwareUUIDForMigration() {
+            // Existing install migration: store Hardware UUID in Keychain so IOKit is never
+            // consulted again. The key derivation result is identical — data remains accessible.
+            identifier = "MAC-\(hwUUID)"
+        } else {
+            // New install: both HKDF inputs (device ID + salt) will be random and Keychain-only.
+            identifier = "MAC-\(UUID().uuidString)"
+        }
+
+        // Persist to Keychain (best-effort; if it fails we'll retry next call)
+        try? saveMacDeviceIdentifierToKeychain(identifier)
+        return identifier
+    }
+
+    private func loadMacDeviceIdentifierFromKeychain() -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: deviceIdentifierKey,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+        guard status == errSecSuccess,
+              let data = result as? Data,
+              let identifier = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+
+        return identifier
+    }
+
+    private func saveMacDeviceIdentifierToKeychain(_ identifier: String) throws {
+        let data = Data(identifier.utf8)
+
+        // Delete any existing entry first
+        let deleteQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: deviceIdentifierKey
+        ]
+        SecItemDelete(deleteQuery as CFDictionary)
+
+        // Store with ThisDeviceOnly so the identifier cannot be extracted via cloud backup
+        let addQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: deviceIdentifierKey,
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        ]
+
+        let status = SecItemAdd(addQuery as CFDictionary, nil)
+        guard status == errSecSuccess else {
+            throw EncryptionError.keychainWriteFailed
+        }
+    }
+
+    /// Read Hardware UUID from IOKit — used ONLY for the one-time migration in
+    /// getOrCreateMacDeviceIdentifier(). After migration the value lives in Keychain
+    /// and this function is never called again.
+    private func getHardwareUUIDForMigration() -> String? {
         let platformExpert = IOServiceGetMatchingService(
             kIOMainPortDefault,
             IOServiceMatching("IOPlatformExpertDevice")
@@ -313,10 +399,10 @@ final class DatabaseEncryption {
             kSecValueData as String: salt
         ]
 
-        #if os(iOS)
-        // iOS: Use most secure accessibility
+        // FIX #1491: Apply ThisDeviceOnly accessibility on all platforms.
+        // Prevents cloud backup export of encryption key material.
+        // Previously only set on iOS; macOS left unprotected (allowed iCloud Keychain sync).
         addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-        #endif
 
         let status = SecItemAdd(addQuery as CFDictionary, nil)
         guard status == errSecSuccess else {

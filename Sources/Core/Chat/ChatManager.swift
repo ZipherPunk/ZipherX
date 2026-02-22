@@ -274,6 +274,19 @@ final class ChatManager: ObservableObject {
             await loadMessageQueue()
         }
 
+        // FIX #1487: When .onion circuits become ready, reset backoff and retry all contacts.
+        // Without this: first connect fails (circuits not ready) → 35s+ backoff → stuck offline.
+        NotificationCenter.default.addObserver(forName: .onionCircuitsReady, object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                guard self.isAvailable else { return }
+                print("💬 FIX #1487: .onion circuits ready — resetting backoff and retrying all contacts")
+                self.connectionFailureCount.removeAll()
+                self.lastConnectionAttempt.removeAll()
+                await self.checkAllContactsOnline()
+            }
+        }
+
         print("💬 ChatManager initialized")
     }
 
@@ -533,25 +546,23 @@ final class ChatManager: ObservableObject {
         defer { connectionsInFlight.remove(contact.onionAddress) }
 
         // ==========================================================================
-        // FIX #330: Circuit health check before operations
-        // Verify Tor circuit is established before attempting .onion connection
-        // This prevents wasted connection attempts during circuit warmup
+        // FIX #330 + FIX #1487: Circuit health check before operations
+        // Verify Tor .onion circuits are established before attempting .onion connection
+        // FIX #1487: Wait for FULL warmup (no 15s cutoff). Observed 46s warmup in production.
+        // Premature connection → "Onion Service not found" → backoff → stuck offline.
         // ==========================================================================
         let torManager = await TorManager.shared
         let isCircuitReady = await torManager.isOnionCircuitsReady
         let warmupRemaining = await torManager.onionCircuitWarmupRemaining
 
         if !isCircuitReady {
-            // Option 1: Wait for warmup if it's short (< 15 seconds)
-            if warmupRemaining > 0 && warmupRemaining <= 15 {
-                print("💬 FIX #330: Waiting \(String(format: "%.0f", warmupRemaining))s for Tor circuit warmup...")
-                try await Task.sleep(nanoseconds: UInt64(warmupRemaining * 1_000_000_000) + 1_000_000_000) // +1s safety
-            } else if warmupRemaining > 15 {
-                // Option 2: If warmup is long, throw informative error
-                print("💬 FIX #330: Tor circuit not ready - \(String(format: "%.0f", warmupRemaining))s remaining")
-                throw ChatError.connectionFailed("Tor circuit warming up (\(Int(warmupRemaining))s remaining). Please wait and try again.")
+            if warmupRemaining > 0 {
+                // FIX #1487: Wait for full remaining warmup + 2s safety margin.
+                // Old code refused to wait if > 15s → premature connection → instant failure.
+                print("💬 FIX #1487: Waiting \(String(format: "%.0f", warmupRemaining + 2))s for .onion circuit warmup...")
+                try await Task.sleep(nanoseconds: UInt64((warmupRemaining + 2) * 1_000_000_000))
             } else {
-                // Option 3: Tor not connected at all
+                // Tor not connected at all
                 print("💬 FIX #330: Tor circuit not available")
                 throw ChatError.hiddenServiceNotRunning
             }
@@ -2142,6 +2153,10 @@ class ChatDatabase {
             unreadCount: contact.unreadCount,
             lastMessageTime: nil
         )
+        // FIX #1486: Checkpoint WAL immediately after contact save.
+        // On iOS, app can be force-killed before applicationDidEnterBackground fires.
+        // Without this: contact written to WAL → app killed → WAL not checkpointed → contact lost.
+        WalletDatabase.shared.checkpoint()
     }
 
     func loadContacts() -> [ChatContact] {
@@ -2218,4 +2233,6 @@ extension Notification.Name {
     static let chatTypingIndicator = Notification.Name("chatTypingIndicator")
     static let chatMessageDelivered = Notification.Name("chatMessageDelivered")
     static let chatMessageRead = Notification.Name("chatMessageRead")
+    /// FIX #1487: Posted by NetworkManager when .onion circuits become ready
+    static let onionCircuitsReady = Notification.Name("onionCircuitsReady")
 }

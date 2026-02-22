@@ -101,11 +101,18 @@ enum ZipherXConstants {
 
     // MARK: - Security
 
-    /// Minimum peers required for consensus operations
-    static let minConsensusPeers = 3
+    // FIX #1493: VULN-009 — Single source of truth for all consensus thresholds.
+    // FIX #934 established that Zclassic's small network cannot reliably provide 5+
+    // agreeing peers. 3 is the proven operational threshold across all components.
 
-    /// Threshold for Byzantine fault tolerance (n=8, f=2)
-    static let consensusThreshold = 5
+    /// Consensus threshold for Byzantine fault tolerance on the Zclassic network.
+    /// All P2P consensus checks (chain height, headers, blocks, Equihash) MUST use this value.
+    static let consensusThreshold = 3
+
+    /// Reduced consensus threshold for degraded network conditions.
+    /// Used ONLY as a fallback when full consensusThreshold cannot be met (e.g., header sync).
+    /// Security is weakened — operations using this threshold log a warning.
+    static let reducedConsensusThreshold = 2
 
     /// Peer ban duration in seconds (7 days)
     static let peerBanDuration: TimeInterval = 604_800

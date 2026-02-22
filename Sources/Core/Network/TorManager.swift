@@ -161,8 +161,9 @@ public final class TorManager: ObservableObject {
     /// Minimum delay after SOCKS proxy is ready before .onion circuits are likely established
     /// Hidden services require rendezvous circuits which take additional time to set up
     /// FIX #331: Increased from 10s to 30s for more reliable .onion circuit establishment
-    /// Tor documentation suggests 30-60 seconds for rendezvous point establishment
-    private let onionCircuitWarmupSeconds: TimeInterval = 30.0
+    /// FIX #1487: Increased from 30s to 60s — observed 46s in production logs.
+    /// Tor documentation says 30-60s; real-world iOS shows closer to 45-60s.
+    private let onionCircuitWarmupSeconds: TimeInterval = 60.0
 
     // MARK: - Initialization
 
@@ -886,6 +887,10 @@ public final class TorManager: ObservableObject {
                                 Task {
                                     await HiddenServiceManager.shared.onTorConnectionStateChanged(isConnected: true)
                                 }
+
+                                // FIX #1488: Notify NetworkManager immediately so it doesn't see stale "Tor connected: false"
+                                // Without this: peer recovery runs before polling detects connection → connects without SOCKS5
+                                NotificationCenter.default.post(name: Notification.Name("torConnectionStateChanged"), object: nil, userInfo: ["connected": true])
                             } else {
                                 self.connectionState = .error("SOCKS proxy not responding on port \(port)")
                             }

@@ -17,7 +17,8 @@ final class HeaderSyncManager {
     // Header sync needs fewer peers since headers are verified by chain continuity + PoW
     // Fake heights are detected and banned by getConsensusChainHeight()
     private let minPeers = 3  // Minimum peers for header sync
-    private let consensusThreshold = 3  // Require 3 peers to agree on headers
+    // FIX #1493: VULN-009 — Use centralized constant (was local hardcoded 3)
+    private let consensusThreshold = ZipherXConstants.consensusThreshold
 
     // Sync state - FIX #133: Use static to prevent duplicate syncs from multiple instances
     private static var isSyncing = false
@@ -1272,7 +1273,7 @@ final class HeaderSyncManager {
 
         // FALLBACK: If we couldn't reach full consensus but have at least 2 peers agreeing,
         // proceed with reduced security. Better than being stuck forever.
-        let reducedThreshold = 2
+        let reducedThreshold = ZipherXConstants.reducedConsensusThreshold  // FIX #1493
         if successfulHeaders.count < consensusThreshold && successfulHeaders.count >= reducedThreshold {
             print("⚠️ Reduced consensus: using \(successfulHeaders.count) peers (ideal is \(consensusThreshold))")
         }

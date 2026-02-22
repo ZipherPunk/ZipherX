@@ -99,6 +99,20 @@ struct ZipherXApp: App {
             WalletDatabase.shared.checkpoint()
             print("💾 FIX #894: WAL checkpoints complete before termination")
         }
+        #else
+        // FIX #1486: iOS equivalent — willTerminateNotification is NOT guaranteed on iOS
+        // but fires when the system terminates the app (not on force-kill from switcher).
+        // Combined with applicationDidEnterBackground checkpoint in AppDelegate,
+        // this covers most iOS termination paths.
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            HeaderStore.shared.checkpoint()
+            WalletDatabase.shared.checkpoint()
+            print("💾 FIX #1486: iOS WAL checkpoints complete before termination")
+        }
         #endif
     }
 

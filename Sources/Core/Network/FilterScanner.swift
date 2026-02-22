@@ -4838,7 +4838,7 @@ final class FilterScanner {
 
         // FIX #228: Wait for enough peers before giving up on import sync
         // Problem: Import sync was failing immediately with 2 peers, leaving wallet with 0 balance
-        let minPeersForConsensus = 3
+        let minPeersForConsensus = ZipherXConstants.consensusThreshold  // FIX #1493
         let maxRetries = 5
         let retryDelay: UInt64 = 3_000_000_000 // 3 seconds
 

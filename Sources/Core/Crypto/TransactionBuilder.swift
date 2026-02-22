@@ -510,9 +510,15 @@ final class TransactionBuilder {
 
         print("✅ Transaction built: \(rawTx.count) bytes")
 
-        // Print raw transaction hex for manual broadcast debugging
+        // FIX #1486 (VULN-001): Raw TX hex MUST NOT be logged in release builds.
+        // The full transaction bytes contain Groth16 proof data, nullifiers, commitments,
+        // and encrypted Sapling outputs. Logging them unconditionally writes the complete
+        // transaction structure to zmac.log, allowing an attacker with log access to link
+        // sender notes to outputs and break Sapling privacy.
+        #if DEBUG
         let txHex = rawTx.map { String(format: "%02x", $0) }.joined()
         print("📋 Raw TX hex: \(txHex)")
+        #endif
 
         // FIX #1402 (NEW-004): Persist the change diversifier index used in this TX
         let changeDivIndex = RustBridge.shared.getLastChangeDiversifierIndex()
