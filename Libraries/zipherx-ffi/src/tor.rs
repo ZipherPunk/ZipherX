@@ -767,21 +767,19 @@ async fn start_hidden_service_async() -> Result<String, Box<dyn std::error::Erro
         eprintln!("🧅 Hidden service handle stored - service will remain active");
     }
 
-    // FIX #1457: Scrub ONLY the .onion identity key from disk after launch.
-    // The authoritative copy lives in macOS Keychain — no need to keep on disk.
-    // Arti holds the identity key in memory for the running service.
-    //
-    // IMPORTANT: Do NOT scrub blind ID, descriptor signing, or intro point keys!
-    // Arti needs these DURING the session to:
-    //   1. Sign and publish the hidden service descriptor to HSDir nodes
+    // FIX #1494: Do NOT scrub ANY keystore files! Arti needs them DURING the session to:
+    //   1. Periodically re-sign and re-publish the hidden service descriptor to HSDir nodes
     //   2. Maintain introduction point circuits for client rendezvous
-    // Scrubbing them breaks descriptor publication → "Onion Service not found"
-    let keystore_dir = data_dir.join("state").join("keystore").join("hss").join("zipherx");
-    let hs_id_keyfile = keystore_dir.join("ks_hs_id.ed25519_expanded_private");
-    if hs_id_keyfile.exists() {
-        let _ = std::fs::remove_file(&hs_id_keyfile);
-        eprintln!("🧅 FIX #1457: Scrubbed .onion identity key from disk (kept in memory only)");
-    }
+    //   3. Respond to descriptor fetch requests from connecting clients
+    //
+    // FIX #1457 scrubbed ks_hs_id.ed25519_expanded_private for security (don't leave key on disk).
+    // But this broke descriptor publication → "Onion Service not found" for ALL connecting clients.
+    // The authoritative copy lives in macOS/iOS Keychain; the disk copy is in Arti's sandboxed
+    // state directory with iOS Data Protection (completeUnlessOpen). Acceptable risk.
+    //
+    // If scrubbing is needed in the future, it must happen AFTER the service is fully stopped,
+    // not while the service is running.
+    eprintln!("🧅 FIX #1494: Keystore files preserved for descriptor publication (FIX #1457 scrub removed)");
 
     // Get the .onion address using the new API
     // FIX #1457v2: Arti may return None before the service is fully published.
