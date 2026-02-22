@@ -68,24 +68,18 @@ struct DisclaimerView: View {
 
     private var scrollableContent: some View {
         #if os(iOS)
-        // FIX #1470: GeometryReader forces content width = screen width
-        // ScrollView(.vertical) alone does NOT constrain horizontal width on iOS
-        GeometryReader { geometry in
-            ScrollView(.vertical, showsIndicators: true) {
-                VStack(alignment: .leading, spacing: 16) {
-                    disclaimerContent
+        ScrollView(.vertical, showsIndicators: true) {
+            VStack(alignment: .leading, spacing: 16) {
+                disclaimerContent
 
-                    GeometryReader { geo in
-                        Color.clear
-                            .preference(key: BottomAnchorYKey.self,
-                                       value: geo.frame(in: .global).maxY)
-                    }
-                    .frame(height: 1)
+                GeometryReader { geo in
+                    Color.clear
+                        .preference(key: BottomAnchorYKey.self,
+                                   value: geo.frame(in: .global).maxY)
                 }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 12)
-                .frame(width: geometry.size.width)
+                .frame(height: 1)
             }
+            .padding()
         }
         #else
         ScrollView(.vertical, showsIndicators: true) {
@@ -401,12 +395,8 @@ struct DisclaimerView: View {
                 .lineSpacing(4)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        #if os(iOS)
-        .padding(.horizontal, 6)
-        .padding(.vertical, 8)
-        #else
-        .padding(16)
-        #endif
+        .padding()
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 8)
                 .fill(NeonColors.primary.opacity(0.05))
@@ -437,12 +427,7 @@ struct DisclaimerView: View {
                 #endif
                 .foregroundColor(NeonColors.primary.opacity(0.7))
         }
-        #if os(iOS)
-        .padding(.horizontal, 6)
-        .padding(.vertical, 8)
-        #else
-        .padding(16)
-        #endif
+        .padding()
         .background(
             RoundedRectangle(cornerRadius: 8)
                 .fill(NeonColors.primary.opacity(0.08))
@@ -470,12 +455,7 @@ struct DisclaimerView: View {
                 acknowledgmentItem("You have backed up all existing wallet files and keys before using this software")
             }
         }
-        #if os(iOS)
-        .padding(.horizontal, 6)
-        .padding(.vertical, 8)
-        #else
-        .padding(16)
-        #endif
+        .padding()
         .background(
             RoundedRectangle(cornerRadius: 8)
                 .fill(Color.white.opacity(0.05))
