@@ -68,6 +68,9 @@ final class WalletManager: ObservableObject {
     // FIX #1475: Cooldown timer — prevents sequential gap-fill restart loop.
     // After gap-fill completes, don't re-trigger for 5 minutes (gives header sync time to catch up).
     private var lastGapFillCompletionTime: Date?
+    // FIX #1484: Cooldown after delta sync validation failure — prevents re-fetching 1024 blocks
+    // every 30s when tree root mismatches. Wait for gap-fill to complete first.
+    private var lastDeltaSyncValidationFailure: Date?
     @Published private(set) var isConnecting: Bool = false
     @Published private(set) var syncStatus: String = ""
 
@@ -712,6 +715,20 @@ final class WalletManager: ObservableObject {
         // Update status to behind
         await MainActor.run { deltaSyncStatus = .behind(blocks: missingBlocks) }
 
+        // FIX #1484: Cooldown after validation failure — don't re-fetch when tree root mismatches.
+        // syncDeltaBundleIfNeeded runs every ~30s via background sync. When validation fails (tree
+        // root mismatch), the blocks are rolled back and gap-fill is triggered. But gap-fill has a
+        // 5-minute cooldown, so the NEXT syncDelta call (30s later) re-fetches the same 1024 blocks
+        // for nothing. This wastes P2P bandwidth and creates a fetch loop.
+        // Wait 5 minutes after validation failure — gap-fill will fix the tree in the meantime.
+        if let lastFailure = lastDeltaSyncValidationFailure {
+            let elapsed = Date().timeIntervalSince(lastFailure)
+            if elapsed < 300.0 {
+                print("⏩ FIX #1484: Delta sync cooldown — validation failed \(Int(elapsed))s ago (waiting 300s for gap-fill)")
+                return
+            }
+        }
+
         // FIX #1186: Increased limit from 100 to 50000 blocks
         // Previous bug: 100-block limit meant delta could NEVER catch up after being cleared.
         // With ~16K blocks between boost file end and chain tip, it would take 160+ app restarts
@@ -956,6 +973,8 @@ final class WalletManager: ObservableObject {
                             print("⚠️ FIX #1194: Incremental sync had missing outputs — will retry next cycle")
                             print("   Existing delta bundle preserved (height \(deltaEndHeight))")
                             validationPassed = false
+                            // FIX #1484: Set cooldown to prevent re-fetching same blocks every 30s
+                            self.lastDeltaSyncValidationFailure = Date()
                             await MainActor.run { deltaSyncStatus = .behind(blocks: missingBlocks) }
 
                             // FIX #1220: Mismatch means EXISTING delta is incomplete (missing CMUs within range).
@@ -976,6 +995,8 @@ final class WalletManager: ObservableObject {
             // FIX #1194: Only persist delta outputs and tree state AFTER validation passes.
             // This prevents saving a bad tree to DB that would be loaded on next restart.
             if validationPassed {
+                // FIX #1484: Clear validation failure cooldown on success
+                self.lastDeltaSyncValidationFailure = nil
                 let treeRoot = ZipherXFFI.treeRoot() ?? Data(count: 32)
 
                 if !collectedOutputs.isEmpty {
@@ -5955,10 +5976,9 @@ final class WalletManager: ObservableObject {
                 // The old pattern KILLED the dispatchers it needed → empty fetch → endHeight stuck → infinite loop.
 
                 // FIX #710 v2: Proper timeout using task group race pattern
-                // FIX #1480: Reduced batch size from max(peers, 3)*256=1024 to 384.
-                // 1024-block batches + 30s timeout was borderline after 5s dispatcher activation.
-                // 384 blocks completes reliably in <15s even with 2 peers.
-                let batchSize: UInt64 = 384
+                // FIX #1480: Dynamic batch size (same formula as syncDelta/gapFill)
+                let witnessPeerCount = await MainActor.run { NetworkManager.shared.peers.filter { $0.isConnectionReady }.count }
+                let batchSize: UInt64 = UInt64(max(witnessPeerCount, 3) * 256)
                 let maxRetries = 2
                 let batchTimeoutSeconds: UInt64 = 45  // 45 seconds (was 30 — too tight after dispatcher wait)
                 var currentHeight = fetchStartHeight + 1
