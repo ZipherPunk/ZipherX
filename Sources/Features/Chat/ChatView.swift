@@ -1053,6 +1053,7 @@ struct ConversationView: View {
             Text("\"\(fileTooLargeName)\" exceeds the 2 MB limit.\n\nPlease choose a smaller file.")
         }
         // FIX #1540: Voice call overlay — shown when call is active, incoming, or outgoing
+        #if os(iOS)
         .fullScreenCover(isPresented: Binding(
             get: { VoiceCallManager.shared.callState != .idle },
             set: { if !$0 { Task { await VoiceCallManager.shared.endCall() } } }
@@ -1062,6 +1063,17 @@ struct ConversationView: View {
                 onionAddress: contact.onionAddress
             )
         }
+        #else
+        .sheet(isPresented: Binding(
+            get: { VoiceCallManager.shared.callState != .idle },
+            set: { if !$0 { Task { await VoiceCallManager.shared.endCall() } } }
+        )) {
+            CallView(
+                contactName: contact.displayName,
+                onionAddress: contact.onionAddress
+            )
+        }
+        #endif
         // FIX #1457: Screenshot & recording detection for encrypted chat
         #if os(iOS)
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.userDidTakeScreenshotNotification)) { _ in
