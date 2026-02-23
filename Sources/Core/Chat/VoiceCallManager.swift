@@ -19,17 +19,17 @@ import Combine
 
 /// FIX #1540: Manages voice calls over encrypted P2P chat
 @MainActor
-public final class VoiceCallManager: ObservableObject {
+final class VoiceCallManager: ObservableObject {
 
-    public static let shared = VoiceCallManager()
+    static let shared = VoiceCallManager()
 
     // MARK: - Published State
 
-    @Published public var callState: VoiceCallState = .idle
-    @Published public var callDuration: TimeInterval = 0
-    @Published public var isMuted: Bool = false
-    @Published public var isSpeakerOn: Bool = false
-    @Published public var remotePeerOnionAddress: String?
+    @Published var callState: VoiceCallState = .idle
+    @Published var callDuration: TimeInterval = 0
+    @Published var isMuted: Bool = false
+    @Published var isSpeakerOn: Bool = false
+    @Published var remotePeerOnionAddress: String?
 
     // MARK: - Audio Engine
 
@@ -78,7 +78,7 @@ public final class VoiceCallManager: ObservableObject {
     // MARK: - Public API
 
     /// Initiate a voice call to a chat peer
-    public func startCall(to onionAddress: String) async -> Bool {
+    func startCall(to onionAddress: String) async -> Bool {
         guard callState == .idle else {
             print("📞 FIX #1540: Cannot start call — already in state \(callState)")
             return false
@@ -128,7 +128,7 @@ public final class VoiceCallManager: ObservableObject {
     }
 
     /// Accept an incoming call
-    public func acceptCall() async {
+    func acceptCall() async {
         guard case .ringing(let callId) = callState else { return }
 
         // Send call answer
@@ -148,14 +148,14 @@ public final class VoiceCallManager: ObservableObject {
     }
 
     /// Decline an incoming call
-    public func declineCall() async {
+    func declineCall() async {
         guard case .ringing(let callId) = callState else { return }
         await endCall(reason: "declined")
         print("📞 FIX #1540: Call declined — callId=\(callId.prefix(8))")
     }
 
     /// End current call (hang up)
-    public func endCall(reason: String? = nil) async {
+    func endCall(reason: String? = nil) async {
         let callId = currentCallId ?? "unknown"
         print("📞 FIX #1540: Ending call — callId=\(callId.prefix(8)), reason=\(reason ?? "user")")
 
@@ -198,14 +198,14 @@ public final class VoiceCallManager: ObservableObject {
     }
 
     /// Toggle microphone mute
-    public func toggleMute() {
+    func toggleMute() {
         isMuted.toggle()
         // Muting doesn't stop capture — just stops sending frames
         print("📞 FIX #1540: Mute \(isMuted ? "ON" : "OFF")")
     }
 
     /// Toggle speaker output
-    public func toggleSpeaker() {
+    func toggleSpeaker() {
         isSpeakerOn.toggle()
         #if os(iOS)
         let session = AVAudioSession.sharedInstance()
@@ -217,7 +217,7 @@ public final class VoiceCallManager: ObservableObject {
     // MARK: - Incoming Signal Handlers (called by ChatManager)
 
     /// Handle incoming call offer
-    public func handleCallOffer(_ offer: CallOffer, from onionAddress: String) {
+    func handleCallOffer(_ offer: CallOffer, from onionAddress: String) {
         guard callState == .idle else {
             // Already in a call — auto-reject
             Task {
@@ -248,7 +248,7 @@ public final class VoiceCallManager: ObservableObject {
     }
 
     /// Handle call answer (peer accepted)
-    public func handleCallAnswer(_ answer: CallAnswer) async {
+    func handleCallAnswer(_ answer: CallAnswer) async {
         guard case .offering(let callId) = callState, answer.callId == callId else { return }
 
         ringTimeoutTask?.cancel()
@@ -259,21 +259,21 @@ public final class VoiceCallManager: ObservableObject {
     }
 
     /// Handle call reject (peer declined)
-    public func handleCallReject(_ control: CallControl) async {
+    func handleCallReject(_ control: CallControl) async {
         guard currentCallId == control.callId else { return }
         print("📞 FIX #1540: Call rejected — reason: \(control.reason ?? "unknown")")
         await endCall(reason: control.reason)
     }
 
     /// Handle call end (peer hung up)
-    public func handleCallEnd(_ control: CallControl) async {
+    func handleCallEnd(_ control: CallControl) async {
         guard currentCallId == control.callId else { return }
         print("📞 FIX #1540: Peer ended call — reason: \(control.reason ?? "hangup")")
         await endCall(reason: control.reason)
     }
 
     /// Handle incoming audio frame
-    public func handleAudioFrame(_ frame: CallAudioFrame) {
+    func handleAudioFrame(_ frame: CallAudioFrame) {
         guard case .active(let callId) = callState, frame.callId == callId else { return }
 
         // Decode base64 audio data
@@ -507,7 +507,7 @@ public final class VoiceCallManager: ObservableObject {
     // MARK: - Helpers
 
     /// Format call duration for display (MM:SS)
-    public static func formatDuration(_ duration: TimeInterval) -> String {
+    static func formatDuration(_ duration: TimeInterval) -> String {
         let minutes = Int(duration) / 60
         let seconds = Int(duration) % 60
         return String(format: "%02d:%02d", minutes, seconds)
