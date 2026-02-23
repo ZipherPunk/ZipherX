@@ -5533,18 +5533,22 @@ public final class NetworkManager: ObservableObject {
         let needed = MIN_PEERS - currentReady
         guard needed > 0 else { return }
 
-        // Collect candidates: known addresses not already connected, not banned, not on cooldown
+        // Collect candidates: known addresses not already connected, not banned, not parked, not on cooldown
+        // FIX #1533b: Also exclude parked peers — they already failed recently and have backoff timers.
+        // Without this: growth wastes SOCKS5 connections on peers that timed out seconds ago.
         let connectedHosts = Set(peers.map { $0.host })
         var candidates: [PeerAddress] = []
 
-        // Hardcoded seeds first
+        // Hardcoded seeds first (only if ready for retry)
         for seedHost in HARDCODED_SEEDS {
-            if !connectedHosts.contains(seedHost) && !isBanned(seedHost) && !isOnCooldown(seedHost, port: defaultPort) {
+            if !connectedHosts.contains(seedHost) && !isBanned(seedHost) &&
+               !isOnCooldown(seedHost, port: defaultPort) &&
+               (!isParked(seedHost) || isParkedPeerReadyForRetry(seedHost)) {
                 candidates.append(PeerAddress(host: seedHost, port: defaultPort))
             }
         }
 
-        // Then known addresses
+        // Then known addresses (skip parked unless ready for retry)
         addressLock.lock()
         let known = knownAddresses.values.map { $0.address }
         addressLock.unlock()
@@ -5552,7 +5556,8 @@ public final class NetworkManager: ObservableObject {
             if candidates.count >= needed + 3 { break } // Try a few extra for failures
             if !connectedHosts.contains(address.host) && !isBanned(address.host) &&
                !isOnCooldown(address.host, port: address.port) &&
-               !candidates.contains(where: { $0.host == address.host }) {
+               !candidates.contains(where: { $0.host == address.host }) &&
+               (!isParked(address.host) || isParkedPeerReadyForRetry(address.host)) {
                 candidates.append(address)
             }
         }
