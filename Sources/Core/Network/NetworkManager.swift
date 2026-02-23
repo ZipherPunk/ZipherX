@@ -9531,14 +9531,18 @@ public final class NetworkManager: ObservableObject {
             return
         }
 
-        // FIX #1461: Proactive peer growth — connect to more peers if below MIN_PEERS
+        // FIX #1461: Proactive peer growth — connect to more peers if below target.
         // This runs even during sync, because having more peers improves P2P fetch reliability.
-        // The main connect() exits early at 3-6 peers for fast startup; this fills to 8+.
-        // FIX #1501/#1506: Skip peer growth when >= CONSENSUS_THRESHOLD peers.
-        // z8.log (iOS): 14 growth attempts in 21 min, each trying 5 SOCKS5 connections, ALL failing.
-        // macOS log: 3/8 growth every 30s with Tor — all SOCKS5 connections fail.
-        // 3 peers = CONSENSUS_THRESHOLD = sufficient for consensus on both platforms.
+        // The main connect() exits early at 3-6 peers for fast startup; this fills to target.
+        // FIX #1501: iOS uses CONSENSUS_THRESHOLD (3) — cellular + SOCKS5 = growth always fails.
+        // FIX #1533: macOS uses MIN_PEERS (8) — has bandwidth for more peers, improves discovery.
+        // Previous FIX #1501 applied CONSENSUS_THRESHOLD to BOTH platforms → macOS stuck at 3 forever
+        // → discovered peers from getaddr never tried → new nodes never found.
+        #if os(iOS)
         let peerGrowthThreshold = CONSENSUS_THRESHOLD
+        #else
+        let peerGrowthThreshold = MIN_PEERS
+        #endif
         if readyPeers.count < peerGrowthThreshold && !isRecoveringPeers {
             debugLog(.network, "🫀 FIX #1461: Only \(readyPeers.count)/\(peerGrowthThreshold) peers — growing peer count in background")
             await growPeerCount(currentReady: readyPeers.count)
