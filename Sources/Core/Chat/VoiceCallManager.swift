@@ -339,10 +339,14 @@ final class VoiceCallManager: ObservableObject {
         engine.attach(player)
 
         // Output format for playback
-        let outputFormat = AVAudioFormat(
+        guard let outputFormat = AVAudioFormat(
             standardFormatWithSampleRate: sampleRate,
             channels: channels
-        )!
+        ) else {
+            print("📞 FIX #1540: Failed to create output audio format")
+            await endCall(reason: "audio_error")
+            return
+        }
 
         engine.connect(player, to: engine.mainMixerNode, format: outputFormat)
 
@@ -360,8 +364,8 @@ final class VoiceCallManager: ObservableObject {
 
         // Start call duration timer
         callDurationTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            guard let self = self, let start = self.callStartTime else { return }
             Task { @MainActor in
+                guard let self = self, let start = self.callStartTime else { return }
                 self.callDuration = Date().timeIntervalSince(start)
             }
         }
@@ -396,10 +400,13 @@ final class VoiceCallManager: ObservableObject {
 
         // Install tap on input node — captures microphone audio
         // Convert to 16kHz mono PCM, then encode to compressed format
-        let captureFormat = AVAudioFormat(
+        guard let captureFormat = AVAudioFormat(
             standardFormatWithSampleRate: sampleRate,
             channels: channels
-        )!
+        ) else {
+            print("📞 FIX #1540: Failed to create capture audio format")
+            return
+        }
 
         // Use a converter if input format differs from our target
         let converter: AVAudioConverter?
@@ -409,16 +416,17 @@ final class VoiceCallManager: ObservableObject {
             converter = nil
         }
 
-        inputNode.installTap(onBus: 0, bufferSize: AVAudioFrameCount(sampleRate * Double(frameDurationMs) / 1000.0), format: inputFormat) { [weak self] buffer, time in
-            guard let self = self else { return }
+        // FIX #1540: Capture constants locally — audio tap runs on audio thread, NOT MainActor
+        let localSampleRate = sampleRate
+        let localFrameDurationMs = frameDurationMs
 
-            // Skip if muted
-            if self.isMuted { return }
+        inputNode.installTap(onBus: 0, bufferSize: AVAudioFrameCount(localSampleRate * Double(localFrameDurationMs) / 1000.0), format: inputFormat) { [weak self] buffer, time in
+            guard self != nil else { return }
 
             // Convert to target format if needed
             let outputBuffer: AVAudioPCMBuffer
             if let conv = converter {
-                guard let converted = AVAudioPCMBuffer(pcmFormat: captureFormat, frameCapacity: AVAudioFrameCount(self.sampleRate * Double(self.frameDurationMs) / 1000.0)) else { return }
+                guard let converted = AVAudioPCMBuffer(pcmFormat: captureFormat, frameCapacity: AVAudioFrameCount(localSampleRate * Double(localFrameDurationMs) / 1000.0)) else { return }
                 var error: NSError?
                 conv.convert(to: converted, error: &error) { _, outStatus in
                     outStatus.pointee = .haveData
@@ -438,14 +446,18 @@ final class VoiceCallManager: ObservableObject {
             let pcmData = Data(bytes: channelData, count: frameCount * MemoryLayout<Float>.size)
             let base64Audio = pcmData.base64EncodedString()
 
-            let seq = self.sendSequence
-            self.sendSequence += 1
             let timestamp = UInt64(Date().timeIntervalSince1970 * 1000)
 
-            // Send audio frame
-            Task { @MainActor in
+            // FIX #1540: All @MainActor property access inside Task block (audio thread safety)
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                // Check mute and call state on MainActor
+                guard !self.isMuted else { return }
                 guard case .active(let callId) = self.callState,
                       let peer = self.remotePeerOnionAddress else { return }
+
+                let seq = self.sendSequence
+                self.sendSequence += 1
 
                 let frame = CallAudioFrame(
                     callId: callId,

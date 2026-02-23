@@ -36,14 +36,16 @@ targets:
       properties:
         CFBundleDisplayName: ZipherX
         CFBundleShortVersionString: "1.0.1"
-        CFBundleVersion: "17"
+        CFBundleVersion: "18"
         UILaunchScreen:
           UIColorName: LaunchScreenColor
         NSFaceIDUsageDescription: ZipherX uses Face ID to protect your wallet and authorize transactions.
         NSLocalNetworkUsageDescription: ZipherX connects to Zclassic network peers to sync your wallet.
         NSCameraUsageDescription: ZipherX uses the camera to scan QR codes for receiving payments.
+        NSMicrophoneUsageDescription: ZipherX uses the microphone for encrypted voice calls over the P2P network.
         UIBackgroundModes:
           - fetch
+          - audio
         ITSAppUsesNonExemptEncryption: false
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
@@ -109,7 +111,7 @@ targets:
       properties:
         CFBundleDisplayName: ZipherX
         CFBundleShortVersionString: "1.0.1"
-        CFBundleVersion: "17"
+        CFBundleVersion: "18"
         CFBundleName: ZipherX
         LSMinimumSystemVersion: "12.0"
         NSLocalNetworkUsageDescription: ZipherX connects to Zclassic network peers to sync your wallet.
