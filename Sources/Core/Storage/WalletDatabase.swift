@@ -5221,9 +5221,10 @@ final class WalletDatabase {
         }
 
         // Calculate totals for logging
-        let totalReceived = allNotes.reduce(0) { $0 + $1.value }
+        // FIX #1515: Overflow-safe reduction
+        let totalReceived = allNotes.reduce(UInt64(0)) { $0 &+ $1.value }
         let unspentNotes = try getUnspentNotes(accountId: 1)
-        let unspentBalance = unspentNotes.reduce(0) { $0 + $1.value }
+        let unspentBalance = unspentNotes.reduce(UInt64(0)) { $0 &+ $1.value }
         let spentNotesCount = allNotes.count - unspentNotes.count
         print("🔧 FIX #162 v3: Inserted \(receivedCount)/\(allNotes.count) received entries")
         print("🔧 FIX #162 v3: - Total ALL notes (spent+unspent): \(allNotes.count)")
@@ -6111,21 +6112,39 @@ final class WalletDatabase {
 
             // FIX #1430: Read from encrypted shadow columns (indices 8, 9, 10)
             // VUL-S-004 zeroes plaintext columns — encrypted shadows have real values
+            // FIX #1515: Validate decrypted values — corrupted enc data causes arithmetic overflow crash
+            let maxReasonableValue: UInt64 = 2_100_000_000_000_000 // 21M ZCL in zatoshis (total supply cap)
+            let maxReasonableHeight: UInt64 = 10_000_000 // Well beyond any current blockchain height
             var value = plaintextValue
             if sqlite3_column_type(stmt, 8) != SQLITE_NULL {
                 let encPtr = sqlite3_column_blob(stmt, 8)
                 let encLen = sqlite3_column_bytes(stmt, 8)
                 if let encPtr = encPtr, encLen > 0 {
-                    value = decryptUInt64(Data(bytes: encPtr, count: Int(encLen))) ?? plaintextValue
+                    let decrypted = decryptUInt64(Data(bytes: encPtr, count: Int(encLen)))
+                    if let d = decrypted, d <= maxReasonableValue {
+                        value = d
+                    } else if let d = decrypted {
+                        print("⚠️ FIX #1515: Corrupted encrypted value \(d) — falling back to plaintext \(plaintextValue)")
+                        value = plaintextValue
+                    } else {
+                        value = plaintextValue
+                    }
                 }
             }
 
+            // FIX #1515: Validate decrypted heights
             var receivedHeight = plaintextReceivedHeight
             if sqlite3_column_type(stmt, 9) != SQLITE_NULL {
                 let encPtr = sqlite3_column_blob(stmt, 9)
                 let encLen = sqlite3_column_bytes(stmt, 9)
                 if let encPtr = encPtr, encLen > 0 {
-                    receivedHeight = decryptUInt64(Data(bytes: encPtr, count: Int(encLen))) ?? plaintextReceivedHeight
+                    let decrypted = decryptUInt64(Data(bytes: encPtr, count: Int(encLen)))
+                    if let d = decrypted, d <= maxReasonableHeight {
+                        receivedHeight = d
+                    } else if let d = decrypted {
+                        print("⚠️ FIX #1515: Corrupted encrypted receivedHeight \(d) — falling back to plaintext \(plaintextReceivedHeight)")
+                        receivedHeight = plaintextReceivedHeight
+                    }
                 }
             }
 
@@ -6134,7 +6153,13 @@ final class WalletDatabase {
                 let encPtr = sqlite3_column_blob(stmt, 10)
                 let encLen = sqlite3_column_bytes(stmt, 10)
                 if let encPtr = encPtr, encLen > 0 {
-                    spentHeight = decryptUInt64(Data(bytes: encPtr, count: Int(encLen))) ?? plaintextSpentHeight
+                    let decrypted = decryptUInt64(Data(bytes: encPtr, count: Int(encLen)))
+                    if let d = decrypted, d <= maxReasonableHeight {
+                        spentHeight = d
+                    } else if let d = decrypted {
+                        print("⚠️ FIX #1515: Corrupted encrypted spentHeight \(d) — falling back to plaintext \(plaintextSpentHeight ?? 0)")
+                        spentHeight = plaintextSpentHeight
+                    }
                 }
             }
 
@@ -6219,9 +6244,13 @@ final class WalletDatabase {
         for note in allNotes where note.isSpent {
             guard let spentTxid = note.spentTxid else { continue }
             let existing = sentTxData[spentTxid]
-            let newInputValue = (existing?.inputValue ?? 0) + note.value
+            // FIX #1515: Overflow-safe addition — corrupted encrypted values can cause crash
+            let (newInputValue, overflow) = (existing?.inputValue ?? 0).addingReportingOverflow(note.value)
+            if overflow {
+                print("⚠️ FIX #1515: Arithmetic overflow summing inputs for txid=\(spentTxid.prefix(8).hexString)... — capping at UInt64.max")
+            }
             let height = note.spentHeight ?? note.receivedHeight
-            sentTxData[spentTxid] = (inputValue: newInputValue, spentHeight: existing?.spentHeight ?? height)
+            sentTxData[spentTxid] = (inputValue: overflow ? UInt64.max : newInputValue, spentHeight: existing?.spentHeight ?? height)
         }
 
         for (spentTxid, txInfo) in sentTxData {
@@ -6255,13 +6284,14 @@ final class WalletDatabase {
                 $0.txid == spentTxid || $0.txid == reversedTxid
             }
 
-            var totalChangeValue = changeOutputs.reduce(0) { $0 + $1.value }
+            // FIX #1515: Overflow-safe reduction
+            var totalChangeValue = changeOutputs.reduce(UInt64(0)) { $0 &+ $1.value }
 
             // FIX #1402: Safety net — if change exceeds inputs, something is wrong.
             // Fall back to strict txid-only matching (single byte order).
             if totalChangeValue > txInfo.inputValue {
                 let txidOnlyChange = allNotes.filter { $0.txid == spentTxid }
-                let txidOnlyValue = txidOnlyChange.reduce(0) { $0 + $1.value }
+                let txidOnlyValue = txidOnlyChange.reduce(UInt64(0)) { $0 &+ $1.value }
                 print("📜 FIX #1402: Change (\(totalChangeValue)) > inputValue (\(txInfo.inputValue)) — falling back to txid-only change (\(txidOnlyValue))")
                 totalChangeValue = txidOnlyValue
             }
@@ -6502,9 +6532,10 @@ final class WalletDatabase {
             let changeOutputs = allNotes.filter {
                 $0.txid == spentTxid || $0.txid == reversedTxid
             }
-            var totalChangeValue = changeOutputs.reduce(0) { $0 + $1.value }
+            // FIX #1515: Overflow-safe reduction
+            var totalChangeValue = changeOutputs.reduce(UInt64(0)) { $0 &+ $1.value }
             if totalChangeValue > txInfo.inputValue {
-                totalChangeValue = allNotes.filter { $0.txid == spentTxid }.reduce(0) { $0 + $1.value }
+                totalChangeValue = allNotes.filter { $0.txid == spentTxid }.reduce(UInt64(0)) { $0 &+ $1.value }
             }
             let totalBalanceImpact = txInfo.inputValue > totalChangeValue ? txInfo.inputValue - totalChangeValue : fee
             let amountToRecipient = totalBalanceImpact > fee ? totalBalanceImpact - fee : 0
