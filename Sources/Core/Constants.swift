@@ -87,6 +87,12 @@ enum ZipherXConstants {
     /// Buttercup consensus branch ID
     static let buttercupBranchId: UInt32 = 0x930b540d
 
+    // MARK: - Protocol Limits
+
+    /// Maximum possible ZCL supply in zatoshis (21M ZCL × 10^8)
+    /// Zclassic inherits Zcash's 21M coin cap — no single note can exceed this
+    static let maxSupplyZatoshis: UInt64 = 2_100_000_000_000_000
+
     // MARK: - Transaction
 
     /// Default transaction fee in zatoshis (0.0001 ZCL)

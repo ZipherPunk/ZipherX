@@ -6093,6 +6093,11 @@ final class WalletDatabase {
         }
         var allNotes: [NoteData] = []
 
+        // FIX #1515: Precompute validation bounds ONCE (not per-row)
+        let maxReasonableValue = ZipherXConstants.maxSupplyZatoshis
+        let currentChainHeight = (try? HeaderStore.shared.getLatestHeight()) ?? ZipherXConstants.effectiveTreeHeight
+        let maxReasonableHeight = max(currentChainHeight, ZipherXConstants.effectiveTreeHeight) + 1_000
+
         while sqlite3_step(stmt) == SQLITE_ROW {
             notesFound += 1
             let diversifierPtr = sqlite3_column_blob(stmt, 0)
@@ -6113,8 +6118,6 @@ final class WalletDatabase {
             // FIX #1430: Read from encrypted shadow columns (indices 8, 9, 10)
             // VUL-S-004 zeroes plaintext columns — encrypted shadows have real values
             // FIX #1515: Validate decrypted values — corrupted enc data causes arithmetic overflow crash
-            let maxReasonableValue: UInt64 = 2_100_000_000_000_000 // 21M ZCL in zatoshis (total supply cap)
-            let maxReasonableHeight: UInt64 = 10_000_000 // Well beyond any current blockchain height
             var value = plaintextValue
             if sqlite3_column_type(stmt, 8) != SQLITE_NULL {
                 let encPtr = sqlite3_column_blob(stmt, 8)
