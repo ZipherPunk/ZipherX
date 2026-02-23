@@ -12,6 +12,15 @@ class ExplorerViewModel: ObservableObject {
 
     init() {}
 
+    /// FIX #1537: Get URLSession routed through Tor when available (privacy protection).
+    /// Block explorer queries to zelcore.io reveal which blocks/TXs the user is interested in.
+    private func getSession() async -> URLSession {
+        if await TorManager.shared.mode == .enabled && await TorManager.shared.connectionState.isConnected {
+            return await TorManager.shared.getTorURLSession(isolate: true)
+        }
+        return URLSession.shared
+    }
+
     /// Perform search based on query
     func search() {
         guard !searchQuery.isEmpty else { return }
@@ -263,7 +272,7 @@ class ExplorerViewModel: ObservableObject {
     private func fetchBlockFromInsight(height: UInt64) async throws -> BlockInfo {
         // Get block hash first
         let hashURL = URL(string: "https://explorer.zcl.zelcore.io/api/block-index/\(height)")!
-        let (hashData, _) = try await URLSession.shared.data(from: hashURL)
+        let (hashData, _) = try await getSession().data(from: hashURL)
         guard let hashJson = try JSONSerialization.jsonObject(with: hashData) as? [String: Any],
               let blockHash = hashJson["blockHash"] as? String else {
             throw ExplorerError.invalidResponse
@@ -274,7 +283,7 @@ class ExplorerViewModel: ObservableObject {
 
     private func fetchBlockByHashFromInsight(hash: String) async throws -> BlockInfo {
         let url = URL(string: "https://explorer.zcl.zelcore.io/api/block/\(hash)")!
-        let (data, _) = try await URLSession.shared.data(from: url)
+        let (data, _) = try await getSession().data(from: url)
 
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw ExplorerError.invalidResponse
@@ -301,7 +310,7 @@ class ExplorerViewModel: ObservableObject {
 
     private func fetchTransactionFromInsight(txid: String) async throws -> TransactionInfo {
         let url = URL(string: "https://explorer.zcl.zelcore.io/api/tx/\(txid)")!
-        let (data, _) = try await URLSession.shared.data(from: url)
+        let (data, _) = try await getSession().data(from: url)
 
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw ExplorerError.invalidResponse
@@ -356,7 +365,7 @@ class ExplorerViewModel: ObservableObject {
 
     private func fetchAddressFromInsight(address: String) async throws -> ExplorerAddressInfo {
         let url = URL(string: "https://explorer.zcl.zelcore.io/api/addr/\(address)")!
-        let (data, _) = try await URLSession.shared.data(from: url)
+        let (data, _) = try await getSession().data(from: url)
 
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw ExplorerError.invalidResponse

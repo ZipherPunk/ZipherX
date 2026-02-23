@@ -769,7 +769,14 @@ public class BootstrapManager: ObservableObject {
 
         let (data, response): (Data, URLResponse)
         do {
-            (data, response) = try await URLSession.shared.data(for: request)
+            // FIX #1537: Route through Tor when available (GitHub API leak)
+            let ghSession: URLSession
+            if await TorManager.shared.mode == .enabled && await TorManager.shared.connectionState.isConnected {
+                ghSession = await TorManager.shared.getTorURLSession(isolate: true)
+            } else {
+                ghSession = URLSession.shared
+            }
+            (data, response) = try await ghSession.data(for: request)
         } catch {
             print("❌ GitHub API request failed: \(error.localizedDescription)")
             throw error
@@ -888,7 +895,14 @@ public class BootstrapManager: ObservableObject {
             return [:]
         }
 
-        let (data, _) = try await URLSession.shared.data(from: URL(string: checksumAsset.browser_download_url)!)
+        // FIX #1537: Route through Tor when available
+        let csSession: URLSession
+        if await TorManager.shared.mode == .enabled && await TorManager.shared.connectionState.isConnected {
+            csSession = await TorManager.shared.getTorURLSession(isolate: true)
+        } else {
+            csSession = URLSession.shared
+        }
+        let (data, _) = try await csSession.data(from: URL(string: checksumAsset.browser_download_url)!)
         guard let content = String(data: data, encoding: .utf8) else {
             return [:]
         }
@@ -1933,7 +1947,14 @@ public class BootstrapManager: ObservableObject {
                 continue
             }
 
-            let (data, _) = try await URLSession.shared.data(from: downloadURL)
+            // FIX #1537: Route through Tor when available
+            let dlSession: URLSession
+            if await TorManager.shared.mode == .enabled && await TorManager.shared.connectionState.isConnected {
+                dlSession = await TorManager.shared.getTorURLSession(isolate: true)
+            } else {
+                dlSession = URLSession.shared
+            }
+            let (data, _) = try await dlSession.data(from: downloadURL)
 
             // Write file
             try data.write(to: filePath)

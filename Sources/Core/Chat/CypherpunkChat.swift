@@ -36,6 +36,78 @@ enum ChatMessageType: String, Codable {
     case nickname = "nickname"      // Nickname announcement
     case avatar = "avatar"          // FIX #1441: Profile picture (base64 JPEG in content)
     case goodbye = "goodbye"        // User going offline
+    case file = "file"              // FIX #1535: File transfer metadata (shown as file bubble)
+    case fileChunk = "file_chunk"   // FIX #1535: File data chunk (NOT saved to DB)
+    case callOffer = "call_offer"   // FIX #1540: Voice call offer (ring UI, 30s timeout)
+    case callAnswer = "call_answer" // FIX #1540: Voice call accepted
+    case callReject = "call_reject" // FIX #1540: Voice call declined
+    case callEnd = "call_end"       // FIX #1540: Voice call ended (hang up)
+    case callAudio = "call_audio"   // FIX #1540: Audio frame (20ms Opus packet, NOT saved to DB)
+}
+
+// MARK: - FIX #1535: File Transfer Structs
+
+/// Metadata for a file being transferred (stored in .file message content as JSON)
+struct FileMetadata: Codable {
+    let fileId: String        // UUID linking chunks to this file
+    let fileName: String      // Original filename
+    let fileSize: UInt64      // File size in bytes
+    let mimeType: String      // MIME type (e.g., "application/pdf", "image/jpeg")
+    let totalChunks: Int      // How many .fileChunk messages to expect
+}
+
+/// Data for a single file chunk (stored in .fileChunk message content as JSON)
+struct FileChunkData: Codable {
+    let fileId: String        // UUID linking this chunk to the .file message
+    let index: Int            // Chunk index (0-based)
+    let data: String          // Base64-encoded chunk data
+}
+
+/// FIX #1535: Maximum file size for chat file transfers (2 MB)
+let CHAT_MAX_FILE_SIZE: UInt64 = 2 * 1024 * 1024
+
+/// FIX #1535: Chunk size for file transfers (32 KB raw = ~44 KB base64, fits in 64 KB message)
+let CHAT_FILE_CHUNK_SIZE: Int = 32 * 1024
+
+// MARK: - FIX #1540: Voice Call Structs
+
+/// Call offer payload — sent to initiate a voice call
+struct CallOffer: Codable {
+    let callId: String        // UUID for this call session
+    let codec: String         // "opus" or "aac-eld"
+    let sampleRate: Int       // 16000 (16kHz) or 24000 (24kHz)
+    let channels: Int         // 1 (mono)
+    let frameDurationMs: Int  // 20 (ms per audio frame)
+    let bitrate: Int          // 16000 (16kbps VBR target)
+}
+
+/// Call answer payload — sent to accept the call
+struct CallAnswer: Codable {
+    let callId: String
+    let codec: String         // Echo back accepted codec
+}
+
+/// Call reject/end payload
+struct CallControl: Codable {
+    let callId: String
+    let reason: String?       // "busy", "declined", "timeout", "network_error"
+}
+
+/// Audio frame payload — 50 per second per direction (~7.5 KB/s)
+struct CallAudioFrame: Codable {
+    let callId: String
+    let seq: UInt32           // Sequence number for ordering/loss detection
+    let ts: UInt64            // Timestamp in milliseconds (for jitter buffer)
+    let opus: String          // Base64-encoded Opus frame (~40-80 bytes raw)
+}
+
+/// FIX #1540: Voice call state
+enum VoiceCallState: Equatable {
+    case idle
+    case offering(callId: String)     // Outgoing call ringing
+    case ringing(callId: String)      // Incoming call ringing
+    case active(callId: String)       // Call in progress
+    case ending                       // Hanging up
 }
 
 // MARK: - Message Status
@@ -105,6 +177,9 @@ struct ChatMessage: Codable, Identifiable {
     var status: MessageStatus           // Delivery/read status (mutable for updates)
     var deliveredAt: Date?              // When message was delivered
     var readAt: Date?                   // When message was read
+    let fileName: String?               // FIX #1535: File name for .file messages
+    let fileSize: UInt64?               // FIX #1535: File size in bytes for .file messages
+    let fileId: String?                 // FIX #1535: UUID linking file chunks to metadata
 
     init(
         type: ChatMessageType,
@@ -116,7 +191,10 @@ struct ChatMessage: Codable, Identifiable {
         paymentAmount: UInt64? = nil,
         ttl: TimeInterval? = nil,
         replyTo: String? = nil,
-        status: MessageStatus = .sending
+        status: MessageStatus = .sending,
+        fileName: String? = nil,
+        fileSize: UInt64? = nil,
+        fileId: String? = nil
     ) {
         self.id = UUID().uuidString
         self.type = type
@@ -132,6 +210,9 @@ struct ChatMessage: Codable, Identifiable {
         self.status = status
         self.deliveredAt = nil
         self.readAt = nil
+        self.fileName = fileName
+        self.fileSize = fileSize
+        self.fileId = fileId
     }
 
     /// FIX #1498: Restore initializer for loading messages from database.
@@ -147,7 +228,10 @@ struct ChatMessage: Codable, Identifiable {
         timestamp: Date,
         content: String,
         replyTo: String? = nil,
-        status: MessageStatus = .sending
+        status: MessageStatus = .sending,
+        fileName: String? = nil,
+        fileSize: UInt64? = nil,
+        fileId: String? = nil
     ) {
         self.id = id
         self.type = type
@@ -163,6 +247,9 @@ struct ChatMessage: Codable, Identifiable {
         self.status = status
         self.deliveredAt = nil
         self.readAt = nil
+        self.fileName = fileName
+        self.fileSize = fileSize
+        self.fileId = fileId
     }
 
     /// Check if message has expired (TTL)

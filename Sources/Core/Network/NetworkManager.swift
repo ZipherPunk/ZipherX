@@ -2410,7 +2410,16 @@ public final class NetworkManager: ObservableObject {
         }
 
         do {
-            let (data, response) = try await URLSession.shared.data(from: url)
+            // FIX #1537: Route through Tor when enabled to prevent IP leak to GitHub.
+            // GitHub sees your real IP + learns you use ZipherX from the URL path.
+            let session: URLSession
+            if await TorManager.shared.mode == .enabled && await TorManager.shared.connectionState.isConnected {
+                session = await TorManager.shared.getTorURLSession(isolate: true)
+                print("🔒 FIX #1537: Peer list download routed through Tor")
+            } else {
+                session = URLSession.shared
+            }
+            let (data, response) = try await session.data(from: url)
             guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
                 print("⚠️ GitHub peers fetch failed: HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)")
                 return 0
@@ -2704,9 +2713,14 @@ public final class NetworkManager: ObservableObject {
 
         // Connect to peers in batches until we reach target
         var connectedCount = 0
-        // FIX #1115: Batch size = 10 for maximum parallelism
-        // Try 10 peers at once - as soon as 3 connect, we exit immediately
+        // FIX #1115: Batch size for maximum parallelism
+        // FIX #1539: iOS reduced from 10 → 4 — SOCKS5 semaphore is 2, so 10 concurrent
+        // just queues 8 behind semaphore causing cascade timeouts. 4 keeps queue manageable.
+        #if os(iOS)
+        let maxConcurrent = 4
+        #else
         let maxConcurrent = 10
+        #endif
         var peerIndex = 0
         var attemptedThisBatch = Set<String>()
 
@@ -3170,6 +3184,14 @@ public final class NetworkManager: ObservableObject {
         consecutiveSOCKS5Failures = 0
         consecutiveZeroPeerRecoveries = 0  // FIX #1419
 
+        // 5b. FIX #1539: Clear ALL parked peers after iOS background.
+        // iOS background killed sockets, NOT peer failures. Parked peers from timeout-during-
+        // background are perfectly healthy nodes — keeping them parked wastes reconnection time.
+        // FIX #352 only clears hardcoded seeds. This clears ALL to maximize candidate pool.
+        PeerManager.shared.clearAllParkedPeers()
+        // Also reset recovery backoff (fresh start, not a real failure pattern)
+        recoveryBackoffSeconds = 30
+
         // 6. Update UI to show disconnected state
         await MainActor.run {
             self.connectedPeers = 0
@@ -3178,6 +3200,19 @@ public final class NetworkManager: ObservableObject {
 
         // 7. Reconnect peers
         let torMode = await TorManager.shared.mode
+
+        // FIX #1538: CRITICAL — Verify Tor SOCKS5 proxy is actually alive before reconnecting.
+        // iOS background kills TCP sockets but Arti may report `connectionState = .connected` (stale cache).
+        // `ensureRunningOnForeground()` does a real TCP probe to the SOCKS5 port:
+        //   - Dead proxy → full Tor restart (stopArti + startArti)
+        //   - Alive but stale (>30s background) → requestNewIdentity() for fresh circuits
+        // Without this: reconnectAfterBackground() trusts stale state → ALL SOCKS5 connections timeout
+        // → 0 peers permanently. z12.log/z13.log evidence: every peer times out at 11s after background.
+        if torMode == .enabled {
+            await TorManager.shared.ensureRunningOnForeground()
+            // Give Tor a moment to stabilize after potential restart
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
 
         #if os(iOS)
         // FIX #1445: On iOS, connect directly first for instant recovery.
@@ -3188,6 +3223,12 @@ public final class NetworkManager: ObservableObject {
         if torMode == .enabled && !strictPrivacy {
             print("⚡ FIX #1445: iOS foreground recovery — connecting directly first, Tor restarts in background")
             debugLog(.network, "⚡ FIX #1445: Direct-first iOS recovery (Tor restarts in background)")
+
+            // FIX #1537: Block TX broadcast during clearnet window to prevent IP leak.
+            // During the ~30s bypass, peers see our real IP. Broadcasting a TX during this
+            // window would link our IP to the transaction — defeating Tor's purpose.
+            isBroadcasting = true
+            print("🔒 FIX #1537: TX broadcast BLOCKED during Tor bypass window (privacy protection)")
 
             // Temporarily bypass Tor for fast peer recovery
             await TorManager.shared.temporarilyBypassTor()
@@ -3215,7 +3256,10 @@ public final class NetworkManager: ObservableObject {
                 guard let self = self else { return }
                 await TorManager.shared.restoreAfterSingleTxBypass()
                 self.sybilBypassActive = false
+                // FIX #1537: Unblock TX broadcast now that Tor is restored
+                self.isBroadcasting = false
                 print("🧅 FIX #1445: Tor restored after iOS foreground recovery")
+                print("🔒 FIX #1537: TX broadcast UNBLOCKED — Tor privacy restored")
             }
         } else if torMode == .enabled && strictPrivacy {
             // FIX #1445: Strict privacy mode — wait for Tor (existing behavior)
@@ -5244,7 +5288,14 @@ public final class NetworkManager: ObservableObject {
         }
 
         do {
-            let (data, response) = try await URLSession.shared.data(from: url)
+            // FIX #1537: Route price fetches through Tor when available
+            let priceSession: URLSession
+            if await TorManager.shared.mode == .enabled && await TorManager.shared.connectionState.isConnected {
+                priceSession = await TorManager.shared.getTorURLSession(isolate: true)
+            } else {
+                priceSession = URLSession.shared
+            }
+            let (data, response) = try await priceSession.data(from: url)
             if let httpResponse = response as? HTTPURLResponse {
                 print("💰 CoinGecko HTTP status: \(httpResponse.statusCode)")
             }
@@ -5272,7 +5323,14 @@ public final class NetworkManager: ObservableObject {
             request.setValue("application/json", forHTTPHeaderField: "Accept")
             request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
 
-            let (data, response) = try await URLSession.shared.data(for: request)
+            // FIX #1537: Route price fetches through Tor when available
+            let cmcSession: URLSession
+            if await TorManager.shared.mode == .enabled && await TorManager.shared.connectionState.isConnected {
+                cmcSession = await TorManager.shared.getTorURLSession(isolate: true)
+            } else {
+                cmcSession = URLSession.shared
+            }
+            let (data, response) = try await cmcSession.data(for: request)
             if let httpResponse = response as? HTTPURLResponse {
                 print("💰 CoinMarketCap HTTP status: \(httpResponse.statusCode)")
                 if httpResponse.statusCode != 200 {
@@ -5530,7 +5588,14 @@ public final class NetworkManager: ObservableObject {
         // Don't overlap with active recovery
         guard !isRecoveringPeers else { return }
 
-        let needed = MIN_PEERS - currentReady
+        // FIX #1539: iOS growth target should match keepalive threshold, not MIN_PEERS (8).
+        // MIN_PEERS - currentReady = 8 - 2 = 6 needed → wastes 6 SOCKS5 connections when target is 4.
+        #if os(iOS)
+        let targetForGrowth = CONSENSUS_THRESHOLD + 1  // 4 on iOS — matches keepalive threshold
+        #else
+        let targetForGrowth = MIN_PEERS  // 8 on macOS
+        #endif
+        let needed = targetForGrowth - currentReady
         guard needed > 0 else { return }
 
         // Collect candidates: known addresses not already connected, not banned, not parked, not on cooldown
@@ -8761,12 +8826,28 @@ public final class NetworkManager: ObservableObject {
 
             // Check if Tor SOCKS failures are the cause
             if consecutiveSOCKS5Failures >= SOCKS5_FAILURE_THRESHOLD && !sybilBypassActive {
-                print("🚨 FIX #1428: \(consecutiveSOCKS5Failures) SOCKS5 failures - bypassing Tor temporarily")
-                sybilBypassActive = true
-                _torIsAvailable = false
-                // FIX #1428: MUST set TorManager bypass — Peer.connect() checks TorManager.isTorBypassed
-                Task {
-                    await TorManager.shared.temporarilyBypassTor()
+                // FIX #1537: In strict privacy mode, NEVER bypass Tor — prefer no connection
+                // over clearnet. An attacker who disrupts 5 Tor connections should NOT cause
+                // automatic deanonymization.
+                let strictPrivacy = await TorManager.shared.strictPrivacyMode
+                if strictPrivacy {
+                    print("🔒 FIX #1537: \(consecutiveSOCKS5Failures) SOCKS5 failures but strict privacy — Tor bypass REFUSED")
+                    print("🔒 FIX #1537: Preferring no connection over clearnet exposure. Restarting Tor...")
+                    // Instead of bypassing, try restarting Tor
+                    Task {
+                        await TorManager.shared.stop()
+                        try? await Task.sleep(nanoseconds: 2_000_000_000)
+                        await TorManager.shared.start()
+                    }
+                    consecutiveSOCKS5Failures = 0  // Reset counter for fresh Tor start
+                } else {
+                    print("🚨 FIX #1428: \(consecutiveSOCKS5Failures) SOCKS5 failures - bypassing Tor temporarily")
+                    sybilBypassActive = true
+                    _torIsAvailable = false
+                    // FIX #1428: MUST set TorManager bypass — Peer.connect() checks TorManager.isTorBypassed
+                    Task {
+                        await TorManager.shared.temporarilyBypassTor()
+                    }
                 }
             }
 
@@ -8819,8 +8900,14 @@ public final class NetworkManager: ObservableObject {
         lastRecoveryAttempt = Date()
         defer {
             isRecoveringPeers = false
-            // Increase backoff: 30 → 60 → 120 → 240 → max 300s (5min)
+            // FIX #1539: iOS cellular flakiness causes transient failures, not permanent.
+            // Old backoff: 30→60→120→240→300s was too aggressive — 120s+ with 0 peers is unacceptable.
+            // iOS: gentler ramp (×1.5) capped at 60s. macOS: existing behavior (×2, cap 300s).
+            #if os(iOS)
+            recoveryBackoffSeconds = min(60, recoveryBackoffSeconds * 1.5)
+            #else
             recoveryBackoffSeconds = min(300, recoveryBackoffSeconds * 2)
+            #endif
         }
 
         print("🔄 FIX #227: Attempting peer recovery...")
@@ -9543,8 +9630,10 @@ public final class NetworkManager: ObservableObject {
         // FIX #1533: macOS uses MIN_PEERS (8) — has bandwidth for more peers, improves discovery.
         // Previous FIX #1501 applied CONSENSUS_THRESHOLD to BOTH platforms → macOS stuck at 3 forever
         // → discovered peers from getaddr never tried → new nodes never found.
+        // FIX #1539: iOS raised from 3 → 4 — 3 is too fragile (1 drop = can't reach consensus).
+        // z13.log: 4 peers connected, 1 dropped → stuck at 2 peers → no consensus possible.
         #if os(iOS)
-        let peerGrowthThreshold = CONSENSUS_THRESHOLD
+        let peerGrowthThreshold = CONSENSUS_THRESHOLD + 1  // 4 — buffer for 1 peer drop
         #else
         let peerGrowthThreshold = MIN_PEERS
         #endif

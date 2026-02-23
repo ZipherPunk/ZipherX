@@ -57,7 +57,16 @@ class AppUpdateChecker: ObservableObject {
                 request.setValue("application/vnd.github.v3+json", forHTTPHeaderField: "Accept")
                 request.timeoutInterval = 15
 
-                let (data, response) = try await URLSession.shared.data(for: request)
+                // FIX #1537: Route through Tor when enabled to prevent IP leak to GitHub.
+                // GitHub sees ZipherX-specific URL path on every launch — ISP can correlate.
+                let session: URLSession
+                if await TorManager.shared.mode == .enabled && await TorManager.shared.connectionState.isConnected {
+                    session = await TorManager.shared.getTorURLSession(isolate: true)
+                    print("🔒 FIX #1537: App update check routed through Tor")
+                } else {
+                    session = URLSession.shared
+                }
+                let (data, response) = try await session.data(for: request)
 
                 guard let httpResponse = response as? HTTPURLResponse else {
                     await MainActor.run {

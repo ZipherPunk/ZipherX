@@ -1556,6 +1556,63 @@ final class ChatManager: ObservableObject {
         case .goodbye:
             // Peer is disconnecting
             updateContactOnlineStatus(message.fromOnion, isOnline: false)
+
+        case .file:
+            // FIX #1535: Incoming file transfer metadata
+            handleFileMessage(message)
+
+            // Update unread count
+            if selectedConversation != message.fromOnion {
+                incrementUnreadCount(for: message.fromOnion)
+                let senderName = message.nickname ?? contacts.first(where: { $0.onionAddress == message.fromOnion })?.displayName ?? String(message.fromOnion.prefix(8)) + "..."
+                NotificationManager.shared.notifyChatMessage(from: senderName, type: "file", preview: "Sent a file")
+            }
+
+        case .fileChunk:
+            // FIX #1535: Incoming file chunk — buffer, do NOT save to DB
+            handleFileChunk(message)
+
+        // FIX #1540: Voice call signaling — NOT saved to DB, routed to VoiceCallManager
+        case .callOffer:
+            if let data = message.content.data(using: .utf8),
+               let offer = try? JSONDecoder().decode(CallOffer.self, from: data) {
+                Task { @MainActor in
+                    VoiceCallManager.shared.handleCallOffer(offer, from: message.fromOnion)
+                }
+            }
+
+        case .callAnswer:
+            if let data = message.content.data(using: .utf8),
+               let answer = try? JSONDecoder().decode(CallAnswer.self, from: data) {
+                Task { @MainActor in
+                    await VoiceCallManager.shared.handleCallAnswer(answer)
+                }
+            }
+
+        case .callReject:
+            if let data = message.content.data(using: .utf8),
+               let control = try? JSONDecoder().decode(CallControl.self, from: data) {
+                Task { @MainActor in
+                    await VoiceCallManager.shared.handleCallReject(control)
+                }
+            }
+
+        case .callEnd:
+            if let data = message.content.data(using: .utf8),
+               let control = try? JSONDecoder().decode(CallControl.self, from: data) {
+                Task { @MainActor in
+                    await VoiceCallManager.shared.handleCallEnd(control)
+                }
+            }
+
+        case .callAudio:
+            // Audio frames — highest priority, don't block
+            if let data = message.content.data(using: .utf8),
+               let frame = try? JSONDecoder().decode(CallAudioFrame.self, from: data) {
+                Task { @MainActor in
+                    VoiceCallManager.shared.handleAudioFrame(frame)
+                }
+            }
         }
     }
 
@@ -1696,6 +1753,344 @@ final class ChatManager: ObservableObject {
         // Use first 16 chars of onion address as filename (safe, unique)
         let safeName = String(onionAddress.prefix(16)).replacingOccurrences(of: ".", with: "_")
         return chatFilesDirectory.appendingPathComponent("avatars/\(safeName).jpg")
+    }
+
+    // MARK: - FIX #1540: Voice Call Signal Sending
+
+    /// Send a call signaling message (offer, answer, reject, end, audio) to a peer.
+    /// Call signals are ephemeral — NOT saved to chat history DB.
+    func sendCallSignal(type: ChatMessageType, content: String, to onionAddress: String) async {
+        guard let contact = contacts.first(where: { $0.onionAddress == onionAddress }) else {
+            print("📞 FIX #1540: Cannot send call signal — contact not found for \(onionAddress.prefix(16))...")
+            return
+        }
+
+        let message = ChatMessage(
+            id: UUID().uuidString,
+            fromOnion: myOnionAddress ?? "",
+            toOnion: onionAddress,
+            type: type,
+            content: content,
+            timestamp: Date(),
+            status: .sending
+        )
+
+        do {
+            try await sendMessage(message, to: contact)
+        } catch {
+            print("📞 FIX #1540: Failed to send call signal (\(type.rawValue)): \(error)")
+            // If audio frame fails, don't crash — just skip
+            if type != .callAudio {
+                // For signaling messages (offer/answer/reject/end), end the call on failure
+                Task { @MainActor in
+                    await VoiceCallManager.shared.endCall(reason: "network_error")
+                }
+            }
+        }
+    }
+
+    // MARK: - FIX #1535: File Transfer
+
+    /// State for an active file transfer (sending or receiving)
+    struct FileTransferState {
+        let fileId: String
+        let fileName: String
+        let fileSize: UInt64
+        let totalChunks: Int
+        var receivedChunks: Int = 0
+        var localPath: URL?
+        var isSending: Bool
+        var progress: Double { totalChunks > 0 ? Double(receivedChunks) / Double(totalChunks) : 0 }
+    }
+
+    /// Active file transfers (both sending and receiving)
+    @Published var activeFileTransfers: [String: FileTransferState] = [:]
+
+    /// Incoming file chunk buffers (fileId → [chunkIndex: rawData])
+    private var incomingFileBuffers: [String: [Int: Data]] = [:]
+
+    /// Maximum concurrent file transfers
+    private let maxConcurrentTransfers = 3
+
+    /// Timeout for incomplete transfers (60 seconds)
+    private let fileTransferTimeout: TimeInterval = 60
+
+    /// Send a file to a contact
+    func sendFile(url: URL, to contact: ChatContact) async throws {
+        // Read file data
+        let fileData = try Data(contentsOf: url)
+        let fileName = url.lastPathComponent
+        let fileSize = UInt64(fileData.count)
+
+        // Validate size
+        guard fileSize <= CHAT_MAX_FILE_SIZE else {
+            throw ChatError.invalidMessage("File too large (\(fileSize / 1024 / 1024) MB). Maximum is 2 MB.")
+        }
+
+        // Check concurrent transfer limit
+        let activeCount = activeFileTransfers.values.filter { $0.isSending }.count
+        guard activeCount < maxConcurrentTransfers else {
+            throw ChatError.invalidMessage("Too many active file transfers. Please wait.")
+        }
+
+        // Detect MIME type
+        let mimeType = Self.mimeType(for: url)
+
+        // Calculate chunks
+        let totalChunks = (fileData.count + CHAT_FILE_CHUNK_SIZE - 1) / CHAT_FILE_CHUNK_SIZE
+        let fileId = UUID().uuidString
+
+        print("📎 FIX #1535: Sending file '\(fileName)' (\(fileSize) bytes, \(totalChunks) chunks) to \(contact.displayName)")
+
+        // Create metadata
+        let metadata = FileMetadata(
+            fileId: fileId,
+            fileName: fileName,
+            fileSize: fileSize,
+            mimeType: mimeType,
+            totalChunks: totalChunks
+        )
+
+        // Encode metadata as JSON for content field
+        let metadataJSON = String(data: try JSONEncoder().encode(metadata), encoding: .utf8) ?? ""
+
+        // Create file message (visible in chat)
+        var fileMessage = ChatMessage(
+            type: .file,
+            fromOnion: ourOnionAddress ?? "",
+            toOnion: contact.onionAddress,
+            content: metadataJSON,
+            nickname: ourNickname.isEmpty ? nil : ourNickname,
+            status: .sending,
+            fileName: fileName,
+            fileSize: fileSize,
+            fileId: fileId
+        )
+
+        // Add to conversation and track transfer
+        addMessageToConversation(fileMessage)
+        database.saveMessage(fileMessage, ourOnionAddress: ourOnionAddress)
+        await MainActor.run {
+            activeFileTransfers[fileId] = FileTransferState(
+                fileId: fileId, fileName: fileName, fileSize: fileSize,
+                totalChunks: totalChunks, isSending: true
+            )
+        }
+
+        // Send metadata message first
+        try await sendMessage(fileMessage, to: contact)
+
+        // Send chunks
+        for chunkIndex in 0..<totalChunks {
+            let start = chunkIndex * CHAT_FILE_CHUNK_SIZE
+            let end = min(start + CHAT_FILE_CHUNK_SIZE, fileData.count)
+            let chunkData = fileData[start..<end]
+            let base64Chunk = chunkData.base64EncodedString()
+
+            let chunkPayload = FileChunkData(
+                fileId: fileId,
+                index: chunkIndex,
+                data: base64Chunk
+            )
+            let chunkJSON = String(data: try JSONEncoder().encode(chunkPayload), encoding: .utf8) ?? ""
+
+            let chunkMessage = ChatMessage(
+                type: .fileChunk,
+                fromOnion: ourOnionAddress ?? "",
+                toOnion: contact.onionAddress,
+                content: chunkJSON,
+                fileId: fileId
+            )
+
+            try await sendMessage(chunkMessage, to: contact)
+
+            // Update progress
+            await MainActor.run {
+                activeFileTransfers[fileId]?.receivedChunks = chunkIndex + 1
+            }
+        }
+
+        // All chunks sent
+        fileMessage.markSent()
+        updateMessageInConversation(fileMessage)
+        database.saveMessage(fileMessage, ourOnionAddress: ourOnionAddress)
+
+        await MainActor.run {
+            activeFileTransfers.removeValue(forKey: fileId)
+        }
+
+        print("📎 FIX #1535: File '\(fileName)' sent successfully (\(totalChunks) chunks)")
+    }
+
+    /// Handle incoming .file metadata message
+    private func handleFileMessage(_ message: ChatMessage) {
+        // Parse metadata from content
+        guard let jsonData = message.content.data(using: .utf8),
+              let metadata = try? JSONDecoder().decode(FileMetadata.self, from: jsonData) else {
+            print("📎 FIX #1535: Failed to parse file metadata")
+            return
+        }
+
+        // Check file size limit
+        guard metadata.fileSize <= CHAT_MAX_FILE_SIZE else {
+            print("📎 FIX #1535: Rejected file '\(metadata.fileName)' — too large (\(metadata.fileSize) bytes)")
+            return
+        }
+
+        // Check disk space
+        let availableSpace = BundledShieldedOutputs.getAvailableDiskSpace()
+        guard availableSpace > Int64(metadata.fileSize) + ZipherXConstants.criticalDiskSpaceBytes else {
+            print("📎 FIX #1535: Rejected file '\(metadata.fileName)' — insufficient disk space")
+            return
+        }
+
+        // Check concurrent transfers
+        let receiving = activeFileTransfers.values.filter { !$0.isSending }.count
+        guard receiving < maxConcurrentTransfers else {
+            print("📎 FIX #1535: Rejected file — too many concurrent transfers")
+            return
+        }
+
+        print("📎 FIX #1535: Receiving file '\(metadata.fileName)' (\(metadata.fileSize) bytes, \(metadata.totalChunks) chunks)")
+
+        // Initialize buffer
+        incomingFileBuffers[metadata.fileId] = [:]
+
+        // Track transfer
+        DispatchQueue.main.async {
+            self.activeFileTransfers[metadata.fileId] = FileTransferState(
+                fileId: metadata.fileId, fileName: metadata.fileName,
+                fileSize: metadata.fileSize, totalChunks: metadata.totalChunks,
+                isSending: false
+            )
+        }
+
+        // Save as visible message in conversation
+        addMessageToConversation(message)
+        database.saveMessage(message, ourOnionAddress: ourOnionAddress)
+
+        // Start timeout timer
+        let fileId = metadata.fileId
+        Task {
+            try? await Task.sleep(nanoseconds: UInt64(fileTransferTimeout * 1_000_000_000))
+            if incomingFileBuffers[fileId] != nil {
+                print("📎 FIX #1535: File transfer timeout for '\(metadata.fileName)'")
+                incomingFileBuffers.removeValue(forKey: fileId)
+                await MainActor.run {
+                    activeFileTransfers.removeValue(forKey: fileId)
+                }
+            }
+        }
+    }
+
+    /// Handle incoming .fileChunk data message
+    private func handleFileChunk(_ message: ChatMessage) {
+        guard let jsonData = message.content.data(using: .utf8),
+              let chunk = try? JSONDecoder().decode(FileChunkData.self, from: jsonData) else {
+            print("📎 FIX #1535: Failed to parse file chunk")
+            return
+        }
+
+        guard var buffer = incomingFileBuffers[chunk.fileId] else {
+            print("📎 FIX #1535: Received chunk for unknown file \(chunk.fileId.prefix(8))")
+            return
+        }
+
+        // Decode base64 data
+        guard let rawData = Data(base64Encoded: chunk.data) else {
+            print("📎 FIX #1535: Failed to decode base64 chunk data")
+            return
+        }
+
+        // Store chunk (idempotent — overwrite if duplicate)
+        buffer[chunk.index] = rawData
+        incomingFileBuffers[chunk.fileId] = buffer
+
+        // Update progress
+        let receivedCount = buffer.count
+        DispatchQueue.main.async {
+            self.activeFileTransfers[chunk.fileId]?.receivedChunks = receivedCount
+        }
+
+        // Check if all chunks received
+        if let transfer = activeFileTransfers[chunk.fileId], receivedCount >= transfer.totalChunks {
+            assembleFile(fileId: chunk.fileId)
+        }
+    }
+
+    /// Assemble received chunks into a complete file and save to disk
+    private func assembleFile(fileId: String) {
+        guard let transfer = activeFileTransfers[fileId],
+              let chunks = incomingFileBuffers[fileId] else { return }
+
+        // Assemble in order
+        var assembledData = Data()
+        for i in 0..<transfer.totalChunks {
+            guard let chunk = chunks[i] else {
+                print("📎 FIX #1535: Missing chunk \(i) for file '\(transfer.fileName)'")
+                return
+            }
+            assembledData.append(chunk)
+        }
+
+        // Verify size
+        guard UInt64(assembledData.count) == transfer.fileSize else {
+            print("📎 FIX #1535: Size mismatch: expected \(transfer.fileSize), got \(assembledData.count)")
+            return
+        }
+
+        // Save to ChatFiles directory
+        let fileURL = chatFilesDirectory
+            .appendingPathComponent("files")
+            .appendingPathComponent("\(fileId)_\(transfer.fileName)")
+
+        do {
+            try FileManager.default.createDirectory(
+                at: fileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try assembledData.write(to: fileURL)
+            print("📎 FIX #1535: File '\(transfer.fileName)' saved to \(fileURL.lastPathComponent)")
+        } catch {
+            print("📎 FIX #1535: Failed to save file: \(error)")
+            return
+        }
+
+        // Clean up buffer
+        incomingFileBuffers.removeValue(forKey: fileId)
+
+        // Update transfer state with local path
+        DispatchQueue.main.async {
+            self.activeFileTransfers[fileId]?.localPath = fileURL
+            self.activeFileTransfers[fileId]?.receivedChunks = transfer.totalChunks
+
+            // Post notification for UI update
+            NotificationCenter.default.post(name: Notification.Name("fileTransferCompleted"), object: nil, userInfo: ["fileId": fileId, "localPath": fileURL])
+        }
+    }
+
+    /// Get saved file URL for a file message
+    func getSavedFileURL(for fileId: String, fileName: String) -> URL? {
+        let fileURL = chatFilesDirectory
+            .appendingPathComponent("files")
+            .appendingPathComponent("\(fileId)_\(fileName)")
+        return FileManager.default.fileExists(atPath: fileURL.path) ? fileURL : nil
+    }
+
+    /// MIME type detection from file extension
+    private static func mimeType(for url: URL) -> String {
+        switch url.pathExtension.lowercased() {
+        case "jpg", "jpeg": return "image/jpeg"
+        case "png": return "image/png"
+        case "gif": return "image/gif"
+        case "pdf": return "application/pdf"
+        case "txt": return "text/plain"
+        case "zip": return "application/zip"
+        case "mp3": return "audio/mpeg"
+        case "mp4": return "video/mp4"
+        case "doc", "docx": return "application/msword"
+        default: return "application/octet-stream"
+        }
     }
 
     // MARK: - Helper Methods

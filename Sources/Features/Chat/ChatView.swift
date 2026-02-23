@@ -873,6 +873,10 @@ struct ConversationView: View {
     @State private var showScreenshotBanner = false
     @State private var showRecordingBanner = false
     @FocusState private var isInputFocused: Bool
+    // FIX #1535: File sending state
+    @State private var showFilePicker = false
+    @State private var showFileTooLargeAlert = false
+    @State private var fileTooLargeName = ""
 
     private var theme: AppTheme { themeManager.currentTheme }
 
@@ -1025,6 +1029,33 @@ struct ConversationView: View {
                 .environmentObject(NetworkManager.shared)
                 .environmentObject(themeManager)
             }
+        }
+        // FIX #1535: File picker for sending files
+        #if os(iOS)
+        .fileImporter(isPresented: $showFilePicker, allowedContentTypes: [.data], allowsMultipleSelection: false) { result in
+            if case .success(let urls) = result, let url = urls.first {
+                // Access security-scoped resource
+                guard url.startAccessingSecurityScopedResource() else { return }
+                defer { url.stopAccessingSecurityScopedResource() }
+                handleFileSelection(url)
+            }
+        }
+        #endif
+        // FIX #1535: File too large alert
+        .alert("File Too Large", isPresented: $showFileTooLargeAlert) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("\"\(fileTooLargeName)\" exceeds the 2 MB limit.\n\nPlease choose a smaller file.")
+        }
+        // FIX #1540: Voice call overlay — shown when call is active, incoming, or outgoing
+        .fullScreenCover(isPresented: Binding(
+            get: { VoiceCallManager.shared.callState != .idle },
+            set: { if !$0 { Task { await VoiceCallManager.shared.endCall() } } }
+        )) {
+            CallView(
+                contactName: contact.displayName,
+                onionAddress: contact.onionAddress
+            )
         }
         // FIX #1457: Screenshot & recording detection for encrypted chat
         #if os(iOS)
@@ -1179,6 +1210,18 @@ struct ConversationView: View {
 
             // Actions
             HStack(spacing: 16) {
+                // FIX #1540: Voice call button
+                Button(action: {
+                    Task {
+                        let _ = await VoiceCallManager.shared.startCall(to: contact.onionAddress)
+                    }
+                }) {
+                    Image(systemName: "phone.fill")
+                        .font(.system(size: 18))
+                        .foregroundColor(theme.accentColor)
+                }
+                .buttonStyle(.plain)
+
                 Button(action: { showPaymentRequest = true }) {
                     Image(systemName: "dollarsign.circle.fill")
                         .font(.system(size: 22))
@@ -1240,13 +1283,26 @@ struct ConversationView: View {
             }
 
             HStack(spacing: 12) {
-                // Attachment button (placeholder)
-                Button(action: { /* TODO: attachments */ }) {
+                // FIX #1535: Attachment button — send files up to 2MB
+                Button(action: {
+                    #if os(macOS)
+                    let panel = NSOpenPanel()
+                    panel.allowsMultipleSelection = false
+                    panel.canChooseDirectories = false
+                    panel.title = "Send File (max 2 MB)"
+                    if panel.runModal() == .OK, let url = panel.url {
+                        handleFileSelection(url)
+                    }
+                    #else
+                    showFilePicker = true
+                    #endif
+                }) {
                     Image(systemName: "plus.circle.fill")
                         .font(.system(size: 26))
-                        .foregroundColor(theme.textPrimary.opacity(0.4))
+                        .foregroundColor(isChatStable ? theme.accentColor.opacity(0.7) : theme.textPrimary.opacity(0.4))
                 }
                 .buttonStyle(.plain)
+                .disabled(!isChatStable)
 
                 // Message input
                 // FIX #343: Add visible placeholder styling for iOS
@@ -1323,6 +1379,27 @@ struct ConversationView: View {
                 try await chatManager.sendTextMessage(text, to: contact)
             } catch {
                 print("Failed to send message: \(error)")
+            }
+        }
+    }
+
+    /// FIX #1535: Handle file selection from picker
+    private func handleFileSelection(_ url: URL) {
+        // Check file size
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let fileSize = attrs[.size] as? UInt64 else { return }
+
+        if fileSize > CHAT_MAX_FILE_SIZE {
+            fileTooLargeName = url.lastPathComponent
+            showFileTooLargeAlert = true
+            return
+        }
+
+        Task {
+            do {
+                try await chatManager.sendFile(url: url, to: contact)
+            } catch {
+                print("📎 FIX #1535: Failed to send file: \(error)")
             }
         }
     }
@@ -1419,6 +1496,9 @@ struct MessageBubble: View {
                 case .paymentReceived:
                     // FIX #219: Explicit payment received type (for backwards compatibility)
                     paymentReceivedBubble
+                case .file:
+                    // FIX #1535: File transfer bubble
+                    fileBubble
                 default:
                     EmptyView()
                 }
@@ -1661,6 +1741,112 @@ struct MessageBubble: View {
                 .stroke(Color.orange.opacity(0.5), lineWidth: 2)
         )
         .cornerRadius(14)
+    }
+
+    // FIX #1535: File transfer bubble
+    private var fileBubble: some View {
+        let metadata = (try? JSONDecoder().decode(FileMetadata.self, from: Data(message.content.utf8)))
+        let fileName = metadata?.fileName ?? message.fileName ?? "file"
+        let fileSize = metadata?.fileSize ?? message.fileSize ?? 0
+        let fileId = metadata?.fileId ?? message.fileId ?? ""
+        let transfer = ChatManager.shared.activeFileTransfers[fileId]
+        let savedURL = ChatManager.shared.getSavedFileURL(for: fileId, fileName: fileName)
+        let isComplete = savedURL != nil || (transfer == nil && !isFromMe)
+
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                // File icon
+                Image(systemName: fileIconName(for: fileName))
+                    .font(.system(size: 28))
+                    .foregroundColor(isFromMe ? .black.opacity(0.7) : theme.accentColor)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(fileName)
+                        .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                        .foregroundColor(isFromMe ? .black : .white)
+                        .lineLimit(2)
+                    Text(formatFileSize(fileSize))
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(isFromMe ? .black.opacity(0.6) : theme.textSecondary)
+                }
+            }
+
+            // Progress bar (during transfer)
+            if let transfer = transfer, transfer.progress < 1.0 {
+                VStack(spacing: 4) {
+                    ProgressView(value: transfer.progress)
+                        .tint(isFromMe ? .black : theme.accentColor)
+                    Text(transfer.isSending ? "Sending..." : "Receiving...")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(isFromMe ? .black.opacity(0.5) : theme.textSecondary)
+                }
+            }
+
+            // Save/Open button (when received and complete)
+            if !isFromMe && isComplete, let url = savedURL {
+                Button(action: {
+                    #if os(macOS)
+                    NSWorkspace.shared.activateFileViewerSelecting([url])
+                    #else
+                    // iOS: share sheet
+                    let activityVC = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+                    if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+                       let rootVC = windowScene.windows.first?.rootViewController {
+                        rootVC.present(activityVC, animated: true)
+                    }
+                    #endif
+                }) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "square.and.arrow.down")
+                            .font(.system(size: 12))
+                        Text("Open")
+                            .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                    }
+                    .foregroundColor(theme.accentColor)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(theme.accentColor.opacity(0.15))
+                    .cornerRadius(8)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(14)
+        .background(
+            isFromMe
+                ? LinearGradient(
+                    colors: [theme.accentColor, theme.accentColor.opacity(0.9)],
+                    startPoint: .topLeading, endPoint: .bottomTrailing)
+                : LinearGradient(
+                    colors: [Color.black.opacity(0.3), Color.black.opacity(0.25)],
+                    startPoint: .topLeading, endPoint: .bottomTrailing)
+        )
+        .cornerRadius(14)
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(isFromMe ? theme.accentColor.opacity(0.3) : Color.white.opacity(0.1), lineWidth: 1)
+        )
+    }
+
+    /// File icon based on extension
+    private func fileIconName(for fileName: String) -> String {
+        let ext = (fileName as NSString).pathExtension.lowercased()
+        switch ext {
+        case "jpg", "jpeg", "png", "gif", "heic": return "photo"
+        case "pdf": return "doc.richtext"
+        case "txt", "md": return "doc.text"
+        case "zip", "gz", "tar": return "archivebox"
+        case "mp3", "wav", "aac": return "music.note"
+        case "mp4", "mov", "avi": return "film"
+        default: return "doc"
+        }
+    }
+
+    /// Format file size for display
+    private func formatFileSize(_ bytes: UInt64) -> String {
+        if bytes < 1024 { return "\(bytes) B" }
+        if bytes < 1024 * 1024 { return String(format: "%.1f KB", Double(bytes) / 1024) }
+        return String(format: "%.1f MB", Double(bytes) / 1024 / 1024)
     }
 
     // Helper to extract TXID from message content like "Payment sent: abc123..."

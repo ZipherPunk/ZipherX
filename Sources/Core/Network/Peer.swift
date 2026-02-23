@@ -667,7 +667,13 @@ actor PeerRateLimiter {
 /// FIX #1401: Semaphore to limit concurrent SOCKS5 handshakes to the Arti proxy.
 /// Without this, 45+ concurrent Tor connection attempts overwhelm the proxy,
 /// causing 30-second timeouts and starving other tasks.
+/// FIX #1538: Reduced to 2 on iOS — Arti can't create 6 simultaneous circuits on cellular.
+/// z13.log evidence: first 4 of 6 succeed, rest cascade-timeout at 11s, then ALL subsequent fail.
+#if os(iOS)
+private let socksSemaphore = DispatchSemaphore(value: 2)
+#else
 private let socksSemaphore = DispatchSemaphore(value: 6)
+#endif
 
 /// Individual peer connection for Zclassic P2P network
 public final class Peer {
@@ -1705,7 +1711,14 @@ public final class Peer {
             }
 
             group.addTask {
-                try await Task.sleep(nanoseconds: 10_000_000_000) // 10 second timeout for Tor
+                // FIX #1538: 10s was too tight for iOS cellular Tor circuits (5-10s circuit + 1-2s SOCKS5).
+                // z13.log: systematic 11s timeouts on ALL peers after initial batch.
+                // iOS: 15s allows 2 full circuit attempts. macOS: 10s is fine on WiFi.
+                #if os(iOS)
+                try await Task.sleep(nanoseconds: 15_000_000_000) // 15s — Tor circuits slower on cellular
+                #else
+                try await Task.sleep(nanoseconds: 10_000_000_000) // 10s — macOS/WiFi
+                #endif
                 throw NetworkError.timeout
             }
 
@@ -1714,7 +1727,20 @@ public final class Peer {
         }
 
         // Perform SOCKS5 handshake
-        try await performSocks5Handshake()
+        do {
+            try await performSocks5Handshake()
+        } catch {
+            // FIX #1538: On SOCKS5 handshake failure, trigger health check.
+            // TorManager.checkSOCKS5Health() has threshold=2 and auto-restarts Tor.
+            // Without this: NetworkManager counts to 5 before acting → 5 wasted connections.
+            Task {
+                let healthy = await TorManager.shared.checkSOCKS5Health()
+                if !healthy {
+                    print("🚨 FIX #1538: [\(self.host)] SOCKS5 health check triggered Tor restart")
+                }
+            }
+            throw error
+        }
         isConnectedViaTor = true
         print("🧅 [\(host)] Connected via Tor (SOCKS5 handshake complete)")
     }

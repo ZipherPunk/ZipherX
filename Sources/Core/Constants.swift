@@ -124,4 +124,18 @@ enum ZipherXConstants {
 
     /// Peer ban duration in seconds (7 days)
     static let peerBanDuration: TimeInterval = 604_800
+
+    // MARK: - Disk Space (FIX #1536)
+
+    /// FIX #1536: Minimum disk space in bytes required for operation.
+    /// Breakdown: Boost file (~520MB) + Header store (~410MB) + Block caches (~107MB)
+    ///          + Sapling params (~50MB) + Tree cache (~33MB) + Wallet DB (~20MB) = ~1.1GB
+    /// Adding margin for delta sync, temp files, and growth → 1.5 GB recommended
+    static let minimumDiskSpaceBytes: Int64 = 1_500_000_000  // 1.5 GB
+
+    /// Warning threshold — show orange banner when below this
+    static let warningDiskSpaceBytes: Int64 = 1_000_000_000  // 1.0 GB
+
+    /// Critical threshold — block sync operations when below this
+    static let criticalDiskSpaceBytes: Int64 = 200_000_000   // 200 MB
 }

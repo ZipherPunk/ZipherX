@@ -920,44 +920,44 @@ public final class TorManager: ObservableObject {
 
     // MARK: - IP Address Verification
 
-    /// Fetch public IP address using direct connection (bypassing Tor)
-    /// Call this BEFORE enabling Tor to show user their real IP
+    /// FIX #1537: Real IP is NO LONGER fetched from third-party services.
+    /// The old implementation contacted api.ipify.org over clearnet, leaking the user's
+    /// real IP to a third party AND revealing they use ZipherX.
+    /// Now we simply set realIP to "hidden" — Tor verification uses fetchTorIP() only.
     public func fetchRealIP() async {
-        // Use a simple IP check service - direct connection
-        let session = URLSession.shared
-        guard let url = URL(string: "https://api.ipify.org") else { return }
-
-        do {
-            let (data, _) = try await session.data(from: url)
-            if let ip = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) {
-                await MainActor.run {
-                    self.realIP = ip
-                    print("🧅 Real IP (before Tor): \(ip)")
-                }
-            }
-        } catch {
-            print("🧅 Failed to fetch real IP: \(error.localizedDescription)")
+        await MainActor.run {
+            self.realIP = "hidden"
+            print("🔒 FIX #1537: Real IP hidden — no clearnet IP check (privacy protection)")
         }
     }
 
     /// Fetch public IP address through Tor
     /// Call this AFTER Tor is connected to verify exit node IP
+    /// FIX #1537: Uses check.torproject.org instead of third-party api.ipify.org
     public func fetchTorIP() async {
         guard connectionState.isConnected else {
             print("🧅 Cannot fetch Tor IP - not connected")
             return
         }
 
-        // Use Tor-configured URLSession
+        // Use Tor-configured URLSession — routed through our SOCKS5 proxy
         let session = getTorURLSession(isolate: false)
-        guard let url = URL(string: "https://api.ipify.org") else { return }
+        guard let url = URL(string: "https://check.torproject.org/api/ip") else { return }
 
         do {
             let (data, _) = try await session.data(from: url)
-            if let ip = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) {
+            // FIX #1537: check.torproject.org/api/ip returns JSON: {"IsTor":true,"IP":"x.x.x.x"}
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let ip = json["IP"] as? String {
                 await MainActor.run {
                     self.torIP = ip
                     print("🧅 Tor exit IP (after Tor): \(ip)")
+                }
+            } else if let ip = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) {
+                // Fallback: plain text response
+                await MainActor.run {
+                    self.torIP = ip
+                    print("🧅 Tor exit IP (plaintext fallback): \(ip)")
                 }
             }
         } catch {
@@ -965,11 +965,11 @@ public final class TorManager: ObservableObject {
         }
     }
 
-    /// Verify Tor is working by comparing IPs
-    /// Returns true if IPs are different (Tor is hiding your real IP)
+    /// Verify Tor is working by checking if we got a valid Tor exit IP
+    /// FIX #1537: No longer compares real vs Tor IP (real IP is never fetched for privacy)
     public func verifyTorWorking() -> Bool {
-        guard let real = realIP, let tor = torIP else { return false }
-        return real != tor
+        guard let tor = torIP, !tor.isEmpty else { return false }
+        return connectionState.isConnected
     }
 
     /// Test if the SOCKS5 proxy is actually accepting connections

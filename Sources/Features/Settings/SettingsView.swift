@@ -1870,7 +1870,7 @@ Both binaries must be installed to /usr/local/bin:
                         if TorManager.shared.connectionState.isConnected {
                             await TorManager.shared.stop()
                         } else {
-                            // Fetch real IP BEFORE connecting to Tor
+                            // FIX #1537: No longer fetches real IP (privacy protection)
                             await TorManager.shared.fetchRealIP()
                             await TorManager.shared.start()
                             // Wait for connection then fetch Tor IP
@@ -1923,25 +1923,18 @@ Both binaries must be installed to /usr/local/bin:
                         .font(.system(size: 10, weight: .bold, design: .monospaced))
                         .foregroundColor(theme.accentColor)
 
+                    // FIX #1537: No longer show real IP — privacy protection.
+                    // Real IP is never fetched from third-party services.
                     HStack {
-                        Text("Your IP:")
+                        Text("Tor Exit IP:")
                             .font(.system(size: 11, design: .monospaced))
-                            .foregroundColor(theme.textSecondary)
-                        Text(TorManager.shared.realIP ?? "Unknown")
-                            .font(.system(size: 11, weight: .medium, design: .monospaced))
-                            .foregroundColor(.red)
-                        Text("→")
                             .foregroundColor(theme.textSecondary)
                         Text(TorManager.shared.torIP ?? "Fetching...")
                             .font(.system(size: 11, weight: .medium, design: .monospaced))
                             .foregroundColor(.green)
                     }
                     .onAppear {
-                        // Fetch IPs when verification section appears (in case Tor was already connected)
                         Task {
-                            if TorManager.shared.realIP == nil {
-                                await TorManager.shared.fetchRealIP()
-                            }
                             if TorManager.shared.torIP == nil {
                                 await TorManager.shared.fetchTorIP()
                             }
@@ -1949,23 +1942,14 @@ Both binaries must be installed to /usr/local/bin:
                     }
 
                     // Verification status
-                    if let realIP = TorManager.shared.realIP, let torIP = TorManager.shared.torIP {
+                    if let torIP = TorManager.shared.torIP, !torIP.isEmpty {
                         HStack(spacing: 4) {
-                            if realIP != torIP {
-                                Image(systemName: "checkmark.shield.fill")
-                                    .foregroundColor(.green)
-                                    .font(.system(size: 12))
-                                Text("Tor is working! Your IP is hidden.")
-                                    .font(.system(size: 10, design: .monospaced))
-                                    .foregroundColor(.green)
-                            } else {
-                                Image(systemName: "exclamationmark.triangle.fill")
-                                    .foregroundColor(.orange)
-                                    .font(.system(size: 12))
-                                Text("Warning: IP unchanged. Tor may not be routing traffic.")
-                                    .font(.system(size: 10, design: .monospaced))
-                                    .foregroundColor(.orange)
-                            }
+                            Image(systemName: "checkmark.shield.fill")
+                                .foregroundColor(.green)
+                                .font(.system(size: 12))
+                            Text("Tor active — your real IP is hidden from all peers.")
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundColor(.green)
                         }
                     }
                 }

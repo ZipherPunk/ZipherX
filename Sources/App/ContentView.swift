@@ -231,23 +231,22 @@ struct ContentView: View {
                             return
                         }
 
-                        // CHECK DISK SPACE AT STARTUP (need ~750 MB for shielded outputs download + processing)
+                        // FIX #1536: Check disk space at startup using centralized constants.
+                        // ZipherX needs ~1.1 GB minimum (boost + headers + caches + params + DB).
                         let diskSpaceBytes = BundledShieldedOutputs.getAvailableDiskSpace()
-                        let requiredBytes: Int64 = 750_000_000 // 750 MB
-                        if diskSpaceBytes < requiredBytes {
-                            let formatter = ByteCountFormatter()
-                            formatter.allowedUnits = [.useGB, .useMB]
-                            formatter.countStyle = .file
+                        let formatter = ByteCountFormatter()
+                        formatter.allowedUnits = [.useGB, .useMB]
+                        formatter.countStyle = .file
+                        if diskSpaceBytes < ZipherXConstants.minimumDiskSpaceBytes {
                             availableDiskSpace = formatter.string(fromByteCount: diskSpaceBytes)
                             await MainActor.run {
                                 showInsufficientDiskSpaceAlert = true
                             }
-                            print("🚨 INSUFFICIENT DISK SPACE: \(availableDiskSpace) available, need ~750 MB")
+                            print("🚨 FIX #1536: INSUFFICIENT DISK SPACE: \(availableDiskSpace) available, need ~1.5 GB")
+                        } else if diskSpaceBytes < ZipherXConstants.warningDiskSpaceBytes {
+                            print("⚠️ FIX #1536: LOW DISK SPACE: \(formatter.string(fromByteCount: diskSpaceBytes)) available (warning threshold: 1 GB)")
                         } else {
-                            let formatter = ByteCountFormatter()
-                            formatter.allowedUnits = [.useGB, .useMB]
-                            formatter.countStyle = .file
-                            print("✅ Disk space OK: \(formatter.string(fromByteCount: diskSpaceBytes)) available")
+                            print("✅ FIX #1536: Disk space OK: \(formatter.string(fromByteCount: diskSpaceBytes)) available")
                         }
 
                         // Suppress background sync during initial startup to avoid race conditions
@@ -4148,7 +4147,7 @@ struct UnifiedAlertSheet: View {
     private var diskSpaceAlert: some View {
         AlertWrapper(
             title: "Insufficient Disk Space",
-            message: "ZipherX requires approximately 750 MB of free space to download blockchain data.\n\nAvailable: \(availableDiskSpace)\n\nPlease free up some space and restart the app.",
+            message: "ZipherX requires approximately 1.5 GB of free space for blockchain data (boost file, headers, block caches, and database).\n\nAvailable: \(availableDiskSpace)\n\nPlease free up some space and restart the app.",
             primaryButton: ("OK", {})
         )
     }

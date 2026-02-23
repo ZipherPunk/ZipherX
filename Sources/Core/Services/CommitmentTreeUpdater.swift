@@ -1382,7 +1382,14 @@ actor CommitmentTreeUpdater {
                 // FIX #360: Short timeout for version check - fall back to cache quickly if GitHub unreachable
                 request.timeoutInterval = 10
 
-                let (data, response) = try await URLSession.shared.data(for: request)
+                // FIX #1537: Route boost file metadata check through Tor when available
+                let session: URLSession
+                if await TorManager.shared.mode == .enabled && await TorManager.shared.connectionState.isConnected {
+                    session = await TorManager.shared.getTorURLSession(isolate: true)
+                } else {
+                    session = URLSession.shared
+                }
+                let (data, response) = try await session.data(for: request)
 
                 guard let httpResponse = response as? HTTPURLResponse else {
                     throw BoostFileError.networkError("No HTTP response")
@@ -1465,9 +1472,16 @@ actor CommitmentTreeUpdater {
                 request.timeoutInterval = 10
                 print("🔍 DEBUG [Manifest Fetch]: Request timeout: \(request.timeoutInterval)s")
 
+                // FIX #1537: Route through Tor when available
+                let manifestSession: URLSession
+                if await TorManager.shared.mode == .enabled && await TorManager.shared.connectionState.isConnected {
+                    manifestSession = await TorManager.shared.getTorURLSession(isolate: true)
+                } else {
+                    manifestSession = URLSession.shared
+                }
                 print("🔍 DEBUG [Manifest Fetch]: Starting URLSession.data() call...")
                 do {
-                    let (data, response) = try await URLSession.shared.data(for: request)
+                    let (data, response) = try await manifestSession.data(for: request)
                     print("🔍 DEBUG [Manifest Fetch]: URLSession.data() completed")
                     print("🔍 DEBUG [Manifest Fetch]: Received \(data.count) bytes of data")
 
