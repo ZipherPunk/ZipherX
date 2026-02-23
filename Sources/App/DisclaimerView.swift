@@ -430,7 +430,6 @@ struct DisclaimerView: View {
                 .font(.system(size: 12, weight: .regular, design: .monospaced))
                 .lineSpacing(4)
                 #endif
-                .italic()
                 .foregroundColor(NeonColors.primary.opacity(0.9))
 
             Text("- Eric Hughes, A Cypherpunk's Manifesto (1993)")
