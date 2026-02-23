@@ -884,7 +884,8 @@ struct ConversationView: View {
     // FIX #1389: Chat uses Tor/onion, NOT P2P peers
     private var isChatStable: Bool { chatManager.isAvailable }
 
-    var body: some View {
+    // FIX #1540: Extracted to help Swift type-checker (body was 230+ lines)
+    private var chatContent: some View {
         VStack(spacing: 0) {
             // Conversation header
             conversationHeader
@@ -971,6 +972,10 @@ struct ConversationView: View {
             inputBar
         }
         .background(theme.backgroundColor)
+    }
+
+    var body: some View {
+        chatContent
         .onAppear {
             // FIX #1387: Set selectedConversation so new messages don't increment unread badge
             chatManager.selectedConversation = contact.onionAddress

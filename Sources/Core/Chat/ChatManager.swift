@@ -1766,12 +1766,10 @@ final class ChatManager: ObservableObject {
         }
 
         let message = ChatMessage(
-            id: UUID().uuidString,
-            fromOnion: myOnionAddress ?? "",
-            toOnion: onionAddress,
             type: type,
+            fromOnion: ourOnionAddress ?? "",
+            toOnion: onionAddress,
             content: content,
-            timestamp: Date(),
             status: .sending
         )
 
