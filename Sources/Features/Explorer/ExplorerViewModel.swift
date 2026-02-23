@@ -15,7 +15,9 @@ class ExplorerViewModel: ObservableObject {
     /// FIX #1537: Get URLSession routed through Tor when available (privacy protection).
     /// Block explorer queries to zelcore.io reveal which blocks/TXs the user is interested in.
     private func getSession() async -> URLSession {
-        if await TorManager.shared.mode == .enabled && await TorManager.shared.connectionState.isConnected {
+        let torMode = await TorManager.shared.mode
+        let torConnected = await TorManager.shared.connectionState.isConnected
+        if torMode == .enabled && torConnected {
             return await TorManager.shared.getTorURLSession(isolate: true)
         }
         return URLSession.shared
