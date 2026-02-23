@@ -59,8 +59,10 @@ class AppUpdateChecker: ObservableObject {
 
                 // FIX #1537: Route through Tor when enabled to prevent IP leak to GitHub.
                 // GitHub sees ZipherX-specific URL path on every launch — ISP can correlate.
+                let torMode = await TorManager.shared.mode
+                let torConnected = await TorManager.shared.connectionState.isConnected
                 let session: URLSession
-                if await TorManager.shared.mode == .enabled && await TorManager.shared.connectionState.isConnected {
+                if torMode == .enabled && torConnected {
                     session = await TorManager.shared.getTorURLSession(isolate: true)
                     print("🔒 FIX #1537: App update check routed through Tor")
                 } else {
