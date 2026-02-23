@@ -19,20 +19,21 @@
 	<key>CFBundleShortVersionString</key>
 	<string>1.0.1</string>
 	<key>CFBundleVersion</key>
-	<string>18</string>
+	<string>19</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
 	<key>NSCameraUsageDescription</key>
 	<string>ZipherX uses the camera to scan QR codes for receiving payments.</string>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>ZipherX uses the microphone for encrypted voice calls over the P2P network.</string>
 	<key>NSFaceIDUsageDescription</key>
 	<string>ZipherX uses Face ID to protect your wallet and authorize transactions.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>ZipherX connects to Zclassic network peers to sync your wallet.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>ZipherX uses the microphone for encrypted voice calls over the P2P network.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>fetch</string>
+		<string>audio</string>
 	</array>
 	<key>UILaunchScreen</key>
 	<dict>
