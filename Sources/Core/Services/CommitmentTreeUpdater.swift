@@ -1384,7 +1384,9 @@ actor CommitmentTreeUpdater {
 
                 // FIX #1537: Route boost file metadata check through Tor when available
                 let session: URLSession
-                if await TorManager.shared.mode == .enabled && await TorManager.shared.connectionState.isConnected {
+                let torMode = await TorManager.shared.mode
+                let torConnected = await TorManager.shared.connectionState.isConnected
+                if torMode == .enabled && torConnected {
                     session = await TorManager.shared.getTorURLSession(isolate: true)
                 } else {
                     session = URLSession.shared
@@ -1474,7 +1476,9 @@ actor CommitmentTreeUpdater {
 
                 // FIX #1537: Route through Tor when available
                 let manifestSession: URLSession
-                if await TorManager.shared.mode == .enabled && await TorManager.shared.connectionState.isConnected {
+                let torMode = await TorManager.shared.mode
+                let torConnected = await TorManager.shared.connectionState.isConnected
+                if torMode == .enabled && torConnected {
                     manifestSession = await TorManager.shared.getTorURLSession(isolate: true)
                 } else {
                     manifestSession = URLSession.shared
