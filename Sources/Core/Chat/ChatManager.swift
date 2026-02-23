@@ -272,15 +272,42 @@ final class ChatManager: ObservableObject {
         // key from Keychain ("com.zipherx.chat-database-key").
         ChatManager.migrateLegacyChatData()
 
-        // Load nickname from SQLCipher
+        // Load nickname from SQLCipher (may be empty if DB not open yet — FIX #1526 reloads)
         self.ourNickname = WalletDatabase.shared.getChatSetting(key: "chatNickname") ?? ""
         self.database = ChatDatabase()
 
+        // FIX #1525: Load profile image SYNCHRONOUSLY before any connections.
+        // Previously called inside async loadPersistentData() → profileImage was nil when
+        // connect(to:) checked it → avatar never sent on initial connection.
+        loadProfileImage()
+
         // Load contacts and conversations from database
-        Task {
-            await loadPersistentData()
-            // FIX #249: Load queued messages
-            await loadMessageQueue()
+        // NOTE: If DB is not open yet (before biometric auth), this loads empty data.
+        // FIX #1526 observer below reloads once DB is ready.
+        if WalletDatabase.shared.isOpen {
+            Task {
+                await loadPersistentData()
+                await loadMessageQueue()
+            }
+        }
+
+        // FIX #1526: ChatManager.init() runs before WalletDatabase.open() (SwiftUI creates
+        // @StateObject before biometric auth completes). All DB reads return empty → 0 contacts,
+        // empty nickname. Observe DB open notification to reload with real data.
+        NotificationCenter.default.addObserver(forName: .walletDatabaseOpened, object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                // Reload nickname from DB (was empty at init time)
+                let savedNickname = WalletDatabase.shared.getChatSetting(key: "chatNickname") ?? ""
+                if !savedNickname.isEmpty && self.ourNickname.isEmpty {
+                    self.ourNickname = savedNickname
+                    print("💬 FIX #1526: Reloaded nickname '\(savedNickname)' after DB open")
+                }
+                // Reload contacts, conversations, messages
+                await self.loadPersistentData()
+                await self.loadMessageQueue()
+                print("💬 FIX #1526: Reloaded \(self.contacts.count) contacts after DB open")
+            }
         }
 
         // FIX #1487: When .onion circuits become ready, reset backoff and retry all contacts.
@@ -514,12 +541,21 @@ final class ChatManager: ObservableObject {
     }
 
     /// FIX #1433: Block a contact — no incoming messages will be shown
+    /// FIX #1529: Also disconnect immediately so they see us go offline
     func blockContact(_ contact: ChatContact) {
         guard let index = contacts.firstIndex(where: { $0.onionAddress == contact.onionAddress }) else { return }
         var updated = contacts[index]
         updated.isBlocked = true
         contacts[index] = updated
         database.saveContact(updated)
+
+        // FIX #1529: Disconnect blocked contact immediately — they should see us as offline
+        if let peer = peers[contact.onionAddress] {
+            peer.connection.cancel()
+            peers.removeValue(forKey: contact.onionAddress)
+            print("💬 FIX #1529: Disconnected blocked contact: \(contact.displayName)")
+        }
+        updateContactOnlineStatus(contact.onionAddress, isOnline: false)
         print("💬 FIX #1433: Blocked contact: \(contact.displayName)")
     }
 
@@ -1165,6 +1201,15 @@ final class ChatManager: ObservableObject {
 
         print("💬 Handshake from: \(onionAddress.prefix(16))...")
 
+        // FIX #1529: Reject connection from blocked contacts — don't reveal online status
+        // Without this: blocked contact connects → handshake succeeds → they know we're online.
+        // With this: connection cancelled immediately → they see "offline" (same as not running).
+        if let existingContact = contacts.first(where: { $0.onionAddress == onionAddress }), existingContact.isBlocked {
+            print("💬 FIX #1529: Rejected incoming connection from blocked contact: \(onionAddress.prefix(16))...")
+            connection.cancel()
+            return
+        }
+
         // Create or update peer
         let peer = ChatPeer(onionAddress: onionAddress, connection: connection)
         try? await peer.setTheirPublicKey(theirPublicKey)
@@ -1195,6 +1240,29 @@ final class ChatManager: ObservableObject {
 
         // Start receiving messages
         receiveMessages(from: peer)
+
+        // FIX #1530: Send our profile (nickname + avatar) on INCOMING connections too
+        // Without this: only outgoing connect() sends profile → other side never gets our picture.
+        // The outgoing side sends in connect() (line ~705), but incoming side never did.
+        if let contact = contacts.first(where: { $0.onionAddress == onionAddress }) {
+            if !ourNickname.isEmpty {
+                do {
+                    try await sendNickname(to: contact)
+                    print("💬 FIX #1530: Sent nickname '\(ourNickname)' on incoming connection to \(contact.displayName)")
+                } catch {
+                    print("💬 FIX #1530: Failed to send nickname on incoming connection: \(error)")
+                }
+            }
+
+            if isProfileImageShared, let imageData = profileImage {
+                do {
+                    try await sendAvatar(imageData, to: contact)
+                    print("💬 FIX #1530: Sent avatar on incoming connection to \(contact.displayName)")
+                } catch {
+                    print("💬 FIX #1530: Failed to send avatar on incoming connection: \(error)")
+                }
+            }
+        }
     }
 
     private func handleConnectionState(_ state: NWConnection.State, for onionAddress: String) async {
@@ -1874,9 +1942,7 @@ final class ChatManager: ObservableObject {
         }
 
         totalUnreadCount = contacts.reduce(0) { $0 + $1.unreadCount }
-
-        // FIX #1436: Load profile image from disk
-        loadProfileImage()
+        // FIX #1525: loadProfileImage() now called synchronously in init() — no longer needed here
     }
 
     // MARK: - FIX #1436: Profile Image
@@ -2315,4 +2381,6 @@ extension Notification.Name {
     /// FIX #1504: Posted from chat/sheets when user interacts — resets inactivity timer.
     /// Sheets are separate view hierarchies, so ContentView gesture recognizers don't fire.
     static let userActivityInSheet = Notification.Name("userActivityInSheet")
+    /// FIX #1526: Posted by WalletDatabase.open() after tables are created and DB is ready.
+    static let walletDatabaseOpened = Notification.Name("walletDatabaseOpened")
 }

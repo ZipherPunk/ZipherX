@@ -547,7 +547,12 @@ struct SettingsView: View {
 
                 securitySection
                 privacyReportSection
-                networkSection
+                // FIX #1517: Split networkSection into two lazy children to prevent
+                // stack overflow on iOS (1MB stack). The old networkSection was 320 lines
+                // with 5 chained .sheet modifiers → Sheet<Sheet<Sheet<Sheet<Sheet<...>>>>>
+                // generic nesting overflowed the stack during view evaluation.
+                networkSectionCore
+                torPrivacySection
                 exportSection
                 repairDatabaseSection
                 debugLoggingSection
@@ -1389,7 +1394,9 @@ Both binaries must be installed to /usr/local/bin:
 
     // MARK: - Network Section
 
-    private var networkSection: some View {
+    // FIX #1517: Renamed from networkSection. Tor section moved to separate lazy child.
+    // Each .sheet attached to its own button to prevent generic type nesting overflow.
+    private var networkSectionCore: some View {
         VStack(spacing: 12) {
             // Section header
             HStack {
@@ -1488,6 +1495,14 @@ Both binaries must be installed to /usr/local/bin:
                         .stroke(theme.textPrimary, lineWidth: 1)
                 )
             }
+            // FIX #1517: Sheet on its own button (was chained on parent VStack)
+            .sheet(isPresented: $showBannedPeers, onDismiss: { networkManager.updatePeerCountsForSettings() }) {
+                bannedPeersSheet
+                    #if os(macOS)
+                    .frame(minWidth: 500, idealWidth: 600, maxWidth: 700,
+                           minHeight: 400, idealHeight: 500, maxHeight: 600)
+                    #endif
+            }
 
             // FIX #284: Parked Peers button (connection timeouts - auto-retry)
             Button(action: {
@@ -1516,6 +1531,14 @@ Both binaries must be installed to /usr/local/bin:
                     Rectangle()
                         .stroke(theme.textPrimary, lineWidth: 1)
                 )
+            }
+            // FIX #1517: Sheet on its own button (was chained on parent VStack)
+            .sheet(isPresented: $showParkedPeers, onDismiss: { networkManager.updatePeerCountsForSettings() }) {
+                parkedPeersSheet
+                    #if os(macOS)
+                    .frame(minWidth: 500, idealWidth: 600, maxWidth: 700,
+                           minHeight: 400, idealHeight: 500, maxHeight: 600)
+                    #endif
             }
 
             // FIX #284: Preferred Seeds button (priority connection, ban-exempt)
@@ -1546,6 +1569,14 @@ Both binaries must be installed to /usr/local/bin:
                         .stroke(theme.textPrimary, lineWidth: 1)
                 )
             }
+            // FIX #1517: Sheet on its own button (was chained on parent VStack)
+            .sheet(isPresented: $showPreferredSeeds, onDismiss: { networkManager.updatePeerCountsForSettings() }) {
+                preferredSeedsSheet
+                    #if os(macOS)
+                    .frame(minWidth: 500, idealWidth: 600, maxWidth: 700,
+                           minHeight: 400, idealHeight: 500, maxHeight: 600)
+                    #endif
+            }
 
             // Custom Nodes button
             Button(action: {
@@ -1572,6 +1603,15 @@ Both binaries must be installed to /usr/local/bin:
                     Rectangle()
                         .stroke(theme.textPrimary, lineWidth: 1)
                 )
+            }
+            // FIX #1517: Sheet on its own button (was chained on parent VStack)
+            .sheet(isPresented: $showCustomNodes, onDismiss: { networkManager.updatePeerCountsForSettings() }) {
+                CustomNodesView()
+                    .environmentObject(themeManager)
+                    #if os(macOS)
+                    .frame(minWidth: 600, idealWidth: 700, maxWidth: 800,
+                           minHeight: 500, idealHeight: 600, maxHeight: 700)
+                    #endif
             }
 
             // FIX #229: Trusted Peers button
@@ -1601,9 +1641,17 @@ Both binaries must be installed to /usr/local/bin:
                         .stroke(theme.textPrimary, lineWidth: 1)
                 )
             }
+            // FIX #1517: Sheet on its own button (was chained on parent VStack)
+            .sheet(isPresented: $showTrustedPeers, onDismiss: { loadTrustedPeersCount() }) {
+                TrustedPeersView()
+                    .environmentObject(themeManager)
+                    #if os(macOS)
+                    .frame(minWidth: 600, idealWidth: 700, maxWidth: 800,
+                           minHeight: 500, idealHeight: 600, maxHeight: 700)
+                    #endif
+            }
 
-            // Tor Privacy Mode
-            torPrivacySection
+            // FIX #1517: torPrivacySection moved to separate LazyVStack child in deletableContent
 
             // Export Reliable Peers button - DEACTIVATED (developer feature)
             if false {
@@ -1660,46 +1708,7 @@ Both binaries must be installed to /usr/local/bin:
             Rectangle()
                 .stroke(theme.textPrimary, lineWidth: 1)
         )
-        .sheet(isPresented: $showBannedPeers, onDismiss: { networkManager.updatePeerCountsForSettings() }) {
-            bannedPeersSheet
-                #if os(macOS)
-                .frame(minWidth: 500, idealWidth: 600, maxWidth: 700,
-                       minHeight: 400, idealHeight: 500, maxHeight: 600)
-                #endif
-        }
-        // FIX #284: Parked Peers sheet
-        .sheet(isPresented: $showParkedPeers, onDismiss: { networkManager.updatePeerCountsForSettings() }) {
-            parkedPeersSheet
-                #if os(macOS)
-                .frame(minWidth: 500, idealWidth: 600, maxWidth: 700,
-                       minHeight: 400, idealHeight: 500, maxHeight: 600)
-                #endif
-        }
-        // FIX #284: Preferred Seeds sheet
-        .sheet(isPresented: $showPreferredSeeds, onDismiss: { networkManager.updatePeerCountsForSettings() }) {
-            preferredSeedsSheet
-                #if os(macOS)
-                .frame(minWidth: 500, idealWidth: 600, maxWidth: 700,
-                       minHeight: 400, idealHeight: 500, maxHeight: 600)
-                #endif
-        }
-        .sheet(isPresented: $showCustomNodes, onDismiss: { networkManager.updatePeerCountsForSettings() }) {
-            CustomNodesView()
-                .environmentObject(themeManager)
-                #if os(macOS)
-                .frame(minWidth: 600, idealWidth: 700, maxWidth: 800,
-                       minHeight: 500, idealHeight: 600, maxHeight: 700)
-                #endif
-        }
-        // FIX #229: Trusted Peers sheet
-        .sheet(isPresented: $showTrustedPeers, onDismiss: { loadTrustedPeersCount() }) {
-            TrustedPeersView()
-                .environmentObject(themeManager)
-                #if os(macOS)
-                .frame(minWidth: 600, idealWidth: 700, maxWidth: 800,
-                       minHeight: 500, idealHeight: 600, maxHeight: 700)
-                #endif
-        }
+        // FIX #1517: Alert for peer export (deactivated feature, kept for completeness)
         .alert("Peers Exported!", isPresented: $showPeerExportSuccess) {
             Button("OK", role: .cancel) {}
         } message: {

@@ -523,14 +523,35 @@ struct BalanceView: View {
                 let _ = {
                     let envFlag = walletManager.balanceIntegrityIssue
                     let sharedFlag = WalletManager.shared.balanceIntegrityIssue
+                    let envKeyMismatch = walletManager.encryptionKeyMismatch
+                    let sharedKeyMismatch = WalletManager.shared.encryptionKeyMismatch
                     print("🔍 FIX #1098 BalanceView RENDER:")
                     print("   @EnvironmentObject flag = \(envFlag)")
                     print("   WalletManager.shared flag = \(sharedFlag)")
+                    print("   🔑 FIX #1520: encryptionKeyMismatch env=\(envKeyMismatch) shared=\(sharedKeyMismatch)")
                     if envFlag != sharedFlag {
                         print("   ⚠️ MISMATCH! Environment object has stale reference!")
                     }
                 }()
-                if walletManager.balanceIntegrityIssue {
+                // FIX #1520: Encryption key mismatch takes priority — balance is 0 due to unreadable values
+                if walletManager.encryptionKeyMismatch {
+                    VStack(spacing: 4) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "key.slash")
+                                .foregroundColor(.orange)
+                            Text("Encryption Key Changed")
+                                .font(.system(size: 18, weight: .bold))
+                                .foregroundColor(.orange)
+                        }
+                        Text("App reinstall changed the database encryption key.\nYour funds are safe — a Full Rescan will restore them.")
+                            .font(.system(size: 12))
+                            .foregroundColor(.orange.opacity(0.8))
+                            .multilineTextAlignment(.center)
+                        Text("Settings → Repair Database → Full Rescan")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(theme.textSecondary)
+                    }
+                } else if walletManager.balanceIntegrityIssue {
                     VStack(spacing: 4) {
                         HStack(spacing: 6) {
                             Image(systemName: "exclamationmark.triangle.fill")

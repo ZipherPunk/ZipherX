@@ -122,7 +122,9 @@ struct ZipherXApp: App {
                 if !hasAcceptedDisclaimer {
                     // Step 1: Disclaimer (first launch)
                     DisclaimerView(hasAcceptedDisclaimer: $hasAcceptedDisclaimer)
+                        #if os(macOS)
                         .frame(minWidth: 600, idealWidth: 700, minHeight: 700, idealHeight: 850)
+                        #endif
                 } else if needsModeSelection {
                     // Step 2: Mode selection (macOS, first launch after disclaimer)
                     #if os(macOS)

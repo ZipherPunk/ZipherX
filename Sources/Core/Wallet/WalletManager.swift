@@ -130,6 +130,12 @@ final class WalletManager: ObservableObject {
     @Published var balanceIntegrityIssue: Bool = false
     @Published var balanceIntegrityMessage: String? = nil
 
+    // MARK: - FIX #1520: Encryption key mismatch detection
+    /// When true, ALL encrypted note values fail to decrypt — DB key changed
+    /// (e.g., TestFlight → Xcode reinstall, provisioning profile change).
+    /// User must do Full Rescan to re-discover notes with current encryption key.
+    @Published var encryptionKeyMismatch: Bool = false
+
     // MARK: - FIX #1141: Block SEND when witnesses are corrupted
     /// When true, at least one witness failed verification (merkle_path.root != witness.root)
     /// SendView disables Send button with clear message until witnesses are rebuilt
@@ -8326,6 +8332,9 @@ final class WalletManager: ObservableObject {
                     let duration = Date().timeIntervalSince(startTime)
                     self.isRescanComplete = true
                     self.rescanCompletionDuration = duration
+                    // FIX #1520b: Reset encryption key mismatch — Full Rescan re-writes all notes
+                    // with the current encryption key, resolving any previous mismatch.
+                    self.encryptionKeyMismatch = false
                     print("🎬 FIX #577 v7 + FIX #582: Full Rescan complete in \(Int(duration))s, showing completion screen")
                     print("🔒 FIX #582: isFullRescan kept true until user clicks Enter Wallet")
                 }
@@ -8340,6 +8349,9 @@ final class WalletManager: ObservableObject {
                         let duration = Date().timeIntervalSince(startTime)
                         self.isRescanComplete = true
                         self.rescanCompletionDuration = duration
+                        // FIX #1520b: Reset encryption key mismatch — Full Rescan re-writes all notes
+                        // with the current encryption key, resolving any previous mismatch.
+                        self.encryptionKeyMismatch = false
                         print("🎬 FIX #577 v7 + FIX #582: Full Rescan complete in \(Int(duration))s, showing completion screen")
                         print("🔒 FIX #582: isFullRescan kept true until user clicks Enter Wallet")
                     }
@@ -11338,9 +11350,23 @@ final class WalletManager: ObservableObject {
             // see their actual balance. Witness availability only matters for SPENDING, not display.
             let confirmedBalance = try WalletDatabase.shared.getTotalUnspentBalance(accountId: account.accountId)
 
+            // FIX #1520: Detect encryption key mismatch BEFORE showing balance.
+            // If ALL encrypted values fail to decrypt, the DB encryption key changed
+            // (e.g., TestFlight→Xcode, provisioning profile change, device ID change).
+            // Balance will show 0 — inform user to Full Rescan.
+            let (notesChecked, decryptFailures) = WalletDatabase.shared.detectEncryptionKeyMismatch()
+            let keyMismatch = notesChecked > 0 && decryptFailures == notesChecked
+            if keyMismatch {
+                print("🚨 FIX #1520: ENCRYPTION KEY MISMATCH — \(decryptFailures)/\(notesChecked) note values failed to decrypt!")
+                print("   Balance shows 0 because encrypted values are unreadable with current key.")
+                print("   Cause: App reinstall changed DB encryption key (provisioning profile, device ID, or keychain salt).")
+                print("   Fix: Settings → Repair Database → Full Rescan")
+            }
+
             await MainActor.run {
                 self.shieldedBalance = confirmedBalance
                 self.pendingBalance = 0
+                self.encryptionKeyMismatch = keyMismatch
                 print("💰 Loaded balance from database: \(confirmedBalance.redactedAmount) (0 pending)")
             }
         } catch {
@@ -12467,9 +12493,15 @@ final class WalletManager: ObservableObject {
                 nullifierToNote.removeValue(forKey: hashedNull)
             }
         }
+        // FIX #1527: Only skip past delta range when ALL nullifiers are accounted for.
+        // See FIX #1527 comment in verifyAllUnspentNotesOnChain for full explanation.
         if let range = deltaRange1319, scanStartHeight >= range.lowerBound && scanStartHeight <= range.upperBound {
-            print("📦 FIX #1319: Advancing scan past delta range → \(range.upperBound + 1)")
-            scanStartHeight = range.upperBound + 1
+            if nullifierToNote.isEmpty {
+                print("📦 FIX #1319: All nullifiers resolved in delta — advancing past delta range → \(range.upperBound + 1)")
+                scanStartHeight = range.upperBound + 1
+            } else {
+                print("📦 FIX #1527: \(nullifierToNote.count) unresolved nullifier(s) — scanning delta range via P2P")
+            }
         }
 
         // FIX #1350: Guard against UInt64 underflow when scanStartHeight > chainHeight
@@ -13613,7 +13645,7 @@ final class WalletManager: ObservableObject {
         // FIX #1300: CFBundleVersion is always "1" during development — never triggers FIX #1283.
         // Use a hardcoded verification version that we bump when spend-related code changes.
         // This forces re-verification on the next startup after a code fix, catching phantom-unspent notes.
-        let verificationCodeVersion = "1302"  // FIX #1302: Bumped — re-scan after auto Full Rescan created phantom notes
+        let verificationCodeVersion = "1527"  // FIX #1527: Bumped — FIX #1319 skipped P2P scan when unresolved nullifiers remained
         let currentBuild = "\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown").\(verificationCodeVersion)"
         let lastVerifiedBuild = UserDefaults.standard.string(forKey: "FIX1283_LastVerifiedBuild") ?? ""
         if hasCompletedFullVerification && currentBuild != lastVerifiedBuild {
@@ -13829,9 +13861,18 @@ final class WalletManager: ObservableObject {
                 externalSpendsFound += 1
             }
         }
+        // FIX #1527: Only skip past delta range when ALL nullifiers are accounted for.
+        // Previous code advanced batchStart past delta range unconditionally — if delta
+        // nullifier bundle was incomplete (missing some spent nullifiers), the P2P scan
+        // that would catch them was skipped → phantom notes persisted forever (0% coverage).
+        // Now: only skip if ourNullifiers is empty (all found in delta or no more to check).
         if let range = deltaRange1319b, batchStart >= range.lowerBound && batchStart <= range.upperBound {
-            print("📦 FIX #1319: Advancing scan past delta range → \(range.upperBound + 1)")
-            batchStart = range.upperBound + 1
+            if ourNullifiers.isEmpty {
+                print("📦 FIX #1319: All nullifiers resolved in delta — advancing past delta range → \(range.upperBound + 1)")
+                batchStart = range.upperBound + 1
+            } else {
+                print("📦 FIX #1527: \(ourNullifiers.count) unresolved nullifier(s) — scanning delta range via P2P")
+            }
         }
 
         var totalBlocksProcessed: Int = 0  // FIX #1301: Track actual coverage

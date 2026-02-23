@@ -37,8 +37,45 @@ public enum PingResult {
 /// Operations register handlers here; block listener dispatches messages to waiting handlers
 /// This eliminates race conditions where multiple operations read from TCP stream
 actor PeerMessageDispatcher {
+
+    // MARK: - FIX #1528: One-shot continuation wrapper
+    // `waitForAnyResponse` registers the SAME continuation for multiple commands.
+    // When one command fires, the continuation is resumed — but the same object
+    // remains registered for the other commands. If another dispatch or cleanup
+    // tries to resume it again → "SWIFT TASK CONTINUATION MISUSE" fatal crash.
+    // This wrapper nil-guards the inner continuation so only the FIRST resume wins.
+    // Actor serialization ensures no data race on the `inner` property.
+    final class OneShotContinuation {
+        private var inner: CheckedContinuation<(String, Data), Error>?
+
+        init(_ continuation: CheckedContinuation<(String, Data), Error>) {
+            self.inner = continuation
+        }
+
+        /// Resume with value. Returns true if this was the first resume, false if already consumed.
+        @discardableResult
+        func resume(returning value: (String, Data)) -> Bool {
+            guard let c = inner else { return false }
+            inner = nil
+            c.resume(returning: value)
+            return true
+        }
+
+        /// Resume with error. Returns true if this was the first resume, false if already consumed.
+        @discardableResult
+        func resume(throwing error: Error) -> Bool {
+            guard let c = inner else { return false }
+            inner = nil
+            c.resume(throwing: error)
+            return true
+        }
+
+        /// Whether this continuation has already been consumed
+        var isConsumed: Bool { inner == nil }
+    }
+
     /// Waiting handlers keyed by expected command (e.g., "headers", "block", "reject")
-    private var pendingHandlers: [String: [CheckedContinuation<(String, Data), Error>]] = [:]
+    private var pendingHandlers: [String: [OneShotContinuation]] = [:]
 
     /// FIX #883: Special handler for broadcast - waits for "reject" OR first message
     /// Key: "broadcast_{txid}" - receives either reject or any other message (silence = accept)
@@ -53,18 +90,46 @@ actor PeerMessageDispatcher {
     /// FIX #887: Track if dispatcher is active (block listener running)
     private(set) var isActive: Bool = false
 
+    /// FIX #1521: Early response queue — holds responses that arrive before handler is registered.
+    /// Prevents race condition where peer responds to getaddr before waitForResponse registers.
+    private var earlyResponses: [String: [(String, Data)]] = [:]
+
     /// FIX #887: Set dispatcher active state
     func setActive(_ active: Bool) {
         isActive = active
     }
 
+    /// FIX #1521: Mark commands as expected so dispatch() queues responses that arrive
+    /// before waitForResponse registers the handler. Call BEFORE sending the request.
+    func expectCommands(_ commands: [String]) {
+        for command in commands {
+            if earlyResponses[command] == nil {
+                earlyResponses[command] = []
+            }
+        }
+    }
+
+    /// FIX #1521: Clear expected commands (cleanup after wait completes or times out)
+    func clearExpectedCommands(_ commands: [String]) {
+        for command in commands {
+            earlyResponses.removeValue(forKey: command)
+        }
+    }
+
     /// Register to wait for a specific response type
     func waitForResponse(command: String) async throws -> (String, Data) {
+        // FIX #1521: Check if response already arrived before handler was registered
+        if var early = earlyResponses[command], !early.isEmpty {
+            let response = early.removeFirst()
+            earlyResponses[command] = early.isEmpty ? nil : early
+            return response
+        }
+
         return try await withCheckedThrowingContinuation { continuation in
             if pendingHandlers[command] == nil {
                 pendingHandlers[command] = []
             }
-            pendingHandlers[command]?.append(continuation)
+            pendingHandlers[command]?.append(OneShotContinuation(continuation))
         }
     }
 
@@ -84,14 +149,17 @@ actor PeerMessageDispatcher {
     }
 
     /// FIX #887: Wait for any of multiple response types (e.g., "headers" OR "reject")
+    /// FIX #1528: Uses OneShotContinuation so the same continuation registered for multiple
+    /// commands can only be resumed ONCE — subsequent dispatch/cleanup calls are no-ops.
     func waitForAnyResponse(commands: [String]) async throws -> (String, Data) {
         return try await withCheckedThrowingContinuation { continuation in
-            // Register same continuation for all expected commands
+            // FIX #1528: Wrap in OneShotContinuation — same instance shared across all commands
+            let oneShot = OneShotContinuation(continuation)
             for command in commands {
                 if pendingHandlers[command] == nil {
                     pendingHandlers[command] = []
                 }
-                pendingHandlers[command]?.append(continuation)
+                pendingHandlers[command]?.append(oneShot)
             }
         }
     }
@@ -129,10 +197,12 @@ actor PeerMessageDispatcher {
     }
 
     /// FIX #887: Cancel waiting handler for a specific command (for cleanup after timeout)
+    /// FIX #1519: MUST resume continuation before removing — dropping a CheckedContinuation
+    /// without resuming it leaks the task forever ("SWIFT TASK CONTINUATION MISUSE" warning).
     func cancelWaitingHandler(command: String) {
-        // Remove the handler without resuming (caller has already moved on)
         if var handlers = pendingHandlers[command], !handlers.isEmpty {
-            handlers.removeFirst()
+            let handler = handlers.removeFirst()
+            handler.resume(throwing: CancellationError())
             pendingHandlers[command] = handlers.isEmpty ? nil : handlers
         }
     }
@@ -181,7 +251,17 @@ actor PeerMessageDispatcher {
         if var handlers = pendingHandlers[command], !handlers.isEmpty {
             let handler = handlers.removeFirst()
             pendingHandlers[command] = handlers.isEmpty ? nil : handlers
-            handler.resume(returning: (command, payload))
+            // FIX #1528: OneShotContinuation returns false if already consumed by another command
+            let wasResumed = handler.resume(returning: (command, payload))
+            if !wasResumed {
+                print("⚠️ FIX #1528: [\(command)] handler already consumed (multi-command race avoided)")
+            }
+            return true
+        }
+
+        // FIX #1521: If command is expected but handler not yet registered, queue it
+        if earlyResponses[command] != nil {
+            earlyResponses[command]?.append((command, payload))
             return true
         }
 
@@ -263,10 +343,11 @@ actor PeerMessageDispatcher {
     }
 
     /// Cancel all pending handlers (called on disconnect)
+    /// FIX #1528: OneShotContinuation safely ignores double-resume from multi-command registrations
     func cancelAll(error: Error) {
         for (_, handlers) in pendingHandlers {
             for handler in handlers {
-                handler.resume(throwing: error)
+                handler.resume(throwing: error)  // No-op if already consumed
             }
         }
         pendingHandlers.removeAll()
@@ -2808,7 +2889,25 @@ public final class Peer {
             // Log but don't error (Zclassic nodes send unsolicited headers)
             print("📨 FIX #883: [\(host)] Received unclaimed 'headers' message (\(payload.count) bytes)")
 
-        case "alert", "addr", "addrv2", "getdata", "notfound", "mempool", "getblocks", "getheaders":
+        case "addr":
+            // FIX #1522: Handle unsolicited addr messages — peers proactively share addresses
+            // when they learn about new nodes. Previously silently discarded.
+            let addresses = parseAddrPayload(payload)
+            if !addresses.isEmpty {
+                print("📡 FIX #1522: [\(host)] Received unsolicited 'addr' → \(addresses.count) addresses")
+                onAddressesReceived?(addresses)
+            }
+
+        case "addrv2":
+            // FIX #1522: Handle unsolicited addrv2 (BIP 155) — includes Tor .onion addresses
+            let addresses = parseAddrV2Payload(payload)
+            if !addresses.isEmpty {
+                let onionCount = addresses.filter { $0.host.hasSuffix(".onion") }.count
+                print("📡 FIX #1522: [\(host)] Received unsolicited 'addrv2' → \(addresses.count) addresses (\(onionCount) .onion)")
+                onAddressesReceived?(addresses)
+            }
+
+        case "alert", "getdata", "notfound", "mempool", "getblocks", "getheaders":
             // Known P2P messages - ignore silently
             break
 
@@ -2854,6 +2953,11 @@ public final class Peer {
 
     /// FIX #883: Callback for mempool transaction notification (legacy)
     var onMempoolTx: ((Data) -> Void)?
+
+    /// FIX #1522: Callback for unsolicited addr/addrv2 messages from peers.
+    /// Zclassic nodes proactively broadcast addr messages when they learn about new peers.
+    /// Previously silently discarded at line 2847 — now parsed and forwarded to NetworkManager.
+    var onAddressesReceived: (([PeerAddress]) -> Void)?
 
     /// FIX #883: Callback for transaction confirmation (legacy)
     var onTxConfirmed: ((Data, UInt32) -> Void)?
@@ -3262,49 +3366,71 @@ public final class Peer {
 
     /// Request addresses from this peer (supports both addr and addrv2 responses)
     /// FIX #1147: Use dispatcher when block listener is active to prevent TCP stream desync
+    /// FIX #1521: Register expected responses BEFORE sending getaddr to prevent race condition.
+    /// Old code: sendMessage("getaddr") → waitForResponse("addr") — if peer responded before
+    /// handler was registered, the addr message was dispatched to NO handler and lost.
+    /// Also: Zclassic nodes only respond to getaddr ONCE per connection (fSentAddr flag in main.cpp:6365).
     func getAddresses() async throws -> [PeerAddress] {
         // Check if dispatcher is active (block listener running)
         let dispatcherActive = await messageDispatcher.isActive
 
         if dispatcherActive {
+            // FIX #1521: Pre-register expected responses BEFORE sending getaddr.
+            // This ensures dispatch() queues the response if it arrives before
+            // waitForResponseWithTimeout registers its handler.
+            let expectedCommands = ["addr", "addrv2"]
+            await messageDispatcher.expectCommands(expectedCommands)
+
             // FIX #1147: Use dispatcher pattern - block listener will deliver response
             try await sendMessage(command: "getaddr", payload: Data())
 
             // Wait for addr or addrv2 response via dispatcher
-            // Try addr first, then addrv2
-            if let response = await messageDispatcher.waitForResponseWithTimeout(command: "addr", timeoutSeconds: 10) {
+            // FIX #1521: Handler checks earlyResponses first (queued by dispatch)
+            if let response = await messageDispatcher.waitForResponseWithTimeout(command: "addr", timeoutSeconds: 15) {
                 let result = parseAddrPayload(response.1)
                 // FIX #1514: Log response type and count
                 print("📡 FIX #1514: \(host) responded with 'addr' (\(response.1.count) bytes) → \(result.count) addresses")
+                await messageDispatcher.clearExpectedCommands(expectedCommands)
                 return result
             } else if let response = await messageDispatcher.waitForResponseWithTimeout(command: "addrv2", timeoutSeconds: 5) {
                 let result = parseAddrV2Payload(response.1)
                 print("📡 FIX #1514: \(host) responded with 'addrv2' (\(response.1.count) bytes) → \(result.count) addresses")
+                await messageDispatcher.clearExpectedCommands(expectedCommands)
                 return result
             }
+            // FIX #1521: Clean up expected commands on timeout
+            await messageDispatcher.clearExpectedCommands(expectedCommands)
             print("📡 FIX #1514: \(host) — no addr/addrv2 response (timeout)")
             return []
         }
 
         // FIX #131: Fallback to direct reads when block listener not running
+        // FIX #1521: Loop to skip unsolicited messages (e.g., getheaders) before addr.
+        // Zclassic nodes often send getheaders before the addr response, and the old code
+        // read ONE message, got getheaders, and gave up — wasting the one-time getaddr response.
         return try await withExclusiveAccess {
             try await sendMessage(command: "getaddr", payload: Data())
 
-            let (command, response) = try await receiveMessage()
+            // Read up to 5 messages looking for addr/addrv2 (skip unsolicited getheaders, ping, etc.)
+            for attempt in 1...5 {
+                let (command, response) = try await receiveMessage()
 
-            switch command {
-            case "addr":
-                let result = parseAddrPayload(response)
-                print("📡 FIX #1514: \(host) (direct) responded with 'addr' → \(result.count) addresses")
-                return result
-            case "addrv2":
-                let result = parseAddrV2Payload(response)
-                print("📡 FIX #1514: \(host) (direct) responded with 'addrv2' → \(result.count) addresses")
-                return result
-            default:
-                print("📡 FIX #1514: \(host) (direct) — unexpected response: '\(command)'")
-                return []
+                switch command {
+                case "addr":
+                    let result = parseAddrPayload(response)
+                    print("📡 FIX #1514: \(host) (direct) responded with 'addr' → \(result.count) addresses (after \(attempt) message(s))")
+                    return result
+                case "addrv2":
+                    let result = parseAddrV2Payload(response)
+                    print("📡 FIX #1514: \(host) (direct) responded with 'addrv2' → \(result.count) addresses (after \(attempt) message(s))")
+                    return result
+                default:
+                    print("📡 FIX #1521: \(host) (direct) — skipping unsolicited '\(command)', waiting for addr (\(attempt)/5)")
+                    continue
+                }
             }
+            print("📡 FIX #1514: \(host) (direct) — no addr/addrv2 after 5 messages")
+            return []
         }
     }
 
@@ -3459,12 +3585,15 @@ public final class Peer {
         guard data.count > 0 else { return [] }
         guard let countValue = readCompactSize(from: data, at: &offset) else { return [] }
         let count = Int(countValue)
-        guard count <= 100 else { return [] }  // NET-005: Cap at 100 addresses per peer response (was 1000)
+        // NET-005: Cap at 100 addresses per peer response (Zclassic sends up to 1000)
+        // FIX #1523: Was `guard count <= 100 else { return [] }` — rejected ENTIRE payload
+        // when count > 100 (all Zclassic nodes send 1000). Now caps iteration like parseAddrV2Payload.
+        let cappedCount = min(count, 100)
 
         // Each addr entry: timestamp (4) + services (8) + IPv6 (16) + port (2) = 30 bytes
         let entrySize = 30
 
-        for _ in 0..<count {
+        for _ in 0..<cappedCount {
             guard offset + entrySize <= data.count else { break }
 
             // Skip timestamp (4) and services (8)
@@ -4004,8 +4133,17 @@ public final class Peer {
                         // Respond to peer's ping (they might be checking us too)
                         try? await sendMessage(command: "pong", payload: responseData)
                         continue
-                    } else if command == "inv" || command == "addr" || command == "addrv2" ||
-                              command == "headers" || command == "block" {
+                    } else if command == "addr" {
+                        // FIX #1522: Parse unsolicited addr and forward to NetworkManager
+                        let addrs = parseAddrPayload(responseData)
+                        if !addrs.isEmpty { onAddressesReceived?(addrs) }
+                        continue
+                    } else if command == "addrv2" {
+                        // FIX #1522: Parse unsolicited addrv2 and forward
+                        let addrs = parseAddrV2Payload(responseData)
+                        if !addrs.isEmpty { onAddressesReceived?(addrs) }
+                        continue
+                    } else if command == "inv" || command == "headers" || command == "block" {
                         // Drain unsolicited messages - peer is alive, just chatty
                         continue
                     } else {
@@ -4122,7 +4260,12 @@ public final class Peer {
                 } else if command == "ping" {
                     try await sendMessage(command: "pong", payload: responseData)
                     continue
-                } else if command == "inv" || command == "addr" || command == "headers" || command == "block" {
+                } else if command == "addr" {
+                    // FIX #1522: Forward unsolicited addr
+                    let addrs = parseAddrPayload(responseData)
+                    if !addrs.isEmpty { onAddressesReceived?(addrs) }
+                    continue
+                } else if command == "inv" || command == "headers" || command == "block" {
                     // Drain buffered messages
                     continue
                 } else {
@@ -4200,7 +4343,12 @@ public final class Peer {
                 } else if command == "ping" {
                     try await sendMessage(command: "pong", payload: responseData)
                     continue
-                } else if command == "inv" || command == "addr" || command == "headers" || command == "block" {
+                } else if command == "addr" {
+                    // FIX #1522: Forward unsolicited addr
+                    let addrs = parseAddrPayload(responseData)
+                    if !addrs.isEmpty { onAddressesReceived?(addrs) }
+                    continue
+                } else if command == "inv" || command == "headers" || command == "block" {
                     continue
                 } else {
                     continue

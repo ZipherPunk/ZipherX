@@ -909,6 +909,8 @@ public final class NetworkManager: ObservableObject {
     }
     private var peerRotationTimer: Timer?
     private var addressDiscoveryTimer: Timer?
+    /// FIX #1521: Track peers that already received getaddr (nodes only respond once per connection)
+    private var peersQueriedForAddresses: Set<String> = []
     private var statsRefreshTimer: Timer?
     // FIX #227: Peer recovery watchdog - runs more frequently to detect lost peers
     private var peerRecoveryTimer: Timer?
@@ -1878,10 +1880,18 @@ public final class NetworkManager: ObservableObject {
 
         var discoveredCount = 0
         var onionDiscoveredCount = 0
-        let peerCount = peers.count
-        // FIX #1514: Debug logging for peer discovery via getaddr
-        print("📡 FIX #1514: Starting peer discovery via getaddr — querying \(peerCount) peers, knownAddresses: \(knownAddresses.count)")
-        for peer in peers {
+        // FIX #1521: Only query peers we haven't asked yet — Zclassic nodes respond to
+        // getaddr ONCE per connection (fSentAddr flag in main.cpp:6365). Subsequent requests
+        // are silently ignored, wasting 15s timeout per peer per cycle.
+        let newPeers = peers.filter { !peersQueriedForAddresses.contains($0.host) }
+        if newPeers.isEmpty {
+            print("📡 FIX #1521: No new peers to query for addresses (all \(peers.count) already queried)")
+            return
+        }
+        print("📡 FIX #1514: Starting peer discovery via getaddr — querying \(newPeers.count) NEW peers (skipping \(peers.count - newPeers.count) already queried), knownAddresses: \(knownAddresses.count)")
+        for peer in newPeers {
+            // FIX #1521: Mark as queried BEFORE sending (even if it fails, node already set fSentAddr)
+            peersQueriedForAddresses.insert(peer.host)
             do {
                 let addresses = try await peer.getAddresses()
                 // FIX #1514: Log per-peer response
@@ -1912,7 +1922,7 @@ public final class NetworkManager: ObservableObject {
         }
 
         // FIX #1514: Summary log
-        print("📡 FIX #1514: Discovery complete — \(discoveredCount) new addresses from \(peerCount) peers (\(onionDiscoveredCount) .onion), total knownAddresses: \(knownAddresses.count)")
+        print("📡 FIX #1514: Discovery complete — \(discoveredCount) new addresses from \(newPeers.count) peers (\(onionDiscoveredCount) .onion), total knownAddresses: \(knownAddresses.count)")
 
         // Log .onion discoveries
         if onionDiscoveredCount > 0 {
@@ -2819,6 +2829,8 @@ public final class NetworkManager: ObservableObject {
                         // FIX #1421: Dedup — remove stale peer for same host:port before adding fresh one
                         if let existingIdx = peers.firstIndex(where: { $0.host == peer.host && $0.port == peer.port }) {
                             peers.remove(at: existingIdx)
+                            // FIX #1521: New connection = node resets fSentAddr, can query again
+                            peersQueriedForAddresses.remove(peer.host)
                         }
                         peers.append(peer)
                         // FIX #478: Also add to PeerManager to keep peer lists in sync
@@ -3095,6 +3107,8 @@ public final class NetworkManager: ObservableObject {
             peer.disconnect()
         }
         peers.removeAll()
+        // FIX #1521: Clear getaddr tracking — new connections get fresh fSentAddr on the node
+        peersQueriedForAddresses.removeAll()
 
         // FIX #384: Sync to PeerManager
         Task { @MainActor in
@@ -3132,6 +3146,8 @@ public final class NetworkManager: ObservableObject {
             peer.disconnect()
         }
         peers.removeAll()
+        // FIX #1521: Clear getaddr tracking — new connections get fresh fSentAddr on the node
+        peersQueriedForAddresses.removeAll()
 
         // FIX #384: Sync to PeerManager
         await MainActor.run {
@@ -5471,6 +5487,8 @@ public final class NetworkManager: ObservableObject {
                         // FIX #1421: Dedup — remove stale peer for same host:port before adding fresh one
                         if let existingIdx = peers.firstIndex(where: { $0.host == peer.host && $0.port == peer.port }) {
                             peers.remove(at: existingIdx)
+                            // FIX #1521: New connection = node resets fSentAddr, can query again
+                            peersQueriedForAddresses.remove(peer.host)
                         }
                         peers.append(peer)
                         // FIX #478: Also add to PeerManager to keep peer lists in sync
@@ -5668,6 +5686,22 @@ public final class NetworkManager: ObservableObject {
             print("🔮 FIX #1333: [\(peer.host)] Received full TX \(txidHex.prefix(16))... from unsolicited inv — trial decrypting...")
             Task {
                 await self.processIncomingMempoolTx(txid: txid, rawTx: rawTx, fromPeer: peer.host)
+            }
+        }
+
+        // FIX #1522: Handle unsolicited addr/addrv2 messages — peers proactively share
+        // new addresses they learn about. Previously silently discarded in block listener.
+        // This provides continuous peer discovery without needing to resend getaddr.
+        peer.onAddressesReceived = { [weak self] addresses in
+            guard let self = self else { return }
+            var accepted = 0
+            for addr in addresses {
+                self.addAddress(addr, source: peer.host)
+                accepted += 1
+            }
+            if accepted > 0 {
+                self.persistAddresses()
+                Task { await self.updateTorAvailability() }
             }
         }
 

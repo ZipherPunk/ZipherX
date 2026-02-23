@@ -2363,7 +2363,7 @@ final class FilterScanner {
         if await WalletManager.shared.isRepairingDatabase {
             UserDefaults.standard.set(true, forKey: "FIX1089_FullVerificationComplete")
             // FIX #1300: Save code version after Full Rescan verification
-            let verificationCodeVersion = "1302"
+            let verificationCodeVersion = "1527"  // FIX #1527: Bumped — force fresh re-scan
             let buildForRescan = "\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown").\(verificationCodeVersion)"
             UserDefaults.standard.set(buildForRescan, forKey: "FIX1283_LastVerifiedBuild")
             print("✅ FIX #1101: Set FIX1089_FullVerificationComplete=true after Full Rescan (skips redundant 73K block scan)")
@@ -2423,22 +2423,25 @@ final class FilterScanner {
             // Set FIX #1089 checkpoint so future startups don't trigger the full 86K scan either
             UserDefaults.standard.set(true, forKey: "FIX1089_FullVerificationComplete")
         } else {
-            // FIX #1500: On iOS, throttle post-scan verification to once every 10 minutes.
-            // z8.log showed 23 runs in 21 minutes, ALL with 0% scan coverage (delta range
-            // covers all blocks). Each run wastes ~1s CPU + P2P fetch for zero benefit.
-            // macOS keeps original behavior (runs after every block sync).
-            #if os(iOS)
+            // FIX #1500/#1518: Throttle post-scan verification on ALL platforms.
+            // FIX #303 is a REDUNDANCY check — FilterScanner's processShieldedOutputsSync()
+            // already catches ALL spent nullifiers in real-time during normal block sync.
+            // FIX #303 re-scans the same blocks FilterScanner just processed → zero benefit.
+            // macOS log showed N-10 probe fetch on EVERY block (~75s), wasting P2P bandwidth.
+            // iOS: 600s (10 min), macOS: 120s (2 min, more responsive for development).
+            // Bypass: fixedNullifiers > 0 forces immediate run (FilterScanner found something).
             let lastVerifyKey = "FIX1500_LastPostScanVerifyTime"
             let lastVerifyTime = UserDefaults.standard.double(forKey: lastVerifyKey)
             let timeSinceLastVerify = Date().timeIntervalSince1970 - lastVerifyTime
+            #if os(iOS)
             let postScanVerifyCooldown: TimeInterval = 600 // 10 minutes
+            #else
+            let postScanVerifyCooldown: TimeInterval = 120 // FIX #1518: 2 minutes on macOS
+            #endif
             let shouldSkipVerification = timeSinceLastVerify < postScanVerifyCooldown && fixedNullifiers == 0
             if shouldSkipVerification {
-                print("⏩ FIX #1500: Skipping FIX #945 on iOS — last run \(Int(timeSinceLastVerify))s ago (cooldown: \(Int(postScanVerifyCooldown))s)")
+                print("⏩ FIX #1518: Skipping FIX #945 — last run \(Int(timeSinceLastVerify))s ago (cooldown: \(Int(postScanVerifyCooldown))s)")
             }
-            #else
-            let shouldSkipVerification = false
-            #endif
             if !shouldSkipVerification {
                 print("🔍 FIX #945: Running post-scan spend verification...")
                 do {
@@ -2450,9 +2453,7 @@ final class FilterScanner {
                     } else {
                         print("✅ FIX #945: All unspent notes verified - no missed spends")
                     }
-                    #if os(iOS)
                     UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: lastVerifyKey)
-                    #endif
                 } catch {
                     print("⚠️ FIX #945: Post-scan verification failed: \(error)")
                     print("   Balance may be incorrect if spends occurred in missed blocks")

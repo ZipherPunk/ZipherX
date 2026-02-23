@@ -2248,8 +2248,31 @@ struct CypherpunkMainView: View {
                 .foregroundColor(matrixGreenDark)
                 .tracking(3)
 
+            // FIX #1520: Encryption key mismatch takes priority — balance is 0 due to unreadable values
+            if walletManager.encryptionKeyMismatch {
+                VStack(spacing: 8) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "key.slash")
+                            .font(.system(size: 28))
+                            .foregroundColor(.orange)
+                        Text("KEY CHANGED")
+                            .font(.system(size: 28, weight: .bold, design: .monospaced))
+                            .foregroundColor(.orange)
+                    }
+                    .shadow(color: .orange.opacity(0.6), radius: 8)
+
+                    Text("App reinstall changed the database\nencryption key. Your funds are safe —\na Full Rescan will restore them.")
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundColor(.orange.opacity(0.8))
+                        .multilineTextAlignment(.center)
+
+                    Text("Settings → Repair Database → Full Rescan")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(matrixGreenDark)
+                }
+                .padding(.vertical, 8)
             // FIX #1118: Show warning instead of balance if integrity issue detected
-            if walletManager.balanceIntegrityIssue {
+            } else if walletManager.balanceIntegrityIssue {
                 VStack(spacing: 8) {
                     HStack(spacing: 8) {
                         Image(systemName: "exclamationmark.triangle.fill")

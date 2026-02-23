@@ -98,8 +98,13 @@ final class WalletDatabase {
     }
 
     /// Decrypt a UInt64 value from shadow column
+    /// FIX #1516: MUST check count == 8, NOT >= 8. When decryption fails (key mismatch from
+    /// TestFlight→Xcode install, salt lost, etc.), decryptBlob's catch block returns the RAW
+    /// encrypted bytes (37 bytes for v2). The old `>= 8` check passed for 37 bytes and
+    /// interpreted encrypted blob bytes as UInt64 → garbage values like 180 billion ZCL.
+    /// A correctly decrypted UInt64 is ALWAYS exactly 8 bytes.
     private func decryptUInt64(_ encrypted: Data) -> UInt64? {
-        guard let decrypted = try? decryptBlob(encrypted, domain: .notes), decrypted.count >= 8 else { return nil }
+        guard let decrypted = try? decryptBlob(encrypted, domain: .notes), decrypted.count == 8 else { return nil }
         return decrypted.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
     }
 
@@ -110,8 +115,10 @@ final class WalletDatabase {
     }
 
     /// Decrypt an Int64 value from shadow column
+    /// FIX #1516: Same exact-size check as decryptUInt64 — prevents raw encrypted bytes
+    /// being interpreted as Int64 when key mismatch causes decryption failure.
     private func decryptInt64(_ encrypted: Data) -> Int64? {
-        guard let decrypted = try? decryptBlob(encrypted, domain: .notes), decrypted.count >= 8 else { return nil }
+        guard let decrypted = try? decryptBlob(encrypted, domain: .notes), decrypted.count == 8 else { return nil }
         return decrypted.withUnsafeBytes { $0.loadUnaligned(as: Int64.self) }
     }
 
@@ -507,6 +514,12 @@ final class WalletDatabase {
         try? parentURL.setResourceValues(resourceValues)
 
         print("📂 Database opened successfully (backup exclusion set)")
+
+        // FIX #1526: Notify subsystems that depend on DB being ready.
+        // ChatManager.init() runs before DB is open (SwiftUI @StateObject init happens
+        // before biometric auth) → loads 0 contacts/empty nickname. This notification
+        // triggers a reload with actual data.
+        NotificationCenter.default.post(name: .walletDatabaseOpened, object: nil)
     }
 
     /// VUL-STOR-009: Apply SQLCipher encryption key to an open database
@@ -3080,6 +3093,34 @@ final class WalletDatabase {
             }
         }
         return total
+    }
+
+    /// FIX #1520: Detect encryption key mismatch (e.g., TestFlight → Xcode install).
+    /// Samples up to 10 notes with non-NULL value_enc. If ALL fail to decrypt (return nil),
+    /// the DB encryption key has changed and a Full Rescan is needed to re-discover note values.
+    /// Returns (notesChecked, decryptionFailures) — mismatch when failures == checked && checked > 0.
+    func detectEncryptionKeyMismatch() -> (notesChecked: Int, failures: Int) {
+        let sql = "SELECT value_enc FROM notes WHERE value_enc IS NOT NULL LIMIT 10;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return (0, 0) }
+        defer { sqlite3_finalize(stmt) }
+
+        var checked = 0
+        var failed = 0
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if sqlite3_column_type(stmt, 0) != SQLITE_NULL {
+                let encPtr = sqlite3_column_blob(stmt, 0)
+                let encLen = sqlite3_column_bytes(stmt, 0)
+                if let encPtr = encPtr, encLen > 0 {
+                    checked += 1
+                    let encrypted = Data(bytes: encPtr, count: Int(encLen))
+                    if decryptUInt64(encrypted) == nil {
+                        failed += 1
+                    }
+                }
+            }
+        }
+        return (checked, failed)
     }
 
     /// FIX #876: Get count and total value of notes WITHOUT valid witnesses
@@ -6287,6 +6328,27 @@ final class WalletDatabase {
                 $0.txid == spentTxid || $0.txid == reversedTxid
             }
 
+            // FIX #1524: Height-based fallback for boost file placeholder txids.
+            // Boost file notes have synthetic received_in_tx (starting with "boost") that
+            // don't match the real spentTxid. But change outputs are ALWAYS in the SAME
+            // block as the spend. Without this: totalChangeValue=0 → amountToRecipient
+            // equals full input value → self-sends show as huge SENT entries (e.g. 0.94 ZCL
+            // instead of "Fee: 0.0001"). Only apply when txid matching returns empty AND
+            // notes at the spend height have placeholder txids.
+            let boostPrefix = Data([0x62, 0x6F, 0x6F, 0x73, 0x74]) // "boost" in ASCII
+            var boostFallbackUsed = false
+            if changeOutputs.isEmpty {
+                let heightMatched = allNotes.filter { note in
+                    note.receivedHeight == txInfo.spentHeight
+                    && note.txid.prefix(5) == boostPrefix
+                }
+                if !heightMatched.isEmpty {
+                    changeOutputs = heightMatched
+                    boostFallbackUsed = true
+                    print("📜 FIX #1524: Found \(heightMatched.count) boost-file change outputs by height at \(txInfo.spentHeight)")
+                }
+            }
+
             // FIX #1515: Overflow-safe reduction
             var totalChangeValue = changeOutputs.reduce(UInt64(0)) { $0 &+ $1.value }
 
@@ -6370,6 +6432,40 @@ final class WalletDatabase {
                 if changes > 0 {
                     count += 1
                     print("📜 SENT: Inserted from notes txid=\(spentTxid.prefix(8).hexString) (no prior record)")
+                } else if boostFallbackUsed {
+                    // FIX #1524b: Existing entry has WRONG amount (change was undetected before FIX #1524).
+                    // UPDATE in-place to correct it. Without this: old entry persists with full input value
+                    // as amount, showing e.g. 0.94 ZCL SENT instead of "Self-Send (Fee: 0.0001)".
+                    let updateSql = """
+                        UPDATE transaction_history SET value = ?, to_address = ?, memo = ?
+                        WHERE txid = ? AND tx_type = ?;
+                    """
+                    var updateStmt: OpaquePointer?
+                    if sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK {
+                        sqlite3_bind_int64(updateStmt, 1, Int64(displayValue))
+                        if let addr = toAddressValue {
+                            sqlite3_bind_text(updateStmt, 2, addr, -1, SQLITE_TRANSIENT)
+                        } else {
+                            sqlite3_bind_null(updateStmt, 2)
+                        }
+                        if isSelfSend, let selfMemo = changeOutputs.compactMap({ $0.memo }).first {
+                            sqlite3_bind_text(updateStmt, 3, selfMemo, -1, SQLITE_TRANSIENT)
+                        } else {
+                            sqlite3_bind_null(updateStmt, 3)
+                        }
+                        _ = spentTxid.withUnsafeBytes { ptr in
+                            sqlite3_bind_blob(updateStmt, 4, ptr.baseAddress, Int32(spentTxid.count), SQLITE_TRANSIENT)
+                        }
+                        let encSent = encryptTxType(.sent)
+                        sqlite3_bind_text(updateStmt, 5, encSent, -1, SQLITE_TRANSIENT)
+                        if sqlite3_step(updateStmt) == SQLITE_DONE {
+                            let updated = sqlite3_changes(db)
+                            if updated > 0 {
+                                print("📜 FIX #1524b: Corrected stale SENT entry txid=\(spentTxid.prefix(8).hexString)... → value=\(displayValue), selfSend=\(isSelfSend)")
+                            }
+                        }
+                        sqlite3_finalize(updateStmt)
+                    }
                 } else {
                     print("📜 SENT: Skipped txid=\(spentTxid.prefix(8).hexString) (already recorded by WalletManager)")
                 }
