@@ -118,6 +118,9 @@ final class ChatManager: ObservableObject {
     /// Is chat service available (requires Tor + Hidden Service)
     @Published private(set) var isAvailable: Bool = false
 
+    /// FIX #1532: True while connecting to contacts after startup (warmup phase)
+    @Published private(set) var isWarmingUp: Bool = false
+
     /// Our .onion address for chat
     @Published private(set) var ourOnionAddress: String?
 
@@ -372,6 +375,7 @@ final class ChatManager: ObservableObject {
             WalletDatabase.shared.saveChatContact(
                 onionAddress: contact.onionAddress,
                 nickname: contact.nickname.isEmpty ? nil : contact.nickname,
+                isBlocked: contact.isBlocked,
                 unreadCount: contact.unreadCount,
                 lastMessageTime: nil
             )
@@ -1822,8 +1826,15 @@ final class ChatManager: ObservableObject {
 
     /// FIX #1440: Public method to trigger immediate online check for all contacts
     /// Called when chat view first appears so dots are green right away (not after 30s)
+    /// FIX #1532: Sets isWarmingUp during the check so UI can show warmup status
     func checkAllContactsOnline() async {
-        for contact in contacts where !contact.isBlocked {
+        let contactsToCheck = contacts.filter { !$0.isBlocked }
+        guard !contactsToCheck.isEmpty else { return }
+
+        isWarmingUp = true
+        defer { isWarmingUp = false }
+
+        for contact in contactsToCheck {
             let isConnected: Bool
             if let peer = peers[contact.onionAddress] {
                 isConnected = await peer.state.isConnected
@@ -2275,10 +2286,12 @@ class ChatDatabase {
 
     // MARK: - Contacts (SQLCipher)
 
+    // FIX #1531: Pass isBlocked to persist blocked status across restarts
     func saveContact(_ contact: ChatContact) {
         WalletDatabase.shared.saveChatContact(
             onionAddress: contact.onionAddress,
             nickname: contact.nickname.isEmpty ? nil : contact.nickname,
+            isBlocked: contact.isBlocked,
             unreadCount: contact.unreadCount,
             lastMessageTime: nil
         )

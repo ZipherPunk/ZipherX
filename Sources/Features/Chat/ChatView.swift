@@ -526,18 +526,24 @@ struct ChatView: View {
     }
 
     // FIX #1389: Chat status color — based on Tor/chat availability, not P2P peers
+    // FIX #1532: Orange during warmup phase
     private var chatStatusColor: Color {
         if !chatManager.isAvailable {
             return Color.red
+        } else if chatManager.isWarmingUp {
+            return Color.orange
         } else {
             return theme.accentColor
         }
     }
 
     // FIX #1389: Chat status text — based on Tor/chat availability, not P2P peers
+    // FIX #1532: Show warming up status while connecting to contacts
     private var chatStatusText: String {
         if !chatManager.isAvailable {
             return "OFFLINE"
+        } else if chatManager.isWarmingUp {
+            return "WARMING UP..."
         } else {
             return "ONLINE"
         }
@@ -2381,11 +2387,11 @@ struct ChatSettingsSheet: View {
                                 Spacer()
                                 HStack(spacing: 6) {
                                     Circle()
-                                        .fill(chatManager.isAvailable ? theme.accentColor : Color.red)
+                                        .fill(chatStatusColor)
                                         .frame(width: 8, height: 8)
-                                    Text(chatManager.isAvailable ? "Online" : "Offline")
+                                    Text(chatStatusText)
                                         .font(.system(size: 14, weight: .medium, design: .monospaced))
-                                        .foregroundColor(chatManager.isAvailable ? theme.accentColor : Color.red)
+                                        .foregroundColor(chatStatusColor)
                                 }
                             }
                             .padding(14)

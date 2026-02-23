@@ -8978,13 +8978,16 @@ final class WalletDatabase {
     // Previous code: `nickname = excluded.nickname` — if contact.nickname was empty (passed as NULL),
     // the DB nickname was wiped. This caused contacts to lose their received nicknames on every
     // status update (online/offline transitions trigger saveContact with the local struct).
-    func saveChatContact(onionAddress: String, nickname: String?, unreadCount: Int, lastMessageTime: Int64?) {
+    // FIX #1531: Added is_blocked parameter — was completely missing from INSERT/UPDATE,
+    // so blocked status was never persisted. After restart, is_blocked always defaulted to 0.
+    func saveChatContact(onionAddress: String, nickname: String?, isBlocked: Bool, unreadCount: Int, lastMessageTime: Int64?) {
         guard db != nil else { return }
         let sql = """
-            INSERT INTO chat_contacts (onion_address, nickname, unread_count, last_message_time)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO chat_contacts (onion_address, nickname, is_blocked, unread_count, last_message_time)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(onion_address) DO UPDATE SET
                 nickname = COALESCE(excluded.nickname, nickname),
+                is_blocked = excluded.is_blocked,
                 unread_count = excluded.unread_count,
                 last_message_time = COALESCE(excluded.last_message_time, last_message_time);
         """
@@ -8997,11 +9000,12 @@ final class WalletDatabase {
         } else {
             sqlite3_bind_null(stmt, 2)
         }
-        sqlite3_bind_int(stmt, 3, Int32(unreadCount))
+        sqlite3_bind_int(stmt, 3, isBlocked ? 1 : 0)
+        sqlite3_bind_int(stmt, 4, Int32(unreadCount))
         if let time = lastMessageTime {
-            sqlite3_bind_int64(stmt, 4, time)
+            sqlite3_bind_int64(stmt, 5, time)
         } else {
-            sqlite3_bind_null(stmt, 4)
+            sqlite3_bind_null(stmt, 5)
         }
         sqlite3_step(stmt)
     }
