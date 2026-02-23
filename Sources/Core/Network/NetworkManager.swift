@@ -2413,7 +2413,9 @@ public final class NetworkManager: ObservableObject {
             // FIX #1537: Route through Tor when enabled to prevent IP leak to GitHub.
             // GitHub sees your real IP + learns you use ZipherX from the URL path.
             let session: URLSession
-            if await TorManager.shared.mode == .enabled && await TorManager.shared.connectionState.isConnected {
+            let torMode = await TorManager.shared.mode
+            let torConnected = await TorManager.shared.connectionState.isConnected
+            if torMode == .enabled && torConnected {
                 session = await TorManager.shared.getTorURLSession(isolate: true)
                 print("🔒 FIX #1537: Peer list download routed through Tor")
             } else {
@@ -5290,7 +5292,9 @@ public final class NetworkManager: ObservableObject {
         do {
             // FIX #1537: Route price fetches through Tor when available
             let priceSession: URLSession
-            if await TorManager.shared.mode == .enabled && await TorManager.shared.connectionState.isConnected {
+            let torMode = await TorManager.shared.mode
+            let torConnected = await TorManager.shared.connectionState.isConnected
+            if torMode == .enabled && torConnected {
                 priceSession = await TorManager.shared.getTorURLSession(isolate: true)
             } else {
                 priceSession = URLSession.shared
@@ -5325,7 +5329,9 @@ public final class NetworkManager: ObservableObject {
 
             // FIX #1537: Route price fetches through Tor when available
             let cmcSession: URLSession
-            if await TorManager.shared.mode == .enabled && await TorManager.shared.connectionState.isConnected {
+            let torMode = await TorManager.shared.mode
+            let torConnected = await TorManager.shared.connectionState.isConnected
+            if torMode == .enabled && torConnected {
                 cmcSession = await TorManager.shared.getTorURLSession(isolate: true)
             } else {
                 cmcSession = URLSession.shared
@@ -8829,7 +8835,7 @@ public final class NetworkManager: ObservableObject {
                 // FIX #1537: In strict privacy mode, NEVER bypass Tor — prefer no connection
                 // over clearnet. An attacker who disrupts 5 Tor connections should NOT cause
                 // automatic deanonymization.
-                let strictPrivacy = await TorManager.shared.strictPrivacyMode
+                let strictPrivacy = UserDefaults.standard.bool(forKey: "torStrictPrivacyMode")
                 if strictPrivacy {
                     print("🔒 FIX #1537: \(consecutiveSOCKS5Failures) SOCKS5 failures but strict privacy — Tor bypass REFUSED")
                     print("🔒 FIX #1537: Preferring no connection over clearnet exposure. Restarting Tor...")
