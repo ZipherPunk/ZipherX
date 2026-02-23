@@ -40,7 +40,7 @@ struct ContentView: View {
     @State private var maxDisplayedProgress: Double = 0.0
 
     // DEBUG: Set to true to pause at sync completion with a confirmation button
-    private let DEBUG_PAUSE_AT_COMPLETION = true
+    private let DEBUG_PAUSE_AT_COMPLETION = false
     @State private var debugWaitingForConfirmation = false
     @State private var debugCompletionMessage = ""
 
