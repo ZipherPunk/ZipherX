@@ -635,7 +635,8 @@ public class FullNodeManager: ObservableObject {
     }
 
     /// Install daemon binaries from app bundle to /usr/local/bin
-    /// Returns true on success
+    /// FIX #1512: NEVER overwrite existing binaries — user may have a custom or newer build.
+    /// Only installs if binaries are NOT already present and accessible.
     public func installDaemonFromBundle() async throws {
         guard let daemonSource = Self.bundledDaemonPath,
               let cliSource = Self.bundledCliPath else {
@@ -650,23 +651,37 @@ public class FullNodeManager: ObservableObject {
             try fm.createDirectory(at: binDir, withIntermediateDirectories: true)
         }
 
-        // Copy daemon binary (overwrite if exists)
+        // FIX #1512: Skip if daemon already exists and is executable
         let daemonDest = Self.daemonPath
-        if fm.fileExists(atPath: daemonDest.path) {
-            try fm.removeItem(at: daemonDest)
+        if fm.fileExists(atPath: daemonDest.path) && fm.isExecutableFile(atPath: daemonDest.path) {
+            print("✅ FIX #1512: zclassicd already exists at \(daemonDest.path) — skipping install")
+        } else {
+            // Only install if not present
+            if fm.fileExists(atPath: daemonDest.path) {
+                // Exists but not executable — fix permissions only
+                try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: daemonDest.path)
+                print("✅ FIX #1512: Fixed permissions on existing zclassicd")
+            } else {
+                try fm.copyItem(at: daemonSource, to: daemonDest)
+                try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: daemonDest.path)
+                print("✅ Installed zclassicd (was not present)")
+            }
         }
-        try fm.copyItem(at: daemonSource, to: daemonDest)
-        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: daemonDest.path)
-        print("✅ Installed zclassicd")
 
-        // Copy CLI binary (overwrite if exists)
+        // FIX #1512: Skip if CLI already exists and is executable
         let cliDest = Self.cliPath
-        if fm.fileExists(atPath: cliDest.path) {
-            try fm.removeItem(at: cliDest)
+        if fm.fileExists(atPath: cliDest.path) && fm.isExecutableFile(atPath: cliDest.path) {
+            print("✅ FIX #1512: zclassic-cli already exists at \(cliDest.path) — skipping install")
+        } else {
+            if fm.fileExists(atPath: cliDest.path) {
+                try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cliDest.path)
+                print("✅ FIX #1512: Fixed permissions on existing zclassic-cli")
+            } else {
+                try fm.copyItem(at: cliSource, to: cliDest)
+                try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cliDest.path)
+                print("✅ Installed zclassic-cli (was not present)")
+            }
         }
-        try fm.copyItem(at: cliSource, to: cliDest)
-        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cliDest.path)
-        print("✅ Installed zclassic-cli")
 
         await MainActor.run {
             isNodeInstalled = true

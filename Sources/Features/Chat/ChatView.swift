@@ -1133,10 +1133,21 @@ struct ConversationView: View {
                         )
                 }
 
+                // FIX #1509: Show both nickname and onion address in header
                 VStack(alignment: .leading, spacing: 2) {
+                    // Primary: nickname if set, otherwise truncated onion
                     Text(liveContact.displayName)
-                        .font(.system(size: 15, weight: .semibold, design: .monospaced))
+                        .font(.system(size: 14, weight: .semibold, design: .monospaced))
                         .foregroundColor(.white)
+                        .lineLimit(1)
+
+                    // Secondary: show onion address below nickname (if nickname is set)
+                    if !liveContact.nickname.isEmpty {
+                        Text(String(liveContact.onionAddress.prefix(16)) + "...")
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundColor(theme.accentColor.opacity(0.5))
+                            .lineLimit(1)
+                    }
 
                     HStack(spacing: 4) {
                         Circle()
@@ -2246,23 +2257,36 @@ struct ChatSettingsSheet: View {
                         .padding(.horizontal, 14)
 
                         VStack(spacing: 12) {
-                            HStack {
-                                Text("Nickname")
-                                    .font(.system(size: 14, design: .monospaced))
-                                    .foregroundColor(theme.textPrimary.opacity(0.7))
-                                Spacer()
-                                // FIX #343: Add visible placeholder styling for iOS
-                                TextField("", text: $chatManager.ourNickname, prompt: Text("Enter nickname")
-                                    .font(.system(size: 14, weight: .medium, design: .monospaced))
-                                    .foregroundColor(theme.accentColor.opacity(0.5)))
-                                    .textFieldStyle(.plain)
-                                    .multilineTextAlignment(.trailing)
-                                    .font(.system(size: 14, weight: .medium, design: .monospaced))
-                                    .foregroundColor(theme.accentColor)
+                            // FIX #1510: Made nickname field more visible with clear border and help text
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Text("Nickname")
+                                        .font(.system(size: 14, design: .monospaced))
+                                        .foregroundColor(theme.textPrimary.opacity(0.7))
+                                    Spacer()
+                                    TextField("", text: $chatManager.ourNickname, prompt: Text("Tap to set nickname")
+                                        .font(.system(size: 14, weight: .medium, design: .monospaced))
+                                        .foregroundColor(theme.accentColor.opacity(0.4)))
+                                        .textFieldStyle(.plain)
+                                        .multilineTextAlignment(.trailing)
+                                        .font(.system(size: 14, weight: .medium, design: .monospaced))
+                                        .foregroundColor(theme.accentColor)
+                                }
+
+                                // Help text when no nickname is set
+                                if chatManager.ourNickname.isEmpty {
+                                    Text("Your nickname will be shown to contacts instead of your onion address")
+                                        .font(.system(size: 10, design: .monospaced))
+                                        .foregroundColor(theme.textPrimary.opacity(0.35))
+                                }
                             }
                             .padding(14)
                             .background(Color.black.opacity(0.2))
                             .cornerRadius(10)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 10)
+                                    .stroke(chatManager.ourNickname.isEmpty ? theme.accentColor.opacity(0.3) : theme.accentColor.opacity(0.15), lineWidth: 1)
+                            )
 
                             // FIX #224: QR Code and .onion address with copy button
                             // FIX #251: Include nickname in QR code + add ZipherX logo

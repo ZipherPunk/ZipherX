@@ -2841,31 +2841,49 @@ final class FilterScanner {
                             // FIX #1281's size guard incorrectly skipped the update because tree size matched, but
                             // the witnesses in DB were corrupted (wrong merkle paths). updateAllWitnessesBatch can't
                             // fix corrupted witnesses — it only APPENDS CMUs to existing paths.
-                            // New approach: treeCreateWitnessForPosition() creates FRESH merkle paths from the
-                            // repaired tree. Each witness root = repaired tree root (validated against blockchain).
-                            print("🔧 FIX #1282: Creating fresh witnesses from repaired tree (not loading from DB)...")
+                            //
+                            // FIX #1505: Original FIX #1282 passed treeSerialize() (compact binary merkle tree, ~11 bytes/node)
+                            // to treeCreateWitnessForPosition() which expects bundled CMU format [count: u64][cmu1: 32]...
+                            // This format mismatch caused ALL witness creations to fail with "Tree data truncated" (160+ errors).
+                            // Same bug as FIX #1361 in WalletManager. Fix: Use treeCreateWitnessesBatch with boost + delta CMUs.
+                            print("🔧 FIX #1505: Creating fresh witnesses via batch (boost + delta CMU data)...")
 
                             var rebuiltCount = 0
-                            if let repairedTreeData = ZipherXFFI.treeSerialize() {
+                            let targetCMUs = validNotes.compactMap { $0.cmu }
+                            if let boostCMUData = await FastWalletCache.shared.getTreeData(), boostCMUData.count >= 8, !targetCMUs.isEmpty {
+                                let boostCMUCount = boostCMUData.prefix(8).withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
+                                let localDeltaCMUs = DeltaCMUManager.shared.loadDeltaCMUs() ?? []
+                                let totalCount = boostCMUCount + UInt64(localDeltaCMUs.count)
+
+                                // Build combined CMU data in bundled format: [count: u64][cmu1: 32]...[cmuN: 32]
+                                var combinedCMUData = Data(capacity: 8 + Int(totalCount) * 32)
+                                var count = totalCount
+                                withUnsafeBytes(of: &count) { combinedCMUData.append(contentsOf: $0) }
+                                combinedCMUData.append(boostCMUData.suffix(from: 8))
+                                for cmu in localDeltaCMUs { combinedCMUData.append(cmu) }
+
+                                print("🔧 FIX #1505: Batch creating \(targetCMUs.count) witnesses (boost:\(boostCMUCount) + delta:\(localDeltaCMUs.count) = \(totalCount) CMUs)...")
+                                let batchResults = ZipherXFFI.treeCreateWitnessesBatch(cmuData: combinedCMUData, targetCMUs: targetCMUs)
+
+                                // Map batch results back to notes (same order as targetCMUs → validNotes with non-nil cmu)
+                                var resultIdx = 0
                                 for noteData in validNotes {
-                                    let witnessIndex = noteData.note.witnessIndex
-                                    if let result = ZipherXFFI.treeCreateWitnessForPosition(
-                                        treeData: repairedTreeData,
-                                        position: witnessIndex
-                                    ) {
-                                        if result.witness.count >= 100 {
-                                            try? database.updateNoteWitness(noteId: noteData.note.id, witness: result.witness)
+                                    guard noteData.cmu != nil, resultIdx < batchResults.count else { continue }
+                                    if let res = batchResults[resultIdx] {
+                                        if res.witness.count >= 100 {
+                                            try? database.updateNoteWitness(noteId: noteData.note.id, witness: res.witness)
                                             // FIX #804: Use witness root as anchor
-                                            if let witnessAnchor = ZipherXFFI.witnessGetRoot(result.witness) {
+                                            if let witnessAnchor = ZipherXFFI.witnessGetRoot(res.witness) {
                                                 try? database.updateNoteAnchor(noteId: noteData.note.id, anchor: witnessAnchor)
                                             }
                                             rebuiltCount += 1
                                         }
                                     }
+                                    resultIdx += 1
                                 }
-                                print("✅ FIX #1282: Created \(rebuiltCount)/\(validNotes.count) fresh witnesses from repaired tree")
+                                print("✅ FIX #1505: Created \(rebuiltCount)/\(validNotes.count) fresh witnesses from boost + delta CMU data")
                             } else {
-                                print("❌ FIX #1282: Failed to serialize repaired tree for witness creation")
+                                print("❌ FIX #1505: No boost CMU data available for witness creation")
 
                                 // Fallback: load witnesses from DB and force-apply ALL delta CMUs
                                 // (bypass FIX #1281 guard since we know repair just happened)

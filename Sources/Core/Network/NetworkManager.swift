@@ -1878,9 +1878,15 @@ public final class NetworkManager: ObservableObject {
 
         var discoveredCount = 0
         var onionDiscoveredCount = 0
+        let peerCount = peers.count
+        // FIX #1514: Debug logging for peer discovery via getaddr
+        print("📡 FIX #1514: Starting peer discovery via getaddr — querying \(peerCount) peers, knownAddresses: \(knownAddresses.count)")
         for peer in peers {
             do {
                 let addresses = try await peer.getAddresses()
+                // FIX #1514: Log per-peer response
+                let onionAddrs = addresses.filter { $0.host.hasSuffix(".onion") }
+                print("📡 FIX #1514: Peer \(peer.host) returned \(addresses.count) addresses (\(onionAddrs.count) .onion)")
                 var peerAccepted = 0
                 for addr in addresses {
                     // NET-005: Per-peer quota per discovery cycle
@@ -1899,9 +1905,14 @@ public final class NetworkManager: ObservableObject {
                 addressSourceCounts[peer.host, default: 0] += peerAccepted
                 peer.recordSuccess()
             } catch {
+                // FIX #1514: Log failed getaddr
+                print("📡 FIX #1514: Peer \(peer.host) getaddr FAILED: \(error)")
                 peer.recordFailure()
             }
         }
+
+        // FIX #1514: Summary log
+        print("📡 FIX #1514: Discovery complete — \(discoveredCount) new addresses from \(peerCount) peers (\(onionDiscoveredCount) .onion), total knownAddresses: \(knownAddresses.count)")
 
         // Log .onion discoveries
         if onionDiscoveredCount > 0 {
@@ -2319,9 +2330,9 @@ public final class NetworkManager: ObservableObject {
 
         if let data = try? JSONEncoder().encode(Array(addresses)) {
             UserDefaults.standard.set(data, forKey: persistedAddressesKey)
-            if verbose {
-                print("📡 Persisted \(addresses.count) peer addresses")
-            }
+            // FIX #1514: Always log persist count for peer discovery verification
+            let onionCount = addresses.filter { $0.host.hasSuffix(".onion") }.count
+            print("📡 FIX #1514: Persisted \(addresses.count) peer addresses (\(onionCount) .onion)")
         }
     }
 
@@ -9489,14 +9500,11 @@ public final class NetworkManager: ObservableObject {
         // FIX #1461: Proactive peer growth — connect to more peers if below MIN_PEERS
         // This runs even during sync, because having more peers improves P2P fetch reliability.
         // The main connect() exits early at 3-6 peers for fast startup; this fills to 8+.
-        // FIX #1501: On iOS, skip peer growth when >= CONSENSUS_THRESHOLD peers.
-        // z8.log: 14 growth attempts in 21 min, each trying 5 SOCKS5 connections, ALL failing.
-        // 3 peers is sufficient for iOS consensus. Growing to 8 wastes CPU/radio.
-        #if os(iOS)
+        // FIX #1501/#1506: Skip peer growth when >= CONSENSUS_THRESHOLD peers.
+        // z8.log (iOS): 14 growth attempts in 21 min, each trying 5 SOCKS5 connections, ALL failing.
+        // macOS log: 3/8 growth every 30s with Tor — all SOCKS5 connections fail.
+        // 3 peers = CONSENSUS_THRESHOLD = sufficient for consensus on both platforms.
         let peerGrowthThreshold = CONSENSUS_THRESHOLD
-        #else
-        let peerGrowthThreshold = MIN_PEERS
-        #endif
         if readyPeers.count < peerGrowthThreshold && !isRecoveringPeers {
             debugLog(.network, "🫀 FIX #1461: Only \(readyPeers.count)/\(peerGrowthThreshold) peers — growing peer count in background")
             await growPeerCount(currentReady: readyPeers.count)

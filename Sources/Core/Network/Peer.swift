@@ -3273,10 +3273,16 @@ public final class Peer {
             // Wait for addr or addrv2 response via dispatcher
             // Try addr first, then addrv2
             if let response = await messageDispatcher.waitForResponseWithTimeout(command: "addr", timeoutSeconds: 10) {
-                return parseAddrPayload(response.1)
+                let result = parseAddrPayload(response.1)
+                // FIX #1514: Log response type and count
+                print("📡 FIX #1514: \(host) responded with 'addr' (\(response.1.count) bytes) → \(result.count) addresses")
+                return result
             } else if let response = await messageDispatcher.waitForResponseWithTimeout(command: "addrv2", timeoutSeconds: 5) {
-                return parseAddrV2Payload(response.1)
+                let result = parseAddrV2Payload(response.1)
+                print("📡 FIX #1514: \(host) responded with 'addrv2' (\(response.1.count) bytes) → \(result.count) addresses")
+                return result
             }
+            print("📡 FIX #1514: \(host) — no addr/addrv2 response (timeout)")
             return []
         }
 
@@ -3288,10 +3294,15 @@ public final class Peer {
 
             switch command {
             case "addr":
-                return parseAddrPayload(response)
+                let result = parseAddrPayload(response)
+                print("📡 FIX #1514: \(host) (direct) responded with 'addr' → \(result.count) addresses")
+                return result
             case "addrv2":
-                return parseAddrV2Payload(response)
+                let result = parseAddrV2Payload(response)
+                print("📡 FIX #1514: \(host) (direct) responded with 'addrv2' → \(result.count) addresses")
+                return result
             default:
+                print("📡 FIX #1514: \(host) (direct) — unexpected response: '\(command)'")
                 return []
             }
         }

@@ -68,25 +68,23 @@ struct DisclaimerView: View {
 
     private var scrollableContent: some View {
         #if os(iOS)
-        // FIX #1496: Use GeometryReader to explicitly constrain content width.
-        // .padding() alone was insufficient — ScrollView content extended beyond screen edges,
-        // causing text to be clipped on both left and right sides.
-        GeometryReader { geometry in
-            ScrollView(.vertical, showsIndicators: true) {
-                VStack(alignment: .leading, spacing: 16) {
-                    disclaimerContent
+        // FIX #1507: Replaced GeometryReader with simple padding.
+        // GeometryReader inside VStack can cause layout issues on iOS — it proposes
+        // zero height and fights with ScrollView's content sizing.
+        // Simple horizontal padding + fixedSize on Text views is sufficient.
+        ScrollView(.vertical, showsIndicators: true) {
+            VStack(alignment: .leading, spacing: 10) {
+                disclaimerContent
 
-                    GeometryReader { geo in
-                        Color.clear
-                            .preference(key: BottomAnchorYKey.self,
-                                       value: geo.frame(in: .global).maxY)
-                    }
-                    .frame(height: 1)
+                GeometryReader { geo in
+                    Color.clear
+                        .preference(key: BottomAnchorYKey.self,
+                                   value: geo.frame(in: .global).maxY)
                 }
-                .frame(width: geometry.size.width - 32)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 16)
+                .frame(height: 1)
             }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 12)
         }
         #else
         ScrollView(.vertical, showsIndicators: true) {
@@ -115,14 +113,14 @@ struct DisclaimerView: View {
                 .resizable()
                 .aspectRatio(contentMode: .fit)
                 #if os(iOS)
-                .frame(width: 48, height: 48)
+                .frame(width: 36, height: 36)
                 #else
                 .frame(width: 60, height: 60)
                 #endif
 
             Text("ZIPHERX")
                 #if os(iOS)
-                .font(.system(size: 22, weight: .bold, design: .monospaced))
+                .font(.system(size: 18, weight: .bold, design: .monospaced))
                 #else
                 .font(.system(size: 28, weight: .bold, design: .monospaced))
                 #endif
@@ -130,16 +128,16 @@ struct DisclaimerView: View {
 
             Text("IMPORTANT LEGAL NOTICE")
                 #if os(iOS)
-                .font(.system(size: 12, weight: .semibold))
+                .font(.system(size: 11, weight: .semibold))
                 #else
                 .font(.system(size: 14, weight: .semibold, design: .monospaced))
                 #endif
                 .foregroundColor(NeonColors.primary.opacity(0.8))
-                .padding(.top, 4)
+                .padding(.top, 2)
         }
         #if os(iOS)
-        .padding(.top, 16)
-        .padding(.bottom, 8)
+        .padding(.top, 8)
+        .padding(.bottom, 4)
         #else
         .padding(.top, 40)
         .padding(.bottom, 20)
@@ -148,8 +146,9 @@ struct DisclaimerView: View {
 
     // MARK: - Disclaimer Content
 
+    // FIX #1507: Reduced iOS section spacing for compact layout
     #if os(iOS)
-    private let sectionSpacing: CGFloat = 14
+    private let sectionSpacing: CGFloat = 10
     #else
     private let sectionSpacing: CGFloat = 24
     #endif
@@ -370,20 +369,20 @@ struct DisclaimerView: View {
     }
 
     private func sectionView(title: String, icon: String? = nil, content: String) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .top, spacing: 6) {
                 if let iconName = icon {
                     Image(systemName: iconName)
                         .foregroundColor(NeonColors.primary)
                         #if os(iOS)
-                        .font(.system(size: 12))
+                        .font(.system(size: 10))
                         #else
                         .font(.system(size: 14))
                         #endif
                 }
                 Text(title)
                     #if os(iOS)
-                    .font(.system(size: 12, weight: .bold))
+                    .font(.system(size: 11, weight: .bold))
                     .lineLimit(nil)
                     .fixedSize(horizontal: false, vertical: true)
                     #else
@@ -394,15 +393,22 @@ struct DisclaimerView: View {
 
             Text(content)
                 #if os(iOS)
-                .font(.system(size: 11, weight: .regular))
+                .font(.system(size: 10, weight: .regular))
+                .lineSpacing(2)
                 #else
                 .font(.system(size: 12, weight: .regular, design: .monospaced))
+                .lineSpacing(4)
                 #endif
                 .foregroundColor(Color.white.opacity(0.85))
-                .lineSpacing(4)
                 .fixedSize(horizontal: false, vertical: true)
         }
+        // FIX #1507: Compact padding on iOS — default .padding() = 16 on all sides
+        #if os(iOS)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        #else
         .padding()
+        #endif
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 8)
@@ -415,26 +421,33 @@ struct DisclaimerView: View {
     }
 
     private var quoteView: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 8) {
             Text("\"Privacy is necessary for an open society in the electronic age. Privacy is not secrecy. A private matter is something one doesn't want the whole world to know, but a secret matter is something one doesn't want anybody to know. Privacy is the power to selectively reveal oneself to the world.\"")
                 #if os(iOS)
-                .font(.system(size: 11, weight: .regular))
+                .font(.system(size: 10, weight: .regular))
+                .lineSpacing(2)
                 #else
                 .font(.system(size: 12, weight: .regular, design: .monospaced))
+                .lineSpacing(4)
                 #endif
                 .italic()
                 .foregroundColor(NeonColors.primary.opacity(0.9))
-                .lineSpacing(4)
 
             Text("- Eric Hughes, A Cypherpunk's Manifesto (1993)")
                 #if os(iOS)
-                .font(.system(size: 10, weight: .semibold))
+                .font(.system(size: 9, weight: .semibold))
                 #else
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
                 #endif
                 .foregroundColor(NeonColors.primary.opacity(0.7))
         }
+        // FIX #1507: Compact padding on iOS
+        #if os(iOS)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        #else
         .padding()
+        #endif
         .background(
             RoundedRectangle(cornerRadius: 8)
                 .fill(NeonColors.primary.opacity(0.08))
@@ -442,16 +455,16 @@ struct DisclaimerView: View {
     }
 
     private var acknowledgmentView: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 8) {
             Text("BY PROCEEDING, YOU ACKNOWLEDGE THAT:")
                 #if os(iOS)
-                .font(.system(size: 11, weight: .bold))
+                .font(.system(size: 10, weight: .bold))
                 #else
                 .font(.system(size: 12, weight: .bold, design: .monospaced))
                 #endif
                 .foregroundColor(.white)
 
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 5) {
                 acknowledgmentItem("You have read and understood all 14 sections of this disclaimer")
                 acknowledgmentItem("You are at least 18 years of age or the age of majority in your jurisdiction")
                 acknowledgmentItem("You accept full responsibility for your use of this software")
@@ -462,7 +475,13 @@ struct DisclaimerView: View {
                 acknowledgmentItem("You have backed up all existing wallet files and keys before using this software")
             }
         }
+        // FIX #1507: Compact padding on iOS
+        #if os(iOS)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        #else
         .padding()
+        #endif
         .background(
             RoundedRectangle(cornerRadius: 8)
                 .fill(Color.white.opacity(0.05))
@@ -474,17 +493,22 @@ struct DisclaimerView: View {
     }
 
     private func acknowledgmentItem(_ text: String) -> some View {
-        HStack(alignment: .top, spacing: 8) {
+        HStack(alignment: .top, spacing: 6) {
             Image(systemName: "checkmark.square")
                 .foregroundColor(NeonColors.primary)
+                #if os(iOS)
+                .font(.system(size: 10))
+                #else
                 .font(.system(size: 12))
+                #endif
             Text(text)
                 #if os(iOS)
-                .font(.system(size: 10, weight: .regular))
+                .font(.system(size: 9, weight: .regular))
                 #else
                 .font(.system(size: 11, weight: .regular, design: .monospaced))
                 #endif
                 .foregroundColor(Color.white.opacity(0.8))
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -498,12 +522,12 @@ struct DisclaimerView: View {
             if !hasScrolledToBottom {
                 Text("Please scroll down to read the entire disclaimer")
                     #if os(iOS)
-                    .font(.system(size: 11, weight: .medium))
+                    .font(.system(size: 10, weight: .medium))
                     #else
                     .font(.system(size: 11, weight: .medium, design: .monospaced))
                     #endif
                     .foregroundColor(NeonColors.primary.opacity(0.6))
-                    .padding(.top, 8)
+                    .padding(.top, 4)
             }
 
             Button(action: {
@@ -537,7 +561,7 @@ struct DisclaimerView: View {
             .disabled(!canAccept)
             #if os(iOS)
             .padding(.horizontal, 12)
-            .padding(.bottom, 20)
+            .padding(.bottom, 12)
             #else
             .padding(.horizontal, 24)
             .padding(.bottom, 30)

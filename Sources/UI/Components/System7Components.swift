@@ -1861,6 +1861,9 @@ struct CypherpunkMainView: View {
     @State private var settlementClearingTime: TimeInterval? = nil
     @State private var settlementTime: TimeInterval? = nil
 
+    // FIX #1513: Dynamic ZCL version (Full Node mode only, macOS only)
+    @State private var zclDaemonVersion: String? = nil
+
     // Matrix green colors (primary = orange on macOS, green on iOS)
     private let matrixGreen = NeonColors.primary
     private let matrixGreenDark = NeonColors.primaryDark
@@ -2010,6 +2013,21 @@ struct CypherpunkMainView: View {
                     networkManager.justConfirmedTx = nil
                 }
             }
+        }
+        .task {
+            // FIX #1513: Load ZCL daemon version dynamically (macOS Full Node only)
+            #if os(macOS)
+            if WalletModeManager.shared.isUsingWalletDat {
+                if let version = await FullNodeManager.shared.getDaemonVersion() {
+                    // Parse version string — getDaemonVersion returns something like "Zcash Daemon version v2.1.2-3"
+                    let cleaned = version
+                        .replacingOccurrences(of: "Zcash Daemon version ", with: "")
+                        .replacingOccurrences(of: "Zclassic Daemon version ", with: "")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    zclDaemonVersion = cleaned.isEmpty ? nil : cleaned
+                }
+            }
+            #endif
         }
         .onReceive(NotificationCenter.default.publisher(for: Notification.Name("transactionHistoryUpdated"))) { _ in
             // FIX #462 v2: Force reload when repair completes
@@ -2569,14 +2587,16 @@ struct CypherpunkMainView: View {
 
     private var networkStatusBar: some View {
         HStack(spacing: 8) {
-            // FIX #270: Zclassic protocol version (left)
-            HStack(spacing: 2) {
-                Text("ZCL")
-                    .font(.system(size: 9, weight: .bold, design: .monospaced))
-                Text("v2.1.2")
-                    .font(.system(size: 8, design: .monospaced))
+            // FIX #270 + FIX #1513: ZCL daemon version — dynamic, Full Node macOS only
+            if let version = zclDaemonVersion {
+                HStack(spacing: 2) {
+                    Text("ZCL")
+                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    Text(version)
+                        .font(.system(size: 8, design: .monospaced))
+                }
+                .foregroundColor(matrixGreenDark)
             }
-            .foregroundColor(matrixGreenDark)
 
             // FIX #1383: ZipherX app version (dynamic from Bundle)
             Text("ZipherX v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")")

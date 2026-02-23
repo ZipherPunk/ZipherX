@@ -126,6 +126,10 @@ final class ChatManager: ObservableObject {
     @Published var ourNickname: String {
         didSet {
             WalletDatabase.shared.saveChatSetting(key: "chatNickname", value: ourNickname)
+            // FIX #1508: Resend nickname to all connected contacts when it changes
+            if ourNickname != oldValue && !ourNickname.isEmpty {
+                Task { await resendProfileToConnectedContacts(nicknameOnly: true) }
+            }
         }
     }
 
@@ -139,7 +143,12 @@ final class ChatManager: ObservableObject {
             WalletDatabase.shared.getChatSetting(key: "chatShareProfileImage") == "true"
         }
         set {
+            let oldValue = WalletDatabase.shared.getChatSetting(key: "chatShareProfileImage") == "true"
             WalletDatabase.shared.saveChatSetting(key: "chatShareProfileImage", value: newValue ? "true" : "false")
+            // FIX #1508: When toggle is enabled, immediately send profile to all connected contacts
+            if newValue && !oldValue {
+                Task { await resendProfileToConnectedContacts(nicknameOnly: false) }
+            }
         }
     }
 
@@ -666,14 +675,23 @@ final class ChatManager: ObservableObject {
         // FIX #329: Reset backoff on successful connection
         resetConnectionFailure(for: contact.onionAddress)
 
-        // Send our nickname
+        // FIX #1508: Send our nickname on every connection (not just initial)
         if !ourNickname.isEmpty {
-            try? await sendNickname(to: contact)
+            do {
+                try await sendNickname(to: contact)
+                print("💬 FIX #1508: Sent nickname '\(ourNickname)' to \(contact.displayName)")
+            } catch {
+                print("💬 FIX #1508: Failed to send nickname to \(contact.displayName): \(error)")
+            }
         }
 
-        // FIX #1441: Send our profile picture if sharing is enabled
+        // FIX #1441/#1508: Send our profile picture if sharing is enabled
         if isProfileImageShared, let imageData = profileImage {
-            try? await sendAvatar(imageData, to: contact)
+            do {
+                try await sendAvatar(imageData, to: contact)
+            } catch {
+                print("💬 FIX #1508: Failed to send avatar to \(contact.displayName): \(error)")
+            }
         }
 
         updateContactOnlineStatus(contact.onionAddress, isOnline: true)
@@ -1554,6 +1572,38 @@ final class ChatManager: ObservableObject {
         print("💬 FIX #1441: Sent avatar to \(contact.displayName) (\(imageData.count) bytes)")
     }
 
+    /// FIX #1508: Resend profile (nickname and/or avatar) to all currently connected contacts.
+    /// Called when: (1) nickname changes, (2) profile sharing toggle is enabled,
+    /// (3) profile image is updated while sharing is enabled.
+    private func resendProfileToConnectedContacts(nicknameOnly: Bool) async {
+        let connectedContacts = contacts.filter { contact in
+            peers[contact.onionAddress] != nil
+        }
+        guard !connectedContacts.isEmpty else { return }
+
+        print("💬 FIX #1508: Resending profile to \(connectedContacts.count) connected contacts (nicknameOnly=\(nicknameOnly))...")
+
+        for contact in connectedContacts {
+            // Send nickname if set
+            if !ourNickname.isEmpty {
+                do {
+                    try await sendNickname(to: contact)
+                } catch {
+                    print("💬 FIX #1508: Failed to resend nickname to \(contact.displayName): \(error)")
+                }
+            }
+
+            // Send avatar if sharing is enabled and not nickname-only
+            if !nicknameOnly, isProfileImageShared, let imageData = profileImage {
+                do {
+                    try await sendAvatar(imageData, to: contact)
+                } catch {
+                    print("💬 FIX #1508: Failed to resend avatar to \(contact.displayName): \(error)")
+                }
+            }
+        }
+    }
+
     /// FIX #1441: Save received contact avatar to disk
     func saveContactAvatar(_ data: Data, for onionAddress: String) {
         let url = contactAvatarURL(for: onionAddress)
@@ -1635,13 +1685,17 @@ final class ChatManager: ObservableObject {
         }
     }
 
+    // FIX #1508: Always update contact nickname when remote sends one.
+    // Previous code only updated if contact.nickname.isEmpty — meaning if a contact
+    // changed their nickname, the update was silently discarded.
     private func updateContactNickname(_ onionAddress: String, nickname: String) {
         if let index = contacts.firstIndex(where: { $0.onionAddress == onionAddress }) {
             var contact = contacts[index]
-            if contact.nickname.isEmpty {
+            if contact.nickname != nickname {
                 contact.nickname = nickname
                 contacts[index] = contact
                 database.saveContact(contact)
+                print("💬 FIX #1508: Updated contact nickname to '\(nickname)' for \(onionAddress.prefix(8))...")
             }
         }
     }
@@ -1798,6 +1852,11 @@ final class ChatManager: ObservableObject {
 
     private func loadPersistentData() async {
         contacts = database.loadContacts()
+        // FIX #1511: Log contact count on startup for debugging contact loss
+        print("💬 FIX #1511: Loaded \(contacts.count) contacts from database")
+        for contact in contacts {
+            print("💬 FIX #1511:   - \(contact.onionAddress.prefix(16))... nickname='\(contact.nickname)' unread=\(contact.unreadCount)")
+        }
 
         // FIX #1369: Reset all contacts to offline on startup — no connections exist yet.
         // isOnline was persisted to disk from the previous session but is stale.
@@ -1840,6 +1899,10 @@ final class ChatManager: ObservableObject {
         if let data = imageData {
             try? data.write(to: profileImageURL)
             print("💬 FIX #1436: Profile image saved (\(data.count) bytes)")
+            // FIX #1508: Resend to connected contacts when image changes while sharing is enabled
+            if isProfileImageShared {
+                Task { await resendProfileToConnectedContacts(nicknameOnly: false) }
+            }
         } else {
             try? FileManager.default.removeItem(at: profileImageURL)
             print("💬 FIX #1436: Profile image removed")

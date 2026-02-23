@@ -8844,13 +8844,17 @@ final class WalletDatabase {
     // Previous SQL unconditionally overwrote last_message_time to NULL on every saveContact() call
     // (including FIX #1369 startup loop that resets isOnline for every contact).
     // This caused contacts to lose their sort order and last message time after restart.
+    // FIX #1511: Use COALESCE for nickname to prevent overwriting non-null nicknames with NULL.
+    // Previous code: `nickname = excluded.nickname` — if contact.nickname was empty (passed as NULL),
+    // the DB nickname was wiped. This caused contacts to lose their received nicknames on every
+    // status update (online/offline transitions trigger saveContact with the local struct).
     func saveChatContact(onionAddress: String, nickname: String?, unreadCount: Int, lastMessageTime: Int64?) {
         guard db != nil else { return }
         let sql = """
             INSERT INTO chat_contacts (onion_address, nickname, unread_count, last_message_time)
             VALUES (?, ?, ?, ?)
             ON CONFLICT(onion_address) DO UPDATE SET
-                nickname = excluded.nickname,
+                nickname = COALESCE(excluded.nickname, nickname),
                 unread_count = excluded.unread_count,
                 last_message_time = COALESCE(excluded.last_message_time, last_message_time);
         """
