@@ -2060,6 +2060,27 @@ struct ChatSettingsSheet: View {
 
     private var theme: AppTheme { themeManager.currentTheme }
 
+    // FIX #1532: Chat status properties (same logic as ChatView)
+    private var chatStatusColor: Color {
+        if !chatManager.isAvailable {
+            return Color.red
+        } else if chatManager.isWarmingUp {
+            return Color.orange
+        } else {
+            return theme.accentColor
+        }
+    }
+
+    private var chatStatusText: String {
+        if !chatManager.isAvailable {
+            return "OFFLINE"
+        } else if chatManager.isWarmingUp {
+            return "WARMING UP..."
+        } else {
+            return "ONLINE"
+        }
+    }
+
     var body: some View {
         chatSettingsInner
             #if os(iOS)
@@ -2131,6 +2152,157 @@ struct ChatSettingsSheet: View {
         #endif
     }
 
+    // MARK: - Settings Sub-Views (broken up for Swift type-checker)
+
+    private var settingsProfilePicture: some View {
+        HStack {
+            Spacer()
+            Button(action: {
+                #if os(macOS)
+                let panel = NSOpenPanel()
+                panel.allowedContentTypes = [.image]
+                panel.allowsMultipleSelection = false
+                panel.canChooseDirectories = false
+                panel.title = "Choose Profile Picture"
+                if panel.runModal() == .OK, let url = panel.url {
+                    if let data = try? Data(contentsOf: url),
+                       let resized = Self.resizedImageData(data, maxSize: 200) {
+                        chatManager.saveProfileImage(resized)
+                    }
+                }
+                #else
+                showImagePicker = true
+                #endif
+            }) {
+                ZStack {
+                    if let imageData = chatManager.profileImage {
+                        #if os(iOS)
+                        if let uiImage = UIImage(data: imageData) {
+                            Image(uiImage: uiImage)
+                                .resizable()
+                                .scaledToFill()
+                                .frame(width: 100, height: 100)
+                                .clipShape(Circle())
+                                .overlay(
+                                    Circle()
+                                        .stroke(theme.accentColor.opacity(0.5), lineWidth: 2)
+                                )
+                        }
+                        #else
+                        if let nsImage = NSImage(data: imageData) {
+                            Image(nsImage: nsImage)
+                                .resizable()
+                                .scaledToFill()
+                                .frame(width: 100, height: 100)
+                                .clipShape(Circle())
+                                .overlay(
+                                    Circle()
+                                        .stroke(theme.accentColor.opacity(0.5), lineWidth: 2)
+                                )
+                        }
+                        #endif
+                    } else {
+                        Circle()
+                            .fill(
+                                LinearGradient(
+                                    colors: [theme.accentColor.opacity(0.6), theme.accentColor.opacity(0.3)],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                )
+                            )
+                            .frame(width: 100, height: 100)
+                            .overlay(
+                                Image(systemName: "camera.fill")
+                                    .font(.system(size: 30))
+                                    .foregroundColor(.white.opacity(0.7))
+                            )
+                    }
+
+                    Circle()
+                        .fill(theme.accentColor)
+                        .frame(width: 28, height: 28)
+                        .overlay(
+                            Image(systemName: "pencil")
+                                .font(.system(size: 12, weight: .bold))
+                                .foregroundColor(.black)
+                        )
+                        .offset(x: 35, y: 35)
+                }
+            }
+            .buttonStyle(.plain)
+            .contextMenu {
+                if chatManager.profileImage != nil {
+                    Button(role: .destructive, action: {
+                        chatManager.saveProfileImage(nil)
+                    }) {
+                        Label("Remove Photo", systemImage: "trash")
+                    }
+                }
+            }
+            Spacer()
+        }
+        .padding(.bottom, 4)
+    }
+
+    private var settingsShareToggle: some View {
+        HStack {
+            Image(systemName: "eye")
+                .font(.system(size: 12))
+                .foregroundColor(theme.accentColor.opacity(0.6))
+            Text("Share with contacts")
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundColor(theme.textPrimary.opacity(0.6))
+            Spacer()
+            Toggle("", isOn: Binding(
+                get: { chatManager.isProfileImageShared },
+                set: { chatManager.isProfileImageShared = $0 }
+            ))
+            .labelsHidden()
+            .tint(theme.accentColor)
+        }
+        .padding(.horizontal, 14)
+    }
+
+    private var settingsStatusSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            sectionHeader("STATUS")
+
+            VStack(spacing: 0) {
+                HStack {
+                    Text("Chat Service")
+                        .font(.system(size: 14, design: .monospaced))
+                        .foregroundColor(theme.textPrimary.opacity(0.7))
+                    Spacer()
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(chatStatusColor)
+                            .frame(width: 8, height: 8)
+                        Text(chatStatusText)
+                            .font(.system(size: 14, weight: .medium, design: .monospaced))
+                            .foregroundColor(chatStatusColor)
+                    }
+                }
+                .padding(14)
+
+                Divider()
+                    .background(theme.accentColor.opacity(0.1))
+
+                HStack {
+                    Text("Active Contacts")
+                        .font(.system(size: 14, design: .monospaced))
+                        .foregroundColor(theme.textPrimary.opacity(0.7))
+                    Spacer()
+                    Text("\(chatManager.contacts.count)")
+                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        .foregroundColor(theme.textPrimary)
+                }
+                .padding(14)
+            }
+            .background(Color.black.opacity(0.2))
+            .cornerRadius(10)
+        }
+    }
+
     private var chatSettingsContent: some View {
         ScrollView {
             VStack(spacing: 24) {
@@ -2153,114 +2325,8 @@ struct ChatSettingsSheet: View {
                     VStack(alignment: .leading, spacing: 16) {
                         sectionHeader("YOUR IDENTITY")
 
-                        // FIX #1436: Profile Picture
-                        HStack {
-                            Spacer()
-                            Button(action: {
-                                #if os(macOS)
-                                // macOS: NSOpenPanel directly (fileImporter silently fails inside sheets)
-                                let panel = NSOpenPanel()
-                                panel.allowedContentTypes = [.image]
-                                panel.allowsMultipleSelection = false
-                                panel.canChooseDirectories = false
-                                panel.title = "Choose Profile Picture"
-                                if panel.runModal() == .OK, let url = panel.url {
-                                    if let data = try? Data(contentsOf: url),
-                                       let resized = Self.resizedImageData(data, maxSize: 200) {
-                                        chatManager.saveProfileImage(resized)
-                                    }
-                                }
-                                #else
-                                showImagePicker = true
-                                #endif
-                            }) {
-                                ZStack {
-                                    if let imageData = chatManager.profileImage {
-                                        #if os(iOS)
-                                        if let uiImage = UIImage(data: imageData) {
-                                            Image(uiImage: uiImage)
-                                                .resizable()
-                                                .scaledToFill()
-                                                .frame(width: 100, height: 100)
-                                                .clipShape(Circle())
-                                                .overlay(
-                                                    Circle()
-                                                        .stroke(theme.accentColor.opacity(0.5), lineWidth: 2)
-                                                )
-                                        }
-                                        #else
-                                        if let nsImage = NSImage(data: imageData) {
-                                            Image(nsImage: nsImage)
-                                                .resizable()
-                                                .scaledToFill()
-                                                .frame(width: 100, height: 100)
-                                                .clipShape(Circle())
-                                                .overlay(
-                                                    Circle()
-                                                        .stroke(theme.accentColor.opacity(0.5), lineWidth: 2)
-                                                )
-                                        }
-                                        #endif
-                                    } else {
-                                        Circle()
-                                            .fill(
-                                                LinearGradient(
-                                                    colors: [theme.accentColor.opacity(0.6), theme.accentColor.opacity(0.3)],
-                                                    startPoint: .topLeading,
-                                                    endPoint: .bottomTrailing
-                                                )
-                                            )
-                                            .frame(width: 100, height: 100)
-                                            .overlay(
-                                                Image(systemName: "camera.fill")
-                                                    .font(.system(size: 30))
-                                                    .foregroundColor(.white.opacity(0.7))
-                                            )
-                                    }
-
-                                    // Edit badge
-                                    Circle()
-                                        .fill(theme.accentColor)
-                                        .frame(width: 28, height: 28)
-                                        .overlay(
-                                            Image(systemName: "pencil")
-                                                .font(.system(size: 12, weight: .bold))
-                                                .foregroundColor(.black)
-                                        )
-                                        .offset(x: 35, y: 35)
-                                }
-                            }
-                            .buttonStyle(.plain)
-                            .contextMenu {
-                                if chatManager.profileImage != nil {
-                                    Button(role: .destructive, action: {
-                                        chatManager.saveProfileImage(nil)
-                                    }) {
-                                        Label("Remove Photo", systemImage: "trash")
-                                    }
-                                }
-                            }
-                            Spacer()
-                        }
-                        .padding(.bottom, 4)
-
-                        // FIX #1436: Share profile picture toggle
-                        HStack {
-                            Image(systemName: "eye")
-                                .font(.system(size: 12))
-                                .foregroundColor(theme.accentColor.opacity(0.6))
-                            Text("Share with contacts")
-                                .font(.system(size: 12, design: .monospaced))
-                                .foregroundColor(theme.textPrimary.opacity(0.6))
-                            Spacer()
-                            Toggle("", isOn: Binding(
-                                get: { chatManager.isProfileImageShared },
-                                set: { chatManager.isProfileImageShared = $0 }
-                            ))
-                            .labelsHidden()
-                            .tint(theme.accentColor)
-                        }
-                        .padding(.horizontal, 14)
+                        settingsProfilePicture
+                        settingsShareToggle
 
                         VStack(spacing: 12) {
                             // FIX #1510: Made nickname field more visible with clear border and help text
@@ -2375,44 +2441,7 @@ struct ChatSettingsSheet: View {
                         }
                     }
 
-                    // Status Section
-                    VStack(alignment: .leading, spacing: 16) {
-                        sectionHeader("STATUS")
-
-                        VStack(spacing: 0) {
-                            HStack {
-                                Text("Chat Service")
-                                    .font(.system(size: 14, design: .monospaced))
-                                    .foregroundColor(theme.textPrimary.opacity(0.7))
-                                Spacer()
-                                HStack(spacing: 6) {
-                                    Circle()
-                                        .fill(chatStatusColor)
-                                        .frame(width: 8, height: 8)
-                                    Text(chatStatusText)
-                                        .font(.system(size: 14, weight: .medium, design: .monospaced))
-                                        .foregroundColor(chatStatusColor)
-                                }
-                            }
-                            .padding(14)
-
-                            Divider()
-                                .background(theme.accentColor.opacity(0.1))
-
-                            HStack {
-                                Text("Active Contacts")
-                                    .font(.system(size: 14, design: .monospaced))
-                                    .foregroundColor(theme.textPrimary.opacity(0.7))
-                                Spacer()
-                                Text("\(chatManager.contacts.count)")
-                                    .font(.system(size: 14, weight: .bold, design: .monospaced))
-                                    .foregroundColor(theme.textPrimary)
-                            }
-                            .padding(14)
-                        }
-                        .background(Color.black.opacity(0.2))
-                        .cornerRadius(10)
-                    }
+                    settingsStatusSection
 
                     // Quote (stored to prevent loop effect)
                     if !quote.isEmpty {
