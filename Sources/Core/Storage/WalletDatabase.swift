@@ -6094,7 +6094,7 @@ final class WalletDatabase {
         var allNotes: [NoteData] = []
 
         // FIX #1515: Precompute validation bounds ONCE (not per-row)
-        let maxReasonableValue = ZipherXConstants.maxSupplyZatoshis
+        let maxReasonableValue = ZipherXConstants.maxMoneyZatoshis
         let currentChainHeight = (try? HeaderStore.shared.getLatestHeight()) ?? ZipherXConstants.effectiveTreeHeight
         let maxReasonableHeight = max(currentChainHeight, ZipherXConstants.effectiveTreeHeight) + 1_000
 

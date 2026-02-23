@@ -89,9 +89,11 @@ enum ZipherXConstants {
 
     // MARK: - Protocol Limits
 
-    /// Maximum possible ZCL supply in zatoshis (21M ZCL × 10^8)
-    /// Zclassic inherits Zcash's 21M coin cap — no single note can exceed this
-    static let maxSupplyZatoshis: UInt64 = 2_100_000_000_000_000
+    /// Consensus MAX_MONEY in zatoshis — from zclassic/src/amount.h line 30
+    /// MAX_MONEY = 21000000 * COIN — used by MoneyRange() for transaction validation
+    /// NOTE: Actual achievable supply is ~11.46M ZCL due to Buttercup triple halving (height 707000)
+    /// but MAX_MONEY remains 21M as the protocol-level sanity check upper bound
+    static let maxMoneyZatoshis: UInt64 = 2_100_000_000_000_000
 
     // MARK: - Transaction
 
