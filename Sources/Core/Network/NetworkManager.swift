@@ -5950,6 +5950,21 @@ public final class NetworkManager: ObservableObject {
         onProgress?("verify", "Proofs validated ✓", 0.1)
 
         // ============================================================================
+        // VULN-NET-001: Request new Tor circuit before broadcast for maximum privacy.
+        // Without this, all TXs are broadcast on the same circuit — an exit node or
+        // traffic analysis can link multiple transactions to the same real IP.
+        // ============================================================================
+        let torMode = await TorManager.shared.mode
+        if torMode == .enabled {
+            let circuitResult = await TorManager.shared.requestNewIdentity()
+            if circuitResult {
+                print("🔒 VULN-NET-001: Fresh Tor circuit requested before broadcast")
+            } else {
+                print("⚠️ VULN-NET-001: Circuit refresh failed — continuing with existing circuit")
+            }
+        }
+
+        // ============================================================================
         // ============================================================================
         // FIX #718: CRITICAL - Validate anchor exists in blockchain via P2P
         // Peers will reject transactions where the anchor (Merkle root) doesn't exist!
