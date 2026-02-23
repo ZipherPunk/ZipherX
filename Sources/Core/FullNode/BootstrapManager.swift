@@ -771,7 +771,9 @@ public class BootstrapManager: ObservableObject {
         do {
             // FIX #1537: Route through Tor when available (GitHub API leak)
             let ghSession: URLSession
-            if await TorManager.shared.mode == .enabled && await TorManager.shared.connectionState.isConnected {
+            let torMode = await TorManager.shared.mode
+            let torConnected = await TorManager.shared.connectionState.isConnected
+            if torMode == .enabled && torConnected {
                 ghSession = await TorManager.shared.getTorURLSession(isolate: true)
             } else {
                 ghSession = URLSession.shared
@@ -897,7 +899,9 @@ public class BootstrapManager: ObservableObject {
 
         // FIX #1537: Route through Tor when available
         let csSession: URLSession
-        if await TorManager.shared.mode == .enabled && await TorManager.shared.connectionState.isConnected {
+        let torMode = await TorManager.shared.mode
+        let torConnected = await TorManager.shared.connectionState.isConnected
+        if torMode == .enabled && torConnected {
             csSession = await TorManager.shared.getTorURLSession(isolate: true)
         } else {
             csSession = URLSession.shared
@@ -1949,7 +1953,9 @@ public class BootstrapManager: ObservableObject {
 
             // FIX #1537: Route through Tor when available
             let dlSession: URLSession
-            if await TorManager.shared.mode == .enabled && await TorManager.shared.connectionState.isConnected {
+            let torMode = await TorManager.shared.mode
+            let torConnected = await TorManager.shared.connectionState.isConnected
+            if torMode == .enabled && torConnected {
                 dlSession = await TorManager.shared.getTorURLSession(isolate: true)
             } else {
                 dlSession = URLSession.shared
