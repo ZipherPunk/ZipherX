@@ -344,6 +344,20 @@ pub extern "C" fn zipherx_tor_stop() -> i32 {
     TOR_BOOTSTRAP_PROGRESS.store(0, Ordering::SeqCst);
     TOR_SOCKS_PORT.store(0, Ordering::SeqCst);
 
+    // FIX #1540: Reset hidden service state so it can be restarted on new TorClient.
+    // Without this, HIDDEN_SERVICE_STATE stays at 2 ("running") after stop(),
+    // preventing restart — iOS's .onion becomes permanently unreachable after background.
+    if let Some(handle_storage) = HIDDEN_SERVICE_HANDLE.get() {
+        if let Ok(mut guard) = handle_storage.lock() {
+            *guard = None; // Drop old RunningOnionService (bound to dead TorClient)
+        }
+    }
+    if let Ok(mut addr) = HIDDEN_SERVICE_ADDRESS.lock() {
+        *addr = None;
+    }
+    HIDDEN_SERVICE_STATE.store(0, Ordering::SeqCst);
+    eprintln!("🧅 Hidden service state reset (will restart on next Tor connect)");
+
     eprintln!("🧅 Tor stopped");
     0
 }

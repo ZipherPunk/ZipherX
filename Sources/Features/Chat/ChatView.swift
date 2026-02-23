@@ -859,6 +859,7 @@ struct ConversationView: View {
     @EnvironmentObject private var themeManager: ThemeManager
     @EnvironmentObject private var networkManager: NetworkManager
     @StateObject private var chatManager = ChatManager.shared
+    @StateObject private var voiceCallManager = VoiceCallManager.shared  // FIX #1540: Observe call state changes
 
     let contact: ChatContact
     var onBack: (() -> Void)? = nil  // FIX #1429: Back button callback (macOS)
@@ -1053,10 +1054,11 @@ struct ConversationView: View {
             Text("\"\(fileTooLargeName)\" exceeds the 2 MB limit.\n\nPlease choose a smaller file.")
         }
         // FIX #1540: Voice call overlay — shown when call is active, incoming, or outgoing
+        // Uses voiceCallManager @StateObject so SwiftUI observes callState changes
         #if os(iOS)
         .fullScreenCover(isPresented: Binding(
-            get: { VoiceCallManager.shared.callState != .idle },
-            set: { if !$0 { Task { await VoiceCallManager.shared.endCall() } } }
+            get: { voiceCallManager.callState != .idle },
+            set: { if !$0 { Task { await voiceCallManager.endCall() } } }
         )) {
             CallView(
                 contactName: contact.displayName,
@@ -1065,8 +1067,8 @@ struct ConversationView: View {
         }
         #else
         .sheet(isPresented: Binding(
-            get: { VoiceCallManager.shared.callState != .idle },
-            set: { if !$0 { Task { await VoiceCallManager.shared.endCall() } } }
+            get: { voiceCallManager.callState != .idle },
+            set: { if !$0 { Task { await voiceCallManager.endCall() } } }
         )) {
             CallView(
                 contactName: contact.displayName,
@@ -1230,7 +1232,7 @@ struct ConversationView: View {
                 // FIX #1540: Voice call button
                 Button(action: {
                     Task {
-                        let _ = await VoiceCallManager.shared.startCall(to: contact.onionAddress)
+                        let _ = await voiceCallManager.startCall(to: contact.onionAddress)
                     }
                 }) {
                     Image(systemName: "phone.fill")
