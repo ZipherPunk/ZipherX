@@ -432,14 +432,23 @@ struct ChatView: View {
             }
             .padding(.horizontal, 12)
 
-            if let onion = chatManager.ourOnionAddress {
-                HStack(spacing: 4) {
-                    Image(systemName: "network")
-                        .font(.system(size: 8))
-                        .foregroundColor(theme.accentColor.opacity(0.6))
-                    Text(onion.prefix(20) + "...")
-                        .font(.system(size: 10, design: .monospaced))
+            // FIX #1534: Show full onion address + nickname in header
+        if let onion = chatManager.ourOnionAddress {
+                VStack(spacing: 2) {
+                    // Full .onion address (selectable for copy)
+                    Text(onion)
+                        .font(.system(size: 9, design: .monospaced))
                         .foregroundColor(theme.textPrimary.opacity(0.5))
+                        .lineLimit(2)
+                        .multilineTextAlignment(.center)
+                        .textSelection(.enabled)
+
+                    // Nickname below address
+                    if !chatManager.ourNickname.isEmpty {
+                        Text(chatManager.ourNickname)
+                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            .foregroundColor(theme.accentColor)
+                    }
                 }
             }
         }
@@ -1911,20 +1920,57 @@ struct AddContactSheet: View {
                         .buttonStyle(.plain)
                         #endif
                     }
-                    TextField("", text: $onionAddress, prompt: Text("xxxxxxxx...xxxxx.onion")
-                        .font(.system(size: 14, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.5)))
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 14, design: .monospaced))
-                        .foregroundColor(.white)
-                        #if os(iOS)
-                        .autocapitalization(.none)
-                        #endif
-                        .disableAutocorrection(true)
-                        .padding(14)
-                        .background(Color.black.opacity(0.25))
-                        .cornerRadius(10)
-                        .overlay(RoundedRectangle(cornerRadius: 10).stroke(theme.accentColor.opacity(0.3), lineWidth: 1))
+                    // FIX #1534: Paste button + text field for onion address
+                    HStack(spacing: 0) {
+                        TextField("", text: $onionAddress, prompt: Text("xxxxxxxx...xxxxx.onion")
+                            .font(.system(size: 14, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.5)))
+                            .textFieldStyle(.plain)
+                            .font(.system(size: 14, design: .monospaced))
+                            .foregroundColor(.white)
+                            #if os(iOS)
+                            .autocapitalization(.none)
+                            #endif
+                            .disableAutocorrection(true)
+
+                        // Paste button
+                        Button(action: {
+                            #if os(iOS)
+                            if let text = UIPasteboard.general.string {
+                                // FIX #251: Parse QR format if pasted
+                                if let qrData = ChatQRCodeData.parse(text) {
+                                    onionAddress = qrData.onionAddress
+                                    if let nick = qrData.nickname, !nick.isEmpty, nickname.isEmpty {
+                                        nickname = generateUniqueNickname(nick)
+                                    }
+                                } else {
+                                    onionAddress = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                                }
+                            }
+                            #else
+                            if let text = NSPasteboard.general.string(forType: .string) {
+                                if let qrData = ChatQRCodeData.parse(text) {
+                                    onionAddress = qrData.onionAddress
+                                    if let nick = qrData.nickname, !nick.isEmpty, nickname.isEmpty {
+                                        nickname = generateUniqueNickname(nick)
+                                    }
+                                } else {
+                                    onionAddress = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                                }
+                            }
+                            #endif
+                        }) {
+                            Image(systemName: "doc.on.clipboard")
+                                .font(.system(size: 14))
+                                .foregroundColor(theme.accentColor)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.trailing, 4)
+                    }
+                    .padding(14)
+                    .background(Color.black.opacity(0.25))
+                    .cornerRadius(10)
+                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(theme.accentColor.opacity(0.3), lineWidth: 1))
                 }
 
                 VStack(alignment: .leading, spacing: 8) {
