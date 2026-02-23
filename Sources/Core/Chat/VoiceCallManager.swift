@@ -84,6 +84,15 @@ final class VoiceCallManager: ObservableObject {
             return false
         }
 
+        // FIX #1540: Request microphone permission before initiating call
+        #if os(iOS)
+        let micPermission = await AVAudioApplication.requestRecordPermission()
+        guard micPermission else {
+            print("📞 FIX #1540: Microphone permission denied — cannot start call")
+            return false
+        }
+        #endif
+
         let callId = UUID().uuidString
         currentCallId = callId
         remotePeerOnionAddress = onionAddress
@@ -309,6 +318,17 @@ final class VoiceCallManager: ObservableObject {
     // MARK: - Audio Session Management
 
     private func beginAudioSession(callId: String) async {
+        // FIX #1540: Request microphone permission BEFORE touching AVAudioEngine.
+        // Accessing engine.inputNode without permission is a guaranteed crash on iOS.
+        #if os(iOS)
+        let micPermission = await AVAudioApplication.requestRecordPermission()
+        guard micPermission else {
+            print("📞 FIX #1540: Microphone permission denied — cannot start call")
+            await endCall(reason: "mic_denied")
+            return
+        }
+        #endif
+
         callState = .active(callId: callId)
         callStartTime = Date()
 
