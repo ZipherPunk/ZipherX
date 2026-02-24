@@ -735,6 +735,25 @@ final class ChatManager: ObservableObject {
         }
 
         updateContactOnlineStatus(contact.onionAddress, isOnline: true)
+
+        // FIX #1541: Monitor NWConnection state for IMMEDIATE offline detection.
+        // Without this, disconnect is only caught by: (1) receiveMessages failing 3x,
+        // (2) 120s stale timeout, or (3) 30s ping failure — all too slow.
+        let onion = contact.onionAddress
+        peer.connection.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .failed, .cancelled:
+                Task { @MainActor [weak self] in
+                    guard let self = self else { return }
+                    self.peers.removeValue(forKey: onion)
+                    self.updateContactOnlineStatus(onion, isOnline: false)
+                    print("💬 FIX #1541: NWConnection state → \(state) — marked \(onion.prefix(16))... offline immediately")
+                }
+            default:
+                break
+            }
+        }
+
         print("💬 Connected to \(contact.displayName)")
     }
 
@@ -1219,6 +1238,22 @@ final class ChatManager: ObservableObject {
         try? await peer.setTheirPublicKey(theirPublicKey)
         await peer.setState(.connected)
         peers[onionAddress] = peer
+
+        // FIX #1541: Monitor incoming connection for IMMEDIATE offline detection
+        let incomingOnion = onionAddress
+        connection.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .failed, .cancelled:
+                Task { @MainActor [weak self] in
+                    guard let self = self else { return }
+                    self.peers.removeValue(forKey: incomingOnion)
+                    self.updateContactOnlineStatus(incomingOnion, isOnline: false)
+                    print("💬 FIX #1541: Incoming connection state → \(state) — marked \(incomingOnion.prefix(16))... offline immediately")
+                }
+            default:
+                break
+            }
+        }
 
         // Send our public key back
         var response = Data()
@@ -1777,9 +1812,11 @@ final class ChatManager: ObservableObject {
             try await sendMessage(message, to: contact)
         } catch {
             print("📞 FIX #1540: Failed to send call signal (\(type.rawValue)): \(error)")
-            // If audio frame fails, don't crash — just skip
-            if type != .callAudio {
-                // For signaling messages (offer/answer/reject/end), end the call on failure
+            // FIX #1552: Only trigger endCall for call_offer and call_answer failures.
+            // NEVER trigger endCall for call_end or call_reject failures — that creates
+            // infinite recursion: endCall → sendCallSignal(call_end) → fails → endCall → ...
+            // Also skip for call_audio (just drop the frame silently).
+            if type == .callOffer || type == .callAnswer {
                 Task { @MainActor in
                     await VoiceCallManager.shared.endCall(reason: "network_error")
                 }
@@ -2260,7 +2297,7 @@ final class ChatManager: ObservableObject {
             await checkAllContactsOnline()
 
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 30_000_000_000) // 30 seconds
+                try? await Task.sleep(nanoseconds: 15_000_000_000) // FIX #1541: 15s for faster online detection (was 30s)
 
                 // Ping connected peers
                 for (onion, peer) in peers {
@@ -2277,8 +2314,9 @@ final class ChatManager: ObservableObject {
                     }
                 }
 
-                // Check for stale connections (no activity for 2 minutes)
-                let staleThreshold = Date().addingTimeInterval(-120)
+                // FIX #1541: Reduced stale threshold from 120s to 45s for faster offline detection.
+                // With NWConnection state monitoring, this is a backup — but 120s was far too long.
+                let staleThreshold = Date().addingTimeInterval(-45)
                 for (onion, peer) in peers {
                     if await peer.lastActivity < staleThreshold {
                         await peer.connection.cancel()

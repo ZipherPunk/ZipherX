@@ -183,6 +183,16 @@ public final class NetworkManager: ObservableObject {
     // FIX #849: UserDefaults key for persisting pending outgoing txids across app restart
     private let PENDING_TXIDS_KEY = "ZipherX_PendingOutgoingTxids"
 
+    // FIX #1550: UserDefaults key for storing broadcast heights alongside pending txids
+    // Maps txid → chain height at time of broadcast, for targeted rescan on restart
+    private let PENDING_TX_BROADCAST_HEIGHTS_KEY = "ZipherX_PendingTxBroadcastHeights"
+
+    // FIX #1550 v3: UserDefaults key for storing mempool verification heights.
+    // Maps txid → chain height at time of mempool acceptance by peers.
+    // A TX that entered mempool was ACCEPTED by the network — NEVER auto-delete it.
+    // If confirmation is missed, inform user to perform Full Repair instead.
+    private let PENDING_TX_MEMPOOL_HEIGHTS_KEY = "ZipherX_PendingTxMempoolHeights"
+
     // FIX #1348: Suppress verbose logging for pre-production build
     private let verbose = false
 
@@ -1265,6 +1275,18 @@ public final class NetworkManager: ObservableObject {
             print("💾 FIX #849: Persisted pending txid: \(txid.prefix(16))... (total: \(txids.count))")
         }
 
+        // FIX #1550: Store broadcast height for targeted rescan on restart.
+        // If app closes before TX confirms, on next startup we scan only
+        // broadcastHeight to broadcastHeight+3 instead of last 100 blocks.
+        if chainHeight > 0 {
+            var heights = UserDefaults.standard.dictionary(forKey: PENDING_TX_BROADCAST_HEIGHTS_KEY) as? [String: Int] ?? [:]
+            if heights[txid] == nil {
+                heights[txid] = Int(chainHeight)
+                UserDefaults.standard.set(heights, forKey: PENDING_TX_BROADCAST_HEIGHTS_KEY)
+                print("📍 FIX #1550: Stored broadcast height \(chainHeight) for txid: \(txid.prefix(16))...")
+            }
+        }
+
         // FIX #1366: Also persist to broadcast history (separate from pending).
         // This survives FIX #970 cleanup — used at startup to detect confirmed TXs
         // missing from history (crash between broadcast and block confirmation).
@@ -1284,6 +1306,63 @@ public final class NetworkManager: ObservableObject {
             txids.remove(at: index)
             UserDefaults.standard.set(txids, forKey: PENDING_TXIDS_KEY)
             print("🗑️ FIX #849: Removed confirmed txid from persistence: \(txid.prefix(16))... (remaining: \(txids.count))")
+        }
+
+        // FIX #1550: Also clean up broadcast + mempool heights
+        removeBroadcastHeight(txid: txid)
+        removeMempoolHeight(txid: txid)
+    }
+
+    /// FIX #1550: Get stored broadcast height for a pending txid
+    /// Returns the chain height at time of broadcast, for targeted block rescan
+    func getBroadcastHeight(txid: String) -> UInt64? {
+        guard let heights = UserDefaults.standard.dictionary(forKey: PENDING_TX_BROADCAST_HEIGHTS_KEY) as? [String: Int],
+              let height = heights[txid] else { return nil }
+        return UInt64(height)
+    }
+
+    /// FIX #1550: Remove broadcast height when TX is confirmed or cleaned up
+    private func removeBroadcastHeight(txid: String) {
+        var heights = UserDefaults.standard.dictionary(forKey: PENDING_TX_BROADCAST_HEIGHTS_KEY) as? [String: Int] ?? [:]
+        if heights.removeValue(forKey: txid) != nil {
+            UserDefaults.standard.set(heights, forKey: PENDING_TX_BROADCAST_HEIGHTS_KEY)
+            print("🗑️ FIX #1550: Removed broadcast height for txid: \(txid.prefix(16))...")
+        }
+    }
+
+    // MARK: - FIX #1550 v3: Mempool Height Persistence
+
+    /// FIX #1550 v3: Persist mempool acceptance height.
+    /// A TX that entered mempool was ACCEPTED by the network — this is proof of acceptance.
+    /// On restart, use this height for targeted rescan (mempoolHeight to mempoolHeight + 10).
+    /// NEVER auto-delete a mempool-verified TX. If not found → alert user for Full Repair.
+    private func persistMempoolHeight(txid: String, height: UInt64) {
+        var heights = UserDefaults.standard.dictionary(forKey: PENDING_TX_MEMPOOL_HEIGHTS_KEY) as? [String: Int] ?? [:]
+        if heights[txid] == nil {
+            heights[txid] = Int(height)
+            UserDefaults.standard.set(heights, forKey: PENDING_TX_MEMPOOL_HEIGHTS_KEY)
+            print("📍 FIX #1550 v3: Stored mempool height \(height) for txid: \(txid.prefix(16))... (ACCEPTED by network)")
+        }
+    }
+
+    /// FIX #1550 v3: Get stored mempool acceptance height for a pending txid
+    func getMempoolHeight(txid: String) -> UInt64? {
+        guard let heights = UserDefaults.standard.dictionary(forKey: PENDING_TX_MEMPOOL_HEIGHTS_KEY) as? [String: Int],
+              let height = heights[txid] else { return nil }
+        return UInt64(height)
+    }
+
+    /// FIX #1550 v3: Check if a TX was verified in mempool (accepted by network)
+    func wasMempoolVerified(txid: String) -> Bool {
+        return getMempoolHeight(txid: txid) != nil
+    }
+
+    /// FIX #1550 v3: Remove mempool height when TX is confirmed or cleaned up
+    private func removeMempoolHeight(txid: String) {
+        var heights = UserDefaults.standard.dictionary(forKey: PENDING_TX_MEMPOOL_HEIGHTS_KEY) as? [String: Int] ?? [:]
+        if heights.removeValue(forKey: txid) != nil {
+            UserDefaults.standard.set(heights, forKey: PENDING_TX_MEMPOOL_HEIGHTS_KEY)
+            print("🗑️ FIX #1550 v3: Removed mempool height for txid: \(txid.prefix(16))...")
         }
     }
 
@@ -3217,53 +3296,19 @@ public final class NetworkManager: ObservableObject {
         }
 
         #if os(iOS)
-        // FIX #1445: On iOS, connect directly first for instant recovery.
-        // iOS background kills ALL sockets including Tor circuits.
-        // Waiting 15s for Tor wastes time and often fails anyway.
-        // Direct-first matches existing FIX #1428 behavior, just faster.
-        let strictPrivacy = await TorManager.shared.strictPrivacyMode
-        if torMode == .enabled && !strictPrivacy {
-            print("⚡ FIX #1445: iOS foreground recovery — connecting directly first, Tor restarts in background")
-            debugLog(.network, "⚡ FIX #1445: Direct-first iOS recovery (Tor restarts in background)")
-
-            // FIX #1537: Block TX broadcast during clearnet window to prevent IP leak.
-            // During the ~30s bypass, peers see our real IP. Broadcasting a TX during this
-            // window would link our IP to the transaction — defeating Tor's purpose.
-            isBroadcasting = true
-            print("🔒 FIX #1537: TX broadcast BLOCKED during Tor bypass window (privacy protection)")
-
-            // Temporarily bypass Tor for fast peer recovery
-            await TorManager.shared.temporarilyBypassTor()
-            sybilBypassActive = true
-
-            // Start Tor restart in background (non-blocking)
-            Task {
-                await TorManager.shared.stop()
-                try? await Task.sleep(nanoseconds: 500_000_000)
-                await TorManager.shared.start()
-            }
-
-            // Connect directly — peers will be available in <3s
-            do {
-                try await connect()
-                print("✅ FIX #1445: iOS direct recovery — \(peers.count) peers")
-                debugLog(.network, "✅ FIX #1445: Recovered \(peers.count) peers via direct connection")
-            } catch {
-                print("❌ FIX #1445: Direct recovery failed: \(error.localizedDescription)")
-            }
-
-            // Restore Tor after onion circuits warm up (30s)
-            Task { [weak self] in
-                try? await Task.sleep(nanoseconds: 30_000_000_000)
-                guard let self = self else { return }
-                await TorManager.shared.restoreAfterSingleTxBypass()
-                self.sybilBypassActive = false
-                // FIX #1537: Unblock TX broadcast now that Tor is restored
-                self.isBroadcasting = false
-                print("🧅 FIX #1445: Tor restored after iOS foreground recovery")
-                print("🔒 FIX #1537: TX broadcast UNBLOCKED — Tor privacy restored")
-            }
-        } else if torMode == .enabled && strictPrivacy {
+        // FIX #1549: NEVER bypass Tor when Tor mode is enabled — direct connections expose real IP.
+        // FIX #1445 previously connected directly for "speed" but zmac.log showed 6,980 clearnet
+        // connections leaking the user's IP. iOS foreground recovery now waits for Tor like macOS.
+        // ensureRunningOnForeground() above already restarts Tor if needed — give it time.
+        let strictPrivacy = true  // FIX #1549: Always strict when Tor enabled
+        if torMode == .enabled {
+            print("🔒 FIX #1549: iOS foreground recovery — waiting for Tor (no clearnet bypass)")
+            debugLog(.network, "🔒 FIX #1549: Privacy-first iOS recovery (Tor only)")
+        }
+        if torMode == .enabled && false {
+            // DEAD CODE — kept for reference. FIX #1549 removed the direct connection path.
+            // Previously: FIX #1445 connected directly then restored Tor after 30s.
+        } else if torMode == .enabled {
             // FIX #1445: Strict privacy mode — wait for Tor (existing behavior)
             // FIX #1476: Don't stop+restart Tor if SOCKS proxy is already working!
             // Stopping Tor kills hidden service descriptor → macOS can't find our .onion.
@@ -3757,6 +3802,14 @@ public final class NetworkManager: ObservableObject {
     func setMempoolVerified() {
         isMempoolVerified = true
         print("✅ Mempool verified for pending broadcast")
+
+        // FIX #1550 v3: Persist mempool acceptance height.
+        // A TX that entered mempool was ACCEPTED by the network.
+        // If app closes before confirmation, on restart we scan from this height.
+        // NEVER auto-delete a mempool-verified TX — inform user instead.
+        if let txid = pendingBroadcastTxid, chainHeight > 0 {
+            persistMempoolHeight(txid: txid, height: chainHeight)
+        }
 
         // Trigger Clearing celebration for sender
         if let txid = pendingBroadcastTxid, pendingBroadcastAmount > 0 {
@@ -5596,10 +5649,14 @@ public final class NetworkManager: ObservableObject {
 
         // FIX #1539: iOS growth target should match keepalive threshold, not MIN_PEERS (8).
         // MIN_PEERS - currentReady = 8 - 2 = 6 needed → wastes 6 SOCKS5 connections when target is 4.
+        // FIX #1549: When Tor is enabled, lower macOS target too. Each growth attempt creates
+        // SOCKS5 circuit handshakes. zmac.log: 1,118 growth attempts × 5 connections = 5,590 SOCKS5
+        // handshakes that all fail because 5 peers is healthy. 5 is sufficient for consensus (3).
+        let torMode = await TorManager.shared.mode
         #if os(iOS)
-        let targetForGrowth = CONSENSUS_THRESHOLD + 1  // 4 on iOS — matches keepalive threshold
+        let targetForGrowth = CONSENSUS_THRESHOLD + 1  // 4 on iOS
         #else
-        let targetForGrowth = MIN_PEERS  // 8 on macOS
+        let targetForGrowth = torMode == .enabled ? CONSENSUS_THRESHOLD + 2 : MIN_PEERS  // 5 Tor, 8 direct
         #endif
         let needed = targetForGrowth - currentReady
         guard needed > 0 else { return }
@@ -8847,29 +8904,28 @@ public final class NetworkManager: ObservableObject {
 
             // Check if Tor SOCKS failures are the cause
             if consecutiveSOCKS5Failures >= SOCKS5_FAILURE_THRESHOLD && !sybilBypassActive {
-                // FIX #1537: In strict privacy mode, NEVER bypass Tor — prefer no connection
-                // over clearnet. An attacker who disrupts 5 Tor connections should NOT cause
-                // automatic deanonymization.
-                let strictPrivacy = UserDefaults.standard.bool(forKey: "torStrictPrivacyMode")
-                if strictPrivacy {
-                    print("🔒 FIX #1537: \(consecutiveSOCKS5Failures) SOCKS5 failures but strict privacy — Tor bypass REFUSED")
-                    print("🔒 FIX #1537: Preferring no connection over clearnet exposure. Restarting Tor...")
-                    // Instead of bypassing, try restarting Tor
-                    Task {
+                // FIX #1549: When Tor mode is enabled, NEVER auto-bypass Tor for peer connections.
+                // zmac.log showed 6,980 direct clearnet connections ("Tor bypassed for speed") in 9.5h,
+                // exposing user's real IP to 5 peer nodes every 30s. An attacker who disrupts SOCKS5
+                // should NOT cause automatic deanonymization. Restart Tor instead.
+                // NOTE: checkPeerRecovery() is non-async (Timer callback), so use Task for await.
+                let failureCount = consecutiveSOCKS5Failures
+                Task { [weak self] in
+                    let torMode = await TorManager.shared.mode
+                    if torMode == .enabled {
+                        print("🔒 FIX #1549: \(failureCount) SOCKS5 failures — Tor bypass REFUSED (Tor mode enabled)")
+                        print("🔒 FIX #1549: Preferring no connection over clearnet exposure. Restarting Tor...")
                         await TorManager.shared.stop()
                         try? await Task.sleep(nanoseconds: 2_000_000_000)
                         await TorManager.shared.start()
-                    }
-                    consecutiveSOCKS5Failures = 0  // Reset counter for fresh Tor start
-                } else {
-                    print("🚨 FIX #1428: \(consecutiveSOCKS5Failures) SOCKS5 failures - bypassing Tor temporarily")
-                    sybilBypassActive = true
-                    _torIsAvailable = false
-                    // FIX #1428: MUST set TorManager bypass — Peer.connect() checks TorManager.isTorBypassed
-                    Task {
+                    } else {
+                        print("🚨 FIX #1428: \(failureCount) SOCKS5 failures - bypassing Tor temporarily")
+                        self?.sybilBypassActive = true
+                        self?._torIsAvailable = false
                         await TorManager.shared.temporarilyBypassTor()
                     }
                 }
+                consecutiveSOCKS5Failures = 0  // Reset counter
             }
 
             // Trigger immediate peer reconnection
@@ -9185,18 +9241,24 @@ public final class NetworkManager: ObservableObject {
                 }
             }
 
-            // If Tor bypass not active yet and we have failures, try direct
-            if !sybilBypassActive {
-                print("🔧 FIX #1428: Enabling Tor bypass for direct connections")
+            // FIX #1549: When Tor mode is enabled, NEVER bypass for peer recovery.
+            // Direct connections expose real IP to peer nodes — defeats the entire Tor setup.
+            // zmac.log: 6,980 direct clearnet connections from recovery/growth over 9.5 hours.
+            // Instead: restart Tor and retry through SOCKS5 on next recovery cycle.
+            if torMode == .enabled && !sybilBypassActive {
+                print("🔒 FIX #1549: 0 peers recovered via Tor — restarting Tor (bypass REFUSED)")
+                Task {
+                    await TorManager.shared.stop()
+                    try? await Task.sleep(nanoseconds: 3_000_000_000)
+                    await TorManager.shared.start()
+                }
+                consecutiveSOCKS5Failures = 0
+            } else if torMode != .enabled && !sybilBypassActive {
+                // Tor not enabled — direct connections are fine
+                print("🔧 FIX #1428: Enabling direct connections (Tor not enabled)")
                 sybilBypassActive = true
                 _torIsAvailable = false
-                // FIX #1428: MUST set TorManager bypass — Peer.connect() checks TorManager.isTorBypassed,
-                // NOT NetworkManager._torIsAvailable. Without this, bypass is broken (all connections
-                // still go through SOCKS5).
-                await TorManager.shared.temporarilyBypassTor()
 
-                // FIX #1428: Retry with direct connections using hardcoded seeds (not preferredSeeds
-                // which is often empty). Clear parked seeds first so they're eligible.
                 clearParkedHardcodedSeeds()
                 var directRecovered = 0
                 for seedHost in HARDCODED_SEEDS {
@@ -9218,11 +9280,8 @@ public final class NetworkManager: ObservableObject {
                 }
 
                 if directRecovered > 0 {
-                    print("✅ FIX #1428: Recovered \(directRecovered) peer(s) via direct connection (Tor bypassed)")
+                    print("✅ FIX #1428: Recovered \(directRecovered) peer(s) via direct connection")
                 } else {
-                    // Direct also failed — restore Tor for next cycle
-                    print("⚠️ FIX #1428: Direct connections also failed — restoring Tor")
-                    await TorManager.shared.restoreAfterSingleTxBypass()
                     sybilBypassActive = false
                 }
             }
@@ -9649,14 +9708,14 @@ public final class NetworkManager: ObservableObject {
         // The main connect() exits early at 3-6 peers for fast startup; this fills to target.
         // FIX #1501: iOS uses CONSENSUS_THRESHOLD (3) — cellular + SOCKS5 = growth always fails.
         // FIX #1533: macOS uses MIN_PEERS (8) — has bandwidth for more peers, improves discovery.
-        // Previous FIX #1501 applied CONSENSUS_THRESHOLD to BOTH platforms → macOS stuck at 3 forever
-        // → discovered peers from getaddr never tried → new nodes never found.
         // FIX #1539: iOS raised from 3 → 4 — 3 is too fragile (1 drop = can't reach consensus).
-        // z13.log: 4 peers connected, 1 dropped → stuck at 2 peers → no consensus possible.
+        // FIX #1549: When Tor enabled, macOS target = 5 (not 8). zmac.log: 1,118 futile growth
+        // attempts at 30s intervals (5 SOCKS5 connections each) because 5 peers < 8. 5 is plenty.
+        let torModeForGrowth = await TorManager.shared.mode
         #if os(iOS)
         let peerGrowthThreshold = CONSENSUS_THRESHOLD + 1  // 4 — buffer for 1 peer drop
         #else
-        let peerGrowthThreshold = MIN_PEERS
+        let peerGrowthThreshold = torModeForGrowth == .enabled ? CONSENSUS_THRESHOLD + 2 : MIN_PEERS  // 5 Tor, 8 direct
         #endif
         if readyPeers.count < peerGrowthThreshold && !isRecoveringPeers {
             debugLog(.network, "🫀 FIX #1461: Only \(readyPeers.count)/\(peerGrowthThreshold) peers — growing peer count in background")

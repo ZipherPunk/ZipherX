@@ -12,6 +12,7 @@
 import SwiftUI
 #if os(iOS)
 import UIKit
+import PhotosUI
 #else
 import AppKit
 #endif
@@ -878,6 +879,11 @@ struct ConversationView: View {
     @State private var showFilePicker = false
     @State private var showFileTooLargeAlert = false
     @State private var fileTooLargeName = ""
+    // FIX #1544: Photo picker for iOS — allows sending photos from Photo Library
+    #if os(iOS)
+    @State private var selectedPhotoItem: Any? = nil  // PhotosPickerItem (iOS 16+), stored as Any for iOS 15 compat
+    @State private var showAttachmentOptions = false
+    #endif
 
     private var theme: AppTheme { themeManager.currentTheme }
 
@@ -1000,6 +1006,14 @@ struct ConversationView: View {
                 }
             }
         }
+        // FIX #1545: Observe read/delivered receipts so status updates immediately
+        // without needing to leave and re-enter the conversation
+        .onReceive(NotificationCenter.default.publisher(for: .chatMessageRead)) { _ in
+            chatManager.objectWillChange.send()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .chatMessageDelivered)) { _ in
+            chatManager.objectWillChange.send()
+        }
         .sheet(isPresented: $showPaymentRequest) {
             PaymentRequestSheet(contact: contact)
             #if os(macOS)
@@ -1038,11 +1052,10 @@ struct ConversationView: View {
         }
         // FIX #1535: File picker for sending files
         #if os(iOS)
-        .fileImporter(isPresented: $showFilePicker, allowedContentTypes: [.data], allowsMultipleSelection: false) { result in
+        .fileImporter(isPresented: $showFilePicker, allowedContentTypes: [.data, .image, .movie, .audio, .pdf, .text], allowsMultipleSelection: false) { result in
             if case .success(let urls) = result, let url = urls.first {
-                // Access security-scoped resource
-                guard url.startAccessingSecurityScopedResource() else { return }
-                defer { url.stopAccessingSecurityScopedResource() }
+                // FIX #1544: Security-scoped access must persist through async sendFile
+                // Old code used defer which stopped access before Task body ran
                 handleFileSelection(url)
             }
         }
@@ -1302,9 +1315,9 @@ struct ConversationView: View {
             }
 
             HStack(spacing: 12) {
-                // FIX #1535: Attachment button — send files up to 2MB
+                // FIX #1535/FIX #1544: Attachment button — files + photos
+                #if os(macOS)
                 Button(action: {
-                    #if os(macOS)
                     let panel = NSOpenPanel()
                     panel.allowsMultipleSelection = false
                     panel.canChooseDirectories = false
@@ -1312,9 +1325,6 @@ struct ConversationView: View {
                     if panel.runModal() == .OK, let url = panel.url {
                         handleFileSelection(url)
                     }
-                    #else
-                    showFilePicker = true
-                    #endif
                 }) {
                     Image(systemName: "plus.circle.fill")
                         .font(.system(size: 26))
@@ -1322,6 +1332,56 @@ struct ConversationView: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(!isChatStable)
+                #else
+                // FIX #1544: iOS attachment — Photos (iOS 16+) + Files
+                if #available(iOS 16.0, *) {
+                    Menu {
+                        Button(action: { showFilePicker = true }) {
+                            Label("Files", systemImage: "doc")
+                        }
+                        PhotosPicker(selection: Binding<PhotosPickerItem?>(
+                            get: { selectedPhotoItem as? PhotosPickerItem },
+                            set: { newItem in
+                                selectedPhotoItem = newItem
+                                guard let item = newItem else { return }
+                                Task {
+                                    if let data = try? await item.loadTransferable(type: Data.self) {
+                                        let suggestedName: String
+                                        if let contentType = item.supportedContentTypes.first,
+                                           let ext = contentType.preferredFilenameExtension {
+                                            suggestedName = "photo_\(Int(Date().timeIntervalSince1970)).\(ext)"
+                                        } else {
+                                            suggestedName = "photo_\(Int(Date().timeIntervalSince1970)).jpg"
+                                        }
+                                        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(suggestedName)
+                                        try? data.write(to: tempURL)
+                                        handleFileSelection(tempURL)
+                                        DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+                                            try? FileManager.default.removeItem(at: tempURL)
+                                        }
+                                    }
+                                    selectedPhotoItem = nil
+                                }
+                            }
+                        ), matching: .any(of: [.images, .videos])) {
+                            Label("Photos & Videos", systemImage: "photo.on.rectangle")
+                        }
+                    } label: {
+                        Image(systemName: "plus.circle.fill")
+                            .font(.system(size: 26))
+                            .foregroundColor(isChatStable ? theme.accentColor.opacity(0.7) : theme.textPrimary.opacity(0.4))
+                    }
+                    .disabled(!isChatStable)
+                } else {
+                    // iOS 15: Files only (no PhotosPicker)
+                    Button(action: { showFilePicker = true }) {
+                        Image(systemName: "plus.circle.fill")
+                            .font(.system(size: 26))
+                            .foregroundColor(isChatStable ? theme.accentColor.opacity(0.7) : theme.textPrimary.opacity(0.4))
+                    }
+                    .disabled(!isChatStable)
+                }
+                #endif
 
                 // Message input
                 // FIX #343: Add visible placeholder styling for iOS
@@ -1402,19 +1462,29 @@ struct ConversationView: View {
         }
     }
 
-    /// FIX #1535: Handle file selection from picker
+    /// FIX #1535/FIX #1544: Handle file selection from picker
     private func handleFileSelection(_ url: URL) {
+        // FIX #1544: Start security-scoped access (for Files picker — photos don't need it)
+        let needsSecurityScope = url.startAccessingSecurityScopedResource()
+
         // Check file size
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let fileSize = attrs[.size] as? UInt64 else { return }
+              let fileSize = attrs[.size] as? UInt64 else {
+            if needsSecurityScope { url.stopAccessingSecurityScopedResource() }
+            return
+        }
 
         if fileSize > CHAT_MAX_FILE_SIZE {
             fileTooLargeName = url.lastPathComponent
             showFileTooLargeAlert = true
+            if needsSecurityScope { url.stopAccessingSecurityScopedResource() }
             return
         }
 
         Task {
+            defer {
+                if needsSecurityScope { url.stopAccessingSecurityScopedResource() }
+            }
             do {
                 try await chatManager.sendFile(url: url, to: contact)
             } catch {

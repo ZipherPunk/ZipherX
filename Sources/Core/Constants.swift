@@ -112,15 +112,26 @@ enum ZipherXConstants {
     // FIX #1493: VULN-009 — Single source of truth for all consensus thresholds.
     // FIX #934 established that Zclassic's small network cannot reliably provide 5+
     // agreeing peers. 3 is the proven operational threshold across all components.
+    // FIX #1551: Now configurable via Settings (UserDefaults). Range: 2-8, default: 3.
+    // Changes take effect on next app restart (local copies capture at init time).
 
     /// Consensus threshold for Byzantine fault tolerance on the Zclassic network.
     /// All P2P consensus checks (chain height, headers, blocks, Equihash) MUST use this value.
-    static let consensusThreshold = 3
+    /// FIX #1551: User-configurable via Settings → Network → Consensus Threshold
+    static var consensusThreshold: Int {
+        let stored = UserDefaults.standard.integer(forKey: "ZipherX_ConsensusThreshold")
+        // Range 2-8: minimum 2 for basic consensus, max 8 for high-security
+        // Default 3 when not set (UserDefaults returns 0 for unset integer keys)
+        return (stored >= 2 && stored <= 8) ? stored : 3
+    }
 
     /// Reduced consensus threshold for degraded network conditions.
     /// Used ONLY as a fallback when full consensusThreshold cannot be met (e.g., header sync).
     /// Security is weakened — operations using this threshold log a warning.
-    static let reducedConsensusThreshold = 2
+    /// FIX #1551: Dynamically derived as consensusThreshold - 1 (minimum 1)
+    static var reducedConsensusThreshold: Int {
+        return max(1, consensusThreshold - 1)
+    }
 
     /// Peer ban duration in seconds (7 days)
     static let peerBanDuration: TimeInterval = 604_800

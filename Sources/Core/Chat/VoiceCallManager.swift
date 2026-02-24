@@ -68,6 +68,10 @@ final class VoiceCallManager: ObservableObject {
 
     private var sendSequence: UInt32 = 0
 
+    // FIX #1552: Cooldown to prevent rapid-fire call attempts when peer is offline
+    private var lastCallEndTime: Date?
+    private let callCooldownSeconds: TimeInterval = 2.0
+
     // MARK: - Codec
 
     private var encoder: AVAudioConverter?
@@ -84,9 +88,21 @@ final class VoiceCallManager: ObservableObject {
             return false
         }
 
+        // FIX #1552: Cooldown to prevent rapid-fire calls when peer is offline.
+        // Each failed call attempt takes ~300ms to detect and cleanup. Without cooldown,
+        // user tapping call button repeatedly overwhelms the signaling path.
+        if let lastEnd = lastCallEndTime, Date().timeIntervalSince(lastEnd) < callCooldownSeconds {
+            print("📞 FIX #1552: Call cooldown active — wait \(String(format: "%.1f", callCooldownSeconds))s between attempts")
+            return false
+        }
+
         // FIX #1540: Request microphone permission before initiating call
         #if os(iOS)
-        let micPermission = await AVAudioApplication.requestRecordPermission()
+        let micPermission = await withCheckedContinuation { continuation in
+            AVAudioSession.sharedInstance().requestRecordPermission { granted in
+                continuation.resume(returning: granted)
+            }
+        }
         guard micPermission else {
             print("📞 FIX #1540: Microphone permission denied — cannot start call")
             return false
@@ -164,25 +180,49 @@ final class VoiceCallManager: ObservableObject {
     }
 
     /// End current call (hang up)
+    /// FIX #1552: Added re-entry guard to prevent recursive endCall cascade.
+    /// Previous bug: sendCallSignal(call_end) fails → calls endCall(network_error)
+    /// → sends another call_end → fails → calls endCall again → infinite loop.
+    /// Now: if already .ending or .idle, skip immediately.
     func endCall(reason: String? = nil) async {
+        // FIX #1552: Re-entry guard — prevent recursive cascade
+        switch callState {
+        case .ending:
+            print("📞 FIX #1552: endCall skipped — already ending")
+            return
+        case .idle:
+            print("📞 FIX #1552: endCall skipped — already idle")
+            return
+        default:
+            break
+        }
+
         let callId = currentCallId ?? "unknown"
         print("📞 FIX #1540: Ending call — callId=\(callId.prefix(8)), reason=\(reason ?? "user")")
 
+        // Set ending state FIRST to block re-entry
         callState = .ending
 
-        // Send call end signal
+        // FIX #1552: Save peer address before cleanup clears it
+        let peerAddress = remotePeerOnionAddress
+
+        // FIX #1552: Send call_end signal in a fire-and-forget manner.
+        // Don't await — if peer is offline, sendCallSignal blocks or fails and
+        // the error handler recursively calls endCall, causing the stuck "Ending call" UI.
         let control = CallControl(callId: callId, reason: reason)
         if let controlJSON = try? JSONEncoder().encode(control),
            let controlString = String(data: controlJSON, encoding: .utf8),
-           let peer = remotePeerOnionAddress {
-            await ChatManager.shared.sendCallSignal(
-                type: .callEnd,
-                content: controlString,
-                to: peer
-            )
+           let peer = peerAddress {
+            Task {
+                await ChatManager.shared.sendCallSignal(
+                    type: .callEnd,
+                    content: controlString,
+                    to: peer
+                )
+            }
         }
 
-        // Cleanup
+        // Cleanup immediately — don't wait for signal delivery
         stopAudioSession()
         ringTimeoutTask?.cancel()
         ringTimeoutTask = nil
@@ -202,6 +242,9 @@ final class VoiceCallManager: ObservableObject {
         consecutiveLosses = 0
         consecutiveSuccesses = 0
         jitterTargetFrames = 4
+
+        // FIX #1552: Record end time for cooldown
+        lastCallEndTime = Date()
 
         callState = .idle
     }
@@ -311,8 +354,11 @@ final class VoiceCallManager: ObservableObject {
             }
         }
 
-        // Play frames from buffer when we have enough
-        drainJitterBuffer()
+        // FIX #1546: Wait until we have enough frames buffered before first drain
+        // Without this, we drain immediately on seq=0 with no lookahead → choppy/silent
+        if jitterBuffer.count >= jitterTargetFrames || frame.seq >= nextPlaybackSeq + UInt32(jitterTargetFrames) {
+            drainJitterBuffer()
+        }
     }
 
     // MARK: - Audio Session Management
@@ -321,7 +367,11 @@ final class VoiceCallManager: ObservableObject {
         // FIX #1540: Request microphone permission BEFORE touching AVAudioEngine.
         // Accessing engine.inputNode without permission is a guaranteed crash on iOS.
         #if os(iOS)
-        let micPermission = await AVAudioApplication.requestRecordPermission()
+        let micPermission = await withCheckedContinuation { continuation in
+            AVAudioSession.sharedInstance().requestRecordPermission { granted in
+                continuation.resume(returning: granted)
+            }
+        }
         guard micPermission else {
             print("📞 FIX #1540: Microphone permission denied — cannot start call")
             await endCall(reason: "mic_denied")
@@ -370,6 +420,10 @@ final class VoiceCallManager: ObservableObject {
 
         engine.connect(player, to: engine.mainMixerNode, format: outputFormat)
 
+        // FIX #1546: Ensure output volume is at maximum
+        player.volume = 1.0
+        engine.mainMixerNode.outputVolume = 1.0
+
         do {
             try engine.start()
             player.play()
@@ -379,8 +433,28 @@ final class VoiceCallManager: ObservableObject {
             return
         }
 
-        // Start capturing audio
-        startAudioCapture()
+        // FIX #1541: Wait for input hardware to initialize before installing tap.
+        // On iOS, engine.inputNode.inputFormat(forBus: 0) can return 0 Hz for up to
+        // ~500ms after engine.start(). Installing a tap during this window crashes with
+        // "Input HW format is invalid" (AVAudioIONodeImpl.mm:1322).
+        var hwReady = false
+        for attempt in 1...10 {
+            let hwFormat = engine.inputNode.inputFormat(forBus: 0)
+            if hwFormat.sampleRate > 0 && hwFormat.channelCount > 0 {
+                print("📞 FIX #1541: Input HW ready after \(attempt) attempts (sr=\(hwFormat.sampleRate), ch=\(hwFormat.channelCount))")
+                hwReady = true
+                break
+            }
+            print("📞 FIX #1541: Input HW not ready (attempt \(attempt)/10, sr=\(hwFormat.sampleRate), ch=\(hwFormat.channelCount)) — waiting 200ms...")
+            try? await Task.sleep(nanoseconds: 200_000_000) // 200ms
+        }
+
+        if !hwReady {
+            print("📞 FIX #1541: Input HW format still invalid after 2s — microphone unavailable, audio capture disabled")
+            // Don't crash — allow playback-only (can hear remote but can't send audio)
+        } else {
+            startAudioCapture()
+        }
 
         // Start call duration timer
         callDurationTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
@@ -416,7 +490,24 @@ final class VoiceCallManager: ObservableObject {
         guard let engine = audioEngine else { return }
 
         let inputNode = engine.inputNode
-        let inputFormat = inputNode.outputFormat(forBus: 0)
+        var inputFormat = inputNode.outputFormat(forBus: 0)
+
+        // FIX #1540: On iOS, inputNode.outputFormat can return 0 Hz / 0 channels if hardware
+        // isn't ready yet. This causes "IsFormatSampleRateAndChannelCountValid(format)" crash
+        // in CreateRecordingTap. Fall back to AVAudioSession's actual hardware format.
+        #if os(iOS)
+        if inputFormat.sampleRate == 0 || inputFormat.channelCount == 0 {
+            let hwSampleRate = AVAudioSession.sharedInstance().sampleRate
+            let hwChannels = max(AVAudioSession.sharedInstance().inputNumberOfChannels, 1)
+            print("📞 FIX #1540: inputNode format invalid (sr=\(inputFormat.sampleRate), ch=\(inputFormat.channelCount)) — using session format (sr=\(hwSampleRate), ch=\(hwChannels))")
+            if let fallback = AVAudioFormat(standardFormatWithSampleRate: hwSampleRate, channels: AVAudioChannelCount(hwChannels)) {
+                inputFormat = fallback
+            } else {
+                print("📞 FIX #1540: Cannot create fallback audio format — aborting capture")
+                return
+            }
+        }
+        #endif
 
         // Install tap on input node — captures microphone audio
         // Convert to 16kHz mono PCM, then encode to compressed format
@@ -503,7 +594,14 @@ final class VoiceCallManager: ObservableObject {
     private func drainJitterBuffer() {
         guard let player = playerNode, let engine = audioEngine, engine.isRunning else { return }
 
+        // FIX #1546: Ensure playerNode is actively playing — scheduleBuffer is silent otherwise
+        if !player.isPlaying {
+            player.play()
+            print("📞 FIX #1546: playerNode restarted for audio playback")
+        }
+
         // Play all consecutive frames starting from nextPlaybackSeq
+        var framesPlayed = 0
         while let audioData = jitterBuffer[nextPlaybackSeq] {
             jitterBuffer.removeValue(forKey: nextPlaybackSeq)
 
@@ -527,8 +625,14 @@ final class VoiceCallManager: ObservableObject {
                 }
             }
 
+            // FIX #1546: Set volume on buffer to ensure audibility
             player.scheduleBuffer(pcmBuffer)
+            framesPlayed += 1
             nextPlaybackSeq += 1
+        }
+
+        if framesPlayed > 0 {
+            print("📞 FIX #1546: Played \(framesPlayed) audio frames, next seq=\(nextPlaybackSeq), buffer=\(jitterBuffer.count)")
         }
 
         // Cleanup old frames (more than 500ms behind)

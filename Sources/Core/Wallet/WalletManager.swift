@@ -130,6 +130,13 @@ final class WalletManager: ObservableObject {
     @Published var balanceIntegrityIssue: Bool = false
     @Published var balanceIntegrityMessage: String? = nil
 
+    // MARK: - FIX #1550 v3: Stuck TX requiring user action
+    /// When set, a mempool-verified TX could not be found on chain after targeted rescan.
+    /// The TX was ACCEPTED by the network (entered mempool) but confirmation was never detected.
+    /// User must be informed and prompted to perform Full Repair/Rescan.
+    /// Contains: (txid: display format, mempoolHeight: height where mempool accepted)
+    @Published var stuckTransactionAlert: (txid: String, mempoolHeight: UInt64)? = nil
+
     // MARK: - FIX #1520: Encryption key mismatch detection
     /// When true, ALL encrypted note values fail to decrypt — DB key changed
     /// (e.g., TestFlight → Xcode reinstall, provisioning profile change).
@@ -2310,155 +2317,276 @@ final class WalletManager: ObservableObject {
         }
     }
 
-    /// FIX #965: Scan recent blocks to find missing sent transactions
+    /// FIX #965 + FIX #1550 v3: Scan for missing sent transactions using mempool/broadcast height
+    ///
+    /// Priority order for targeted rescan:
+    /// 1. Mempool height (most precise — TX was ACCEPTED by network at this height)
+    /// 2. Broadcast height (fallback — TX was sent at this height)
+    /// 3. Last confirmed TX height (secondary — rescan from last known-good state)
+    /// 4. Legacy: last 100 blocks (worst case — no height info at all)
+    ///
+    /// Key rule: A TX that entered mempool was ACCEPTED by the network.
+    /// If we can't find confirmation → NEVER auto-delete → inform user with txid.
     private func scanForMissingSentTransactions(txids: [String]) async {
-        print("🔍 FIX #965: Scanning recent blocks for \(txids.count) missing TX(s)...")
+        print("🔍 FIX #1550 v3: Scanning for \(txids.count) missing TX(s)...")
 
         // Wait for network to be ready
         var attempts = 0
         var peerCount = await MainActor.run { NetworkManager.shared.connectedPeers }
         while peerCount < 3 && attempts < 30 {
-            try? await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
             attempts += 1
             peerCount = await MainActor.run { NetworkManager.shared.connectedPeers }
         }
 
         if peerCount < 1 {
-            print("⚠️ FIX #965: No peers available, will check on next startup")
+            print("⚠️ FIX #1550 v3: No peers available, will check on next startup")
             return
         }
 
         // Get current chain height
         guard let chainHeight = try? await NetworkManager.shared.getChainHeight(), chainHeight > 0 else {
-            print("⚠️ FIX #965: Could not get chain height")
+            print("⚠️ FIX #1550 v3: Could not get chain height")
             return
         }
 
-        // Scan last 100 blocks for the missing transactions
-        let lastScanned = (try? WalletDatabase.shared.getLastScannedHeight()) ?? chainHeight
-        // FIX #1082: Prevent UInt64 underflow when lastScanned < 100
-        let scanStart = lastScanned >= 100 ? lastScanned - 100 : 0
+        // FIX #1550 v3: Determine the best rescan start height for each TX
+        var earliestRescanHeight: UInt64?
 
-        print("🔍 FIX #965: Quick scan from \(scanStart) to \(lastScanned) for missing TXs")
-
-        // The FilterScanner will handle detection via nullifier matching
-        // For now, trigger a confirmation check which will use FIX #964's pre-tracking
         for txid in txids {
-            // Add to tracking set if not already there
+            // Add to tracking set for FilterScanner nullifier matching
             await MainActor.run { NetworkManager.shared.addToPendingOutgoingSet(txid: txid) }
+
+            // Priority 1: Mempool height (TX was accepted by peers at this height)
+            let mempoolHeight = await MainActor.run {
+                NetworkManager.shared.getMempoolHeight(txid: txid)
+            }
+            // Priority 2: Broadcast height (TX was sent at this height)
+            let broadcastHeight = await MainActor.run {
+                NetworkManager.shared.getBroadcastHeight(txid: txid)
+            }
+
+            let rescanHeight: UInt64?
+            if let mh = mempoolHeight {
+                rescanHeight = mh
+                let wasMempoolVerified = true
+                print("🎯 FIX #1550 v3: TX \(txid.prefix(16))... mempool verified at height \(mh) (NETWORK ACCEPTED — will NOT auto-delete)")
+            } else if let bh = broadcastHeight {
+                rescanHeight = bh
+                print("🎯 FIX #1550 v3: TX \(txid.prefix(16))... broadcast at height \(bh) (no mempool proof)")
+            } else {
+                rescanHeight = nil
+                print("⚠️ FIX #1550 v3: TX \(txid.prefix(16))... no height info (pre-FIX #1550 TX)")
+            }
+
+            if let rh = rescanHeight {
+                if earliestRescanHeight == nil || rh < earliestRescanHeight! {
+                    earliestRescanHeight = rh
+                }
+            }
         }
 
-        // Trigger confirmation checking
+        // FIX #1550 v3: Lower lastScannedHeight to trigger FilterScanner rescan
+        if let rescanFrom = earliestRescanHeight {
+            let currentScanned = (try? WalletDatabase.shared.getLastScannedHeight()) ?? chainHeight
+            if currentScanned > rescanFrom {
+                try? WalletDatabase.shared.resetLastScannedHeightForRecovery(rescanFrom)
+                print("🎯 FIX #1550 v3: Lowered lastScannedHeight from \(currentScanned) to \(rescanFrom)")
+                print("   FilterScanner will rescan from \(rescanFrom) — TX should be in blocks +1 to +10")
+            }
+        } else {
+            // Legacy fallback: no heights stored at all — use last 100 blocks
+            let lastScanned = (try? WalletDatabase.shared.getLastScannedHeight()) ?? chainHeight
+            let scanStart = lastScanned >= 100 ? lastScanned - 100 : UInt64(0)
+            if lastScanned > scanStart {
+                try? WalletDatabase.shared.resetLastScannedHeightForRecovery(scanStart)
+                print("🔍 FIX #965 (legacy): Lowered lastScannedHeight to \(scanStart) for legacy rescan")
+            }
+        }
+
+        // Trigger confirmation checking (mempool + dispatcher path)
         await NetworkManager.shared.checkPendingOutgoingConfirmations()
 
-        // FIX #970: After confirmation check, clean up orphaned pending txids
-        // If txid is STILL not in history after FIX #965's attempt to find it,
-        // it was a rejected TX that was never confirmed. Remove from persistence.
-        try? await Task.sleep(nanoseconds: 2_000_000_000) // Wait 2s for confirmation callbacks
-        await cleanOrphanedPendingTxids(txids: txids)
+        // FIX #1550 v3: Check if FilterScanner has already passed confirmation windows.
+        // Only run cleanup if scanner has ACTUALLY scanned the relevant blocks.
+        // Otherwise, defer — FilterScanner will find the TX during normal catch-up.
+        let lastScanned = (try? WalletDatabase.shared.getLastScannedHeight()) ?? UInt64(0)
+        let scanWindowEnd = (earliestRescanHeight ?? UInt64(0)) + 10  // mempool/broadcast + 10 blocks
 
-        print("✅ FIX #965: Missing TX check complete")
+        if lastScanned >= scanWindowEnd {
+            // Scanner already past the confirmation window — safe to run cleanup
+            await cleanOrphanedPendingTxids(txids: txids)
+        } else {
+            // Scanner still catching up — DO NOT classify yet
+            // FilterScanner will process these blocks during normal sync
+            // cleanOrphanedPendingTransactions() runs again at next startup/periodic check
+            print("⏳ FIX #1550 v3: FilterScanner at \(lastScanned), needs \(scanWindowEnd) — deferring cleanup")
+            print("   TX(s) will be confirmed when FilterScanner reaches their blocks")
+        }
+
+        print("✅ FIX #1550 v3: Missing TX check complete")
     }
 
-    /// FIX #970: Clean up orphaned pending txids that were never confirmed
-    /// These are transactions that were rejected but never cleaned up (before FIX #969)
-    /// Also deletes phantom entries from transaction_history that were never confirmed on blockchain
+    /// FIX #970 + FIX #1550 v3: Clean up orphaned pending txids
+    ///
+    /// KEY RULE: A TX that entered mempool was ACCEPTED by the network.
+    /// - Mempool-verified TX not found on chain → NEVER auto-delete → alert user with txid
+    /// - Non-mempool TX (broadcast failed or never verified) → can auto-cleanup
+    ///
+    /// Decision tree:
+    /// 1. TX confirmed in DB? → remove from pending (done)
+    /// 2. FilterScanner hasn't scanned past confirmation window? → keep pending (defer)
+    /// 3. TX was mempool-verified but not found? → ALERT USER (never delete)
+    /// 4. TX was NOT mempool-verified and not found? → auto-delete (rejected)
     private func cleanOrphanedPendingTxids(txids: [String]) async {
         var orphanedCount = 0
-        var needsRescan = false  // FIX #1366: Track if we need to rescan for missing change outputs
+        var needsRescan = false
+
+        let currentChainHeight = try? await NetworkManager.shared.getChainHeight()
 
         for txid in txids {
-            // Convert display format txid to wire format for database lookup
             guard let txidDisplayData = Data(hexString: txid) else { continue }
             let txidWireFormat = Data(txidDisplayData.reversed())
 
-            // FIX #970 + FIX #888: Check if this TX is actually confirmed on blockchain
-            // A TX is orphaned/phantom if it's in our pending list but NOT confirmed
+            // ── Step 1: Check DB — FilterScanner may have already confirmed ──
+            let inHistory = (try? WalletDatabase.shared.transactionExistsInHistory(txid: txidWireFormat)) ?? false
+            if inHistory {
+                if let status = try? WalletDatabase.shared.getTransactionStatus(txid: txidWireFormat),
+                   status == "confirmed" {
+                    print("✅ FIX #1550 v3: TX \(txid.prefix(16))... confirmed in DB — removing from pending")
+                    await MainActor.run {
+                        NetworkManager.shared.removePendingTxidFromPersistence(txid)
+                        NetworkManager.shared.removeFromPendingOutgoingSet(txid: txid)
+                    }
+                    _ = await NetworkManager.shared.removeFromActorTracking(txid: txid)
+                    continue
+                }
+            }
+
+            // ── Step 2: Get heights ──
+            let mempoolHeight = await MainActor.run { NetworkManager.shared.getMempoolHeight(txid: txid) }
+            let broadcastHeight = await MainActor.run { NetworkManager.shared.getBroadcastHeight(txid: txid) }
+            let referenceHeight = mempoolHeight ?? broadcastHeight  // Mempool is more precise
+            let isMempoolVerified = mempoolHeight != nil
+            let lastScanned = (try? WalletDatabase.shared.getLastScannedHeight()) ?? UInt64(0)
+
+            if let refHeight = referenceHeight, let chainH = currentChainHeight, chainH > 0 {
+                let blocksSince = chainH - refHeight
+                let scanWindow = refHeight + 10  // TX must be found within 10 blocks
+
+                print("📊 FIX #1550 v3: TX \(txid.prefix(16))... \(isMempoolVerified ? "MEMPOOL" : "broadcast") at \(refHeight), chain at \(chainH) (\(blocksSince) blocks), scanned to \(lastScanned), mempool=\(isMempoolVerified)")
+
+                // ── Step 2a: FilterScanner hasn't reached scan window yet ──
+                if lastScanned < scanWindow {
+                    print("⏳ FIX #1550 v3: FilterScanner at \(lastScanned), needs \(scanWindow) — keeping pending")
+                    continue
+                }
+
+                // ── Step 2b: FilterScanner HAS scanned past the window ──
+                // TX should have been found. If not:
+
+                if isMempoolVerified {
+                    // ═══════════════════════════════════════════════════════════════
+                    // MEMPOOL-VERIFIED TX NOT FOUND — NEVER AUTO-DELETE!
+                    // This TX was ACCEPTED by the network. The fact that we can't
+                    // find it in blocks means our scanner missed it or there's a
+                    // data issue. User MUST be informed to perform Full Repair.
+                    // ═══════════════════════════════════════════════════════════════
+                    print("🚨 FIX #1550 v3: MEMPOOL-VERIFIED TX \(txid.prefix(16))... NOT found after scanning past height \(scanWindow)")
+                    print("   This TX was ACCEPTED by the network at height \(refHeight) — NOT auto-deleting!")
+                    print("   User must perform Full Repair to resolve. Displaying alert.")
+
+                    await MainActor.run {
+                        self.stuckTransactionAlert = (txid: txid, mempoolHeight: refHeight)
+                    }
+                    // Keep in pending — user will handle via Full Repair
+                    continue
+
+                } else {
+                    // Not mempool-verified — TX was likely rejected or never propagated
+                    if blocksSince > 10 {
+                        print("🧹 FIX #1550 v3: TX \(txid.prefix(16))... NOT confirmed, NOT mempool-verified, \(blocksSince) blocks — classifying as rejected")
+
+                        if let (restoredCount, restoredValue) = try? WalletDatabase.shared.restoreNotesSpentByPhantomTx(txid: txidWireFormat),
+                           restoredCount > 0 {
+                            print("✅ FIX #1168: Restored \(restoredCount) note(s) totaling \(restoredValue.redactedAmount) from rejected TX")
+                        }
+
+                        if let deletedValue = try? WalletDatabase.shared.deletePhantomTransaction(txid: txidWireFormat) {
+                            print("🗑️ FIX #1550 v3: Deleted rejected TX from history (value: \(deletedValue.redactedAmount))")
+                        }
+
+                        await MainActor.run {
+                            NetworkManager.shared.removePendingTxidFromPersistence(txid)
+                            NetworkManager.shared.removeFromPendingOutgoingSet(txid: txid)
+                        }
+                        _ = await NetworkManager.shared.removeFromActorTracking(txid: txid)
+                        orphanedCount += 1
+                        continue
+                    } else {
+                        print("⏳ FIX #1550 v3: TX \(txid.prefix(16))... only \(blocksSince) blocks — keeping pending")
+                        continue
+                    }
+                }
+            }
+
+            // ── Step 3: Fallback — no height info (pre-FIX #1550 TXs) ──
             let verificationResult = await verifyTxConfirmedOnChain(txid: txid)
 
             switch verificationResult {
             case .some(true):
-                // TX is confirmed on chain
-                // FIX #1366: Check if TX is actually in transaction_history.
-                // If NOT, the app crashed between broadcast and block confirmation.
-                // Change outputs were never discovered. DON'T remove from pending —
-                // lower lastScannedHeight to force FilterScanner rescan.
-                let inHistory = (try? WalletDatabase.shared.transactionExistsInHistory(txid: txidWireFormat)) ?? false
                 if inHistory {
-                    // TX confirmed AND in history - safe to remove
-                    print("✅ FIX #970: TX \(txid.prefix(16))... is confirmed - removing from pending")
+                    print("✅ FIX #970: TX \(txid.prefix(16))... is confirmed — removing from pending")
                     await MainActor.run {
                         NetworkManager.shared.removePendingTxidFromPersistence(txid)
                         NetworkManager.shared.removeFromPendingOutgoingSet(txid: txid)
                     }
                     _ = await NetworkManager.shared.removeFromActorTracking(txid: txid)
                 } else {
-                    // FIX #1366: TX confirmed but NOT in history — needs rescan for change outputs
-                    print("⚠️ FIX #1366: TX \(txid.prefix(16))... confirmed on chain but NOT in history — scheduling rescan")
+                    print("⚠️ FIX #1366: TX \(txid.prefix(16))... confirmed but NOT in history — scheduling rescan")
                     needsRescan = true
-                    // Keep in pending — will be cleaned up after rescan discovers it
                 }
 
             case .some(false):
-                // TX definitely doesn't exist - it was rejected. Clean up everything.
-                print("🧹 FIX #970: Removing phantom/rejected TX: \(txid.prefix(16))... (never confirmed on blockchain)")
+                print("🧹 FIX #970: Removing phantom/rejected TX: \(txid.prefix(16))...")
 
-                // FIX #1168: FIRST restore notes spent by this phantom TX BEFORE deleting from history
-                // The note must be restored to unspent since the TX was rejected by the network
                 if let (restoredCount, restoredValue) = try? WalletDatabase.shared.restoreNotesSpentByPhantomTx(txid: txidWireFormat),
                    restoredCount > 0 {
                     print("✅ FIX #1168: Restored \(restoredCount) note(s) totaling \(restoredValue.redactedAmount) from phantom TX")
                 }
 
-                // Delete from transaction_history database (if it exists there)
                 if let deletedValue = try? WalletDatabase.shared.deletePhantomTransaction(txid: txidWireFormat) {
                     print("🗑️ FIX #970: Deleted phantom TX from history (value: \(deletedValue.redactedAmount))")
                 }
 
-                // Remove from UserDefaults persistence
                 await MainActor.run {
                     NetworkManager.shared.removePendingTxidFromPersistence(txid)
-                }
-
-                // Remove from in-memory tracking
-                await MainActor.run {
                     NetworkManager.shared.removeFromPendingOutgoingSet(txid: txid)
                 }
-
-                // Remove from actor tracking
                 _ = await NetworkManager.shared.removeFromActorTracking(txid: txid)
-
                 orphanedCount += 1
 
             case .none:
-                // FIX #888: Unable to verify (network issues) - DO NOT DELETE!
-                // Keep the TX in pending, will check again later when network is available
-                print("⚠️ FIX #888: TX \(txid.prefix(16))... unable to verify - keeping in pending (network unavailable)")
+                print("⚠️ FIX #888: TX \(txid.prefix(16))... unable to verify — keeping in pending")
             }
         }
 
-        // FIX #1366: If any confirmed TX is missing from history, lower lastScannedHeight
-        // to force FilterScanner to rescan recent blocks and discover change outputs.
-        // This handles crash-between-broadcast-and-confirmation recovery.
+        // FIX #1366: Rescan for missing change outputs
         if needsRescan {
             if let currentScanned = try? WalletDatabase.shared.getLastScannedHeight(), currentScanned > 100 {
                 let rescanFrom = currentScanned - 100
                 try? WalletDatabase.shared.resetLastScannedHeightForRecovery(rescanFrom)
-                print("⚠️ FIX #1366: Lowered lastScannedHeight by 100 blocks — FilterScanner will rescan to discover change outputs")
+                print("⚠️ FIX #1366: Lowered lastScannedHeight by 100 blocks for change output discovery")
             }
         }
 
         if orphanedCount > 0 {
             print("🧹 FIX #970: Cleaned up \(orphanedCount) phantom/rejected TX(s)")
-
-            // Refresh balance after cleaning up phantom transactions
             try? await refreshBalance()
 
-            // FIX #1170: Force UI to reload transaction history after phantom cleanup
-            // Without this, the UI keeps showing deleted phantom TXs from its in-memory cache
             await MainActor.run {
                 NotificationCenter.default.post(name: Notification.Name("transactionHistoryUpdated"), object: nil)
-                print("✅ FIX #1170: Posted transactionHistoryUpdated notification after phantom cleanup")
+                print("✅ FIX #1170: Posted transactionHistoryUpdated after phantom cleanup")
             }
         }
 
@@ -2467,7 +2595,7 @@ final class WalletManager: ObservableObject {
         if remainingTxids.isEmpty {
             await MainActor.run {
                 NetworkManager.shared.clearPendingFlags()
-                print("🧹 FIX #970: All pending txids processed - flags cleared")
+                print("🧹 FIX #970: All pending txids processed — flags cleared")
             }
         }
     }
@@ -4506,6 +4634,29 @@ final class WalletManager: ObservableObject {
                                 WalletManager.shared.shieldedBalance = postVerifyBalance
                                 NotificationCenter.default.post(name: Notification.Name("transactionHistoryUpdated"), object: nil)
                                 print("✅ FIX #1245: UI balance refreshed to \(postVerifyBalance.redactedAmount)")
+                            }
+                        }
+
+                        // FIX #1542: After Full Rescan, boost file only has outputs — NOT spend descriptions.
+                        // Notes spent in the boost range appear "unspent" → inflated balance.
+                        // Force P2P nullifier verification to find the actual spending transactions.
+                        let needsPostRescanVerification = UserDefaults.standard.bool(forKey: "FIX1542_NullifierVerificationNeeded")
+                        if needsPostRescanVerification {
+                            print("🔍 FIX #1542: Post-rescan nullifier verification REQUIRED — boost file lacks spend descriptions")
+                            await MainActor.run {
+                                WalletManager.shared.balanceIntegrityIssue = true
+                                WalletManager.shared.balanceIntegrityMessage = "Verifying spent notes on chain..."
+                            }
+                            try? await WalletManager.shared.verifyNullifierSpendStatus()
+                            UserDefaults.standard.set(false, forKey: "FIX1542_NullifierVerificationNeeded")
+                            // Refresh balance after verification found spent notes
+                            let postVerifyBal = try WalletDatabase.shared.getTotalUnspentBalance(accountId: 1)
+                            await MainActor.run {
+                                WalletManager.shared.shieldedBalance = postVerifyBal
+                                WalletManager.shared.balanceIntegrityIssue = false
+                                WalletManager.shared.balanceIntegrityMessage = nil
+                                NotificationCenter.default.post(name: Notification.Name("transactionHistoryUpdated"), object: nil)
+                                print("✅ FIX #1542: Post-rescan nullifier verification complete — balance refreshed to \(postVerifyBal.redactedAmount)")
                             }
                         }
 
@@ -8281,7 +8432,12 @@ final class WalletManager: ObservableObject {
             UserDefaults.standard.set(false, forKey: "FIX1089_FullVerificationComplete")
             // FIX #1136: Clear witness rebuild timestamp - force fresh witness verification after rescan
             UserDefaults.standard.removeObject(forKey: "WitnessRebuildTimestamp")
-            print("🔧 FIX #1252/#782/#783/#1089/#1136: Cleared delta verified + repair counters")
+            // FIX #1542: Force P2P nullifier verification on next startup after Full Rescan.
+            // Boost file only has outputs (not spend descriptions), so spent notes can't be detected
+            // from boost data alone. The P2P nullifier scan MUST run to find spending transactions.
+            // Without this, notes spent in the boost-file range appear "unspent" → inflated balance.
+            UserDefaults.standard.set(true, forKey: "FIX1542_NullifierVerificationNeeded")
+            print("🔧 FIX #1252/#782/#783/#1089/#1136/#1542: Cleared delta verified + repair counters + forced nullifier verification")
 
             await MainActor.run {
                 isFullRescan = true

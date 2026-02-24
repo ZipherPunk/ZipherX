@@ -311,6 +311,11 @@ struct SettingsView: View {
     @State private var recoveryMessage = ""
     @State private var useP2POnly = UserDefaults.standard.bool(forKey: "useP2POnly")
     @State private var useDNSSeeds = UserDefaults.standard.object(forKey: "useDNSSeeds") != nil ? UserDefaults.standard.bool(forKey: "useDNSSeeds") : false  // Disabled by default
+    // FIX #1551: Configurable consensus threshold (default 3, range 2-8)
+    @State private var consensusThresholdSetting: Int = {
+        let stored = UserDefaults.standard.integer(forKey: "ZipherX_ConsensusThreshold")
+        return (stored >= 2 && stored <= 8) ? stored : 3
+    }()
     @State private var debugLoggingEnabled = DebugLogger.shared.isEnabled
     @State private var showDebugLogShare = false
     @State private var showLogExportWarning = false  // Privacy warning before export
@@ -1701,6 +1706,61 @@ Both binaries must be installed to /usr/local/bin:
                     )
                 }
             }
+
+            // FIX #1551: Configurable consensus threshold
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Image(systemName: "person.3.fill")
+                        .font(.system(size: 14))
+                        .foregroundColor(theme.textPrimary)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Consensus Threshold")
+                            .font(theme.bodyFont)
+                            .foregroundColor(theme.textPrimary)
+                        Text("Min peers for chain agreement")
+                            .font(theme.captionFont)
+                            .foregroundColor(theme.textSecondary)
+                    }
+
+                    Spacer()
+
+                    // Stepper with current value display
+                    HStack(spacing: 8) {
+                        Text("\(consensusThresholdSetting)")
+                            .font(.system(size: 16, weight: .bold, design: .monospaced))
+                            .foregroundColor(consensusThresholdColor)
+                            .frame(minWidth: 20)
+
+                        Stepper("", value: $consensusThresholdSetting, in: 2...8)
+                            .labelsHidden()
+                            .onChange(of: consensusThresholdSetting) { newValue in
+                                UserDefaults.standard.set(newValue, forKey: "ZipherX_ConsensusThreshold")
+                                print("🔒 FIX #1551: Consensus threshold changed to \(newValue) (takes effect on restart)")
+                            }
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+
+                // Security level indicator
+                HStack(spacing: 6) {
+                    Image(systemName: consensusThresholdIcon)
+                        .font(.system(size: 11))
+                        .foregroundColor(consensusThresholdColor)
+                    Text(consensusThresholdDescription)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(theme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 8)
+            }
+            .background(theme.surfaceColor)
+            .overlay(
+                Rectangle()
+                    .stroke(theme.textPrimary, lineWidth: 1)
+            )
         }
         .padding(12)
         .background(theme.backgroundColor)
@@ -2136,6 +2196,41 @@ Both binaries must be installed to /usr/local/bin:
             return .green
         case .error:
             return .red
+        }
+    }
+
+    // MARK: - FIX #1551: Consensus Threshold Helpers
+
+    /// FIX #1551: Color for consensus threshold security level
+    private var consensusThresholdColor: Color {
+        switch consensusThresholdSetting {
+        case 2: return .orange
+        case 3: return .yellow
+        case 4...5: return .green
+        case 6...8: return Color(red: 0.2, green: 1.0, blue: 0.4)
+        default: return .yellow
+        }
+    }
+
+    /// FIX #1551: Icon for consensus threshold security level
+    private var consensusThresholdIcon: String {
+        switch consensusThresholdSetting {
+        case 2: return "exclamationmark.shield"
+        case 3: return "shield"
+        case 4...5: return "shield.fill"
+        case 6...8: return "shield.checkered"
+        default: return "shield"
+        }
+    }
+
+    /// FIX #1551: Description text for current consensus threshold
+    private var consensusThresholdDescription: String {
+        switch consensusThresholdSetting {
+        case 2: return "Minimum security. Faster sync, but vulnerable to Sybil attacks. Use only on trusted networks."
+        case 3: return "Default. Balanced security for Zclassic's network size. Recommended for most users."
+        case 4...5: return "Enhanced security. Requires more peers to agree. Sync may be slower."
+        case 6...8: return "Maximum security. Requires \(consensusThresholdSetting) peers. May struggle on small networks."
+        default: return "Custom threshold. Restart app to apply."
         }
     }
 

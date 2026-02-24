@@ -411,9 +411,21 @@ final class BiometricAuthManager: ObservableObject {
     }
 
     /// Authenticate for viewing private key / seed
+    /// FIX #1553: ALWAYS requires fresh authentication — NO grace period, NO cache.
+    /// Private key is the most sensitive data. FIX #1433's 60s grace period in
+    /// authenticateForSensitiveOperation() must NEVER apply to key export.
+    /// Uses authenticateFresh() which sets touchIDAuthenticationAllowableReuseDuration = 0.
     func authenticateForKeyExport(completion: @escaping (Bool, Error?) -> Void) {
-        // FIX #1273: Key export MUST always require auth (was using authenticate() which bypasses when biometric disabled)
-        authenticateForSensitiveOperation(reason: "Authenticate to export private key", completion: completion)
+        let reason = "Authenticate to export private key"
+
+        let biometricEnabled = UserDefaults.standard.bool(forKey: "useBiometricAuth")
+        if biometricEnabled {
+            // FIX #1553: Always fresh biometric — no reuse, no grace period
+            authenticateFresh(reason: reason, completion: completion)
+        } else {
+            // FIX #1553: Always fresh passcode — no reuse
+            authenticateWithPasscode(reason: reason, completion: completion)
+        }
     }
 
     /// Authenticate for app unlock

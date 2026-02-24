@@ -1471,11 +1471,16 @@ public final class Peer {
             return
         }
         // FIX #144: If Tor is bypassed, use direct connection for faster header sync
+        // FIX #1549: Log bypass clearly so it's visible in logs for privacy auditing
         if torBypassed || isLocalhost {
             if isLocalhost {
                 print("📡 [\(host)] Connecting directly (localhost - never through Tor)")
+            } else if torEnabled {
+                // FIX #1549: This should ONLY happen for explicit user-initiated actions (e.g. TX broadcast bypass)
+                // If you see this in logs during peer growth/recovery, FIX #1549 has a gap
+                print("⚠️ FIX #1549: [\(host)] Connecting directly (Tor BYPASSED — verify this is user-initiated)")
             } else {
-                print("📡 [\(host)] Connecting directly (Tor bypassed for speed)")
+                print("📡 [\(host)] Connecting directly (Tor not enabled)")
             }
         }
 
