@@ -31,6 +31,8 @@ struct ChatView: View {
     @State private var showSettings = false
     @State private var selectedContact: ChatContact?
     @State private var noContactsQuote: String = ""  // Store quote to prevent loop
+    // FIX #1574: Timer tick to refresh .onion circuit warmup countdown
+    @State private var warmupTick: Bool = false
 
     // FIX #252: Callback to navigate to main app settings (for enabling Tor)
     var onShowAppSettings: (() -> Void)?
@@ -69,6 +71,10 @@ struct ChatView: View {
             .onAppear {
                 autoStartChatIfNeeded()
             }
+            // FIX #1574: Tick every 1s to refresh .onion warmup countdown
+            .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
+                if !torManager.isOnionCircuitsReady { warmupTick.toggle() }
+            }
             #else
             // FIX #1429: WhatsApp-style full-screen navigation (replaces split pane)
             // FIX #1429b: Use if/else (not opacity) so contact list re-renders with fresh data
@@ -98,6 +104,10 @@ struct ChatView: View {
             }
             .onAppear {
                 autoStartChatIfNeeded()
+            }
+            // FIX #1574: Tick every 1s to refresh .onion warmup countdown
+            .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
+                if !torManager.isOnionCircuitsReady { warmupTick.toggle() }
             }
             #endif
         }
@@ -540,6 +550,9 @@ struct ChatView: View {
     private var chatStatusColor: Color {
         if !chatManager.isAvailable {
             return Color.red
+        } else if !torManager.isOnionCircuitsReady {
+            // FIX #1574: Tor SOCKS connected but .onion circuits still warming up
+            return Color.orange
         } else if chatManager.isWarmingUp {
             return Color.orange
         } else {
@@ -549,11 +562,16 @@ struct ChatView: View {
 
     // FIX #1389: Chat status text — based on Tor/chat availability, not P2P peers
     // FIX #1532: Show warming up status while connecting to contacts
+    // FIX #1574: Show .onion circuit warmup status (warmupTick forces re-eval each second)
     private var chatStatusText: String {
+        let _ = warmupTick  // FIX #1574: Force SwiftUI re-evaluation on timer tick
         if !chatManager.isAvailable {
             return "OFFLINE"
+        } else if !torManager.isOnionCircuitsReady {
+            let remaining = Int(torManager.onionCircuitWarmupRemaining)
+            return "CIRCUITS WARMING UP\(remaining > 0 ? " (\(remaining)s)" : "...")"
         } else if chatManager.isWarmingUp {
-            return "WARMING UP..."
+            return "CONNECTING..."
         } else {
             return "ONLINE"
         }
@@ -860,6 +878,7 @@ struct ConversationView: View {
     @EnvironmentObject private var themeManager: ThemeManager
     @EnvironmentObject private var networkManager: NetworkManager
     @StateObject private var chatManager = ChatManager.shared
+    @StateObject private var torManager = TorManager.shared  // FIX #1574: .onion circuit warmup
     @StateObject private var voiceCallManager = VoiceCallManager.shared  // FIX #1540: Observe call state changes
 
     let contact: ChatContact
@@ -885,6 +904,8 @@ struct ConversationView: View {
     @State private var showAttachmentOptions = false
     @State private var showPhotosPicker = false  // FIX #1566: Separate state — PhotosPicker inside Menu doesn't open
     #endif
+    // FIX #1574: Timer tick to dismiss warmup banner when circuits ready
+    @State private var circuitCheckTick: Bool = false
 
     private var theme: AppTheme { themeManager.currentTheme }
 
@@ -1031,6 +1052,10 @@ struct ConversationView: View {
         .onReceive(NotificationCenter.default.publisher(for: .chatMessageDelivered)) { _ in
             chatManager.objectWillChange.send()
         }
+        // FIX #1574: Tick every 2s to dismiss warmup banner when circuits become ready
+        .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
+            if !torManager.isOnionCircuitsReady { circuitCheckTick.toggle() }
+        }
         .sheet(isPresented: $showPaymentRequest) {
             PaymentRequestSheet(contact: contact)
             #if os(macOS)
@@ -1166,9 +1191,27 @@ struct ConversationView: View {
                     .background(Color.red)
                     .transition(.move(edge: .top).combined(with: .opacity))
                 }
+                // FIX #1574: .onion circuit warmup banner
+                if chatManager.isAvailable && !torManager.isOnionCircuitsReady {
+                    HStack(spacing: 8) {
+                        Image(systemName: "antenna.radiowaves.left.and.right")
+                            .foregroundColor(.white)
+                            .font(.system(size: 14, weight: .bold))
+                        Text("Hidden service circuits warming up — messages may be delayed")
+                            .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                            .foregroundColor(.white)
+                            .lineLimit(2)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .background(Color.orange.opacity(0.9))
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                }
             }
             .animation(.easeInOut(duration: 0.3), value: showScreenshotBanner)
             .animation(.easeInOut(duration: 0.3), value: showRecordingBanner)
+            .animation(.easeInOut(duration: 0.3), value: circuitCheckTick)
         }
     }
 
@@ -2491,6 +2534,7 @@ struct AddContactSheet: View {
 struct ChatSettingsSheet: View {
     @EnvironmentObject private var themeManager: ThemeManager
     @StateObject private var chatManager = ChatManager.shared
+    @StateObject private var torManager = TorManager.shared
     @Environment(\.dismiss) private var dismiss
 
     // Store quote once to prevent "loop" effect from re-rendering
@@ -2503,9 +2547,12 @@ struct ChatSettingsSheet: View {
     private var theme: AppTheme { themeManager.currentTheme }
 
     // FIX #1532: Chat status properties (same logic as ChatView)
+    // FIX #1574: Added .onion circuit warmup state
     private var chatStatusColor: Color {
         if !chatManager.isAvailable {
             return Color.red
+        } else if !torManager.isOnionCircuitsReady {
+            return Color.orange
         } else if chatManager.isWarmingUp {
             return Color.orange
         } else {
@@ -2516,8 +2563,11 @@ struct ChatSettingsSheet: View {
     private var chatStatusText: String {
         if !chatManager.isAvailable {
             return "OFFLINE"
+        } else if !torManager.isOnionCircuitsReady {
+            let remaining = Int(torManager.onionCircuitWarmupRemaining)
+            return "CIRCUITS WARMING UP\(remaining > 0 ? " (\(remaining)s)" : "...")"
         } else if chatManager.isWarmingUp {
-            return "WARMING UP..."
+            return "CONNECTING..."
         } else {
             return "ONLINE"
         }
