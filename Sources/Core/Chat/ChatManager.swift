@@ -1650,6 +1650,8 @@ final class ChatManager: ObservableObject {
             markMessageRead(id: message.content)
 
         case .ping:
+            // FIX #1586: Receiving a ping is proof the sender is alive — mark online
+            updateContactOnlineStatus(message.fromOnion, isOnline: true)
             // Respond with pong
             Task {
                 if let contact = contacts.first(where: { $0.onionAddress == message.fromOnion }) {
@@ -1664,7 +1666,8 @@ final class ChatManager: ObservableObject {
             }
 
         case .pong:
-            // Update last seen
+            // FIX #1586: Receiving a pong is proof of life — mark online + update last seen
+            updateContactOnlineStatus(message.fromOnion, isOnline: true)
             updateContactLastSeen(message.fromOnion)
 
         case .nickname:
@@ -2412,6 +2415,12 @@ final class ChatManager: ObservableObject {
                         updateContactOnlineStatus(contact.onionAddress, isOnline: false)
                     }
                 }
+            } else if !contact.isOnline {
+                // FIX #1586: Peer is connected but contact.isOnline is stale (false).
+                // This happens when loadPersistentData() resets all isOnline=false AFTER
+                // connections were already established. Reconcile now.
+                updateContactOnlineStatus(contact.onionAddress, isOnline: true)
+                print("💬 FIX #1586: Reconciled stale offline status for \(contact.displayName) — peer is connected")
             }
         }
     }
@@ -2495,10 +2504,15 @@ final class ChatManager: ObservableObject {
 
         // FIX #1369: Reset all contacts to offline on startup — no connections exist yet.
         // isOnline was persisted to disk from the previous session but is stale.
+        // FIX #1586: Don't reset if a live peer connection already exists (race with
+        // walletDatabaseOpened notification — connections can be established before this runs)
         for i in contacts.indices {
             if contacts[i].isOnline {
-                contacts[i].isOnline = false
-                database.saveContact(contacts[i])
+                let hasPeer = peers[contacts[i].onionAddress] != nil
+                if !hasPeer {
+                    contacts[i].isOnline = false
+                    database.saveContact(contacts[i])
+                }
             }
         }
 

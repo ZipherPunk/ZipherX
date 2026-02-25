@@ -520,13 +520,17 @@ final class VoiceCallManager: ObservableObject {
             // "Input HW format is invalid" (AVAudioIONodeImpl.mm:1322).
             var hwReady = false
             for attempt in 1...10 {
-                let hwFormat = engine.inputNode.inputFormat(forBus: 0)
+                // FIX #1583: Use outputFormat (what startAudioCapture reads at line 583),
+                // NOT inputFormat. inputFormat is the raw hardware format; outputFormat is
+                // what the node produces downstream — they can differ. The readiness check
+                // must match what startAudioCapture actually uses.
+                let hwFormat = engine.inputNode.outputFormat(forBus: 0)
                 if hwFormat.sampleRate > 0 && hwFormat.channelCount > 0 {
-                    print("📞 FIX #1541: Input HW ready after \(attempt) attempts (sr=\(hwFormat.sampleRate), ch=\(hwFormat.channelCount))")
+                    print("📞 FIX #1583: Input HW ready after \(attempt) attempts (sr=\(hwFormat.sampleRate), ch=\(hwFormat.channelCount))")
                     hwReady = true
                     break
                 }
-                print("📞 FIX #1541: Input HW not ready (attempt \(attempt)/10, sr=\(hwFormat.sampleRate), ch=\(hwFormat.channelCount)) — waiting 200ms...")
+                print("📞 FIX #1583: Input HW not ready (attempt \(attempt)/10, sr=\(hwFormat.sampleRate), ch=\(hwFormat.channelCount)) — waiting 200ms...")
                 try? await Task.sleep(nanoseconds: 200_000_000) // 200ms
             }
 
@@ -671,10 +675,11 @@ final class VoiceCallManager: ObservableObject {
 
             let timestamp = UInt64(Date().timeIntervalSince1970 * 1000)
 
-            // FIX #1540: All @MainActor property access inside Task block (audio thread safety)
+            // FIX #1585: Read MainActor state quickly, then send on background Task.
+            // Old code: entire sendCallSignal awaited on MainActor → blocked UI + receive path
+            // for 30-45s during Tor reconnects. Now: grab state on MainActor, fire-and-forget send.
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
-                // Check mute and call state on MainActor
                 guard !self.isMuted else { return }
                 guard case .active(let callId) = self.callState,
                       let peer = self.remotePeerOnionAddress else { return }
@@ -692,11 +697,14 @@ final class VoiceCallManager: ObservableObject {
                 guard let frameJSON = try? JSONEncoder().encode(frame),
                       let frameString = String(data: frameJSON, encoding: .utf8) else { return }
 
-                await ChatManager.shared.sendCallSignal(
-                    type: .callAudio,
-                    content: frameString,
-                    to: peer
-                )
+                // FIX #1585: Send on detached task — do NOT await on MainActor
+                Task.detached {
+                    await ChatManager.shared.sendCallSignal(
+                        type: .callAudio,
+                        content: frameString,
+                        to: peer
+                    )
+                }
             }
         }
     }
@@ -743,6 +751,19 @@ final class VoiceCallManager: ObservableObject {
             player.scheduleBuffer(pcmBuffer)
             framesPlayed += 1
             nextPlaybackSeq += 1
+        }
+
+        // FIX #1584: If no frames played but buffer has data, the leading packet was lost.
+        // Skip forward to the lowest buffered sequence to prevent permanent deadlock.
+        if framesPlayed == 0 && !jitterBuffer.isEmpty {
+            if let minSeq = jitterBuffer.keys.min(), minSeq > nextPlaybackSeq {
+                let skipped = minSeq - nextPlaybackSeq
+                print("📞 FIX #1584: Skipping \(skipped) lost packets (seq \(nextPlaybackSeq)→\(minSeq)), buffer=\(jitterBuffer.count)")
+                nextPlaybackSeq = minSeq
+                // Retry drain now that nextPlaybackSeq points to a buffered frame
+                drainJitterBuffer()
+                return
+            }
         }
 
         if framesPlayed > 0 {

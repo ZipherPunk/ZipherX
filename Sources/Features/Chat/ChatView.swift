@@ -3583,6 +3583,20 @@ struct SendViewForPayment: View {
         // FIX #1385: Use round() to avoid floating point truncation
         let amountZatoshis = UInt64(round(amount * 100_000_000))
 
+        // FIX #1582: SECURITY — Require biometric/passcode auth before every payment.
+        // Same pattern as SendView.sendTransaction() — no payment without authentication.
+        BiometricAuthManager.shared.authenticateForSend(amount: amountZatoshis) { success, error in
+            if success {
+                self.executePayment(amountZatoshis: amountZatoshis)
+            } else {
+                self.errorMessage = error?.localizedDescription ?? "Authentication required to send payment"
+                self.showError = true
+            }
+        }
+    }
+
+    // FIX #1582: Extracted payment execution — only called after successful auth
+    private func executePayment(amountZatoshis: UInt64) {
         isSending = true
         sendProgress = [
             SendProgressStep(id: "build", title: "Building transaction", status: .inProgress),
