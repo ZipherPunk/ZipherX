@@ -107,6 +107,17 @@ final class VoiceCallManager: ObservableObject {
             print("📞 FIX #1540: Microphone permission denied — cannot start call")
             return false
         }
+        #else
+        // macOS: TCC requires NSMicrophoneUsageDescription + explicit permission request
+        let macMicPermission = await withCheckedContinuation { continuation in
+            AVCaptureDevice.requestAccess(for: .audio) { granted in
+                continuation.resume(returning: granted)
+            }
+        }
+        guard macMicPermission else {
+            print("📞 Microphone permission denied (macOS) — cannot start call")
+            return false
+        }
         #endif
 
         let callId = UUID().uuidString
@@ -377,6 +388,18 @@ final class VoiceCallManager: ObservableObject {
             await endCall(reason: "mic_denied")
             return
         }
+        #else
+        // macOS: TCC requires NSMicrophoneUsageDescription + explicit permission request
+        let macMicPermission = await withCheckedContinuation { continuation in
+            AVCaptureDevice.requestAccess(for: .audio) { granted in
+                continuation.resume(returning: granted)
+            }
+        }
+        guard macMicPermission else {
+            print("📞 Microphone permission denied (macOS) — cannot start call")
+            await endCall(reason: "mic_denied")
+            return
+        }
         #endif
 
         callState = .active(callId: callId)
@@ -386,7 +409,7 @@ final class VoiceCallManager: ObservableObject {
         #if os(iOS)
         let session = AVAudioSession.sharedInstance()
         do {
-            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth, .defaultToSpeaker])
+            try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth])
             try session.setPreferredSampleRate(sampleRate)
             try session.setPreferredIOBufferDuration(Double(frameDurationMs) / 1000.0)
             try session.setActive(true)
@@ -408,17 +431,10 @@ final class VoiceCallManager: ObservableObject {
 
         engine.attach(player)
 
-        // Output format for playback
-        guard let outputFormat = AVAudioFormat(
-            standardFormatWithSampleRate: sampleRate,
-            channels: channels
-        ) else {
-            print("📞 FIX #1540: Failed to create output audio format")
-            await endCall(reason: "audio_error")
-            return
-        }
-
-        engine.connect(player, to: engine.mainMixerNode, format: outputFormat)
+        // Connect playerNode with nil format — AVAudioEngine auto-negotiates
+        // with hardware output (44.1kHz/48kHz). Hardcoding 16kHz causes silent
+        // playback when hardware sample rate doesn't match.
+        engine.connect(player, to: engine.mainMixerNode, format: nil)
 
         // FIX #1546: Ensure output volume is at maximum
         player.volume = 1.0
@@ -531,7 +547,9 @@ final class VoiceCallManager: ObservableObject {
         let localSampleRate = sampleRate
         let localFrameDurationMs = frameDurationMs
 
-        inputNode.installTap(onBus: 0, bufferSize: AVAudioFrameCount(localSampleRate * Double(localFrameDurationMs) / 1000.0), format: inputFormat) { [weak self] buffer, time in
+        // Pass nil format to installTap — AVAudioEngine uses the node's native
+        // output format. Passing a mismatched format causes silent/no tap delivery.
+        inputNode.installTap(onBus: 0, bufferSize: AVAudioFrameCount(localSampleRate * Double(localFrameDurationMs) / 1000.0), format: nil) { [weak self] buffer, time in
             guard self != nil else { return }
 
             // Convert to target format if needed

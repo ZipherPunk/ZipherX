@@ -449,6 +449,16 @@ final class ChatManager: ObservableObject {
 
     /// Start the chat service (requires Hidden Service to be running)
     func start() async throws {
+        // FIX #1561: Race condition — Hidden Service (Arti/Rust) starts accepting TCP connections
+        // on port 8034 as soon as state == .running. If start() waits for the state check first,
+        // there is a window where Tor forwards an iOS connection to 127.0.0.1:8034 but no
+        // NWListener is bound yet → "Connection refused" → iOS drops the call/message.
+        // Fix: bind the NWListener BEFORE checking hidden service state so the port is ready
+        // the moment the first connection arrives, regardless of timing.
+        if listener == nil {
+            try startListener()
+        }
+
         guard await HiddenServiceManager.shared.state == .running else {
             throw ChatError.hiddenServiceNotRunning
         }
@@ -458,9 +468,6 @@ final class ChatManager: ObservableObject {
         }
 
         ourOnionAddress = onion
-
-        // Start listening for incoming chat connections
-        try startListener()
 
         // Start maintenance loop
         startMaintenanceLoop()
@@ -1574,7 +1581,13 @@ final class ChatManager: ObservableObject {
                 )
             }
 
-            // Send delivery confirmation
+            // FIX #1562: Send delivery confirmation directly via the existing peer connection.
+            // Previous code looked up message.fromOnion in contacts before sending the ACK.
+            // If the sender is not yet in the contacts list (or the lookup races with auto-add),
+            // the ACK was silently dropped → no delivered checkmarks on sender's device.
+            // Fix: send the ACK directly on peer.connection using the shared key already
+            // established during handshake. No contact lookup required — the peer IS connected.
+            let ackPeer = peer
             Task {
                 let delivery = ChatMessage(
                     type: .delivered,
@@ -1582,8 +1595,22 @@ final class ChatManager: ObservableObject {
                     toOnion: message.fromOnion,
                     content: message.id
                 )
-                if let contact = contacts.first(where: { $0.onionAddress == message.fromOnion }) {
-                    try? await sendMessage(delivery, to: contact)
+                guard let sharedKey = await ackPeer.sharedKey else { return }
+                do {
+                    let encryptedPayload = try ChatEncryption.encryptMessage(delivery, using: sharedKey)
+                    let wireData = ChatProtocol.encode(encryptedPayload: encryptedPayload)
+                    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                        ackPeer.connection.send(content: wireData, completion: .contentProcessed { error in
+                            if let error = error {
+                                continuation.resume(throwing: error)
+                            } else {
+                                continuation.resume()
+                            }
+                        })
+                    }
+                    print("💬 FIX #1562: Delivery ACK sent for message \(message.id.prefix(8))...")
+                } catch {
+                    print("💬 FIX #1562: Failed to send delivery ACK: \(error)")
                 }
             }
 
@@ -2251,6 +2278,7 @@ final class ChatManager: ObservableObject {
 
     private func markMessageDelivered(id: String) {
         // Find and update the message in conversations
+        var found = false
         for (onion, var conversation) in conversations {
             if let index = conversation.messages.firstIndex(where: { $0.id == id }) {
                 var message = conversation.messages[index]
@@ -2260,20 +2288,32 @@ final class ChatManager: ObservableObject {
 
                 // Update in database
                 database.saveMessage(message, ourOnionAddress: ourOnionAddress)
+                found = true
                 break
             }
         }
 
-        // Notify UI of delivery confirmation
-        NotificationCenter.default.post(
-            name: .chatMessageDelivered,
-            object: nil,
-            userInfo: ["messageId": id]
-        )
+        // FIX #1562: Only post notification when a message was actually updated.
+        // Previously posted unconditionally — if the id matched nothing, the notification
+        // fired but conversations was unchanged → UI re-rendered with stale .sent status.
+        // Also explicitly send objectWillChange to guarantee SwiftUI redraws on macOS
+        // where @Published dict mutations can be coalesced before the view re-evaluates.
+        if found {
+            objectWillChange.send()
+            NotificationCenter.default.post(
+                name: .chatMessageDelivered,
+                object: nil,
+                userInfo: ["messageId": id]
+            )
+            print("💬 FIX #1562: Marked message \(id.prefix(8))... as delivered")
+        } else {
+            print("💬 FIX #1562: Delivery ACK for unknown message id \(id.prefix(8))... (ignored)")
+        }
     }
 
     private func markMessageRead(id: String) {
         // Find and update the message in conversations
+        var found = false
         for (onion, var conversation) in conversations {
             if let index = conversation.messages.firstIndex(where: { $0.id == id }) {
                 var message = conversation.messages[index]
@@ -2283,16 +2323,20 @@ final class ChatManager: ObservableObject {
 
                 // Update in database
                 database.saveMessage(message, ourOnionAddress: ourOnionAddress)
+                found = true
                 break
             }
         }
 
-        // Notify UI of read receipt
-        NotificationCenter.default.post(
-            name: .chatMessageRead,
-            object: nil,
-            userInfo: ["messageId": id]
-        )
+        // FIX #1562: Only post notification when a message was actually updated (mirrors markMessageDelivered fix).
+        if found {
+            objectWillChange.send()
+            NotificationCenter.default.post(
+                name: .chatMessageRead,
+                object: nil,
+                userInfo: ["messageId": id]
+            )
+        }
     }
 
     private func isValidOnionAddress(_ address: String) -> Bool {

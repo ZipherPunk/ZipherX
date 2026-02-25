@@ -2331,8 +2331,11 @@ struct AddContactSheet: View {
                             .textFieldStyle(.plain)
                             .font(.system(size: 14, design: .monospaced))
                             .foregroundColor(.white)
+                            .frame(maxWidth: .infinity)
                             #if os(iOS)
                             .autocapitalization(.none)
+                            .keyboardType(.URL)
+                            .textContentType(.none)
                             #endif
                             .disableAutocorrection(true)
 
@@ -2506,6 +2509,9 @@ struct ChatSettingsSheet: View {
     @State private var showCopiedFeedback = false
     // FIX #1436: Profile image picker
     @State private var showImagePicker = false
+    #if os(macOS)
+    @State private var showFileImporter = false
+    #endif
 
     private var theme: AppTheme { themeManager.currentTheme }
 
@@ -2538,6 +2544,20 @@ struct ChatSettingsSheet: View {
                 ImagePickerView { imageData in
                     if let resized = Self.resizedImageData(imageData, maxSize: 200) {
                         chatManager.saveProfileImage(resized)
+                    }
+                }
+            }
+            #else
+            // macOS: Use SwiftUI .fileImporter instead of NSOpenPanel
+            // NSOpenPanel crashes with XPC error inside SwiftUI sheets
+            .fileImporter(isPresented: $showFileImporter, allowedContentTypes: [.image]) { result in
+                if case .success(let url) = result {
+                    if url.startAccessingSecurityScopedResource() {
+                        defer { url.stopAccessingSecurityScopedResource() }
+                        if let data = try? Data(contentsOf: url),
+                           let resized = Self.resizedImageData(data, maxSize: 200) {
+                            chatManager.saveProfileImage(resized)
+                        }
                     }
                 }
             }
@@ -2608,23 +2628,7 @@ struct ChatSettingsSheet: View {
             Spacer()
             Button(action: {
                 #if os(macOS)
-                // FIX: Use begin() instead of runModal() — runModal() crashes XPC
-                // inside SwiftUI sheets (NSXPCSharedListenerErrorDomain Code=2)
-                let panel = NSOpenPanel()
-                panel.allowedContentTypes = [.image]
-                panel.allowsMultipleSelection = false
-                panel.canChooseDirectories = false
-                panel.title = "Choose Profile Picture"
-                panel.begin { response in
-                    if response == .OK, let url = panel.url {
-                        if let data = try? Data(contentsOf: url),
-                           let resized = Self.resizedImageData(data, maxSize: 200) {
-                            DispatchQueue.main.async {
-                                chatManager.saveProfileImage(resized)
-                            }
-                        }
-                    }
-                }
+                showFileImporter = true
                 #else
                 showImagePicker = true
                 #endif
