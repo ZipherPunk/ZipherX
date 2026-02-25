@@ -44,6 +44,12 @@ final class DatabaseEncryption {
     /// Salt for key derivation (stored in keychain)
     private var salt: Data?
 
+    /// Thread safety lock — domainKeys/encryptionKey/salt are accessed from multiple
+    /// threads during startup (ChatManager notification handler + DB opening).
+    /// Without this lock: data race on domainKeys dict → corrupted memory →
+    /// "NSTaggedPointerString count: unrecognized selector" crash.
+    private let lock = NSLock()
+
     /// Keychain service identifiers
     private let keychainService = "com.zipherx.wallet.dbencryption"
     private let saltKey = "dbEncryptionSalt"
@@ -148,9 +154,12 @@ final class DatabaseEncryption {
 
     /// Get or create the database encryption key (v1 legacy)
     private func getOrCreateEncryptionKey() throws -> SymmetricKey {
+        lock.lock()
         if let key = encryptionKey {
+            lock.unlock()
             return key
         }
+        lock.unlock()
 
         // Get or create salt
         let salt = try getOrCreateSalt()
@@ -167,16 +176,21 @@ final class DatabaseEncryption {
             outputByteCount: 32  // 256-bit key
         )
 
+        lock.lock()
         self.encryptionKey = derivedKey
+        lock.unlock()
         return derivedKey
     }
 
     /// VUL-STOR-009: Get or create a domain-separated encryption key
     /// Each domain uses a unique HKDF info string to derive an independent key
     private func getOrCreateDomainKey(_ domain: EncryptionDomain) throws -> SymmetricKey {
+        lock.lock()
         if let key = domainKeys[domain] {
+            lock.unlock()
             return key
         }
+        lock.unlock()
 
         let salt = try getOrCreateSalt()
         let deviceId = getDeviceIdentifier()
@@ -189,19 +203,26 @@ final class DatabaseEncryption {
             outputByteCount: 32
         )
 
+        lock.lock()
         domainKeys[domain] = derivedKey
+        lock.unlock()
         return derivedKey
     }
 
     /// Get or create encryption salt (stored in keychain)
     private func getOrCreateSalt() throws -> Data {
+        lock.lock()
         if let salt = self.salt {
+            lock.unlock()
             return salt
         }
+        lock.unlock()
 
         // Try to retrieve from keychain
         if let existingSalt = try? loadSaltFromKeychain() {
+            lock.lock()
             self.salt = existingSalt
+            lock.unlock()
             return existingSalt
         }
 
@@ -217,7 +238,9 @@ final class DatabaseEncryption {
 
         // Store in keychain
         try saveSaltToKeychain(newSalt)
+        lock.lock()
         self.salt = newSalt
+        lock.unlock()
         return newSalt
     }
 
@@ -414,9 +437,11 @@ final class DatabaseEncryption {
 
     /// Clear cached keys (forces re-derivation on next use)
     func clearCachedKey() {
+        lock.lock()
         encryptionKey = nil
         domainKeys.removeAll()
         salt = nil
+        lock.unlock()
     }
 
     /// Delete encryption salt (DANGEROUS - will make encrypted data unrecoverable!)
