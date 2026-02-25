@@ -2347,9 +2347,10 @@ final class FilterScanner {
         if await WalletManager.shared.isRepairingDatabase {
             UserDefaults.standard.set(true, forKey: "FIX1089_FullVerificationComplete")
             // FIX #1300: Save code version after Full Rescan verification
-            let verificationCodeVersion = "1527"  // FIX #1527: Bumped — force fresh re-scan
-            let buildForRescan = "\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown").\(verificationCodeVersion)"
-            UserDefaults.standard.set(buildForRescan, forKey: "FIX1283_LastVerifiedBuild")
+            // FIX #1589: Save ONLY verificationCodeVersion (matches WalletManager CHECK point).
+            // Previous bug: build number included → every build bump forced 5000-block rescan.
+            let verificationCodeVersion = "1559"  // Must match WalletManager.verifyAllUnspentNotesOnChain
+            UserDefaults.standard.set(verificationCodeVersion, forKey: "FIX1283_LastVerifiedBuild")
             print("✅ FIX #1101: Set FIX1089_FullVerificationComplete=true after Full Rescan (skips redundant 73K block scan)")
             // FIX #1252: Mark delta as verified after Full Rescan — immutable from now on.
             // Full Rescan builds delta with complete P2P scan (same rigor as boost file).

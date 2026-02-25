@@ -13809,8 +13809,13 @@ final class WalletManager: ObservableObject {
         // FIX #1300: CFBundleVersion is always "1" during development — never triggers FIX #1283.
         // Use a hardcoded verification version that we bump when spend-related code changes.
         // This forces re-verification on the next startup after a code fix, catching phantom-unspent notes.
+        // FIX #1589: Use ONLY verificationCodeVersion for the build check, NOT CFBundleVersion.
+        // Previous bug: "36.1559" != "35.1559" → every build bump forced full 5000-block P2P rescan
+        // (z24.log: 5053 blocks in 21s at startup → battery drain + iOS overheating).
+        // CFBundleVersion changes on every release even when nullifier code hasn't changed.
+        // verificationCodeVersion is bumped explicitly only when nullifier/verification logic changes.
         let verificationCodeVersion = "1559"  // FIX #1559: Equihash variant validation — corrupted HeaderStore detection
-        let currentBuild = "\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown").\(verificationCodeVersion)"
+        let currentBuild = verificationCodeVersion
         let lastVerifiedBuild = UserDefaults.standard.string(forKey: "FIX1283_LastVerifiedBuild") ?? ""
         if hasCompletedFullVerification && currentBuild != lastVerifiedBuild {
             print("🔄 FIX #1300: Code version changed (\(lastVerifiedBuild) → \(currentBuild)) — forcing full re-verification")
@@ -14324,9 +14329,9 @@ final class WalletManager: ObservableObject {
                         // FIX #1300: Save code version to detect changes on next startup
                         // FIX #1555: MUST match the version at line ~13824 — if these differ,
                         // FIX #1300 forces full re-verification EVERY cycle (infinite scan loop).
+                        // FIX #1589: Save ONLY verificationCodeVersion (matches CHECK point above).
                         let verificationCodeVersion = "1559"
-                        let buildForCheckpoint = "\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown").\(verificationCodeVersion)"
-                        UserDefaults.standard.set(buildForCheckpoint, forKey: "FIX1283_LastVerifiedBuild")
+                        UserDefaults.standard.set(verificationCodeVersion, forKey: "FIX1283_LastVerifiedBuild")
                         // FIX #1090: Clear the nullifier fix flag now that we've done full verification
                         UserDefaults.standard.set(false, forKey: "FIX1090_NeedsFullVerification")
                         // FIX #1195c: Clear partial scan progress — full scan completed
