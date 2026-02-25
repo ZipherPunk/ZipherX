@@ -438,7 +438,7 @@ class ChatEncryption {
 /// Message format: [4 bytes: length][1 byte: version][N bytes: encrypted payload]
 struct ChatProtocol {
     static let VERSION: UInt8 = 1
-    static let MAX_MESSAGE_SIZE: UInt32 = 65536  // 64KB max message
+    static let MAX_MESSAGE_SIZE: UInt32 = 262144  // 256KB max message (avatars are base64 ~60KB + encryption overhead)
     static let HEADER_SIZE: Int = 5              // 4 bytes length + 1 byte version
 
     /// Encode a message for wire transmission
