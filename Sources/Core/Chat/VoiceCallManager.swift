@@ -402,6 +402,11 @@ final class VoiceCallManager: ObservableObject {
         // Decode base64 audio data
         guard let audioData = Data(base64Encoded: frame.opus) else { return }
 
+        // FIX #1587: Log first received frame to confirm audio pipeline is working
+        if jitterBuffer.isEmpty && frame.seq == 0 {
+            print("📞 FIX #1587: ✅ First audio frame RECEIVED from peer (seq=\(frame.seq), bytes=\(audioData.count))")
+        }
+
         // Add to jitter buffer
         jitterBuffer[frame.seq] = audioData
 
@@ -538,9 +543,18 @@ final class VoiceCallManager: ObservableObject {
             // even though startAudioCapture() already has its own AVAudioSession format fallback
             // (line 593-603) that always works after setActive(true).
             //
-            // Fix: Skip the outputFormat readiness check entirely. Go straight to startAudioCapture()
-            // which uses AVAudioSession.sampleRate as fallback — this is ALWAYS valid after
-            // setActive(true) and matches the actual hardware rate.
+            // Fix: Give hardware 500ms to initialize (covers most devices), then proceed regardless.
+            // startAudioCapture() uses AVAudioSession.sampleRate as fallback — ALWAYS valid after
+            // setActive(true). The explicit tap format (FIX #1587b) ensures installTap doesn't crash.
+            #if os(iOS)
+            try? await Task.sleep(nanoseconds: 500_000_000)  // 500ms — enough for most iOS devices
+            let hwCheck = engine.inputNode.outputFormat(forBus: 0)
+            if hwCheck.sampleRate > 0 {
+                print("📞 FIX #1587: Input HW ready after 500ms (sr=\(hwCheck.sampleRate), ch=\(hwCheck.channelCount))")
+            } else {
+                print("📞 FIX #1587: Input HW still 0 Hz after 500ms — proceeding with AVAudioSession fallback")
+            }
+            #endif
             startAudioCapture()
         } else {
             print("📞 FIX #1567: Microphone capture skipped — listen-only mode")
@@ -637,9 +651,15 @@ final class VoiceCallManager: ObservableObject {
         #else
         let tapFormat: AVAudioFormat? = nil
         #endif
+        print("📞 FIX #1587: Installing tap with format=\(tapFormat?.description ?? "nil") (inputFormat=\(inputFormat))")
         hasTapInstalled = true  // FIX #1573: Track tap installation
         inputNode.installTap(onBus: 0, bufferSize: AVAudioFrameCount(localSampleRate * Double(localFrameDurationMs) / 1000.0), format: tapFormat) { [weak self] buffer, time in
             guard let self = self else { return }
+
+            // FIX #1587: Log first audio frame to confirm tap is working
+            if self.tapCallbackCount == 0 {
+                print("📞 FIX #1587: ✅ First audio frame captured! (frames=\(buffer.frameLength), sr=\(buffer.format.sampleRate), ch=\(buffer.format.channelCount))")
+            }
 
             // FIX #1573: Send every other frame (25fps instead of 50fps) to halve Tor bandwidth.
             // Combined with Int16 encoding: 640 bytes × 25fps = ~16KB/s vs original ~85KB/s.
