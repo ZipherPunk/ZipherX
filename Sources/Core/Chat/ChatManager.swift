@@ -1258,7 +1258,10 @@ final class ChatManager: ObservableObject {
 
     private func receiveInitialHandshake(from connection: NWConnection) async {
         // Receive their public key and onion address
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 1024) { [weak self] data, _, _, error in
+        // FIX #1577: Cap at 94 bytes (32 pubkey + 62 max v3 onion) — old 1024 limit caused
+        // TCP stream desync: NWConnection delivered handshake + message bytes in one read,
+        // consuming the next message's header → permanent stream misalignment → lost messages
+        connection.receive(minimumIncompleteLength: 32, maximumLength: 94) { [weak self] data, _, _, error in
             guard let self = self, let data = data, error == nil else {
                 connection.cancel()
                 return
@@ -2225,6 +2228,18 @@ final class ChatManager: ObservableObject {
 
     private func addMessageToConversation(_ message: ChatMessage) {
         let onion = message.fromOnion == ourOnionAddress ? message.toOnion : message.fromOnion
+
+        // FIX #1578: Create conversation on demand if missing — old code silently dropped
+        // messages when conversations[onion] was nil (race with loadPersistentData / FIX #1526)
+        if conversations[onion] == nil {
+            if let contact = contacts.first(where: { $0.onionAddress == onion }) {
+                conversations[onion] = ChatConversation(contact: contact)
+                print("💬 FIX #1578: Created missing conversation for \(onion.prefix(16))... on message receive")
+            } else {
+                print("💬 FIX #1578: Dropping message from unknown contact \(onion.prefix(16))...")
+                return
+            }
+        }
 
         if var conversation = conversations[onion] {
             conversation.messages.append(message)

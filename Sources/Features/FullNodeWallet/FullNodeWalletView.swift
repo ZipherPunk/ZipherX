@@ -2245,6 +2245,16 @@ struct FullNodeWalletView: View {
     // MARK: - Helpers
 
     private func loadWalletData() async {
+        // FIX #1579: Skip RPC calls while bootstrap is in progress — daemon isn't running
+        let bootstrapStatus = await MainActor.run { BootstrapManager.shared.status }
+        switch bootstrapStatus {
+        case .idle, .complete, .completeNeedsDaemon, .completeDaemonStopped, .error, .cancelled:
+            break  // OK to proceed
+        default:
+            print("📊 FIX #1579: Skipping loadWalletData — bootstrap in progress (\(bootstrapStatus))")
+            return
+        }
+
         isLoading = true
         errorMessage = nil
 
@@ -2419,6 +2429,15 @@ struct FullNodeWalletView: View {
 
     // FIX #286 v14: Update detailed sync status from RPC with HTTP 500 detection
     private func updateDetailedSyncStatus() async {
+        // FIX #1579: Skip RPC calls while bootstrap is downloading/extracting — daemon isn't running yet
+        let bootstrapStatus = await MainActor.run { BootstrapManager.shared.status }
+        switch bootstrapStatus {
+        case .downloading, .verifying, .combining, .extracting, .configuringDaemon, .downloadingParams, .checkingRelease:
+            return  // Daemon not ready — don't spam "Could not connect" errors
+        default:
+            break
+        }
+
         do {
             let status = try await RPCClient.shared.getDetailedSyncStatus()
             let wasOffline = await MainActor.run { rpcUnavailableCount >= 2 }
@@ -2788,6 +2807,14 @@ struct FullNodeWalletView: View {
     private func checkExternalRescanStatus() async {
         // Don't check if we're already doing a local import
         guard !isImporting else { return }
+        // FIX #1579: Skip RPC calls while bootstrap is in progress
+        let bsStatus = await MainActor.run { BootstrapManager.shared.status }
+        switch bsStatus {
+        case .idle, .complete, .completeNeedsDaemon, .completeDaemonStopped, .error, .cancelled:
+            break
+        default:
+            return
+        }
 
         do {
             let status = try await RPCClient.shared.getRescanStatus()

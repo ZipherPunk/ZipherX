@@ -63,9 +63,10 @@ struct FullNodeSettingsView: View {
 
     // MARK: - Daemon Status Helpers
 
+    // FIX #1581: Include .starting — daemon is warming up after bootstrap, don't show "Start Daemon"
     private var isDaemonRunning: Bool {
         switch fullNodeManager.daemonStatus {
-        case .running, .syncing:
+        case .running, .syncing, .starting:
             return true
         default:
             return false
@@ -271,6 +272,19 @@ struct FullNodeSettingsView: View {
                 // Control buttons
                 HStack(spacing: 12) {
                     if isDaemonRunning {
+                        // FIX #1581: Show "Warming up..." spinner when daemon is starting
+                        if case .starting = fullNodeManager.daemonStatus {
+                            HStack {
+                                ProgressView()
+                                    .scaleEffect(0.7)
+                                Text("Warming up...")
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(Color.orange.opacity(0.1))
+                            .cornerRadius(6)
+                            .foregroundColor(.orange)
+                        } else {
                         Button(action: stopDaemon) {
                             HStack {
                                 if isStoppingDaemon {
@@ -289,6 +303,7 @@ struct FullNodeSettingsView: View {
                         .cornerRadius(6)
                         .foregroundColor(.red)
                         .disabled(isStoppingDaemon || isDaemonBusy)
+                        }
                     } else {
                         Button(action: startDaemon) {
                             HStack {

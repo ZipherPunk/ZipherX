@@ -172,8 +172,14 @@ final class VoiceCallManager: ObservableObject {
         startRingtone(isIncoming: false)
 
         // Start 30s ring timeout
+        // FIX #1575: Use try/catch — try? swallows CancellationError, causing cancelled task
+        // to continue executing and call endCall("timeout") at the exact moment peer accepts
         ringTimeoutTask = Task {
-            try? await Task.sleep(nanoseconds: 30_000_000_000)
+            do {
+                try await Task.sleep(nanoseconds: 30_000_000_000)
+            } catch {
+                return  // Task was cancelled (call answered/ended) — do NOT call endCall
+            }
             if case .offering = callState {
                 print("📞 FIX #1540: Call offer timed out (30s)")
                 await endCall(reason: "timeout")
@@ -329,8 +335,13 @@ final class VoiceCallManager: ObservableObject {
         startRingtone(isIncoming: true)
 
         // Auto-reject after 30s if not answered
+        // FIX #1575: Use try/catch — try? swallows CancellationError (same bug as outgoing)
         ringTimeoutTask = Task {
-            try? await Task.sleep(nanoseconds: 30_000_000_000)
+            do {
+                try await Task.sleep(nanoseconds: 30_000_000_000)
+            } catch {
+                return  // Task was cancelled (call accepted/declined) — do NOT call endCall
+            }
             if case .ringing = callState {
                 print("📞 FIX #1540: Incoming call timed out (30s)")
                 await endCall(reason: "timeout")
@@ -788,6 +799,9 @@ final class VoiceCallManager: ObservableObject {
         #if os(iOS)
         vibrationTimer?.invalidate()
         vibrationTimer = nil
+        // FIX #1576: Deactivate audio session after ringtone — allows clean switch
+        // from .playback to .playAndRecord in beginAudioSession()
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         #endif
     }
 
