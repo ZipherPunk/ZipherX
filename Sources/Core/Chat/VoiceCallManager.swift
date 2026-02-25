@@ -166,6 +166,14 @@ final class VoiceCallManager: ObservableObject {
             to: onionAddress
         )
 
+        // FIX #1588: sendCallSignal fires endCall("network_error") on failure for .callOffer.
+        // The await above yields, letting endCall set callState to .idle. Without this guard,
+        // we log "offer sent" and start ringtone even though it failed (zmac.log confirmed).
+        guard callState != .idle, callState != .ending else {
+            print("📞 FIX #1588: Call offer failed to send — call already ended")
+            return false
+        }
+
         print("📞 FIX #1540: Call offer sent to \(onionAddress.prefix(16))... callId=\(callId.prefix(8))")
 
         // FIX #1563: Play ringback tone while waiting for answer
@@ -207,6 +215,16 @@ final class VoiceCallManager: ObservableObject {
             content: answerString,
             to: peer
         )
+
+        // FIX #1588: sendCallSignal fires endCall("network_error") asynchronously on .callAnswer
+        // failure (ChatManager line 1918-1921). The await above yields to the MainActor run loop,
+        // allowing that endCall Task to run and set callState to .idle/.ending BEFORE we get here.
+        // Without this guard: beginAudioSession sets up engine → endCall tears it down → crash or
+        // inconsistent state. From user's perspective: tap Accept → call immediately ends.
+        guard callState != .idle, callState != .ending else {
+            print("📞 FIX #1588: Call ended during answer delivery — skipping audio session")
+            return
+        }
 
         // Start audio session
         await beginAudioSession(callId: callId)
@@ -514,32 +532,16 @@ final class VoiceCallManager: ObservableObject {
         #endif
 
         if shouldCapture {
-            // FIX #1541: Wait for input hardware to initialize before installing tap.
-            // On iOS, engine.inputNode.inputFormat(forBus: 0) can return 0 Hz for up to
-            // ~500ms after engine.start(). Installing a tap during this window crashes with
-            // "Input HW format is invalid" (AVAudioIONodeImpl.mm:1322).
-            var hwReady = false
-            for attempt in 1...10 {
-                // FIX #1583: Use outputFormat (what startAudioCapture reads at line 583),
-                // NOT inputFormat. inputFormat is the raw hardware format; outputFormat is
-                // what the node produces downstream — they can differ. The readiness check
-                // must match what startAudioCapture actually uses.
-                let hwFormat = engine.inputNode.outputFormat(forBus: 0)
-                if hwFormat.sampleRate > 0 && hwFormat.channelCount > 0 {
-                    print("📞 FIX #1583: Input HW ready after \(attempt) attempts (sr=\(hwFormat.sampleRate), ch=\(hwFormat.channelCount))")
-                    hwReady = true
-                    break
-                }
-                print("📞 FIX #1583: Input HW not ready (attempt \(attempt)/10, sr=\(hwFormat.sampleRate), ch=\(hwFormat.channelCount)) — waiting 200ms...")
-                try? await Task.sleep(nanoseconds: 200_000_000) // 200ms
-            }
-
-            if !hwReady {
-                print("📞 FIX #1541: Input HW format still invalid after 2s — microphone unavailable, audio capture disabled")
-                // Don't crash — allow playback-only (can hear remote but can't send audio)
-            } else {
-                startAudioCapture()
-            }
+            // FIX #1587: On iOS, engine.inputNode.outputFormat(forBus: 0) returns 0 Hz / 0 channels
+            // for >2 seconds after engine.start() — z24.log: ALL 10 attempts fail (sr=0.0, ch=2).
+            // The old hwReady guard prevented startAudioCapture() from ever being called,
+            // even though startAudioCapture() already has its own AVAudioSession format fallback
+            // (line 593-603) that always works after setActive(true).
+            //
+            // Fix: Skip the outputFormat readiness check entirely. Go straight to startAudioCapture()
+            // which uses AVAudioSession.sampleRate as fallback — this is ALWAYS valid after
+            // setActive(true) and matches the actual hardware rate.
+            startAudioCapture()
         } else {
             print("📞 FIX #1567: Microphone capture skipped — listen-only mode")
         }
@@ -625,10 +627,18 @@ final class VoiceCallManager: ObservableObject {
         let localSampleRate = sampleRate
         let localFrameDurationMs = frameDurationMs
 
-        // Pass nil format to installTap — AVAudioEngine uses the node's native
-        // output format. Passing a mismatched format causes silent/no tap delivery.
+        // FIX #1587: On iOS, use inputFormat (AVAudioSession fallback) for the tap format.
+        // format:nil uses inputNode.outputFormat which returns 0 Hz during hardware init → crash
+        // with "IsFormatSampleRateAndChannelCountValid(format)" in CreateRecordingTap.
+        // AVAudioSession.sampleRate matches actual hardware rate — always valid after setActive(true).
+        // On macOS, outputFormat is always valid immediately, so nil is correct.
+        #if os(iOS)
+        let tapFormat: AVAudioFormat? = inputFormat
+        #else
+        let tapFormat: AVAudioFormat? = nil
+        #endif
         hasTapInstalled = true  // FIX #1573: Track tap installation
-        inputNode.installTap(onBus: 0, bufferSize: AVAudioFrameCount(localSampleRate * Double(localFrameDurationMs) / 1000.0), format: nil) { [weak self] buffer, time in
+        inputNode.installTap(onBus: 0, bufferSize: AVAudioFrameCount(localSampleRate * Double(localFrameDurationMs) / 1000.0), format: tapFormat) { [weak self] buffer, time in
             guard let self = self else { return }
 
             // FIX #1573: Send every other frame (25fps instead of 50fps) to halve Tor bandwidth.
