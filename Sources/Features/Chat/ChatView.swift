@@ -2608,15 +2608,21 @@ struct ChatSettingsSheet: View {
             Spacer()
             Button(action: {
                 #if os(macOS)
+                // FIX: Use begin() instead of runModal() — runModal() crashes XPC
+                // inside SwiftUI sheets (NSXPCSharedListenerErrorDomain Code=2)
                 let panel = NSOpenPanel()
                 panel.allowedContentTypes = [.image]
                 panel.allowsMultipleSelection = false
                 panel.canChooseDirectories = false
                 panel.title = "Choose Profile Picture"
-                if panel.runModal() == .OK, let url = panel.url {
-                    if let data = try? Data(contentsOf: url),
-                       let resized = Self.resizedImageData(data, maxSize: 200) {
-                        chatManager.saveProfileImage(resized)
+                panel.begin { response in
+                    if response == .OK, let url = panel.url {
+                        if let data = try? Data(contentsOf: url),
+                           let resized = Self.resizedImageData(data, maxSize: 200) {
+                            DispatchQueue.main.async {
+                                chatManager.saveProfileImage(resized)
+                            }
+                        }
                     }
                 }
                 #else
