@@ -191,6 +191,16 @@ struct ZclassicBlockHeader {
         }
         let solution = data.subdata(in: offset..<offset+solutionLen)
 
+        // FIX #1559: Enforce equihash variant based on activation height — ALWAYS checked (not sampling-dependent)
+        // Post-Bubbles (>585318): must use Equihash(192,7) with 400-byte solution
+        // Pre-Bubbles (≤585318): must use Equihash(200,9) with 1344-byte solution
+        // A peer on a pre-Bubbles fork can send 1344-byte solutions that pass Equihash verification
+        // but are for the WRONG chain. This check catches them regardless of sampling.
+        if height > ZipherXConstants.bubblesActivationHeight && solutionLen == 1344 {
+            print("🚨 FIX #1559: Rejecting pre-Bubbles header (1344-byte Equihash(200,9)) at post-Bubbles height \(height)")
+            throw ParseError.equihashVerificationFailed(height: height)
+        }
+
         // Extract 140-byte header for Equihash verification
         let headerOnly = data.subdata(in: 0..<140)
 

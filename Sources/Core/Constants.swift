@@ -81,6 +81,9 @@ enum ZipherXConstants {
     /// Zclassic Sapling activation height
     static let saplingActivationHeight: UInt64 = 476_969
 
+    /// Zclassic Bubbles activation height (Equihash changes from (200,9) to (192,7))
+    static let bubblesActivationHeight: UInt64 = 585_318
+
     /// Zclassic Buttercup activation height
     static let buttercupActivationHeight: UInt64 = 707_000
 

@@ -2184,6 +2184,52 @@ final class WalletManager: ObservableObject {
         } else {
             print("✅ FIX #1366b: All delta outputs accounted for (\(deltaOutputs.count) outputs, \(candidates.count) unknown, 0 ours)")
         }
+
+        // ── FIX #1556: Detect delta tail gap (missing blocks at end of delta range) ──
+        // Problem: Delta bundle claims endHeight=X, but P2P fetch failures cause the ACTUAL
+        // last output/nullifier to be at height Y < X. Blocks Y+1..X have NO data in the delta.
+        // Phase 1b trusts the delta for this range (finds nothing). Phase 2 starts at X+1.
+        // Result: Blocks Y+1..X are NEVER scanned — any notes received or spent there are invisible.
+        //
+        // Example: Delta claims endHeight=3022078, actual data ends at 3021571.
+        // A TX at height 3022049 (with 1 spend + 2 outputs) is completely missed:
+        //   - Its nullifier never matches → old change note stays "unspent" (phantom balance)
+        //   - Its outputs never discovered → new change + self-send lost
+        //
+        // Solution: Compare actual max output height vs manifest endHeight. If gap exists,
+        // lower lastScannedHeight so FilterScanner re-scans the gap blocks.
+        // Only run ONCE per delta state (keyed on endHeight to avoid repeat rescans).
+        if let manifest = DeltaCMUManager.shared.getManifest() {
+            let actualMaxHeight = deltaOutputs.map { $0.height }.max() ?? 0
+            let claimedEnd = UInt32(manifest.endHeight)
+            let gapSize = actualMaxHeight < claimedEnd ? Int(claimedEnd - actualMaxHeight) : 0
+
+            // FIX #1556: Only trigger once per delta state
+            let gapCheckKey = "FIX1556_LastCheckedDeltaEnd"
+            let lastCheckedEnd = UserDefaults.standard.integer(forKey: gapCheckKey)
+
+            if gapSize > 0 && lastCheckedEnd != Int(claimedEnd) {
+                print("⚠️ FIX #1556: Delta tail gap detected!")
+                print("   Delta manifest endHeight: \(claimedEnd)")
+                print("   Actual last output height: \(actualMaxHeight)")
+                print("   Gap: \(gapSize) blocks (\(actualMaxHeight + 1)...\(claimedEnd)) — NEVER SCANNED")
+
+                // Lower lastScannedHeight to just before the gap
+                // FilterScanner will re-scan from here, discovering any notes/spends in the gap
+                let rescanFrom = UInt64(actualMaxHeight)
+                if let currentScanned = try? WalletDatabase.shared.getLastScannedHeight(),
+                   currentScanned > rescanFrom {
+                    try? WalletDatabase.shared.resetLastScannedHeightForRecovery(rescanFrom)
+                    print("⚠️ FIX #1556: lastScannedHeight lowered from \(currentScanned) to \(rescanFrom)")
+                    print("   FilterScanner will re-scan \(gapSize) gap blocks on next background sync")
+                }
+
+                // Mark as checked so we don't repeat
+                UserDefaults.standard.set(Int(claimedEnd), forKey: gapCheckKey)
+            } else if gapSize > 0 {
+                print("✅ FIX #1556: Delta tail gap (\(gapSize) blocks) already handled")
+            }
+        }
     }
 
     /// FIX #1366: Check broadcast history for confirmed TXs missing from transaction_history.
@@ -12566,6 +12612,21 @@ final class WalletManager: ObservableObject {
             return
         }
 
+        // FIX #1554: Check if FIX #1542 post-rescan verification is required BEFORE FIX #1103 skip.
+        // Full Rescan sets BOTH FIX1089_FullVerificationComplete=true AND FIX1542_NullifierVerificationNeeded=true.
+        // FIX #1103 would skip because FIX1089=true, but the WHOLE POINT of FIX #1542 is to force
+        // P2P verification for spends the rescan MISSED (incomplete delta nullifiers — only 249 out of 3362 blocks).
+        // Without this: confirmed TX in delta range never found → balance wrong → user loses funds visibility.
+        let postRescanVerificationRequired = UserDefaults.standard.bool(forKey: "FIX1542_NullifierVerificationNeeded")
+        if postRescanVerificationRequired {
+            print("🔍 FIX #1554: Post-rescan verification FORCED — clearing FIX1089 to bypass FIX #1103 skip")
+            print("   Reason: Full Rescan delta nullifiers can be incomplete → P2P scan required for unresolved spends")
+            UserDefaults.standard.set(false, forKey: "FIX1089_FullVerificationComplete")
+            UserDefaults.standard.removeObject(forKey: "FIX1195_PartialScanHeight")
+            // Also force full verification from delta start (not checkpoint)
+            UserDefaults.standard.set(true, forKey: "FIX1090_NeedsFullVerification")
+        }
+
         // FIX #1103: CRITICAL - Skip if FIX #1089 already completed full verification
         // FIX #1089 (verifyAllUnspentNotesOnChain) does comprehensive verification from oldest note
         // If that already ran, this redundant scan would waste 10+ minutes scanning 73K blocks
@@ -12657,6 +12718,11 @@ final class WalletManager: ObservableObject {
                 scanStartHeight = range.upperBound + 1
             } else {
                 print("📦 FIX #1527: \(nullifierToNote.count) unresolved nullifier(s) — scanning delta range via P2P")
+                // FIX #1554: Reset to delta start — TX may be confirmed before scanStartHeight
+                if scanStartHeight > range.lowerBound {
+                    print("🔍 FIX #1554: Resetting scan start from \(scanStartHeight) to delta start \(range.lowerBound)")
+                    scanStartHeight = range.lowerBound
+                }
             }
         }
 
@@ -13801,7 +13867,7 @@ final class WalletManager: ObservableObject {
         // FIX #1300: CFBundleVersion is always "1" during development — never triggers FIX #1283.
         // Use a hardcoded verification version that we bump when spend-related code changes.
         // This forces re-verification on the next startup after a code fix, catching phantom-unspent notes.
-        let verificationCodeVersion = "1527"  // FIX #1527: Bumped — FIX #1319 skipped P2P scan when unresolved nullifiers remained
+        let verificationCodeVersion = "1559"  // FIX #1559: Equihash variant validation — corrupted HeaderStore detection
         let currentBuild = "\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown").\(verificationCodeVersion)"
         let lastVerifiedBuild = UserDefaults.standard.string(forKey: "FIX1283_LastVerifiedBuild") ?? ""
         if hasCompletedFullVerification && currentBuild != lastVerifiedBuild {
@@ -13835,12 +13901,22 @@ final class WalletManager: ObservableObject {
                 checkpointHeight = minNoteHeight
                 print("🔍 FIX #1195c: Full scan from oldest note \(minNoteHeight) to chain tip")
             }
-        } else if storedCheckpoint > 0 {
-            checkpointHeight = storedCheckpoint
-            print("🔍 FIX #1089: No notes - using checkpoint \(storedCheckpoint)")
         } else {
-            checkpointHeight = 0
-            print("⚠️ FIX #1089: No checkpoint and no notes - cannot verify")
+            // FIX #1554: Boost file notes have height=0 (no block height stored).
+            // When minNoteHeight=0, we can't determine scan start from notes.
+            // Use delta startHeight (= boost file end + 1) as fallback — this is
+            // exactly the range where incomplete delta nullifiers may have missed spends.
+            // Without this: checkpointHeight=0 → guard fails → verification aborts → confirmed TX never found.
+            if let manifest = DeltaCMUManager.shared.getManifest(), manifest.startHeight > 0 {
+                checkpointHeight = UInt64(manifest.startHeight)
+                print("🔍 FIX #1554: Using delta startHeight \(checkpointHeight) for height=0 notes (boost file range ends here)")
+            } else if storedCheckpoint > 0 {
+                checkpointHeight = storedCheckpoint
+                print("🔍 FIX #1089: No notes height — using checkpoint \(storedCheckpoint)")
+            } else {
+                checkpointHeight = 0
+                print("⚠️ FIX #1089: No checkpoint and no notes - cannot verify")
+            }
         }
 
         guard checkpointHeight > 0 else {
@@ -14028,6 +14104,15 @@ final class WalletManager: ObservableObject {
                 batchStart = range.upperBound + 1
             } else {
                 print("📦 FIX #1527: \(ourNullifiers.count) unresolved nullifier(s) — scanning delta range via P2P")
+                // FIX #1554: Delta nullifiers are incomplete — the TX's spending nullifier
+                // could be in ANY block in the delta range. minNoteHeight (batchStart) may be
+                // AFTER the block where the TX was confirmed. Reset to delta lowerBound to
+                // scan the ENTIRE delta range. Without this: blocks before minNoteHeight are
+                // never scanned → confirmed TX never found → balance wrong.
+                if batchStart > range.lowerBound {
+                    print("🔍 FIX #1554: Resetting scan start from \(batchStart) to delta start \(range.lowerBound) (unresolved nullifiers need full delta scan)")
+                    batchStart = range.lowerBound
+                }
             }
         }
 
@@ -14088,6 +14173,11 @@ final class WalletManager: ObservableObject {
 
                     for (height, _, _, txData) in blocks {
                         batchMaxHeight = max(batchMaxHeight, height)
+                        // FIX #1557: Debug — log blocks with shielded spends
+                        let spendTxCount = txData.filter { $0.2?.isEmpty == false }.count
+                        if spendTxCount > 0 {
+                            print("🔍 FIX #1557: verifyUnspent block \(height): \(txData.count) TXs, \(spendTxCount) with spends")
+                        }
                         for (txidHex, _, spends) in txData {
                             guard let spends = spends, !spends.isEmpty else { continue }
 
@@ -14275,19 +14365,35 @@ final class WalletManager: ObservableObject {
             if successfulBatches > 0 {
                 do {
                     try database.updateVerifiedCheckpointHeight(chainHeight)
-                    // FIX #1089: Mark full verification as complete
-                    // Next startup will trust checkpoint instead of re-scanning from oldest note
-                    UserDefaults.standard.set(true, forKey: "FIX1089_FullVerificationComplete")
-                    // FIX #1300: Save code version to detect changes on next startup
-                    let verificationCodeVersion = "1302"
-                    let buildForCheckpoint = "\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown").\(verificationCodeVersion)"
-                    UserDefaults.standard.set(buildForCheckpoint, forKey: "FIX1283_LastVerifiedBuild")
-                    // FIX #1090: Clear the nullifier fix flag now that we've done full verification
-                    UserDefaults.standard.set(false, forKey: "FIX1090_NeedsFullVerification")
-                    // FIX #1195c: Clear partial scan progress — full scan completed
-                    UserDefaults.standard.removeObject(forKey: "FIX1195_PartialScanHeight")
-                    print("📍 FIX #1089: Updated checkpoint to \(chainHeight) + marked full verification complete")
-                    print("   Next startup will be FAST (uses checkpoint, not oldest note)")
+
+                    // FIX #1559: If header corruption was detected during this scan, do NOT mark verification
+                    // as complete. Blocks at corrupted heights were skipped. Headers are being re-synced.
+                    // Next startup: FIX1089=false → re-verification → correct blocks → TX found.
+                    let headerCorruptionDetected = UserDefaults.standard.bool(forKey: "FIX1559_HeaderCorruptionDetected")
+                    if headerCorruptionDetected {
+                        print("⚠️ FIX #1559: Header corruption detected during scan — NOT marking verification as complete")
+                        print("   Headers above corruption point deleted. Next startup will re-sync and re-verify.")
+                        UserDefaults.standard.set(false, forKey: "FIX1559_HeaderCorruptionDetected")
+                        // Don't set FIX1089=true or save build version — forces re-verification next startup
+                    } else {
+                        // FIX #1089: Mark full verification as complete
+                        // Next startup will trust checkpoint instead of re-scanning from oldest note
+                        UserDefaults.standard.set(true, forKey: "FIX1089_FullVerificationComplete")
+                        // FIX #1300: Save code version to detect changes on next startup
+                        // FIX #1555: MUST match the version at line ~13824 — if these differ,
+                        // FIX #1300 forces full re-verification EVERY cycle (infinite scan loop).
+                        let verificationCodeVersion = "1559"
+                        let buildForCheckpoint = "\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown").\(verificationCodeVersion)"
+                        UserDefaults.standard.set(buildForCheckpoint, forKey: "FIX1283_LastVerifiedBuild")
+                        // FIX #1090: Clear the nullifier fix flag now that we've done full verification
+                        UserDefaults.standard.set(false, forKey: "FIX1090_NeedsFullVerification")
+                        // FIX #1195c: Clear partial scan progress — full scan completed
+                        UserDefaults.standard.removeObject(forKey: "FIX1195_PartialScanHeight")
+                    }
+                    if !headerCorruptionDetected {
+                        print("📍 FIX #1089: Updated checkpoint to \(chainHeight) + marked full verification complete")
+                        print("   Next startup will be FAST (uses checkpoint, not oldest note)")
+                    }
                 } catch {
                     print("⚠️ FIX #1089: Failed to update checkpoint: \(error)")
                 }

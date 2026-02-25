@@ -916,13 +916,29 @@ struct ConversationView: View {
                                     ($0.type == .paymentSent) && ($0.replyTo == message.id)
                                 }
 
+                                // Check if this payment request has been rejected
+                                let isRejected = message.type == .paymentRequest && conversation.messages.contains {
+                                    ($0.type == .paymentRejected) && ($0.replyTo == message.id)
+                                }
+
                                 MessageBubble(
                                     message: message,
                                     isFromMe: message.fromOnion == chatManager.ourOnionAddress,
                                     isPaid: isPaid,
+                                    isRejected: isRejected,
+                                    conversation: conversation,
                                     onPayNow: { paymentMsg in
                                         paymentRequestToPay = paymentMsg
                                         showPayNowSheet = true
+                                    },
+                                    onReject: { paymentMsg in
+                                        Task {
+                                            try? await chatManager.sendPaymentRejection(
+                                                to: contact,
+                                                requestId: paymentMsg.id,
+                                                reason: nil
+                                            )
+                                        }
                                     }
                                 )
                                     .id(message.id)
@@ -1550,7 +1566,10 @@ struct MessageBubble: View {
     let message: ChatMessage
     let isFromMe: Bool
     var isPaid: Bool = false  // FIX #219: True if this payment request has been paid
+    var isRejected: Bool = false  // True if this payment request has been rejected
+    var conversation: ChatConversation? = nil  // For looking up linked payment messages
     var onPayNow: ((ChatMessage) -> Void)? = nil  // Callback for PAY NOW button
+    var onReject: ((ChatMessage) -> Void)? = nil  // Callback for REJECT button
     @State private var copiedTxId: String? = nil  // FIX #405: Track copied txid for feedback
 
     private var theme: AppTheme { themeManager.currentTheme }
@@ -1585,6 +1604,8 @@ struct MessageBubble: View {
                 case .paymentReceived:
                     // FIX #219: Explicit payment received type (for backwards compatibility)
                     paymentReceivedBubble
+                case .paymentRejected:
+                    paymentRejectedBubble
                 case .file:
                     // FIX #1535: File transfer bubble
                     fileBubble
@@ -1644,19 +1665,19 @@ struct MessageBubble: View {
     private var paymentRequestBubble: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Image(systemName: isPaid ? "checkmark.seal.fill" : "dollarsign.circle.fill")
+                Image(systemName: isPaid ? "checkmark.seal.fill" : isRejected ? "xmark.seal.fill" : "dollarsign.circle.fill")
                     .font(.system(size: 18))
-                    .foregroundColor(isPaid ? .green : theme.accentColor)
-                Text(isPaid ? "PAYMENT REQUEST - PAID" : "PAYMENT REQUEST")
+                    .foregroundColor(isPaid ? .green : isRejected ? .red : theme.accentColor)
+                Text(isPaid ? "PAYMENT REQUEST - PAID" : isRejected ? "PAYMENT REQUEST - DECLINED" : "PAYMENT REQUEST")
                     .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundColor(isPaid ? .green : theme.accentColor)
+                    .foregroundColor(isPaid ? .green : isRejected ? .red : theme.accentColor)
             }
 
             if let amount = message.formattedAmount {
                 Text(amount)
                     .font(.system(size: 22, weight: .bold, design: .monospaced))
-                    .foregroundColor(isPaid ? .green.opacity(0.8) : theme.textPrimary)
-                    .strikethrough(isPaid, color: .green.opacity(0.5))
+                    .foregroundColor(isPaid ? .green.opacity(0.8) : isRejected ? .red.opacity(0.6) : theme.textPrimary)
+                    .strikethrough(isPaid || isRejected, color: isPaid ? .green.opacity(0.5) : .red.opacity(0.5))
             }
 
             if !message.content.isEmpty {
@@ -1665,41 +1686,77 @@ struct MessageBubble: View {
                     .foregroundColor(theme.textPrimary.opacity(0.7))
             }
 
-            // FIX #219: Show PAY NOW button only if not paid and not from me
-            if !isFromMe && !isPaid {
-                Button(action: { onPayNow?(message) }) {
+            // Show PAY NOW + REJECT buttons only if not paid/rejected and not from me
+            if !isFromMe && !isPaid && !isRejected {
+                HStack(spacing: 8) {
+                    Button(action: { onPayNow?(message) }) {
+                        HStack {
+                            Image(systemName: "arrow.right.circle.fill")
+                            Text("PAY NOW")
+                        }
+                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                        .foregroundColor(.black)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .background(theme.accentColor)
+                        .cornerRadius(8)
+                    }
+                    .buttonStyle(.plain)
+
+                    Button(action: { onReject?(message) }) {
+                        HStack {
+                            Image(systemName: "xmark.circle.fill")
+                            Text("REJECT")
+                        }
+                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.8))
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .background(Color.red.opacity(0.6))
+                        .cornerRadius(8)
+                    }
+                    .buttonStyle(.plain)
+                }
+            } else if isPaid {
+                // Show paid confirmation badge + confirmation info
+                VStack(alignment: .leading, spacing: 6) {
                     HStack {
-                        Image(systemName: "arrow.right.circle.fill")
-                        Text("PAY NOW")
+                        Image(systemName: "checkmark.circle.fill")
+                        Text("PAID")
                     }
                     .font(.system(size: 12, weight: .bold, design: .monospaced))
-                    .foregroundColor(.black)
+                    .foregroundColor(.green)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 8)
-                    .background(theme.accentColor)
+                    .background(Color.green.opacity(0.15))
                     .cornerRadius(8)
+
+                    // Show confirmation details from linked payment message
+                    if let paymentMsg = conversation?.messages.first(where: { $0.type == .paymentSent && $0.replyTo == message.id }),
+                       let txid = extractTxIdFromContent(paymentMsg.content),
+                       let info = WalletDatabase.shared.getTransactionConfirmationInfo(txidHex: txid) {
+                        confirmationInfoView(blockHeight: info.blockHeight, blockTime: info.blockTime, confirmations: info.confirmations, status: info.status)
+                    }
                 }
-                .buttonStyle(.plain)
-            } else if isPaid {
-                // Show paid confirmation badge
+            } else if isRejected {
                 HStack {
-                    Image(systemName: "checkmark.circle.fill")
-                    Text("PAID")
+                    Image(systemName: "xmark.circle.fill")
+                    Text("DECLINED")
                 }
                 .font(.system(size: 12, weight: .bold, design: .monospaced))
-                .foregroundColor(.green)
+                .foregroundColor(.red)
                 .padding(.horizontal, 16)
                 .padding(.vertical, 8)
-                .background(Color.green.opacity(0.15))
+                .background(Color.red.opacity(0.15))
                 .cornerRadius(8)
             }
         }
         .padding(14)
-        .background(isPaid ? Color.green.opacity(0.1) : Color.black.opacity(0.25))
+        .background(isPaid ? Color.green.opacity(0.1) : isRejected ? Color.red.opacity(0.1) : Color.black.opacity(0.25))
         .cornerRadius(14)
         .overlay(
             RoundedRectangle(cornerRadius: 14)
-                .stroke(isPaid ? Color.green.opacity(0.5) : theme.accentColor.opacity(0.4), lineWidth: isPaid ? 2 : 1)
+                .stroke(isPaid ? Color.green.opacity(0.5) : isRejected ? Color.red.opacity(0.5) : theme.accentColor.opacity(0.4), lineWidth: (isPaid || isRejected) ? 2 : 1)
         )
     }
 
@@ -1749,6 +1806,11 @@ struct MessageBubble: View {
                         }
                         .buttonStyle(.plain)
                     }
+                }
+
+                // Confirmation details: block height, date, confirmations
+                if let info = WalletDatabase.shared.getTransactionConfirmationInfo(txidHex: txid) {
+                    confirmationInfoView(blockHeight: info.blockHeight, blockTime: info.blockTime, confirmations: info.confirmations, status: info.status)
                 }
             }
         }
@@ -1808,6 +1870,11 @@ struct MessageBubble: View {
                         .buttonStyle(.plain)
                     }
                 }
+
+                // Confirmation details: block height, date, confirmations
+                if let info = WalletDatabase.shared.getTransactionConfirmationInfo(txidHex: txid) {
+                    confirmationInfoView(blockHeight: info.blockHeight, blockTime: info.blockTime, confirmations: info.confirmations, status: info.status)
+                }
             }
 
             // Cypherpunk quote
@@ -1830,6 +1897,33 @@ struct MessageBubble: View {
                 .stroke(Color.orange.opacity(0.5), lineWidth: 2)
         )
         .cornerRadius(14)
+    }
+
+    // Payment rejected bubble — shown when recipient declines a payment request
+    private var paymentRejectedBubble: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 16))
+                    .foregroundColor(.red)
+                Text("PAYMENT DECLINED")
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    .foregroundColor(.red)
+            }
+
+            if !message.content.isEmpty && message.content != "Payment request declined" {
+                Text(message.content)
+                    .font(.system(size: 13, design: .monospaced))
+                    .foregroundColor(theme.textPrimary.opacity(0.7))
+            }
+        }
+        .padding(12)
+        .background(Color.red.opacity(0.1))
+        .cornerRadius(10)
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.red.opacity(0.3), lineWidth: 1)
+        )
     }
 
     // FIX #1535: File transfer bubble
@@ -1963,6 +2057,40 @@ struct MessageBubble: View {
 
     private func formatTime(_ date: Date) -> String {
         return Self.timeFormatter.string(from: date)
+    }
+
+    private static let confirmationDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .short
+        return f
+    }()
+
+    /// Reusable confirmation info view for payment bubbles
+    @ViewBuilder
+    private func confirmationInfoView(blockHeight: UInt64, blockTime: UInt64?, confirmations: Int, status: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            if blockHeight > 0 {
+                Text("Block \(blockHeight)")
+                    .font(.system(size: 9, weight: .medium, design: .monospaced))
+                    .foregroundColor(theme.textPrimary.opacity(0.5))
+            }
+            if let blockTime = blockTime, blockTime > 0 {
+                let date = Date(timeIntervalSince1970: TimeInterval(blockTime))
+                Text(Self.confirmationDateFormatter.string(from: date))
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundColor(theme.textPrimary.opacity(0.4))
+            }
+            HStack(spacing: 4) {
+                Circle()
+                    .fill(confirmations > 0 ? Color.green : Color.orange)
+                    .frame(width: 6, height: 6)
+                Text(confirmations > 0 ? "\(confirmations) confirmations" : status.capitalized)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundColor(theme.textPrimary.opacity(0.5))
+            }
+        }
+        .padding(.top, 4)
     }
 }
 

@@ -28,6 +28,7 @@ enum ChatMessageType: String, Codable {
     case paymentRequest = "pay_req" // ZCL payment request
     case paymentSent = "pay_sent"   // Notification that payment was sent (shown to payer)
     case paymentReceived = "pay_rcv" // FIX #219: Confirmation that payment was received (shown to requester)
+    case paymentRejected = "pay_rej" // Payment request rejected/declined by recipient
     case typing = "typing"          // User is typing indicator
     case delivered = "delivered"    // Message delivery confirmation
     case read = "read"              // Message read receipt
@@ -231,7 +232,9 @@ struct ChatMessage: Codable, Identifiable {
         status: MessageStatus = .sending,
         fileName: String? = nil,
         fileSize: UInt64? = nil,
-        fileId: String? = nil
+        fileId: String? = nil,
+        paymentAddress: String? = nil,
+        paymentAmount: UInt64? = nil
     ) {
         self.id = id
         self.type = type
@@ -240,8 +243,8 @@ struct ChatMessage: Codable, Identifiable {
         self.timestamp = timestamp
         self.content = content
         self.nickname = nil
-        self.paymentAddress = nil
-        self.paymentAmount = nil
+        self.paymentAddress = paymentAddress
+        self.paymentAmount = paymentAmount
         self.ttl = nil
         self.replyTo = replyTo
         self.status = status

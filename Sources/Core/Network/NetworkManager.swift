@@ -7908,7 +7908,8 @@ public final class NetworkManager: ObservableObject {
             prevHash: block.prevHash,
             finalSaplingRoot: block.finalSaplingRoot,
             time: block.time,
-            transactions: block.transactions
+            transactions: block.transactions,
+            equihashSolutionSize: block.equihashSolutionSize
         )
 
         // Convert block hash to hex string
@@ -8472,11 +8473,81 @@ public final class NetworkManager: ObservableObject {
 
             // Match fetched blocks to their heights
             // getBlocksByHashes returns blocks in order of the hashes we sent
+            var corruptedHeights: [UInt64] = []
             for (index, block) in fetchedBlocks.enumerated() {
                 if index < blockHashes.count {
                     let height = blockHashes[index].0
+
+                    // FIX #1559: Detect pre-Bubbles blocks at post-Bubbles heights
+                    // HeaderStore corruption: wrong block hashes stored (from pre-Bubbles fork peer)
+                    // These blocks have Equihash(200,9) 1344-byte solutions + v1/v2 TXs
+                    // Real blocks at height >585318 use Equihash(192,7) 400-byte solutions + v4 Sapling TXs
+                    if height > ZipherXConstants.bubblesActivationHeight && block.equihashSolutionSize == 1344 {
+                        let hashHex = block.blockHash.prefix(4).map { String(format: "%02x", $0) }.joined()
+                        print("🚨 FIX #1559: Pre-Bubbles block \(hashHex)... (Equihash 200,9, \(block.equihashSolutionSize)B solution) at post-Bubbles height \(height) — HeaderStore hash CORRUPTED")
+                        corruptedHeights.append(height)
+                        continue  // Skip this block — it's from the wrong chain
+                    }
+
+                    // FIX #1558: Log details for block 3022049 specifically
+                    if height >= 3022045 && height <= 3022055 {
+                        let txCount = block.transactions.count
+                        let shieldedTxs = block.transactions.filter { !$0.spends.isEmpty || !$0.outputs.isEmpty }
+                        let hashHex = block.blockHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+                        print("🔍 FIX #1558: HEIGHT \(height) hash=\(hashHex) TXs=\(txCount) shielded=\(shieldedTxs.count)")
+                        for (i, tx) in block.transactions.enumerated() {
+                            let txHashHex = tx.txHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+                            print("🔍 FIX #1558:   TX[\(i)] \(txHashHex) spends=\(tx.spends.count) outputs=\(tx.outputs.count)")
+                        }
+                    }
                     blocks.append((height, block))
                 }
+            }
+
+            // FIX #1559: Clean up corrupted HeaderStore entries so correct headers get re-synced
+            // CRITICAL: Use deleteHeadersAbove (not deleteHeadersInRange) so header sync detects the gap.
+            // HeaderSyncManager syncs from maxHeight — if only a range is deleted in the middle,
+            // the gap is never re-fetched. Deleting from corruption point forces re-sync of everything above.
+            if !corruptedHeights.isEmpty {
+                let minHeight = corruptedHeights.min()!
+                let maxHeight = corruptedHeights.max()!
+                var deleteFrom = minHeight > 0 ? minHeight - 1 : 0
+                print("🚨 FIX #1559: Detected \(corruptedHeights.count) corrupted headers (heights \(minHeight)-\(maxHeight))")
+                print("🚨 FIX #1559: Deleting all headers above height \(deleteFrom) to force re-sync with equihash variant validation")
+                try? HeaderStore.shared.deleteHeadersAbove(height: deleteFrom)
+
+                // FIX #1560: Verify remaining tip header's Equihash variant.
+                // The fork divergence point sits AT or BELOW the first detected corruption.
+                // The block fetcher only scanned a limited range, so the fork's first block
+                // (which has the wrong Equihash variant) may survive the cleanup.
+                // Walk backward checking solution size until we find a correct header (400 bytes)
+                // or a header without a stored solution (boost file / can't verify — stop).
+                var extraDeleted = 0
+                while deleteFrom > ZipherXConstants.bubblesActivationHeight {
+                    let solSize = (try? HeaderStore.shared.getSolutionSize(at: deleteFrom)) ?? 0
+                    if solSize == 1344 {
+                        // Wrong Equihash variant — header is from pre-Bubbles fork
+                        print("🚨 FIX #1560: Header at \(deleteFrom) has 1344-byte solution (pre-Bubbles fork) — deleting")
+                        try? HeaderStore.shared.deleteHeadersAbove(height: deleteFrom - 1)
+                        extraDeleted += 1
+                        deleteFrom -= 1
+                    } else {
+                        // solSize == 400 (correct variant) or 0 (no solution stored — trustworthy)
+                        break
+                    }
+                }
+                if extraDeleted > 0 {
+                    print("🚨 FIX #1560: Deleted \(extraDeleted) additional fork headers below detection range (new tip: \(deleteFrom))")
+                }
+
+                // Set flag so verifyAllUnspentNotesOnChain does NOT mark verification as complete.
+                // Current scan is incomplete (blocks skipped at corrupted heights). After this run:
+                //   1. Header sync re-fetches correct headers (FIX #1559 rejects pre-Bubbles)
+                //   2. Current scan completes but FIX1089 NOT set (flag prevents it)
+                //   3. Next startup: FIX1089=false → full re-verification runs
+                //   4. Correct headers available → correct blocks fetched → TX found → balance corrected
+                UserDefaults.standard.set(true, forKey: "FIX1559_HeaderCorruptionDetected")
+                print("🔄 FIX #1559: Set HeaderCorruptionDetected flag — verification will NOT mark as complete")
             }
         } catch {
             // FIX #939: On batch failure, fall back to sequential fetch (one block at a time)
@@ -8575,6 +8646,12 @@ public final class NetworkManager: ObservableObject {
                 if !shieldedOutputs.isEmpty || (shieldedSpends?.isEmpty == false) {
                     txDataList.append((txidHex, shieldedOutputs, shieldedSpends))
                 }
+            }
+
+            // FIX #1557: Debug — log blocks with shielded data
+            let shieldedTxs = txDataList.filter { !$0.1.isEmpty || ($0.2?.isEmpty == false) }
+            if !shieldedTxs.isEmpty {
+                print("🔍 FIX #1557: fetchBatch block \(blockHeight): \(compactBlock.transactions.count) TXs, \(shieldedTxs.count) shielded → \(shieldedTxs.map { "\($0.1.count)o/\($0.2?.count ?? 0)s" }.joined(separator: ","))")
             }
 
             results.append((blockHeight, finalBlockHash, blockTimestamp, txDataList))

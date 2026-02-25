@@ -2009,6 +2009,12 @@ final class FilterScanner {
                     // Solution: Use blockOutputIndex that increments across ALL transactions in a block
                     var blockOutputIndex: UInt32 = 0
 
+                    // FIX #1557: Debug — log block content summary
+                    let shieldedTxCount = txList.filter { !$0.1.isEmpty || $0.2?.isEmpty == false }.count
+                    if shieldedTxCount > 0 {
+                        print("🔍 FIX #1557: PHASE 2 block \(height): \(txList.count) TXs, \(shieldedTxCount) with shielded data")
+                    }
+
                     for (txid, outputs, spends) in txList {
                         // Process if there are outputs OR spends (for nullifier detection)
                         let hasOutputs = !outputs.isEmpty
@@ -5328,6 +5334,18 @@ struct CompactBlock: Hashable {
     let finalSaplingRoot: Data  // The anchor! (32 bytes)
     let time: UInt32
     let transactions: [CompactTx]
+    let equihashSolutionSize: Int  // FIX #1559: 400 = post-Bubbles (192,7), 1344 = pre-Bubbles (200,9), 0 = unknown
+
+    // FIX #1559: Default equihashSolutionSize to 0 so existing callsites don't need to change
+    init(blockHeight: UInt64, blockHash: Data, prevHash: Data, finalSaplingRoot: Data, time: UInt32, transactions: [CompactTx], equihashSolutionSize: Int = 0) {
+        self.blockHeight = blockHeight
+        self.blockHash = blockHash
+        self.prevHash = prevHash
+        self.finalSaplingRoot = finalSaplingRoot
+        self.time = time
+        self.transactions = transactions
+        self.equihashSolutionSize = equihashSolutionSize
+    }
 }
 
 /// Compact transaction with spends and outputs

@@ -74,6 +74,34 @@ final class HeaderSyncManager {
             Self.syncLock.unlock()
         }
 
+        // FIX #1560: Pre-sync validation — verify HeaderStore tip's Equihash variant.
+        // If the tip has a pre-Bubbles solution (1344 bytes) at a post-Bubbles height,
+        // it's a fork header left behind by FIX #1559 cleanup (off-by-one: deleteFrom kept
+        // the fork divergence point). This corrupt tip causes ALL subsequent getheaders to
+        // send a wrong locator hash → peers return wrong-chain headers → permanent deadlock.
+        // Walk backward deleting fork headers until we find one with correct variant (400 bytes).
+        // The existing code at FIX #141 below recalculates effectiveStartHeight from HeaderStore,
+        // so it will automatically pick up the new tip after cleanup.
+        if let tipHeight = try? headerStore.getLatestHeight(),
+           tipHeight > ZipherXConstants.bubblesActivationHeight {
+            var checkHeight = tipHeight
+            var forkHeadersCleaned = 0
+            while checkHeight > ZipherXConstants.bubblesActivationHeight {
+                let solSize = (try? headerStore.getSolutionSize(at: checkHeight)) ?? 0
+                if solSize == 1344 {
+                    try? headerStore.deleteHeadersAbove(height: checkHeight - 1)
+                    forkHeadersCleaned += 1
+                    checkHeight -= 1
+                } else {
+                    break  // 400-byte (correct) or 0 (no solution / can't verify) — stop
+                }
+            }
+            if forkHeadersCleaned > 0 {
+                print("🚨 FIX #1560: Cleaned \(forkHeadersCleaned) pre-Bubbles fork headers from HeaderStore tip")
+                print("   Old tip: \(tipHeight), new tip: \(checkHeight)")
+            }
+        }
+
         // FIX #1418: Header sync now routes through the dispatcher (sendAndWaitViaDispatcher).
         // Block listeners receive "headers" responses and dispatch them to our waiting handler.
         // This eliminates the need to stop/restart block listeners, which was the #1 cause of

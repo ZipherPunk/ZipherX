@@ -5118,7 +5118,8 @@ public final class Peer {
                             prevHash: block.prevHash,
                             finalSaplingRoot: block.finalSaplingRoot,
                             time: block.time,
-                            transactions: block.transactions
+                            transactions: block.transactions,
+                            equihashSolutionSize: block.equihashSolutionSize
                         )
                         blocks.append(block)
                         // FIX #565 v4: Removed debug print for performance (2000 blocks = 2000 prints!)
@@ -5210,6 +5211,9 @@ public final class Peer {
         }
         offset += Int(safeSolutionSize) // Skip solution data
 
+        // FIX #1559: Record equihash solution size for variant validation
+        let equihashSolutionSize = Int(safeSolutionSize)
+
         // Compute block hash from header + solution
         let headerAndSolution = data.prefix(offset)
         let blockHash = headerAndSolution.doubleSHA256()
@@ -5218,13 +5222,22 @@ public final class Peer {
         var transactions: [CompactTx] = []
 
         guard offset < data.count else {
+            // FIX #1558: Log truncated blocks — data ends at equihash with no TX data
+            let hashHex = blockHash.prefix(4).map { String(format: "%02x", $0) }.joined()
+            print("🔍 FIX #1558: TRUNCATED block \(hashHex)... data=\(data.count)B, offset=\(offset) — NO TX DATA!")
             return CompactBlock(blockHeight: 0, blockHash: blockHash, prevHash: prevHash,
-                                finalSaplingRoot: finalSaplingRoot, time: time, transactions: [])
+                                finalSaplingRoot: finalSaplingRoot, time: time, transactions: [],
+                                equihashSolutionSize: equihashSolutionSize)
         }
 
         // Read transaction count (compactSize)
         let (txCount, txCountBytes) = readCompactSize(data, at: offset)
         offset += txCountBytes
+        // FIX #1558: Log when txCount is 0 (every real block has at least a coinbase)
+        if txCount == 0 {
+            let hashHex = blockHash.prefix(4).map { String(format: "%02x", $0) }.joined()
+            print("🔍 FIX #1558: ZERO-TX block \(hashHex)... data=\(data.count)B, offset=\(offset), txCount=0 — possible data issue!")
+        }
         // Sanity limit - blocks rarely have >10000 transactions
         let safeTxCount = min(txCount, 100000)
 
@@ -5244,6 +5257,19 @@ public final class Peer {
                     outputs: outputs
                 ))
             }
+
+            // FIX #1557: Debug — log when shielded data found in P2P block
+            if !spends.isEmpty || !outputs.isEmpty {
+                let txHashHex = txHash.map { String(format: "%02x", $0) }.joined()
+                print("🔍 FIX #1557: parseCompactBlock TX[\(txIndex)] \(txHashHex.prefix(16))... → \(spends.count) spends, \(outputs.count) outputs (block \(data.count) bytes)")
+            }
+        }
+
+        // FIX #1558: Log block parse summary for non-trivial blocks
+        if data.count > 1500 || transactions.contains(where: { !$0.spends.isEmpty || !$0.outputs.isEmpty }) {
+            let shieldedCount = transactions.filter { !$0.spends.isEmpty || !$0.outputs.isEmpty }.count
+            let hashHex = blockHash.prefix(4).map { String(format: "%02x", $0) }.joined()
+            print("🔍 FIX #1558: BLOCK \(hashHex)... \(data.count)B, \(Int(safeTxCount))tx parsed → \(transactions.count) kept, \(shieldedCount) shielded")
         }
 
         return CompactBlock(
@@ -5252,7 +5278,8 @@ public final class Peer {
             prevHash: prevHash,
             finalSaplingRoot: finalSaplingRoot,
             time: time,
-            transactions: transactions
+            transactions: transactions,
+            equihashSolutionSize: equihashSolutionSize
         )
     }
 
@@ -5297,11 +5324,15 @@ public final class Peer {
         // FIX #325: Disabled verbose log
         // debugLog(.network, "📋 P2P TX: offset=\(offset) header=0x\(String(format: "%08X", header)) v\(version) overwinter=\(fOverwintered)")
 
+        // FIX #1558: Log TX parse details for non-trivial blocks (3270 bytes = block 3022049)
+        let isLargeBlock = data.count > 1500
+
         // Check for Sapling transaction (v4 with overwintered)
         guard fOverwintered && version >= 4 else {
             // Not a Sapling transaction - skip it entirely
-            // FIX #325: Disabled verbose log
-            // debugLog(.network, "⏭️ P2P TX: Not Sapling (v\(version), overwinter=\(fOverwintered)) - skipping")
+            if isLargeBlock {
+                print("🔍 FIX #1558: TX@\(offset) header=0x\(String(format: "%08X", header)) v\(version) ow=\(fOverwintered) → skipLegacy (blockSize=\(data.count))")
+            }
             return (Data(repeating: 0, count: 32), [], [], skipLegacyTransaction(data, offset: offset))
         }
 
@@ -5313,8 +5344,9 @@ public final class Peer {
         // Verify Sapling version group ID (0x892F2085)
         guard versionGroupId == 0x892F2085 else {
             // Not a Sapling transaction - could be Overwinter (0x03C48270) or other
-            // FIX #325: Disabled verbose log
-            // debugLog(.network, "⏭️ P2P TX: Not Sapling versionGroupId=0x\(String(format: "%08X", versionGroupId)) - skipping")
+            if isLargeBlock {
+                print("🔍 FIX #1558: TX@\(offset) vgid=0x\(String(format: "%08X", versionGroupId)) → skipLegacy (blockSize=\(data.count))")
+            }
             return (Data(repeating: 0, count: 32), [], [], skipLegacyTransaction(data, offset: offset))
         }
 
@@ -5431,6 +5463,11 @@ public final class Peer {
 
             // zkproof (192 bytes) - skip
             pos += 192
+        }
+
+        // FIX #1558: Log Sapling v4 parse results for large blocks
+        if isLargeBlock {
+            print("🔍 FIX #1558: TX@\(offset) Sapling v4: vin=\(safeVinCount) vout=\(safeVoutCount) spends=\(spends.count)/\(safeSpendCount) outputs=\(outputs.count)/\(safeOutputCount) (blockSize=\(data.count), pos=\(pos))")
         }
 
         // JoinSplits (usually empty for Sapling era)

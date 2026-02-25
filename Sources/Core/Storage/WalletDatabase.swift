@@ -896,6 +896,8 @@ final class WalletDatabase {
                 is_read INTEGER NOT NULL DEFAULT 0,
                 timestamp INTEGER NOT NULL,
                 reply_to_id TEXT,
+                payment_amount INTEGER,
+                payment_address TEXT,
                 FOREIGN KEY (conversation_address) REFERENCES chat_contacts(onion_address) ON DELETE CASCADE
             );
             """,
@@ -1510,6 +1512,7 @@ final class WalletDatabase {
                 print("⚠️ P-DB-001: Migration error (non-fatal): \(String(cString: sqlite3_errmsg(db)))")
             }
         }
+
     }
 
     // MARK: - Privacy: Diversified Address Helpers
@@ -9055,7 +9058,8 @@ final class WalletDatabase {
     /// VUL-STOR-009: Chat content encrypted with .chat domain key
     func saveChatMessage(id: String, conversationAddress: String, fromOnion: String, toOnion: String,
                          content: String, messageType: String, isSent: Bool, isDelivered: Bool,
-                         isRead: Bool, timestamp: Int64, replyToId: String?) {
+                         isRead: Bool, timestamp: Int64, replyToId: String?,
+                         paymentAmount: UInt64? = nil, paymentAddress: String? = nil) {
         guard db != nil else { return }
 
         // VUL-STOR-009: Encrypt content with .chat domain key
@@ -9069,12 +9073,15 @@ final class WalletDatabase {
 
         let sql = """
             INSERT INTO chat_messages (id, conversation_address, from_onion, to_onion, content,
-                message_type, is_sent, is_delivered, is_read, timestamp, reply_to_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                message_type, is_sent, is_delivered, is_read, timestamp, reply_to_id,
+                payment_amount, payment_address)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 is_sent = excluded.is_sent,
                 is_delivered = excluded.is_delivered,
-                is_read = excluded.is_read;
+                is_read = excluded.is_read,
+                payment_amount = COALESCE(excluded.payment_amount, chat_messages.payment_amount),
+                payment_address = COALESCE(excluded.payment_address, chat_messages.payment_address);
         """
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
@@ -9096,19 +9103,29 @@ final class WalletDatabase {
         } else {
             sqlite3_bind_null(stmt, 11)
         }
+        if let amount = paymentAmount {
+            sqlite3_bind_int64(stmt, 12, Int64(amount))
+        } else {
+            sqlite3_bind_null(stmt, 12)
+        }
+        if let address = paymentAddress {
+            sqlite3_bind_text(stmt, 13, address, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        } else {
+            sqlite3_bind_null(stmt, 13)
+        }
         sqlite3_step(stmt)
     }
 
-    func loadChatMessages(for conversationAddress: String, limit: Int = 1000) -> [(id: String, fromOnion: String, toOnion: String, content: String, messageType: String, isSent: Bool, isDelivered: Bool, isRead: Bool, timestamp: Int64, replyToId: String?)] {
+    func loadChatMessages(for conversationAddress: String, limit: Int = 1000) -> [(id: String, fromOnion: String, toOnion: String, content: String, messageType: String, isSent: Bool, isDelivered: Bool, isRead: Bool, timestamp: Int64, replyToId: String?, paymentAmount: UInt64?, paymentAddress: String?)] {
         guard db != nil else { return [] }
-        let sql = "SELECT id, from_onion, to_onion, content, message_type, is_sent, is_delivered, is_read, timestamp, reply_to_id FROM chat_messages WHERE conversation_address = ? ORDER BY timestamp ASC LIMIT ?;"
+        let sql = "SELECT id, from_onion, to_onion, content, message_type, is_sent, is_delivered, is_read, timestamp, reply_to_id, payment_amount, payment_address FROM chat_messages WHERE conversation_address = ? ORDER BY timestamp ASC LIMIT ?;"
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
         defer { sqlite3_finalize(stmt) }
         sqlite3_bind_text(stmt, 1, conversationAddress, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
         sqlite3_bind_int(stmt, 2, Int32(limit))
 
-        var results: [(String, String, String, String, String, Bool, Bool, Bool, Int64, String?)] = []
+        var results: [(String, String, String, String, String, Bool, Bool, Bool, Int64, String?, UInt64?, String?)] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
             let id = String(cString: sqlite3_column_text(stmt, 0))
             let from = String(cString: sqlite3_column_text(stmt, 1))
@@ -9140,9 +9157,43 @@ final class WalletDatabase {
             let read = sqlite3_column_int(stmt, 7) != 0
             let ts = sqlite3_column_int64(stmt, 8)
             let reply = sqlite3_column_type(stmt, 9) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 9)) : nil
-            results.append((id, from, to, content, type, sent, delivered, read, ts, reply))
+            let paymentAmount: UInt64? = sqlite3_column_type(stmt, 10) != SQLITE_NULL ? UInt64(sqlite3_column_int64(stmt, 10)) : nil
+            let paymentAddress: String? = sqlite3_column_type(stmt, 11) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 11)) : nil
+            results.append((id, from, to, content, type, sent, delivered, read, ts, reply, paymentAmount, paymentAddress))
         }
         return results
+    }
+
+    /// Look up transaction confirmation details by txid hex string (from chat payment content)
+    /// Checks both byte orders (display vs wire format) per FIX #1230
+    func getTransactionConfirmationInfo(txidHex: String) -> (blockHeight: UInt64, blockTime: UInt64?, confirmations: Int, status: String)? {
+        guard db != nil else { return nil }
+        guard let txidData = Data(hex: txidHex) else { return nil }
+        let reversedData = Data(txidData.reversed())
+
+        let sql = """
+            SELECT block_height, block_time, confirmations, status
+            FROM transaction_history
+            WHERE txid = ? OR txid = ?
+            ORDER BY block_height DESC LIMIT 1;
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(stmt) }
+
+        txidData.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(txidData.count), unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        }
+        reversedData.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(reversedData.count), unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        }
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+        let height = UInt64(sqlite3_column_int64(stmt, 0))
+        let blockTime: UInt64? = sqlite3_column_type(stmt, 1) != SQLITE_NULL ? UInt64(sqlite3_column_int64(stmt, 1)) : nil
+        let confirmations = Int(sqlite3_column_int(stmt, 2))
+        let status = String(cString: sqlite3_column_text(stmt, 3))
+        return (height, blockTime, confirmations, status)
     }
 
     func deleteChatMessages(for conversationAddress: String) {

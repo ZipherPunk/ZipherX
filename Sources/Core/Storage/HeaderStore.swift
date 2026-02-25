@@ -1410,6 +1410,29 @@ final class HeaderStore {
         return sqlite3_step(stmt) == SQLITE_ROW
     }
 
+    /// FIX #1560: Get solution size for a header at a specific height
+    /// Used to verify Equihash variant (1344 = pre-Bubbles Equihash(200,9), 400 = post-Bubbles Equihash(192,7))
+    /// Returns 0 if no solution stored or header not found.
+    func getSolutionSize(at height: UInt64) throws -> Int {
+        if db == nil {
+            try open()
+        }
+        guard db != nil else { return 0 }
+
+        let sql = "SELECT length(solution) FROM headers WHERE height = ? AND solution IS NOT NULL;"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw DatabaseError.prepareFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, Int64(height))
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+        return Int(sqlite3_column_int64(stmt, 0))
+    }
+
     /// Delete headers above a certain height (for reorg handling)
     func deleteHeadersAbove(height: UInt64) throws {
         // FIX #794: Ensure database is open before deleting

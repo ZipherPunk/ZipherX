@@ -1100,6 +1100,53 @@ final class ChatManager: ObservableObject {
         }
     }
 
+    /// Send a payment rejection back to the requester
+    func sendPaymentRejection(
+        to contact: ChatContact,
+        requestId: String,
+        reason: String?
+    ) async throws {
+        var message = ChatMessage(
+            type: .paymentRejected,
+            fromOnion: ourOnionAddress ?? "",
+            toOnion: contact.onionAddress,
+            content: reason ?? "Payment request declined",
+            nickname: ourNickname.isEmpty ? nil : ourNickname,
+            replyTo: requestId,
+            status: .sending
+        )
+
+        // FIX #1432: Gate behind queue for ordering
+        if let queued = messageQueue[contact.onionAddress], !queued.isEmpty {
+            message.markQueued()
+            addMessageToConversation(message)
+            database.saveMessage(message, ourOnionAddress: ourOnionAddress)
+            queueMessage(message, for: contact.onionAddress)
+            return
+        }
+
+        addMessageToConversation(message)
+
+        do {
+            try await sendMessage(message, to: contact)
+            message.markSent()
+            updateMessageInConversation(message)
+            database.saveMessage(message, ourOnionAddress: ourOnionAddress)
+        } catch {
+            if isOfflineError(error) {
+                message.markQueued()
+                updateMessageInConversation(message)
+                database.saveMessage(message, ourOnionAddress: ourOnionAddress)
+                queueMessage(message, for: contact.onionAddress)
+            } else {
+                message.markFailed()
+                updateMessageInConversation(message)
+                database.saveMessage(message, ourOnionAddress: ourOnionAddress)
+                throw error
+            }
+        }
+    }
+
     /// Send typing indicator
     func sendTypingIndicator(to contact: ChatContact) async throws {
         let message = ChatMessage(
@@ -1490,7 +1537,7 @@ final class ChatManager: ObservableObject {
         }
 
         switch message.type {
-        case .text, .paymentRequest, .paymentSent, .paymentReceived:
+        case .text, .paymentRequest, .paymentSent, .paymentReceived, .paymentRejected:
             addMessageToConversation(message)
             database.saveMessage(message, ourOnionAddress: ourOnionAddress)
 
@@ -2773,7 +2820,9 @@ class ChatDatabase {
             isDelivered: isDelivered,
             isRead: isRead,
             timestamp: Int64(message.timestamp.timeIntervalSince1970),
-            replyToId: message.replyTo
+            replyToId: message.replyTo,
+            paymentAmount: message.paymentAmount,
+            paymentAddress: message.paymentAddress
         )
 
         // FIX #1499: Update contact's last_message_time so contacts sort correctly after restart.
@@ -2808,7 +2857,9 @@ class ChatDatabase {
                 timestamp: Date(timeIntervalSince1970: TimeInterval(row.timestamp)),
                 content: row.content,
                 replyTo: row.replyToId,
-                status: status
+                status: status,
+                paymentAddress: row.paymentAddress,
+                paymentAmount: row.paymentAmount
             )
         }
     }
