@@ -477,14 +477,18 @@ final class VoiceCallManager: ObservableObject {
         let session = AVAudioSession.sharedInstance()
         do {
             try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth])
-            try session.setPreferredSampleRate(sampleRate)
-            try session.setPreferredIOBufferDuration(Double(frameDurationMs) / 1000.0)
+            // FIX #1587: Do NOT call setPreferredSampleRate(16000). Most iOS devices only
+            // support 48kHz natively. Requesting 16kHz stalls the audio route negotiation,
+            // causing inputNode.outputFormat to return 0 Hz indefinitely (z24.log: 10/10 fail).
+            // The converter in startAudioCapture() handles 48kHz → 16kHz conversion.
+            // Also skip setPreferredIOBufferDuration — let iOS pick optimal buffer size.
             try session.setActive(true)
         } catch {
             print("📞 FIX #1540: Audio session setup failed: \(error)")
             await endCall(reason: "audio_error")
             return
         }
+        print("📞 FIX #1587: AVAudioSession active — sampleRate=\(session.sampleRate), inputChannels=\(session.inputNumberOfChannels)")
         #endif
 
         // Setup audio engine
@@ -495,6 +499,12 @@ final class VoiceCallManager: ObservableObject {
             await endCall(reason: "audio_error")
             return
         }
+
+        // FIX #1587: Access inputNode BEFORE engine.start() to trigger audio route setup.
+        // This gives the system time to negotiate the hardware format. Without this,
+        // the first access of inputNode after start() returns 0 Hz because the route
+        // hasn't been configured yet.
+        let _ = engine.inputNode
 
         engine.attach(player)
 
@@ -537,25 +547,32 @@ final class VoiceCallManager: ObservableObject {
         #endif
 
         if shouldCapture {
-            // FIX #1587: On iOS, engine.inputNode.outputFormat(forBus: 0) returns 0 Hz / 0 channels
-            // for >2 seconds after engine.start() — z24.log: ALL 10 attempts fail (sr=0.0, ch=2).
-            // The old hwReady guard prevented startAudioCapture() from ever being called,
-            // even though startAudioCapture() already has its own AVAudioSession format fallback
-            // (line 593-603) that always works after setActive(true).
-            //
-            // Fix: Give hardware 500ms to initialize (covers most devices), then proceed regardless.
-            // startAudioCapture() uses AVAudioSession.sampleRate as fallback — ALWAYS valid after
-            // setActive(true). The explicit tap format (FIX #1587b) ensures installTap doesn't crash.
+            // FIX #1587: On iOS, engine.inputNode.outputFormat(forBus: 0) returns 0 Hz
+            // when setPreferredSampleRate(16kHz) was called (hardware can't do 16kHz natively).
+            // Now that preferred rate is removed, the format should stabilize quickly at 48kHz.
+            // Wait up to 3 seconds (30 × 100ms). Access inputNode before start() helps.
             #if os(iOS)
-            try? await Task.sleep(nanoseconds: 500_000_000)  // 500ms — enough for most iOS devices
-            let hwCheck = engine.inputNode.outputFormat(forBus: 0)
-            if hwCheck.sampleRate > 0 {
-                print("📞 FIX #1587: Input HW ready after 500ms (sr=\(hwCheck.sampleRate), ch=\(hwCheck.channelCount))")
-            } else {
-                print("📞 FIX #1587: Input HW still 0 Hz after 500ms — proceeding with AVAudioSession fallback")
+            var hwReady = false
+            for attempt in 1...30 {
+                let hwFormat = engine.inputNode.outputFormat(forBus: 0)
+                if hwFormat.sampleRate > 0 && hwFormat.channelCount > 0 {
+                    print("📞 FIX #1587: Input HW ready after \(attempt * 100)ms (sr=\(hwFormat.sampleRate), ch=\(hwFormat.channelCount))")
+                    hwReady = true
+                    break
+                }
+                if attempt % 10 == 0 {
+                    print("📞 FIX #1587: Input HW not ready after \(attempt * 100)ms (sr=\(hwFormat.sampleRate), ch=\(hwFormat.channelCount))...")
+                }
+                try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
             }
-            #endif
+            if !hwReady {
+                print("📞 FIX #1587: Input HW still 0 Hz after 3s — mic capture disabled (playback-only)")
+            } else {
+                startAudioCapture()
+            }
+            #else
             startAudioCapture()
+            #endif
         } else {
             print("📞 FIX #1567: Microphone capture skipped — listen-only mode")
         }
@@ -641,19 +658,13 @@ final class VoiceCallManager: ObservableObject {
         let localSampleRate = sampleRate
         let localFrameDurationMs = frameDurationMs
 
-        // FIX #1587: On iOS, use inputFormat (AVAudioSession fallback) for the tap format.
-        // format:nil uses inputNode.outputFormat which returns 0 Hz during hardware init → crash
-        // with "IsFormatSampleRateAndChannelCountValid(format)" in CreateRecordingTap.
-        // AVAudioSession.sampleRate matches actual hardware rate — always valid after setActive(true).
-        // On macOS, outputFormat is always valid immediately, so nil is correct.
-        #if os(iOS)
-        let tapFormat: AVAudioFormat? = inputFormat
-        #else
-        let tapFormat: AVAudioFormat? = nil
-        #endif
-        print("📞 FIX #1587: Installing tap with format=\(tapFormat?.description ?? "nil") (inputFormat=\(inputFormat))")
+        // FIX #1587: Use format:nil — AVAudioEngine uses the node's native output format.
+        // This is safe because startAudioCapture() is ONLY called after hwReady=true (iOS)
+        // or always (macOS, where outputFormat is immediately valid).
+        // Previous attempt to pass non-nil tapFormat crashed when node couldn't convert from 0 Hz.
+        print("📞 FIX #1587: Installing tap with format=nil (inputFormat=\(inputFormat))")
         hasTapInstalled = true  // FIX #1573: Track tap installation
-        inputNode.installTap(onBus: 0, bufferSize: AVAudioFrameCount(localSampleRate * Double(localFrameDurationMs) / 1000.0), format: tapFormat) { [weak self] buffer, time in
+        inputNode.installTap(onBus: 0, bufferSize: AVAudioFrameCount(localSampleRate * Double(localFrameDurationMs) / 1000.0), format: nil) { [weak self] buffer, time in
             guard let self = self else { return }
 
             // FIX #1587: Log first audio frame to confirm tap is working
