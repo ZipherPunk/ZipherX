@@ -883,6 +883,7 @@ struct ConversationView: View {
     #if os(iOS)
     @State private var selectedPhotoItem: Any? = nil  // PhotosPickerItem (iOS 16+), stored as Any for iOS 15 compat
     @State private var showAttachmentOptions = false
+    @State private var showPhotosPicker = false  // FIX #1566: Separate state — PhotosPicker inside Menu doesn't open
     #endif
 
     private var theme: AppTheme { themeManager.currentTheme }
@@ -1075,6 +1076,8 @@ struct ConversationView: View {
                 handleFileSelection(url)
             }
         }
+        // FIX #1566: PhotosPicker modifier — separate from Menu to avoid SwiftUI dismissal bug
+        .modifier(PhotosPickerModifier(isPresented: $showPhotosPicker, contact: contact, chatManager: chatManager))
         #endif
         // FIX #1535: File too large alert
         .alert("File Too Large", isPresented: $showFileTooLargeAlert) {
@@ -1083,7 +1086,8 @@ struct ConversationView: View {
             Text("\"\(fileTooLargeName)\" exceeds the 2 MB limit.\n\nPlease choose a smaller file.")
         }
         // FIX #1540: Voice call overlay — shown when call is active, incoming, or outgoing
-        // Uses voiceCallManager @StateObject so SwiftUI observes callState changes
+        // FIX #1567: ALSO added to ContentView for calls arriving outside chat.
+        // This one handles calls while the chat sheet is open (separate modal hierarchy).
         #if os(iOS)
         .fullScreenCover(isPresented: Binding(
             get: { voiceCallManager.callState != .idle },
@@ -1103,6 +1107,7 @@ struct ConversationView: View {
                 contactName: contact.displayName,
                 onionAddress: contact.onionAddress
             )
+            .frame(minWidth: 400, minHeight: 500)
         }
         #endif
         // FIX #1457: Screenshot & recording detection for encrypted chat
@@ -1331,15 +1336,22 @@ struct ConversationView: View {
             }
 
             HStack(spacing: 12) {
-                // FIX #1535/FIX #1544: Attachment button — files + photos
+                // FIX #1535/FIX #1544/FIX #1566: Attachment button — files + photos
                 #if os(macOS)
+                // FIX #1572: NSOpenPanel.runModal() fails silently inside SwiftUI .sheet() windows.
+                // CypherpunkChat is presented as .sheet() from ContentView → modal run loop conflicts.
+                // Use panel.begin {} (async callback) instead, same pattern as profile picture picker.
                 Button(action: {
-                    let panel = NSOpenPanel()
-                    panel.allowsMultipleSelection = false
-                    panel.canChooseDirectories = false
-                    panel.title = "Send File (max 2 MB)"
-                    if panel.runModal() == .OK, let url = panel.url {
-                        handleFileSelection(url)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        let panel = NSOpenPanel()
+                        panel.allowsMultipleSelection = false
+                        panel.canChooseDirectories = false
+                        panel.title = "Send File (max 2 MB)"
+                        panel.begin { response in
+                            if response == .OK, let url = panel.url {
+                                handleFileSelection(url)
+                            }
+                        }
                     }
                 }) {
                     Image(systemName: "plus.circle.fill")
@@ -1349,37 +1361,15 @@ struct ConversationView: View {
                 .buttonStyle(.plain)
                 .disabled(!isChatStable)
                 #else
-                // FIX #1544: iOS attachment — Photos (iOS 16+) + Files
+                // FIX #1544/FIX #1566: iOS attachment — Photos (iOS 16+) + Files
+                // FIX #1566: PhotosPicker CANNOT be placed inside a Menu — menu dismissal
+                // kills the picker sheet before it opens. Use a separate state + .photosPicker() modifier.
                 if #available(iOS 16.0, *) {
                     Menu {
                         Button(action: { showFilePicker = true }) {
                             Label("Files", systemImage: "doc")
                         }
-                        PhotosPicker(selection: Binding<PhotosPickerItem?>(
-                            get: { selectedPhotoItem as? PhotosPickerItem },
-                            set: { newItem in
-                                selectedPhotoItem = newItem
-                                guard let item = newItem else { return }
-                                Task {
-                                    if let data = try? await item.loadTransferable(type: Data.self) {
-                                        let suggestedName: String
-                                        if let contentType = item.supportedContentTypes.first,
-                                           let ext = contentType.preferredFilenameExtension {
-                                            suggestedName = "photo_\(Int(Date().timeIntervalSince1970)).\(ext)"
-                                        } else {
-                                            suggestedName = "photo_\(Int(Date().timeIntervalSince1970)).jpg"
-                                        }
-                                        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(suggestedName)
-                                        try? data.write(to: tempURL)
-                                        handleFileSelection(tempURL)
-                                        DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
-                                            try? FileManager.default.removeItem(at: tempURL)
-                                        }
-                                    }
-                                    selectedPhotoItem = nil
-                                }
-                            }
-                        ), matching: .any(of: [.images, .videos])) {
+                        Button(action: { showPhotosPicker = true }) {
                             Label("Photos & Videos", systemImage: "photo.on.rectangle")
                         }
                     } label: {
@@ -3825,6 +3815,73 @@ struct RoundedCornerMac: Shape {
         path.closeSubpath()
 
         return path
+    }
+}
+#endif
+
+// MARK: - FIX #1566: PhotosPicker View Modifier (iOS 16+)
+// Separate modifier because PhotosPicker inside a Menu doesn't work (menu dismissal kills the picker)
+
+#if os(iOS)
+@available(iOS 16.0, *)
+struct PhotosPickerModifierContent: ViewModifier {
+    @Binding var isPresented: Bool
+    let contact: ChatContact
+    let chatManager: ChatManager
+    @State private var selectedItem: PhotosPickerItem?
+
+    func body(content: Content) -> some View {
+        content
+            .photosPicker(isPresented: $isPresented, selection: $selectedItem, matching: .any(of: [.images, .videos]))
+            .onChange(of: selectedItem) { newItem in
+                guard let item = newItem else { return }
+                selectedItem = nil  // Reset for next pick
+                Task {
+                    if let data = try? await item.loadTransferable(type: Data.self) {
+                        let ext: String
+                        if let contentType = item.supportedContentTypes.first {
+                            ext = contentType.preferredFilenameExtension ?? "jpg"
+                        } else {
+                            ext = "jpg"
+                        }
+                        let fileName = "photo_\(Int(Date().timeIntervalSince1970)).\(ext)"
+                        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+
+                        if data.count > Int(CHAT_MAX_FILE_SIZE) {
+                            print("📎 FIX #1566: Photo too large (\(data.count) bytes)")
+                            return
+                        }
+
+                        do {
+                            try data.write(to: tempURL)
+                            try await chatManager.sendFile(url: tempURL, to: contact)
+                            try? FileManager.default.removeItem(at: tempURL)
+                        } catch {
+                            print("📎 FIX #1566: Failed to send photo: \(error)")
+                            try? FileManager.default.removeItem(at: tempURL)
+                        }
+                    }
+                }
+            }
+    }
+}
+
+/// Wrapper that handles iOS version availability
+struct PhotosPickerModifier: ViewModifier {
+    @Binding var isPresented: Bool
+    let contact: ChatContact
+    let chatManager: ChatManager
+
+    func body(content: Content) -> some View {
+        if #available(iOS 16.0, *) {
+            content.modifier(PhotosPickerModifierContent(
+                isPresented: $isPresented,
+                contact: contact,
+                chatManager: chatManager
+            ))
+        } else {
+            content  // iOS 15: no photo picker available
+        }
     }
 }
 #endif

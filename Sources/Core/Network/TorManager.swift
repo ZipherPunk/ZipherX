@@ -578,21 +578,28 @@ public final class TorManager: ObservableObject {
 
     /// Perform a quick SOCKS5 health check (non-blocking, fast)
     /// Returns true if SOCKS5 proxy is accepting connections
+    /// FIX #1570: Added 30s debounce — was firing 206 times in 20 min (10x expected).
+    /// Called from: health timer (60s), keepalive (30/90s), AND every peer SOCKS5 failure.
+    /// Without debounce: 206 TCP connections in 20 min → constant socket churn → iOS overheating.
     public func checkSOCKS5Health() async -> Bool {
-        print("🔍 [SOCKS5] checkSOCKS5Health() called - mode: \(mode.rawValue), socksPort: \(socksPort)")
-
         guard mode == .enabled, socksPort > 0 else {
-            print("🔍 [SOCKS5] Skipped - Tor not enabled or socksPort=0")
             return false  // Tor not enabled or not started
         }
+
+        // FIX #1570: Debounce — skip if recently checked (within 30s)
+        if let lastCheck = lastSOCKS5HealthCheck,
+           Date().timeIntervalSince(lastCheck) < 30.0 {
+            return consecutiveSOCKS5Failures == 0  // Return last known state
+        }
+
+        // Always update timestamp to prevent rapid re-entry
+        lastSOCKS5HealthCheck = Date()
 
         // Quick TCP connection test to SOCKS5 proxy
         let isHealthy = await testSOCKS5Connection(timeout: 1.0)  // 1 second timeout
 
         if isHealthy {
             consecutiveSOCKS5Failures = 0
-            lastSOCKS5HealthCheck = Date()
-            print("🔍 [SOCKS5] Health check PASSED ✅")
             return true
         } else {
             consecutiveSOCKS5Failures += 1
@@ -610,12 +617,11 @@ public final class TorManager: ObservableObject {
     }
 
     /// Test SOCKS5 connection with timeout
+    /// FIX #1570: Removed verbose logging — was flooding logs with state updates
     private func testSOCKS5Connection(timeout: TimeInterval) async -> Bool {
-        print("🔍 [SOCKS5] Testing connection to 127.0.0.1:\(socksPort) (timeout: \(timeout)s)")
-
         return await withCheckedContinuation { continuation in
             let endpoint = NWEndpoint.hostPort(
-                host: NWEndpoint.Host("127.0.0.1"),
+                host: NWEndpoint.Host(proxyHost),
                 port: NWEndpoint.Port(integerLiteral: socksPort)
             )
             let connection = NWConnection(to: endpoint, using: .tcp)
@@ -625,10 +631,8 @@ public final class TorManager: ObservableObject {
 
             connection.stateUpdateHandler = { state in
                 guard !hasResumed else { return }
-                print("🔍 [SOCKS5] State update: \(state)")
                 switch state {
                 case .ready:
-                    print("🔍 [SOCKS5] Connection READY ✅")
                     hasResumed = true
                     connection.cancel()
                     continuation.resume(returning: true)
@@ -985,7 +989,7 @@ public final class TorManager: ObservableObject {
 
         return await withCheckedContinuation { continuation in
             let endpoint = NWEndpoint.hostPort(
-                host: NWEndpoint.Host("127.0.0.1"),
+                host: NWEndpoint.Host(proxyHost),
                 port: NWEndpoint.Port(integerLiteral: socksPort)
             )
             let connection = NWConnection(to: endpoint, using: .tcp)

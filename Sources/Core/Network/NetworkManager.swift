@@ -537,6 +537,12 @@ public final class NetworkManager: ObservableObject {
         if isDeviceOverheating { return }
         #endif
 
+        // FIX #1564: Update Tor circuit status on every health check. Without this,
+        // updateTorAvailability() only fires during address discovery/peer connection.
+        // When all peers are disconnected (Tor startup), the circuit-ready notification
+        // never posts → chat service never auto-starts → iOS/macOS chat broken.
+        await updateTorAvailability()
+
         // FIX #543: Check if we're in snooze period (user recently dismissed alert)
         if let dismissTime = healthAlertDismissTime {
             let timeSinceDismiss = Date().timeIntervalSince(dismissTime)
@@ -784,15 +790,43 @@ public final class NetworkManager: ObservableObject {
         // They will be started explicitly when main balance view is ready
     }
 
+    /// FIX #1571: Quick dispatcher availability check for recurring background tasks.
+    /// Returns true if at least 1 dispatcher is active. Does NOT touch blocked/headerSync flags.
+    /// Does NOT restart listeners — during normal operation, listeners should already be running.
+    /// If no dispatchers are active, callers should fall back gracefully (skip P2P work or use on-demand activation via getBlocksDataP2P).
+    public func hasActiveDispatchers() async -> Bool {
+        for peer in peers where peer.isConnectionReady {
+            if await peer.isDispatcherActive {
+                return true
+            }
+        }
+        return false
+    }
+
     /// FIX #509: Start block listeners ONLY when app is fully ready on main balance screen
     /// This should be called explicitly by the UI when the main screen is displayed
+    /// FIX #1570: Debounce block listener starts — was restarting 70 times in 20 min on iOS.
+    /// Each UNBLOCK event triggered a full restart cycle (reconnect + start all peers).
+    private var lastBlockListenerStartTime: Date?
+
     /// FIX #907: Check if operations are blocking listeners before starting
     public func startBlockListenersOnMainScreen() async {
         // FIX #907: Don't start if operations are in progress
         if PeerManager.shared.areBlockListenersBlocked() {
-            print("🛑 FIX #907: startBlockListenersOnMainScreen BLOCKED - operations in progress")
             return
         }
+
+        // FIX #1570: Debounce — skip if listeners were started in the last 30s.
+        // 30 UNBLOCK events in 20 min × 5 peers = 150 start attempts → iOS overheating.
+        // Block listeners are long-running (300s timeout) so 30s debounce is safe.
+        // Peer.startBlockListener() has its own state machine guard (won't double-start).
+        #if os(iOS)
+        if let lastStart = lastBlockListenerStartTime,
+           Date().timeIntervalSince(lastStart) < 30.0 {
+            return
+        }
+        #endif
+        lastBlockListenerStartTime = Date()
 
         print("▶️ FIX #509: Starting block listeners on main balance screen...")
 
@@ -9769,6 +9803,12 @@ public final class NetworkManager: ObservableObject {
         #if os(iOS)
         if isDeviceOverheating { return }
         #endif
+
+        // FIX #1564: Check Tor circuit status on every keepalive (30s macOS / 90s iOS).
+        // Without this, circuit-ready notification only fires during address discovery,
+        // which requires active peers. During slow Tor startup with no peers, the
+        // notification never posts → chat service never auto-starts.
+        await updateTorAvailability()
 
         // FIX #1461: Allow peer growth even during sync — only skip ping when syncing
         let isBusySyncing = isHeaderSyncing || WalletManager.shared.isSyncing

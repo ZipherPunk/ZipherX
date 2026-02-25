@@ -5,6 +5,7 @@ struct ContentView: View {
     @EnvironmentObject var networkManager: NetworkManager
     @EnvironmentObject var themeManager: ThemeManager
     @StateObject private var biometricManager = BiometricAuthManager.shared
+    @StateObject private var voiceCallManager = VoiceCallManager.shared  // FIX #1567: Global call overlay
     #if os(macOS)
     @StateObject private var modeManager = WalletModeManager.shared  // FIX #448: Observe wallet source changes
     #endif
@@ -92,6 +93,15 @@ struct ContentView: View {
     private var healthAlertTitle: String {
         guard let alert = networkManager.criticalHealthAlert else { return "⚠️ Health Issue" }
         return "\(alert.severity.rawValue) \(alert.title)"
+    }
+
+    // FIX #1567: Look up caller's display name from contacts
+    private var callerDisplayName: String {
+        guard let onion = voiceCallManager.remotePeerOnionAddress else { return "Unknown" }
+        if let contact = ChatManager.shared.contacts.first(where: { $0.onionAddress == onion }) {
+            return contact.displayName
+        }
+        return String(onion.prefix(12)) + "..."
     }
 
     enum Tab {
@@ -2877,6 +2887,21 @@ struct ContentView: View {
 
             } else {
                 WalletSetupView()
+            }
+
+            // FIX #1567: Global voice call overlay — shows from ANY screen (balance, settings, etc)
+            // Previously inside ConversationView (chat sheet only), so incoming calls while on
+            // balance/settings showed ringtone but no accept/decline UI.
+            // Note: ConversationView still has its own overlay for calls while chat sheet is open
+            // (sheet is a separate modal hierarchy — ZStack content doesn't show over it).
+            if voiceCallManager.callState != .idle && !showCypherpunkChat {
+                CallView(
+                    contactName: callerDisplayName,
+                    onionAddress: voiceCallManager.remotePeerOnionAddress ?? ""
+                )
+                .ignoresSafeArea()
+                .transition(.opacity)
+                .zIndex(999)
             }
 
             // Overlays extracted to separate view to reduce type-check complexity

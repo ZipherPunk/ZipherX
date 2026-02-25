@@ -1633,7 +1633,7 @@ public final class Peer {
 
         // Connect to local Tor SOCKS5 proxy
         let proxyEndpoint = NWEndpoint.hostPort(
-            host: NWEndpoint.Host("127.0.0.1"),
+            host: NWEndpoint.Host(TorManager.shared.proxyHost),
             port: NWEndpoint.Port(integerLiteral: socksPort)
         )
 

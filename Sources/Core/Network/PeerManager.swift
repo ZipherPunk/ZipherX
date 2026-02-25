@@ -941,9 +941,13 @@ public final class PeerManager: ObservableObject {
     /// Block listeners can ONLY run when blocked = false
     nonisolated public func setBlockListenersBlocked(_ blocked: Bool) {
         blockListenersBlockedLock.lock()
-        defer { blockListenersBlockedLock.unlock() }
+        let changed = blockListenersBlockedFlag != blocked
         blockListenersBlockedFlag = blocked
-        print("🛑 FIX #907: Block listeners \(blocked ? "BLOCKED" : "UNBLOCKED")")
+        blockListenersBlockedLock.unlock()
+        // FIX #1570: Only log state CHANGES to reduce log spam (was 70 lines in 20 min)
+        if changed {
+            print("🛑 FIX #907: Block listeners \(blocked ? "BLOCKED" : "UNBLOCKED")")
+        }
     }
 
     /// FIX #907: Check if block listeners are blocked

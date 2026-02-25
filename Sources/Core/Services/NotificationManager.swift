@@ -2,6 +2,7 @@ import Foundation
 import UserNotifications
 #if canImport(UIKit)
 import UIKit
+import AudioToolbox
 #endif
 #if canImport(AppKit)
 import AppKit
@@ -338,6 +339,25 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
                 print("❌ Chat notification error: \(error)")
             }
         }
+    }
+
+    // MARK: - In-App Sounds (FIX #1568)
+
+    /// FIX #1568: Play in-app chat message sound.
+    /// Called for ALL incoming messages (even when viewing the same conversation).
+    /// Uses system sound — no external sound file dependencies.
+    func playChatMessageSound() {
+        #if os(iOS)
+        // iOS: system message received sound (ID 1007 = standard message tone)
+        AudioServicesPlaySystemSound(1007)
+        #elseif os(macOS)
+        // macOS: play system sound
+        if let sound = NSSound(named: .init("Tink")) {
+            sound.play()
+        } else {
+            NSSound.beep()
+        }
+        #endif
     }
 
     /// Clear all notifications

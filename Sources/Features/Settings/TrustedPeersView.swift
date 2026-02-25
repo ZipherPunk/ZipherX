@@ -84,7 +84,15 @@ struct TrustedPeersView: View {
                 let db = WalletDatabase.shared
                 let peers = try db.getTrustedPeers()
                 await MainActor.run {
-                    self.trustedPeers = peers
+                    // FIX #1569: Sort by success rate (higher first)
+                    self.trustedPeers = peers.sorted { a, b in
+                        let totalA = a.successes + a.failures
+                        let totalB = b.successes + b.failures
+                        let rateA = totalA > 0 ? Double(a.successes) / Double(totalA) : 0
+                        let rateB = totalB > 0 ? Double(b.successes) / Double(totalB) : 0
+                        if rateA != rateB { return rateA > rateB }
+                        return a.successes > b.successes  // Break ties by total successes
+                    }
                     self.isLoading = false
                 }
             } catch {

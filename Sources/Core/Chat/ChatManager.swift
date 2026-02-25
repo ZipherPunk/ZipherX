@@ -315,10 +315,23 @@ final class ChatManager: ObservableObject {
 
         // FIX #1487: When .onion circuits become ready, reset backoff and retry all contacts.
         // Without this: first connect fails (circuits not ready) → 35s+ backoff → stuck offline.
+        // FIX #1564: Also auto-start the chat service if not yet started. Previously, chat only
+        // started when the user opened the Chat tab (ChatView.onAppear). If the user stays on
+        // the wallet screen, the NWListener on port 8034 never starts → macOS can't connect →
+        // messages never arrive. Now the service starts automatically when Tor is ready.
         NotificationCenter.default.addObserver(forName: .onionCircuitsReady, object: nil, queue: .main) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
-                guard self.isAvailable else { return }
+                // FIX #1564: Auto-start chat service when circuits are ready (regardless of UI state)
+                if !self.isAvailable {
+                    do {
+                        try await self.start()
+                        print("💬 FIX #1564: Chat auto-started on circuits ready (no ChatView needed)")
+                    } catch {
+                        print("💬 FIX #1564: Chat auto-start failed: \(error)")
+                        return
+                    }
+                }
                 print("💬 FIX #1487: .onion circuits ready — resetting backoff and retrying all contacts")
                 self.connectionFailureCount.removeAll()
                 self.lastConnectionAttempt.removeAll()
@@ -648,7 +661,7 @@ final class ChatManager: ObservableObject {
 
         // Step 1: Connect to SOCKS5 proxy first (not directly to .onion)
         let proxyEndpoint = NWEndpoint.hostPort(
-            host: NWEndpoint.Host("127.0.0.1"),
+            host: NWEndpoint.Host(TorManager.shared.proxyHost),
             port: NWEndpoint.Port(integerLiteral: socksPort)
         )
 
@@ -1548,6 +1561,9 @@ final class ChatManager: ObservableObject {
             addMessageToConversation(message)
             database.saveMessage(message, ourOnionAddress: ourOnionAddress)
 
+            // FIX #1568: Play in-app sound for ALL incoming messages
+            NotificationManager.shared.playChatMessageSound()
+
             // FIX #1386: Bridge chat payment confirmations to balance view + system notifications
             // When we receive paymentSent (someone paid our request) or paymentReceived,
             // trigger a balance view refresh and send a payment notification
@@ -1669,6 +1685,9 @@ final class ChatManager: ObservableObject {
         case .file:
             // FIX #1535: Incoming file transfer metadata
             handleFileMessage(message)
+
+            // FIX #1568: Play in-app sound for incoming file
+            NotificationManager.shared.playChatMessageSound()
 
             // Update unread count
             if selectedConversation != message.fromOnion {

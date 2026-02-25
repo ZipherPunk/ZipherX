@@ -305,34 +305,12 @@ final class FilterScanner {
         if isLightweightScan {
             print("🔍 FIX #1410: Lightweight scan (\(expectedBlockCount) blocks) — keeping block listeners active")
         } else {
-            // FIX #1425: Use dispatcher pattern instead of stopping block listeners.
-            // OLD approach (FIX #907): stopAllBlockListeners → FIX #1184b killed ALL NWConnections
-            // → all peers dead (connection=nil) → FIX #1228 reconnected 5 peers via Tor (5-10s overhead)
-            // → scan proceeded with freshly reconnected peers.
-            // NEW approach: Keep block listeners RUNNING — they ARE the dispatcher.
-            // Block fetches route through dispatcher (lock-free, 300+ blocks/s).
-            // Same pattern as FIX #1423 (verifyNullifierSpendStatus) and FIX #1184 (verifyAllUnspentNotesOnChain).
-            print("🔍 FIX #1425: Full scan (\(expectedBlockCount) blocks) — using dispatcher (keeping block listeners active)")
-            PeerManager.shared.setBlockListenersBlocked(false)
-            PeerManager.shared.setHeaderSyncInProgress(false)
-            await networkManager.startBlockListenersOnMainScreen()
-            var activeDispatchers1425 = 0
-            for attempt in 1...10 {
-                try? await Task.sleep(nanoseconds: 500_000_000)
-                activeDispatchers1425 = 0
-                for peer in await MainActor.run(body: { networkManager.peers }) {
-                    if await peer.isDispatcherActive {
-                        activeDispatchers1425 += 1
-                    }
-                }
-                if activeDispatchers1425 >= 3 {
-                    print("✅ FIX #1425: \(activeDispatchers1425) dispatcher(s) active after \(attempt * 500)ms")
-                    break
-                }
-            }
-            if activeDispatchers1425 == 0 {
-                print("⚠️ FIX #1425: No dispatchers active — getBlocksDataP2P will retry activation")
-            }
+            // FIX #1425: Keep block listeners RUNNING — they ARE the dispatcher.
+            // FIX #1571: Don't touch blocked/headerSync flags or restart listeners during normal scans.
+            // Listeners are already running from startup. getBlocksDataP2P has its own on-demand
+            // dispatcher activation (FIX #1285) if somehow none are active.
+            let hasDispatchers = await networkManager.hasActiveDispatchers()
+            print("🔍 FIX #1571: Full scan (\(expectedBlockCount) blocks) — dispatchers \(hasDispatchers ? "active ✅" : "inactive (getBlocksDataP2P will activate on demand)")")
         }
 
         defer {
@@ -2382,11 +2360,9 @@ final class FilterScanner {
             }
         }
 
-        // FIX #1425: Block listeners were kept running via dispatcher — just ensure unblocked
-        print("▶️ FIX #907: Resuming block listeners after scan complete...")
-        PeerManager.shared.setBlockListenersBlocked(false)
-        await PeerManager.shared.resumeAllBlockListeners()
-        print("✅ FIX #907: Block listeners resumed")
+        // FIX #1571: Block listeners are already running (never stopped during normal scans).
+        // Removed redundant setBlockListenersBlocked(false) + resumeAllBlockListeners() calls
+        // that triggered 70 restart cycles in 20 min on iOS (z21.log).
 
         // FIX #1090: CRITICAL - Recompute nullifiers with correct tree positions BEFORE verification
         // ROOT CAUSE: processDecryptedNote used placeholder positions (height * 1000 + outputIndex)

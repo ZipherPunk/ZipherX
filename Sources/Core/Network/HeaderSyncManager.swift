@@ -532,6 +532,14 @@ final class HeaderSyncManager {
         var currentHeight = startHeight
         var failedPeers = Set<String>()
 
+        // FIX #1565: Track consecutive Equihash failures at the SAME height across peers.
+        // When ALL peers fail Equihash at the same height, the problem is our locator hash
+        // (HeaderStore has a fork block hash that no peer recognizes → peers return genesis
+        // headers → 1344-byte solution at post-Bubbles height → FIX #1559 rejects).
+        // This is a more robust detection than FIX #1561's error pattern matching.
+        var consecutiveEquihashFailures = 0
+        var lastEquihashFailHeight: UInt64 = 0
+
         // FIX #501: Much longer total timeout - we'll try many peers
         let headersNeeded = chainTip - currentHeight
         let maxSyncDuration: TimeInterval = 300.0  // 5 minutes to try all peers
@@ -701,6 +709,71 @@ final class HeaderSyncManager {
                     print("⚠️ FIX #579: Peer \(peer.host) has different chain (BundledBlockHashes may be outdated) - keeping peer connected")
                     failedPeers.insert(peer.host)
                     continue
+                }
+
+                // FIX #1561: Detect "corrupt locator hash in HeaderStore" causing all peers to
+                // return genesis-era pre-Bubbles headers (1344-byte Equihash(200,9)) assigned to
+                // a post-Bubbles height. Symptom: FIX #1559 fires at headersStartHeight itself
+                // because the peer didn't recognize our locator and fell back to genesis.
+                //
+                // Root cause: HeaderStore has a block hash for `actualLocatorHeight` that belongs
+                // to a pre-Bubbles fork block. ALL peers on the main chain don't recognize it →
+                // ALL return headers from genesis → 1344-byte solution at post-Bubbles height →
+                // FIX #1559 rejects it → all 5 peers disconnected → permanent stuck loop.
+                //
+                // Detection: invalidHeadersPayload with Equihash failure where the locator height
+                // is post-Bubbles (so we're asking for Equihash(192,7) headers but got 1344-byte).
+                // This is NOT a peer failure — the peers are healthy. Delete the bad locator entry
+                // and fall back to the nearest valid checkpoint below it.
+                if case SyncError.invalidHeadersPayload(let reason) = error,
+                   reason.contains("Equihash verification failed"),
+                   actualLocatorHeight > ZipherXConstants.bubblesActivationHeight {
+                    print("🚨 FIX #1561: Equihash failure at locator height \(actualLocatorHeight) — corrupt HeaderStore locator hash detected")
+                    print("   Peer \(peer.host) returned genesis-era headers (locator hash not recognized on main chain)")
+                    print("   Deleting HeaderStore entries from height \(actualLocatorHeight) upward and falling back to checkpoint")
+                    try? headerStore.deleteHeadersAbove(height: actualLocatorHeight - 1)
+                    failedPeers.removeAll()
+                    consecutiveEquihashFailures = 0  // FIX #1565: Reset counter on successful detection
+                    if let newTip = try? headerStore.getLatestHeight() {
+                        currentHeight = newTip + 1
+                        print("   FIX #1561: Reset currentHeight to \(currentHeight) (new HeaderStore tip: \(newTip))")
+                    } else {
+                        currentHeight = startHeight
+                        print("   FIX #1561: HeaderStore empty after deletion, restarting from \(startHeight)")
+                    }
+                    break  // FIX #1565: Must BREAK, not continue — recalculate payload in outer while loop
+                }
+
+                // FIX #1565: Counter-based corrupt locator detection (robust fallback for FIX #1561).
+                // Track consecutive Equihash failures at the same height. When 3+ peers all fail,
+                // the locator hash is corrupt (fork hash), not the peers.
+                let errorDesc = error.localizedDescription
+                if errorDesc.contains("Equihash verification failed") {
+                    // Extract the failing height from the error
+                    let failHeight = headersStartHeight  // First header height = where Equihash fails
+                    if failHeight == lastEquihashFailHeight {
+                        consecutiveEquihashFailures += 1
+                    } else {
+                        consecutiveEquihashFailures = 1
+                        lastEquihashFailHeight = failHeight
+                    }
+                    print("⚠️ FIX #1565: Equihash failure #\(consecutiveEquihashFailures) at height \(failHeight) (locator: \(actualLocatorHeight), error type: \(type(of: error)))")
+
+                    if consecutiveEquihashFailures >= 3 && actualLocatorHeight > ZipherXConstants.bubblesActivationHeight {
+                        print("🚨 FIX #1565: \(consecutiveEquihashFailures) peers failed Equihash at height \(failHeight) — corrupt locator hash at \(actualLocatorHeight)")
+                        print("   Deleting HeaderStore entries from height \(actualLocatorHeight) upward")
+                        try? headerStore.deleteHeadersAbove(height: actualLocatorHeight - 1)
+                        failedPeers.removeAll()
+                        consecutiveEquihashFailures = 0
+                        if let newTip = try? headerStore.getLatestHeight() {
+                            currentHeight = newTip + 1
+                            print("   FIX #1565: Reset currentHeight to \(currentHeight) (new HeaderStore tip: \(newTip))")
+                        } else {
+                            currentHeight = startHeight
+                            print("   FIX #1565: HeaderStore empty, restarting from \(startHeight)")
+                        }
+                        break  // Exit peer loop → while loop recalculates payload with new currentHeight
+                    }
                 }
 
                 // For other errors, disconnect and try next peer
@@ -918,6 +991,27 @@ final class HeaderSyncManager {
                         print("⚠️ FIX #579: Peer \(peer.host) has different chain - keeping peer connected")
                         failedPeers.insert(peer.host)
                         continue
+                    }
+
+                    // FIX #1561: Detect corrupt locator hash in HeaderStore (parallel path).
+                    // Same logic as syncHeadersSimple: Equihash failure at a post-Bubbles locator
+                    // height means all peers returned genesis-era 1344-byte headers because they
+                    // didn't recognize the locator. Delete the bad HeaderStore entry and fall back.
+                    // Break the PEER loop immediately — no point trying other peers with same payload.
+                    if case SyncError.invalidHeadersPayload(let reason) = error,
+                       reason.contains("Equihash verification failed"),
+                       actualLocatorHeight > ZipherXConstants.bubblesActivationHeight {
+                        print("🚨 FIX #1561: Equihash failure in parallel sync at locator height \(actualLocatorHeight) — corrupt HeaderStore locator hash")
+                        print("   Deleting HeaderStore entries from height \(actualLocatorHeight) upward and falling back to checkpoint")
+                        try? headerStore.deleteHeadersAbove(height: actualLocatorHeight - 1)
+                        failedPeers.removeAll()
+                        if let newTip = try? headerStore.getLatestHeight() {
+                            currentHeight = newTip + 1
+                            print("   FIX #1561: Reset currentHeight to \(currentHeight) (new tip: \(newTip))")
+                        } else {
+                            currentHeight = startHeight
+                        }
+                        break  // Exit peer loop — outer while loop will retry with corrected locator
                     }
 
                     // For other errors, disconnect and try next peer

@@ -12745,34 +12745,16 @@ final class WalletManager: ObservableObject {
 
         print("🔍 FIX #1093: Scanning \(blocksToScan) blocks (single pass for \(nullifierToNote.count) nullifiers)")
 
-        // FIX #1423: Use dispatcher instead of stopping block listeners.
-        // Old approach (FIX #1096) stopped all block listeners → FIX #1184b killed NWConnections
-        // → all peers dead → reconnect 300-600ms each via Tor → scan got 0% coverage → repeat every 30s.
-        // New approach: ensure block listeners are RUNNING so dispatcher routes P2P reads.
-        // Same pattern as verifyAllUnspentNotesOnChain (FIX #1184).
-        PeerManager.shared.setBlockListenersBlocked(false)
-        PeerManager.shared.setHeaderSyncInProgress(false)
-        await networkManager.startBlockListenersOnMainScreen()
-        // Wait for dispatchers to activate
-        var activeDispatchers1423 = 0
-        for attempt in 1...10 {
-            try? await Task.sleep(nanoseconds: 500_000_000)
-            activeDispatchers1423 = 0
-            for peer in await MainActor.run(body: { networkManager.peers }) {
-                if await peer.isDispatcherActive {
-                    activeDispatchers1423 += 1
-                }
-            }
-            if activeDispatchers1423 >= 3 {
-                print("✅ FIX #1423: \(activeDispatchers1423) dispatcher(s) active after \(attempt * 500)ms")
-                break
-            }
-        }
-        if activeDispatchers1423 == 0 {
-            print("⚠️ FIX #1423: No dispatchers active — getBlocksDataP2P will retry activation")
+        // FIX #1571: During normal operation, block listeners are already running from startup.
+        // Don't touch blocked/headerSync flags or restart listeners every 30s — that caused
+        // 70 restart cycles in 20 min on iOS (z21.log). getBlocksDataP2P has its own on-demand
+        // dispatcher activation (FIX #1285) if needed.
+        let hasDispatchers1423 = await networkManager.hasActiveDispatchers()
+        if !hasDispatchers1423 {
+            print("⚠️ FIX #1571: No dispatchers active for nullifier verification — getBlocksDataP2P will activate on demand")
         }
         await MainActor.run { networkManager.isIntensiveP2PFetchInProgress = true }
-        print("🔒 FIX #1423: P2P fetch via dispatcher (\(activeDispatchers1423) dispatchers active)")
+        print("🔒 FIX #1571: P2P fetch via dispatcher (dispatchers \(hasDispatchers1423 ? "active ✅" : "will activate on demand"))")
 
         defer {
             Task { @MainActor in
@@ -12905,28 +12887,14 @@ final class WalletManager: ObservableObject {
             return 0
         }
 
-        // FIX #1423: Use dispatcher instead of stopping block listeners.
-        // Old approach killed NWConnections → all peers dead → destructive reconnect cycle.
-        // Same fix as verifyNullifierSpendStatus: keep listeners running, use dispatcher.
-        PeerManager.shared.setBlockListenersBlocked(false)
-        PeerManager.shared.setHeaderSyncInProgress(false)
-        await networkManager.startBlockListenersOnMainScreen()
-        var activeDispatchers1423b = 0
-        for attempt in 1...10 {
-            try? await Task.sleep(nanoseconds: 500_000_000)
-            activeDispatchers1423b = 0
-            for peer in networkManager.peers {
-                if await peer.isDispatcherActive {
-                    activeDispatchers1423b += 1
-                }
-            }
-            if activeDispatchers1423b >= 3 {
-                print("✅ FIX #1423: \(activeDispatchers1423b) dispatcher(s) active after \(attempt * 500)ms (spent note verification)")
-                break
-            }
+        // FIX #1571: During normal operation, block listeners are already running.
+        // Don't restart them every 30s — caused 70 restart cycles in 20 min on iOS.
+        let hasDispatchers1423b = await networkManager.hasActiveDispatchers()
+        if !hasDispatchers1423b {
+            print("⚠️ FIX #1571: No dispatchers active for spent note verification — getBlocksDataP2P will activate on demand")
         }
         networkManager.isIntensiveP2PFetchInProgress = true
-        print("🔒 FIX #1423: P2P fetch via dispatcher (\(activeDispatchers1423b) dispatchers active) — spent note verification")
+        print("🔒 FIX #1571: Spent note verification (dispatchers \(hasDispatchers1423b ? "active ✅" : "will activate on demand"))")
 
         defer {
             networkManager.isIntensiveP2PFetchInProgress = false
@@ -13216,13 +13184,8 @@ final class WalletManager: ObservableObject {
             }
         }
 
-        defer {
-            // FIX #1057 v2: Restart block listeners after P2P scan completes
-            Task {
-                print("▶️ FIX #1057 v2: Restarting block listeners after unrecorded spend scan...")
-                await NetworkManager.shared.startBlockListenersOnMainScreen()
-            }
-        }
+        // FIX #1571: Removed FIX #1057 defer that called startBlockListenersOnMainScreen() after
+        // every unrecorded spend scan. Block listeners are already running during normal operation.
 
         // Fetch blocks via P2P
         var recoveredCount = 0
@@ -13811,36 +13774,15 @@ final class WalletManager: ObservableObject {
             return 0
         }
 
-        // FIX #1184: Ensure block listeners are RUNNING so dispatcher is active.
-        // Previous startup steps (witness validation, delta sync) stop listeners and don't restart.
-        // Without active listeners, P2P falls back to "direct reads" with 3s lock timeouts (~76 blocks/s).
-        // With dispatcher: lock-free, ~300 blocks/s.
-        // FIX #1184: Clear ALL flags that prevent block listeners from starting
-        PeerManager.shared.setBlockListenersBlocked(false)
-        PeerManager.shared.setHeaderSyncInProgress(false)
-        print("📡 FIX #1184: Cleared blockListenersBlocked + headerSyncInProgress flags")
-        await networkManager.startBlockListenersOnMainScreen()
-        // FIX #1184: Wait for dispatchers to activate — startBlockListener() is async,
-        // listeners need time to enter their receive loop and set isActive = true
-        var activeDispatchers = 0
-        for attempt in 1...10 {
-            try? await Task.sleep(nanoseconds: 500_000_000) // 0.5s
-            activeDispatchers = 0
-            for peer in await MainActor.run(body: { networkManager.peers }) {
-                if await peer.isDispatcherActive {
-                    activeDispatchers += 1
-                }
-            }
-            if activeDispatchers >= 3 {
-                print("✅ FIX #1184: \(activeDispatchers) dispatcher(s) active after \(attempt * 500)ms")
-                break
-            }
-        }
-        if activeDispatchers == 0 {
-            print("⚠️ FIX #1184: No dispatchers active — getBlocksDataP2P will retry activation")
+        // FIX #1571: During normal operation, block listeners are already running from startup.
+        // Don't clear flags or restart listeners here — caused 70 restart cycles in 20 min on iOS.
+        // getBlocksDataP2P has its own on-demand dispatcher activation (FIX #1285).
+        let hasDispatchers1184 = await networkManager.hasActiveDispatchers()
+        if !hasDispatchers1184 {
+            print("⚠️ FIX #1571: No dispatchers active for unspent note verification — getBlocksDataP2P will activate on demand")
         }
         networkManager.isIntensiveP2PFetchInProgress = true
-        print("🔒 FIX #1184: P2P fetch isolation (\(activeDispatchers) dispatchers active)")
+        print("🔒 FIX #1571: Unspent note verification (dispatchers \(hasDispatchers1184 ? "active ✅" : "will activate on demand"))")
 
         defer {
             networkManager.isIntensiveP2PFetchInProgress = false
@@ -14061,9 +14003,9 @@ final class WalletManager: ObservableObject {
         // Connected peers with inactive dispatchers return 0 blocks (FIX #1184 fast-return).
         // Old code: 5 connected peers → batchSize=640, but only 1 active → 128 delivered →
         // 20% < FIX #1218 50% threshold → EVERY batch fails → scan aborts → balance wrong.
-        // New: use activeDispatchers count (measured above) for correct sizing.
+        // New: use connected peer count for sizing. getBlocksDataP2P activates dispatchers on demand.
         // FIX #1287: Dynamic batch = 2 chunks per peer (scales with connected peers)
-        let effectivePeers = max(activeDispatchers, 1)
+        let effectivePeers = max(networkManager.peers.filter({ $0.isConnectionReady }).count, 1)
         let batchSize: UInt64 = UInt64(max(effectivePeers, 3) * 256)
 
         // FIX #1252: Proportional timeout based on block count (was hardcoded 360s)
