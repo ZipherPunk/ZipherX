@@ -48,32 +48,92 @@ ZipherX provides full-node-level security through direct P2P networking — with
 - **P2P Networking** — Connects directly to the Zclassic blockchain via peer-to-peer protocol
 - **Tor Integration** — All connections routed through embedded Tor (Arti) for network privacy
 - **Encrypted Chat** — End-to-end encrypted messaging over Tor hidden services
+- **Voice Calls** — Encrypted voice over Tor (WebRTC-style, peer-to-peer)
 - **Biometric Security** — Face ID / Touch ID protection for wallet access and transactions
 - **Cross-Platform** — Native macOS (Apple Silicon + Intel) and iOS (iPhone + iPad)
-- **Full Node Mode** — Optional: connect to your own Zclassic full node via RPC
+- **Full Node Mode** — Optional: connect to your own Zclassic full node via RPC (macOS only)
 - **Fast Sync** — Boost files enable wallet sync in under 30 seconds
 - **SQLCipher** — Database encrypted at rest with 256-bit AES
+- **Hardened Runtime** — macOS app is signed and notarized with Hardened Runtime enabled
 
 ---
 
-## Prerequisites
+## Download (macOS)
 
-### macOS
+### Pre-built DMG
 
-| Requirement | Version |
-|-------------|---------|
-| macOS | 13.0 (Ventura) or later |
-| Xcode | 15.0 or later |
-| Rust | 1.75+ (for FFI compilation) |
-| Command Line Tools | `xcode-select --install` |
+Download the latest release from the [Releases](https://github.com/ZipherPunk/ZipherX/releases) page:
 
-### iOS
+| File | Description |
+|------|-------------|
+| `ZipherX_v4.2.1.dmg` | macOS installer (Apple Silicon + Intel) |
+| `SHA256SUMS.txt` | SHA-256 checksums for verification |
 
-| Requirement | Version |
-|-------------|---------|
-| iOS | 15.0 or later |
-| Xcode | 15.0 or later |
-| Rust (cross-compile) | 1.75+ with `aarch64-apple-ios` target |
+### Verify the Download
+
+**Always verify the checksum before installing.** This ensures the file has not been tampered with or corrupted during download.
+
+#### macOS / Linux
+
+```bash
+# 1. Download both the .dmg and SHA256SUMS.txt from the Releases page
+
+# 2. Verify the checksum
+shasum -a 256 ZipherX_v4.2.1.dmg
+
+# 3. Compare the output with the hash in SHA256SUMS.txt
+# The two hashes MUST match exactly. If they don't, do NOT install — re-download or report the issue.
+```
+
+#### Windows (PowerShell)
+
+```powershell
+Get-FileHash ZipherX_v4.2.1.dmg -Algorithm SHA256
+```
+
+### Install from DMG
+
+1. **Open** the `.dmg` file (double-click)
+2. **Drag** `ZipherX.app` into your `/Applications` folder
+3. **First launch**: Right-click `ZipherX.app` > **Open** (required for unsigned or first-time apps on macOS)
+4. If macOS shows "ZipherX can't be opened because Apple cannot check it for malicious software":
+   - Go to **System Settings > Privacy & Security**
+   - Scroll down and click **Open Anyway**
+5. On first launch, ZipherX will download Sapling parameters (~50 MB) and a boost file (~1 GB) for fast sync
+
+### Uninstall
+
+1. Quit ZipherX
+2. Move `ZipherX.app` from `/Applications` to Trash
+3. Optionally remove application data:
+   ```bash
+   rm -rf ~/Library/Application\ Support/ZipherX/
+   rm -rf ~/Library/Application\ Support/ZipherXMac/
+   ```
+   **WARNING**: This deletes your wallet database. Export your spending key **before** removing data.
+
+---
+
+## Build from Source
+
+### Prerequisites
+
+#### Build Environment
+
+| Component | Minimum | Tested With |
+|-----------|---------|-------------|
+| macOS | 13.0 (Ventura) | 15.6.1 (Sequoia) |
+| Xcode | 15.0 | 16.4 (Build 16F6) |
+| Swift | 5.9 | 6.1.2 |
+| Rust | 1.75 | 1.93.1 |
+| Command Line Tools | Required | `xcode-select --install` |
+
+#### iOS Additional Requirements
+
+| Component | Minimum |
+|-----------|---------|
+| iOS deployment target | 15.0 |
+| Rust target | `aarch64-apple-ios` |
 | Apple Developer Account | Required for device deployment |
 
 ### Rust Toolchain
@@ -95,18 +155,14 @@ rustup target add x86_64-apple-darwin
 
 ZipherX requires Sapling cryptographic parameters for zk-SNARK proof generation. These are downloaded automatically on first launch, or you can pre-download them:
 
-| File | Size | Purpose |
-|------|------|---------|
-| `sapling-spend.params` | ~47 MB | Spend proof generation |
-| `sapling-output.params` | ~3.5 MB | Output proof generation |
+| File | Size | SHA-256 (first 16 chars) | Purpose |
+|------|------|--------------------------|---------|
+| `sapling-spend.params` | ~47 MB | `8270785a1a0d0bc7...` | Spend proof generation (Groth16) |
+| `sapling-output.params` | ~3.5 MB | `657e3d38dbb5cb5e...` | Output proof generation (Groth16) |
 
 Parameters are stored in `~/Library/Application Support/ZipherX/SaplingParams/`.
 
----
-
-## Installation
-
-### Build from Source (macOS)
+### Build (macOS)
 
 ```bash
 # 1. Clone the repository
@@ -126,7 +182,7 @@ open ZipherX.xcodeproj
 # 5. Build and Run (Cmd+R)
 ```
 
-### Build from Source (iOS)
+### Build (iOS)
 
 ```bash
 # 1. Clone the repository
@@ -143,7 +199,7 @@ open ZipherX.xcodeproj
 
 # 4. Select the "ZipherX" scheme and your iOS device
 
-# 5. Configure signing (Signing & Capabilities → select your team)
+# 5. Configure signing (Signing & Capabilities > select your team)
 
 # 6. Build and Run (Cmd+R)
 ```
@@ -151,8 +207,41 @@ open ZipherX.xcodeproj
 ### Build Notes
 
 - **SQLCipher**: Pre-built xcframework is included in `Libraries/SQLCipher.xcframework/`
-- **ZipherXFFI**: Pre-built xcframework headers are included. To rebuild from source, use the build scripts in `Libraries/zipherx-ffi/`
+- **ZipherXFFI**: Pre-built static library is included. To rebuild from source, use the Cargo workspace in `Libraries/zipherx-ffi/`
 - **Boost Files**: Downloaded automatically on first launch from the ZipherX CDN. Enables fast sync (~30 seconds vs ~5 minutes for full scan)
+- **Code Signing**: The macOS target uses Hardened Runtime. For distribution, sign and notarize with your Apple Developer ID.
+
+---
+
+## Version Details
+
+### ZipherX v4.2.1 (Build 21)
+
+| Component | Version | Notes |
+|-----------|---------|-------|
+| **ZipherX** | 4.2.1 (Build 21) | This release |
+| **zipherx-ffi** | 0.1.0 | Rust FFI — Sapling crypto, commitment tree, Groth16, Tor |
+| **SQLCipher** | 3.46.1 (SQLite 3.45.3) | AES-256 encrypted database |
+| **Arti (Tor)** | 0.37.x | Embedded Tor client (onion services, SOCKS5) |
+| **bellman** | 0.14 | Groth16 zk-SNARK prover |
+| **jubjub** | 0.10 | Jubjub elliptic curve (Sapling) |
+| **bls12_381** | 0.8 | BLS12-381 pairing (zk-SNARK) |
+| **zstd** | 0.13 | Compression (boost file extraction) |
+
+### Zclassic Full Node (for Full Node Mode)
+
+| Binary | Version | Path |
+|--------|---------|------|
+| **zclassicd** | v2.1.2-beta1 (ZipherX fork) | `/usr/local/bin/zclassicd` |
+| **zclassic-cli** | v2.1.2-beta1 (ZipherX fork) | `/usr/local/bin/zclassic-cli` |
+
+The ZipherX fork of Zclassic includes:
+- **Buttercup upgrade** support (triple halving at block 707,000)
+- **Equihash (192,7)** post-Bubbles (block 585,318)
+- Protocol version **170009**
+- Sapling activation at block **476,969**
+
+These binaries are only required for **Full Node Mode**. P2P Mode works without them.
 
 ---
 
@@ -183,7 +272,7 @@ open ZipherX.xcodeproj
 
 1. Tap **Receive** from the main screen
 2. Share your shielded address or QR code with the sender
-3. Incoming transactions appear after 1 block confirmation (~150 seconds)
+3. Incoming transactions appear after 1 block confirmation (~75 seconds post-Buttercup)
 
 ### Encrypted Chat
 
@@ -192,10 +281,11 @@ ZipherX includes peer-to-peer encrypted messaging over Tor:
 1. Go to **Chat** from the main menu
 2. **Enable Tor** — Required for chat (all messages route through Tor hidden services)
 3. **Add Contact** — Share your onion address with the other party
-4. **Send Messages** — End-to-end encrypted with Curve25519 key agreement
-5. **Send Payment Requests** — Request ZCL directly in chat
-6. **Profile Picture** — Set in Chat Settings (iOS: from Photos, macOS: from file)
-7. **Block Contacts** — Right-click (macOS) or long-press (iOS) a contact to block
+4. **Send Messages** — End-to-end encrypted with Curve25519 key agreement + ChaCha20-Poly1305
+5. **Voice Calls** — Encrypted peer-to-peer voice over Tor
+6. **Send Payment Requests** — Request ZCL directly in chat
+7. **Profile Picture** — Set in Chat Settings (iOS: from Photos, macOS: from file)
+8. **Block Contacts** — Right-click (macOS) or long-press (iOS) a contact to block
 
 ### Full Node Mode (macOS only)
 
@@ -207,8 +297,8 @@ ZipherX can connect to a local Zclassic full node for enhanced security, full tr
 
 | Requirement | Details |
 |-------------|---------|
-| **zclassicd** | Daemon binary at `/usr/local/bin/zclassicd` |
-| **zclassic-cli** | CLI tool at `/usr/local/bin/zclassic-cli` |
+| **zclassicd** | v2.1.2-beta1 (ZipherX fork) at `/usr/local/bin/zclassicd` |
+| **zclassic-cli** | v2.1.2-beta1 (ZipherX fork) at `/usr/local/bin/zclassic-cli` |
 | **Blockchain data** | `~/Library/Application Support/Zclassic/blocks/` (~5 GB) |
 | **zclassic.conf** | Configuration file (auto-generated if missing) |
 | **zstd** | Required for bootstrap extraction (`brew install zstd`) |
@@ -282,40 +372,58 @@ Your spending key is the master secret for your wallet. **If you lose it, your f
 3. Copy or write down your spending key
 4. Store it securely offline (never screenshot, never share)
 
+### Data Locations
+
+| Platform | Path | Contents |
+|----------|------|----------|
+| macOS | `~/Library/Application Support/ZipherX/` | Wallet database, Sapling params, logs |
+| macOS (Full Node) | `~/Library/Application Support/Zclassic/` | Blockchain data, wallet.dat |
+| iOS | App sandbox (managed by iOS) | Wallet database, Sapling params |
+| Logs (macOS) | `~/Library/Application Support/ZipherX/Logs/zmac.log` | Debug log |
+| Logs (iOS) | App sandbox `Logs/z.log` | Debug log |
+
 ### Network Status
 
 The status bar shows:
-- **Peers**: Number of connected P2P peers (3+ recommended)
+- **Peers**: Number of connected P2P peers (3+ recommended for consensus)
 - **Height**: Current blockchain height vs. your synced height
-- **Tor**: Connection status (required for chat)
+- **Tor**: Connection status (required for chat and enhanced privacy)
 
 ---
 
 ## Architecture
 
 ```
-SwiftUI / AppKit UI
-    |
-Swift Core (WalletManager, NetworkManager, FilterScanner)
-    |
-Rust FFI (Sapling crypto, commitment tree, Groth16 prover)
-    |
-Storage (SQLCipher encrypted database, HeaderStore)
-    |
-Network (P2P protocol over Tor, DNS seed discovery)
+┌─────────────────────────────────────────────────────────────┐
+│                    SwiftUI / AppKit UI                        │
+│  ContentView · BalanceView · SendView · ChatView · Settings  │
+├─────────────────────────────────────────────────────────────┤
+│                    Swift Core Layer                           │
+│  WalletManager · NetworkManager · FilterScanner · ChatManager│
+├─────────────────────────────────────────────────────────────┤
+│                  Rust FFI (zipherx-ffi)                       │
+│  Sapling crypto · Commitment tree · Groth16 · Tor (Arti)     │
+├─────────────────────────────────────────────────────────────┤
+│                     Storage Layer                            │
+│  WalletDatabase (SQLCipher) · HeaderStore · DeltaCMUManager  │
+├─────────────────────────────────────────────────────────────┤
+│                    Network Layer                             │
+│  P2P Protocol · Tor hidden services · DNS seed discovery     │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ### Key Technologies
 
-| Component | Technology |
-|-----------|-----------|
-| UI | SwiftUI (iOS + macOS) |
-| Crypto | Sapling / Groth16 zk-SNARKs (Rust FFI) |
-| Database | SQLCipher (256-bit AES) |
-| Networking | P2P Bitcoin-based protocol |
-| Privacy | Tor (embedded Arti client) |
-| Key Storage | Secure Enclave (iOS/macOS) |
-| Chat Encryption | Curve25519 + ChaCha20-Poly1305 |
+| Component | Technology | Version |
+|-----------|-----------|---------|
+| UI | SwiftUI (iOS + macOS) | Swift 6.1 |
+| Crypto | Sapling / Groth16 zk-SNARKs | bellman 0.14 / jubjub 0.10 |
+| Database | SQLCipher (256-bit AES) | 3.46.1 |
+| Networking | P2P Bitcoin-based protocol | Protocol 170009 |
+| Privacy | Tor (embedded Arti client) | 0.37.x |
+| Key Storage | Secure Enclave (iOS/macOS) | Hardware-backed |
+| Chat Encryption | Curve25519 + ChaCha20-Poly1305 | NaCl-compatible |
+| Compression | zstd | 0.13 |
 
 ---
 
@@ -325,16 +433,42 @@ Network (P2P protocol over Tor, DNS seed discovery)
 |-----------|-------|
 | Network | Zclassic Mainnet |
 | Protocol Version | 170009 |
+| Magic Bytes | `0x24 0xE9 0x27 0x64` |
 | Default Port | 8033 |
+| RPC Port | 8023 |
 | Sapling Activation | Block 476,969 |
-| Equihash Parameters | (192, 7) |
+| Bubbles Activation | Block 585,318 |
+| Buttercup Activation | Block 707,000 |
+| Equihash (post-Bubbles) | (192, 7) — 400-byte solution |
+| Block Spacing (post-Buttercup) | 75 seconds |
+| Block Reward (post-Buttercup) | 0.78125 ZCL |
 | Default Fee | 10,000 zatoshis (0.0001 ZCL) |
+
+---
+
+## Security
+
+ZipherX has undergone a security audit (v4.2.1). Key security features:
+
+- **Secure Enclave** — Spending keys stored in hardware-backed secure element
+- **SQLCipher** — All database files encrypted with AES-256
+- **Tor** — All P2P and chat traffic routed through Tor for IP privacy
+- **Groth16 zk-SNARKs** — Zero-knowledge proofs for shielded transactions
+- **Multi-peer consensus** — Requires 3+ peers to agree on chain state (anti-Sybil)
+- **Equihash PoW verification** — Block headers verified using Equihash (192,7)
+- **Hardened Runtime** — macOS binary uses Apple's Hardened Runtime protections
+- **Rate limiting** — P2P message processing rate-limited to prevent DoS
+- **Input validation** — All external inputs (addresses, amounts, P2P messages) validated
+
+For the full security audit report, see the [Releases](https://github.com/ZipherPunk/ZipherX/releases) page.
 
 ---
 
 ## License
 
 MIT License — See [LICENSE](LICENSE) for details.
+
+Copyright (c) 2025-2026 Zipherpunk
 
 ---
 
