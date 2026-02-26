@@ -1308,7 +1308,7 @@ final class ChatManager: ObservableObject {
 
         // FIX M-003: Reject duplicate onion address if existing session is active
         // Prevents session hijacking where attacker claims same onion as existing peer
-        if let existingPeer = peers[onionAddress], await existingPeer.getState() == .connected {
+        if let existingPeer = peers[onionAddress], await existingPeer.state == .connected {
             print("💬 FIX M-003: Rejected duplicate connection from \(onionAddress.prefix(16))... — active session exists")
             connection.cancel()
             return
@@ -1333,7 +1333,7 @@ final class ChatManager: ObservableObject {
                 if let idx = contacts.firstIndex(where: { $0.onionAddress == onionAddress }) {
                     contacts[idx] = updatedContact
                 }
-                saveContact(updatedContact)
+                self.saveContact(updatedContact)
                 print("💬 FIX M-001: Captured public key for \(onionAddress.prefix(16))... (Trust On First Use, incoming)")
             }
         }
@@ -1480,7 +1480,7 @@ final class ChatManager: ObservableObject {
                 if let idx = contacts.firstIndex(where: { $0.onionAddress == peerOnion }) {
                     contacts[idx] = updatedContact
                 }
-                saveContact(updatedContact)
+                self.saveContact(updatedContact)
                 print("💬 FIX M-001: Captured public key for \(peerOnion.prefix(16))... (Trust On First Use, outgoing)")
             }
         }
