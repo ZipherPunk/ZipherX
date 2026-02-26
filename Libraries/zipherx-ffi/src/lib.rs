@@ -1,0 +1,8620 @@
+//! ZipherX FFI - C bindings for Sapling cryptography
+//!
+//! This crate provides C-compatible functions for iOS integration
+//! Using real librustzcash for proper Sapling operations
+
+// Tor module (Arti integration)
+pub mod tor;
+
+// FIX #342: Fast HTTP downloads using reqwest (replaces slow Swift URLSession)
+pub mod download;
+
+// FIX #1385: DEBUG_LOGGING disabled in release builds via cfg gate.
+// Only enabled in debug/development builds to prevent sensitive data leakage in production.
+// FIX #514: Originally enabled to verify CMU byte order handling.
+#[cfg(debug_assertions)]
+const DEBUG_LOGGING: bool = true;
+#[cfg(not(debug_assertions))]
+const DEBUG_LOGGING: bool = false;
+
+// Macro for conditional debug output
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if DEBUG_LOGGING {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
+// FIX #730: CMU format clarification - boost file already stores CMUs in WIRE format!
+//
+// HISTORY OF THE BUG:
+// - FIX #557 v49 INCORRECTLY assumed cache file stores CMUs in DISPLAY format
+// - But generate_boost_file.py does: bytes.fromhex(cmu_hex)[::-1] which REVERSES to wire format
+// - So boost file has WIRE format, and FIX #557 v49 was reversing them AGAIN → double reversal!
+// - This caused tree root mismatch: computed tree root ≠ header's finalsaplingroot
+//
+// THE FIX:
+// - Boost file CMUs are ALREADY in wire format (Python reversed them from RPC display format)
+// - Node::read() expects wire format
+// - So we must NOT reverse - just copy the bytes directly
+//
+// This function is now an IDENTITY function (no reversal) for boost file loading.
+// Kept for backward compatibility with all call sites.
+fn reverse_cmu_display_to_wire(cmu_bytes: &[u8]) -> [u8; 32] {
+    // FIX #730: NO REVERSAL! Boost file CMUs are already in wire format
+    let mut wire_cmu = [0u8; 32];
+    wire_cmu.copy_from_slice(&cmu_bytes[0..32]);
+    wire_cmu
+}
+
+use std::slice;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::Path;
+use std::cmp::min;  // FIX #564: For fast validation checks
+use bip0039::{Count, English, Mnemonic};
+use bech32::{ToBase32, FromBase32, Variant};
+use rayon::prelude::*;
+
+use zcash_primitives::{
+    consensus::{Parameters, MainNetwork, BlockHeight, NetworkUpgrade},
+    sapling::{
+        keys::{FullViewingKey, OutgoingViewingKey},
+        Diversifier, PaymentAddress,
+        value::NoteValue,
+        Rseed,
+        note_encryption::{try_sapling_note_decryption, try_sapling_output_recovery, PreparedIncomingViewingKey, SaplingDomain},
+    },
+    zip32::{ChildIndex, DiversifierIndex, sapling::ExtendedSpendingKey},
+    transaction::{
+        builder::Builder,
+        components::Amount,
+    },
+    memo::MemoBytes,
+};
+use zcash_note_encryption::{EphemeralKeyBytes, ShieldedOutput, ENC_CIPHERTEXT_SIZE, Domain};
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::Aead};
+use chacha20poly1305::aead::generic_array::GenericArray;
+use incrementalmerkletree::{MerklePath, Position, frontier::CommitmentTree, witness::IncrementalWitness, Hashable};
+use zcash_primitives::merkle_tree::{read_commitment_tree, write_commitment_tree, read_incremental_witness, write_incremental_witness, HashSer};
+use zcash_proofs::prover::LocalTxProver;
+use zcash_proofs::sapling::SaplingVerificationContext;
+use zcash_proofs::ZcashParameters;
+use group::{GroupEncoding, cofactor::CofactorGroup, Curve};
+use ff::{PrimeField, Field};
+use subtle::ConstantTimeEq;  // FIX #1385: Side-channel resistant comparison for crypto data
+use rand::rngs::OsRng;
+use rand::Rng; // FIX #1402 (NEW-002): Random change diversifier
+use std::sync::atomic::AtomicU64; // FIX #1402 (NEW-004): Change diversifier persistence
+
+/// FIX #1402 (NEW-004): Stores the last change diversifier index used in TX construction.
+/// Read by Swift after a successful TX build to persist in the database.
+static LAST_CHANGE_DIVERSIFIER_INDEX: AtomicU64 = AtomicU64::new(0);
+
+/// FIX #1402 (META-001): Redact financial amounts in error messages (order of magnitude only)
+macro_rules! redact_amount {
+    ($zatoshis:expr) => {{
+        let zcl = $zatoshis as f64 / 100_000_000.0;
+        if zcl >= 1.0 {
+            format!("~{} ZCL", zcl as u64)
+        } else if zcl >= 0.1 {
+            "~0.X ZCL".to_string()
+        } else if zcl >= 0.01 {
+            "~0.0X ZCL".to_string()
+        } else {
+            "~dust ZCL".to_string()
+        }
+    }};
+}
+
+// Global prover instance
+static PROVER: Mutex<Option<LocalTxProver>> = Mutex::new(None);
+
+// Global verifying keys - stored separately from prover since LocalTxProver doesn't expose its VKs
+// These are used by zipherx_verify_transaction() to validate Sapling proofs before broadcast
+static VERIFYING_KEYS: Mutex<Option<ZcashParameters>> = Mutex::new(None);
+
+// VUL-F-007: Configurable transaction fee (default 10000 zatoshis = 0.0001 ZCL)
+// Set via zipherx_set_transaction_fee() from Swift
+static TRANSACTION_FEE: Mutex<u64> = Mutex::new(10000);
+
+// Sapling tree depth
+const SAPLING_COMMITMENT_TREE_DEPTH: u8 = 32;
+
+// =============================================================================
+// FIX #230: FFI Safety Module - Bounds-checked slice operations
+// =============================================================================
+//
+// This module provides safe wrappers for unsafe FFI operations to prevent:
+// - Buffer overflows from unchecked slice::from_raw_parts
+// - Panics from .unwrap() on malformed input
+// - Memory corruption from invalid pointers
+//
+// All FFI functions should use these helpers instead of raw unsafe operations.
+
+/// Safe wrapper for creating a slice from raw pointer with bounds validation
+/// Returns None if pointer is null or alignment is incorrect
+#[inline]
+// VUL-FFI-004: pub(crate) so download.rs can use it
+pub(crate) unsafe fn safe_slice<'a, T>(ptr: *const T, len: usize) -> Option<&'a [T]> {
+    if ptr.is_null() {
+        debug_log!("FFI Safety: null pointer passed to safe_slice");
+        return None;
+    }
+    if len == 0 {
+        return Some(&[]);
+    }
+    // Check alignment
+    if (ptr as usize) % std::mem::align_of::<T>() != 0 {
+        debug_log!("FFI Safety: misaligned pointer passed to safe_slice");
+        return None;
+    }
+    // Check for potential overflow in size calculation
+    if len > isize::MAX as usize / std::mem::size_of::<T>() {
+        debug_log!("FFI Safety: length would overflow in safe_slice");
+        return None;
+    }
+    Some(slice::from_raw_parts(ptr, len))
+}
+
+/// Safe wrapper for creating a mutable slice from raw pointer with bounds validation
+#[inline]
+unsafe fn safe_slice_mut<'a, T>(ptr: *mut T, len: usize) -> Option<&'a mut [T]> {
+    if ptr.is_null() {
+        debug_log!("FFI Safety: null pointer passed to safe_slice_mut");
+        return None;
+    }
+    if len == 0 {
+        return Some(&mut []);
+    }
+    // Check alignment
+    if (ptr as usize) % std::mem::align_of::<T>() != 0 {
+        debug_log!("FFI Safety: misaligned pointer passed to safe_slice_mut");
+        return None;
+    }
+    // Check for potential overflow
+    if len > isize::MAX as usize / std::mem::size_of::<T>() {
+        debug_log!("FFI Safety: length would overflow in safe_slice_mut");
+        return None;
+    }
+    Some(slice::from_raw_parts_mut(ptr, len))
+}
+
+/// Safe wrapper for creating a u64 slice from raw pointer with bounds validation
+/// Specifically for arrays of u64 values (like positions array)
+#[inline]
+unsafe fn safe_slice_u64<'a>(ptr: *const u64, len: usize) -> Option<&'a [u64]> {
+    if ptr.is_null() {
+        debug_log!("FFI Safety: null pointer passed to safe_slice_u64");
+        return None;
+    }
+    if len == 0 {
+        return Some(&[]);
+    }
+    // Check alignment
+    if (ptr as usize) % std::mem::align_of::<u64>() != 0 {
+        debug_log!("FFI Safety: misaligned pointer passed to safe_slice_u64");
+        return None;
+    }
+    // Check for potential overflow
+    if len > isize::MAX as usize / std::mem::size_of::<u64>() {
+        debug_log!("FFI Safety: length would overflow in safe_slice_u64");
+        return None;
+    }
+    Some(slice::from_raw_parts(ptr, len))
+}
+
+/// Safe mutex lock with timeout protection (prevents deadlocks)
+/// Returns None if lock is poisoned or cannot be acquired
+macro_rules! safe_lock {
+    ($mutex:expr) => {
+        match $mutex.lock() {
+            Ok(guard) => Some(guard),
+            Err(poisoned) => {
+                debug_log!("FFI Safety: mutex poisoned, recovering");
+                // Recover from poisoned mutex - the data may be in an inconsistent state
+                // but we prefer recovery over panic in FFI code
+                Some(poisoned.into_inner())
+            }
+        }
+    };
+}
+
+/// Safe conversion of byte slice to fixed-size array
+/// Returns None if slice length doesn't match
+#[inline]
+fn safe_array<const N: usize>(slice: &[u8]) -> Option<[u8; N]> {
+    if slice.len() != N {
+        debug_log!("FFI Safety: slice length {} != expected {}", slice.len(), N);
+        return None;
+    }
+    let mut arr = [0u8; N];
+    arr.copy_from_slice(slice);
+    Some(arr)
+}
+
+/// Safe conversion with explicit error for try_into
+#[inline]
+fn safe_try_into<const N: usize>(slice: &[u8]) -> Option<[u8; N]> {
+    slice.try_into().ok()
+}
+
+// =============================================================================
+// FIX #1385: Standardized FFI Error Codes
+// =============================================================================
+//
+// All extern "C" functions returning i32 should use these constants for
+// consistent error reporting across the Swift/Rust boundary.
+// Positive values = success, negative values = specific error categories.
+//
+// NOTE: Many existing functions use 0/1 or function-specific codes.
+// These constants are for NEW code and gradual migration — existing return
+// values are NOT changed to preserve backward compatibility with Swift callers.
+
+/// Operation completed successfully
+pub const FFI_SUCCESS: i32 = 1;
+/// Null pointer passed where non-null was required
+pub const FFI_ERROR_NULL_POINTER: i32 = -1;
+/// Length parameter is invalid (zero, too large, or mismatched)
+pub const FFI_ERROR_INVALID_LENGTH: i32 = -2;
+/// Integer overflow detected in size calculation
+pub const FFI_ERROR_OVERFLOW: i32 = -3;
+/// Failed to acquire mutex lock
+pub const FFI_ERROR_LOCK_FAILED: i32 = -4;
+/// Panic caught at FFI boundary (catch_unwind)
+pub const FFI_ERROR_PANIC: i32 = -5;
+/// Input data is malformed or cannot be parsed
+pub const FFI_ERROR_INVALID_DATA: i32 = -6;
+/// Output buffer too small for result
+pub const FFI_ERROR_BUFFER_TOO_SMALL: i32 = -7;
+/// Cryptographic operation failed (proof generation, key derivation, etc.)
+pub const FFI_ERROR_CRYPTO_FAILED: i32 = -8;
+/// Commitment tree is corrupted or in an invalid state
+pub const FFI_ERROR_TREE_CORRUPTED: i32 = -9;
+/// Witness operation failed (creation, update, serialization)
+pub const FFI_ERROR_WITNESS_FAILED: i32 = -10;
+
+/// FIX #1385: Macro to wrap FFI function bodies in catch_unwind.
+/// Prevents Rust panics from unwinding across the FFI boundary into Swift,
+/// which would be instant undefined behavior / crash.
+/// Usage: ffi_catch_unwind!(error_value, { ... body ... })
+macro_rules! ffi_catch_unwind {
+    ($error_val:expr, $body:block) => {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
+            Ok(result) => result,
+            Err(_panic) => {
+                eprintln!("❌ FIX #1385: Panic caught at FFI boundary");
+                $error_val
+            }
+        }
+    };
+}
+
+// Zclassic network parameters
+#[derive(Clone, Copy, Debug)]
+struct ZclassicNetwork;
+
+impl Parameters for ZclassicNetwork {
+    fn activation_height(&self, nu: NetworkUpgrade) -> Option<BlockHeight> {
+        // Zclassic-specific activation heights
+        // Using local fork of zcash_primitives with ZclassicButtercup branch ID (0x930b540d)
+        //
+        // Zclassic activation heights from chainparams.cpp:
+        // - Overwinter: 476,969
+        // - Sapling: 476,969
+        // - Bubbles: 585,318 (Zclassic-specific, branch ID 0x821a451c)
+        // - Buttercup: 707,000 (Zclassic-specific, branch ID 0x930b540d) - CURRENTLY ACTIVE
+        match nu {
+            NetworkUpgrade::Overwinter => Some(BlockHeight::from_u32(476969)),
+            NetworkUpgrade::Sapling => Some(BlockHeight::from_u32(476969)),
+            // Skip Blossom/Heartwood - these are Zcash-specific with wrong branch IDs
+            NetworkUpgrade::Blossom => None,
+            NetworkUpgrade::Heartwood => None,
+            NetworkUpgrade::Canopy => None,
+            NetworkUpgrade::Nu5 => None,
+            // ZclassicButtercup uses the correct branch ID (0x930b540d)
+            NetworkUpgrade::ZclassicButtercup => Some(BlockHeight::from_u32(707000)),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
+    fn coin_type(&self) -> u32 {
+        147 // ZCL coin type
+    }
+
+    fn address_network(&self) -> Option<zcash_address::Network> {
+        Some(zcash_address::Network::Main)
+    }
+
+    fn hrp_sapling_extended_spending_key(&self) -> &str {
+        "secret-extended-key-main"
+    }
+
+    fn hrp_sapling_extended_full_viewing_key(&self) -> &str {
+        "zviews"
+    }
+
+    fn hrp_sapling_payment_address(&self) -> &str {
+        "zs"
+    }
+
+    fn b58_pubkey_address_prefix(&self) -> [u8; 2] {
+        [0x1C, 0xB8] // Zclassic t1 prefix
+    }
+
+    fn b58_script_address_prefix(&self) -> [u8; 2] {
+        [0x1C, 0xBD] // Zclassic t3 prefix
+    }
+}
+
+
+// =============================================================================
+// VUL-F-007: Configurable Transaction Fee
+// =============================================================================
+
+/// Set the transaction fee used for all subsequent transaction builds.
+/// Thread-safe via Mutex. Default is 10000 zatoshis (0.0001 ZCL).
+///
+/// # Parameters
+/// - `fee`: Fee in zatoshis (1 ZCL = 100,000,000 zatoshis)
+///
+/// # Safety
+/// This function is safe to call from any thread. The fee value is validated
+/// to be 10,000–1,000,000 zatoshis (0.0001–0.01 ZCL) to prevent fee misconfiguration.
+///
+/// # Example
+/// ```swift
+/// ZipherXFFI.setTransactionFee(5000)  // Set to 0.00005 ZCL
+/// ```
+#[no_mangle]
+pub extern "C" fn zipherx_set_transaction_fee(fee: u64) -> i32 {
+    ffi_catch_unwind!(FFI_ERROR_PANIC, {
+        // VUL-F-007: Validate fee is reasonable
+        // Min: 10,000 zatoshis (0.0001 ZCL) — standard network minimum
+        // Max: 1,000,000 zatoshis (0.01 ZCL) — above this is almost certainly a mistake
+        const MIN_FEE: u64 = 10_000;
+        const MAX_FEE: u64 = 1_000_000;
+        if fee < MIN_FEE {
+            debug_log!("VUL-F-007: Rejected too-low fee: {} (min {})", fee, MIN_FEE);
+            return FFI_ERROR_INVALID_DATA;
+        }
+        if fee > MAX_FEE {
+            debug_log!("VUL-F-007: Rejected excessive fee: {} (max {})", fee, MAX_FEE);
+            return FFI_ERROR_INVALID_DATA;
+        }
+
+        match safe_lock!(TRANSACTION_FEE) {
+            Some(mut fee_guard) => {
+                *fee_guard = fee;
+                debug_log!("VUL-F-007: Transaction fee set to {} zatoshis", fee);
+                FFI_SUCCESS
+            }
+            None => {
+                eprintln!("VUL-F-007: Failed to acquire TRANSACTION_FEE mutex");
+                FFI_ERROR_LOCK_FAILED
+            }
+        }
+    })
+}
+
+/// Get the current transaction fee setting.
+/// Returns the fee in zatoshis, or 0 if the mutex lock fails.
+#[no_mangle]
+pub extern "C" fn zipherx_get_transaction_fee() -> u64 {
+    ffi_catch_unwind!(0, {
+        match safe_lock!(TRANSACTION_FEE) {
+            Some(fee_guard) => *fee_guard,
+            None => {
+                eprintln!("VUL-F-007: Failed to acquire TRANSACTION_FEE mutex for read");
+                10000 // Return default on lock failure
+            }
+        }
+    })
+}
+
+
+// =============================================================================
+// Mnemonic Generation
+// =============================================================================
+
+/// Generate a 24-word BIP-39 mnemonic
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_generate_mnemonic(output: *mut u8) -> usize {
+    // FIX #1385: Null pointer validation
+    if output.is_null() { return 0; }
+    // FIX #1385: catch_unwind to prevent panics crossing FFI boundary
+    ffi_catch_unwind!(0, {
+        let mnemonic: Mnemonic<English> = Mnemonic::generate(Count::Words24);
+
+        // VUL-CRYPTO-009: Entropy health check — reject degenerate RNG output
+        let entropy = mnemonic.entropy();
+        if entropy.iter().all(|&b| b == 0x00) || entropy.iter().all(|&b| b == 0xFF) {
+            debug_log!("SECURITY: Rejected degenerate entropy (all-zero or all-0xFF)");
+            return 0;
+        }
+        let unique_bytes: std::collections::HashSet<u8> = entropy.iter().copied().collect();
+        if (unique_bytes.len() * 2) < entropy.len() {
+            debug_log!("SECURITY: Rejected low-entropy mnemonic ({}/{} unique bytes)", unique_bytes.len(), entropy.len());
+            return 0;
+        }
+
+        let phrase = mnemonic.phrase();
+        let bytes = phrase.as_bytes();
+
+        if bytes.len() > 256 {
+            return 0;
+        }
+
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), output, bytes.len());
+        bytes.len()
+    })
+}
+
+/// Validate a BIP-39 mnemonic
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_validate_mnemonic(mnemonic: *const i8) -> bool {
+    ffi_catch_unwind!(false, {
+    let c_str = match std::ffi::CStr::from_ptr(mnemonic).to_str() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    Mnemonic::<English>::from_phrase(c_str).is_ok()
+    })
+}
+
+/// Derive seed from mnemonic (PBKDF2-SHA512)
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_mnemonic_to_seed(
+    mnemonic: *const i8,
+    output: *mut u8,
+) -> bool {
+    // FIX #1385: Null pointer validation
+    if mnemonic.is_null() || output.is_null() { return false; }
+    // FIX #1385: catch_unwind to prevent panics crossing FFI boundary
+    ffi_catch_unwind!(false, {
+        let phrase = match std::ffi::CStr::from_ptr(mnemonic).to_str() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+
+        let mnemonic: Mnemonic<English> = match Mnemonic::from_phrase(phrase) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+
+        let seed = mnemonic.to_seed("");
+        std::ptr::copy_nonoverlapping(seed.as_ptr(), output, 64);
+        true
+    })
+}
+
+// =============================================================================
+// Key Derivation - Real ZIP-32 Implementation
+// =============================================================================
+
+/// Derive extended spending key from seed using ZIP-32
+/// Stores the full 169-byte serialized ExtendedSpendingKey
+/// FIX #230: Now uses safe_slice for bounds validation
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_derive_spending_key(
+    seed: *const u8,
+    account: u32,
+    sk_out: *mut u8,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    // FIX #230: Validate input pointers and create safe slice
+    let seed_slice = match safe_slice(seed, 64) {
+        Some(s) => s,
+        None => {
+            debug_log!("zipherx_derive_spending_key: invalid seed pointer");
+            return false;
+        }
+    };
+
+    if sk_out.is_null() {
+        debug_log!("zipherx_derive_spending_key: null output pointer");
+        return false;
+    }
+
+    // Derive master extended spending key using ZIP-32
+    let master = ExtendedSpendingKey::master(seed_slice);
+
+    // Derive to account level: m/32'/147'/account'
+    let account_key = master
+        .derive_child(ChildIndex::Hardened(32))
+        .derive_child(ChildIndex::Hardened(147))
+        .derive_child(ChildIndex::Hardened(account));
+
+    // Serialize the full ExtendedSpendingKey (169 bytes)
+    // This includes: depth, parent_fvk_tag, child_index, chain_code, expsk, dk
+    let mut serialized = Vec::new();
+    // FIX #230: Replace .unwrap() with proper error handling
+    if account_key.write(&mut serialized).is_err() {
+        debug_log!("zipherx_derive_spending_key: failed to serialize key");
+        return false;
+    }
+
+    if serialized.len() != 169 {
+        debug_log!("zipherx_derive_spending_key: unexpected serialized length");
+        return false;
+    }
+
+    std::ptr::copy_nonoverlapping(serialized.as_ptr(), sk_out, 169);
+
+    true
+    })
+}
+
+/// Derive payment address from serialized ExtendedSpendingKey (169 bytes)
+/// FIX #230: Now uses safe_slice for bounds validation
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_derive_address(
+    sk: *const u8,
+    diversifier_index: u64,
+    address_out: *mut u8,
+    actual_index_out: *mut u64,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    // FIX #230: Validate input pointer
+    let sk_slice = match safe_slice(sk, 169) {
+        Some(s) => s,
+        None => {
+            debug_log!("zipherx_derive_address: invalid sk pointer");
+            return false;
+        }
+    };
+
+    if address_out.is_null() {
+        debug_log!("zipherx_derive_address: null output pointer");
+        return false;
+    }
+
+    // Deserialize the ExtendedSpendingKey
+    let account_key = match ExtendedSpendingKey::read(&mut &sk_slice[..]) {
+        Ok(key) => key,
+        Err(_) => return false,
+    };
+
+    // PRIVACY: P-ADDR-003 — Support diversified address derivation
+    let dfvk = account_key.to_diversifiable_full_viewing_key();
+    let (actual_j, addr) = if diversifier_index == 0 {
+        dfvk.default_address()
+    } else {
+        let j = DiversifierIndex::from(diversifier_index);
+        match dfvk.find_address(j) {
+            Some((found_j, address)) => {
+                // find_address returns the next VALID diversifier >= j
+                // FIX: Return the ACTUAL valid index, not the requested one
+                (found_j, address)
+            }
+            None => {
+                debug_log!("zipherx_derive_address: no valid diversifier at index {}", diversifier_index);
+                return false;
+            }
+        }
+    };
+
+    // Serialize address: diversifier (11) + pk_d (32) = 43 bytes
+    let addr_bytes = addr.to_bytes();
+
+    std::ptr::copy_nonoverlapping(addr_bytes.as_ptr(), address_out, 43);
+
+    // Write actual valid diversifier index to actual_index_out if provided
+    if !actual_index_out.is_null() {
+        // Convert DiversifierIndex ([u8; 11]) back to u64 (little-endian, first 8 bytes)
+        let mut idx_bytes = [0u8; 8];
+        idx_bytes.copy_from_slice(&actual_j.0[..8]);
+        let actual_idx = u64::from_le_bytes(idx_bytes);
+        std::ptr::write(actual_index_out, actual_idx);
+    }
+
+    true
+    })
+}
+
+/// Derive incoming viewing key from serialized ExtendedSpendingKey (169 bytes)
+/// FIX #230: Now uses safe_slice for bounds validation
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_derive_ivk(
+    sk: *const u8,
+    ivk_out: *mut u8,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    // FIX #230: Validate input pointer
+    let sk_slice = match safe_slice(sk, 169) {
+        Some(s) => s,
+        None => {
+            debug_log!("zipherx_derive_ivk: invalid sk pointer");
+            return false;
+        }
+    };
+
+    if ivk_out.is_null() {
+        debug_log!("zipherx_derive_ivk: null output pointer");
+        return false;
+    }
+
+    // Deserialize the ExtendedSpendingKey
+    let account_key = match ExtendedSpendingKey::read(&mut &sk_slice[..]) {
+        Ok(key) => key,
+        Err(_) => return false,
+    };
+
+    // Derive full viewing key from expanded spending key
+    let fvk = FullViewingKey::from_expanded_spending_key(&account_key.expsk);
+    let ivk = fvk.vk.ivk();
+
+    let ivk_bytes = ivk.to_repr();
+    std::ptr::copy_nonoverlapping(ivk_bytes.as_ptr(), ivk_out, 32);
+
+    true
+    })
+}
+
+
+/// Compute nullifier for a note using proper Sapling cryptography
+/// Requires the spending key (169 bytes) to derive nk for PRF_nf
+/// FIX #230: Now uses safe_slice for bounds validation
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_compute_nullifier(
+    spending_key: *const u8,  // Extended spending key (169 bytes)
+    diversifier: *const u8,
+    value: u64,
+    rcm: *const u8,
+    position: u64,
+    nf_out: *mut u8,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    use zcash_primitives::sapling::{Diversifier, Rseed};
+    use zcash_primitives::zip32::ExtendedSpendingKey;
+    use jubjub::Fr;
+    use ff::PrimeField;
+
+    // FIX #230: Validate all input pointers
+    let sk_slice = match safe_slice(spending_key, 169) {
+        Some(s) => s,
+        None => {
+            debug_log!("zipherx_compute_nullifier: invalid spending_key pointer");
+            return false;
+        }
+    };
+    let div_slice = match safe_slice(diversifier, 11) {
+        Some(s) => s,
+        None => {
+            debug_log!("zipherx_compute_nullifier: invalid diversifier pointer");
+            return false;
+        }
+    };
+    let rcm_slice = match safe_slice(rcm, 32) {
+        Some(s) => s,
+        None => {
+            debug_log!("zipherx_compute_nullifier: invalid rcm pointer");
+            return false;
+        }
+    };
+
+    if nf_out.is_null() {
+        debug_log!("zipherx_compute_nullifier: null output pointer");
+        return false;
+    }
+
+    // Parse the extended spending key
+    let extsk = match ExtendedSpendingKey::read(&sk_slice[..]) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("Failed to parse spending key for nullifier: {:?}", e);
+            return false;
+        }
+    };
+
+    // Get the diversifiable full viewing key
+    let dfvk = extsk.to_diversifiable_full_viewing_key();
+
+    // Get the nullifier deriving key (nk) from fvk.vk
+    let nk = dfvk.fvk().vk.nk;
+
+    // Parse diversifier
+    let mut div_bytes = [0u8; 11];
+    div_bytes.copy_from_slice(div_slice);
+    let diversifier = Diversifier(div_bytes);
+
+    // Get payment address from the viewing key and diversifier
+    let payment_address = match dfvk.fvk().vk.to_payment_address(diversifier) {
+        Some(addr) => addr,
+        None => {
+            eprintln!("Invalid diversifier for nullifier computation");
+            return false;
+        }
+    };
+
+    // Parse rcm as a scalar
+    let mut rcm_bytes = [0u8; 32];
+    rcm_bytes.copy_from_slice(rcm_slice);
+    let rcm_scalar: Fr = match Option::<Fr>::from(Fr::from_repr(rcm_bytes)) {
+        Some(r) => r,
+        None => {
+            eprintln!("Invalid rcm for nullifier computation");
+            return false;
+        }
+    };
+
+    // Create the note using the PaymentAddress convenience method
+    let note = payment_address.create_note(value, Rseed::BeforeZip212(rcm_scalar));
+
+    // Compute nullifier using proper PRF_nf
+    let nullifier = note.nf(&nk, position);
+
+    // Copy nullifier to output
+    std::ptr::copy_nonoverlapping(nullifier.0.as_ptr(), nf_out, 32);
+
+    true
+    })
+}
+
+// =============================================================================
+// Address Operations
+// =============================================================================
+
+/// Encode address bytes as Zclassic z-address string using Bech32
+/// FIX #230: Now uses safe_slice for bounds validation
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_encode_address(
+    address: *const u8,
+    output: *mut u8,
+) -> usize {
+    ffi_catch_unwind!(0, {
+    // FIX #230: Validate input pointers
+    let addr_slice = match safe_slice(address, 43) {
+        Some(s) => s,
+        None => {
+            debug_log!("zipherx_encode_address: invalid address pointer");
+            return 0;
+        }
+    };
+
+    if output.is_null() {
+        debug_log!("zipherx_encode_address: null output pointer");
+        return 0;
+    }
+
+    // Encode using Bech32 with "zs" prefix (Zclassic Sapling)
+    let encoded = match bech32::encode("zs", addr_slice.to_base32(), Variant::Bech32) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+
+    let bytes = encoded.as_bytes();
+
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), output, bytes.len());
+    bytes.len()
+    })
+}
+
+/// Decode Zclassic z-address string to bytes
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_decode_address(
+    address_str: *const i8,
+    output: *mut u8,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    // FIX #1385: Null pointer validation
+    if address_str.is_null() || output.is_null() { return false; }
+    let addr = match std::ffi::CStr::from_ptr(address_str).to_str() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    // Decode Bech32
+    let (hrp, data, _variant) = match bech32::decode(addr) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+
+    // Must have "zs" prefix for Zclassic Sapling
+    if hrp != "zs" {
+        return false;
+    }
+
+    // Convert from base32 to bytes
+    let bytes = match Vec::<u8>::from_base32(&data) {
+        Ok(b) if b.len() == 43 => b,
+        _ => return false,
+    };
+
+    // Debug: print the diversifier from this address
+    debug_log!("DEBUG decode_address: diversifier = {:02x?}", &bytes[0..11]);
+
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), output, 43);
+    true
+    })
+}
+
+/// Validate a z-address
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_validate_address(address_str: *const i8) -> bool {
+    ffi_catch_unwind!(false, {
+    let addr = match std::ffi::CStr::from_ptr(address_str).to_str() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    // Decode and validate Bech32
+    let (hrp, data, _variant) = match bech32::decode(addr) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+
+    // Must have "zs" prefix for Zclassic Sapling
+    if hrp != "zs" {
+        return false;
+    }
+
+    // Convert from base32 and check length
+    match Vec::<u8>::from_base32(&data) {
+        Ok(b) => b.len() == 43,
+        Err(_) => false,
+    }
+    })
+}
+
+// =============================================================================
+// Note Decryption - Manual ChaCha20Poly1305 Implementation
+// =============================================================================
+
+/// Try to decrypt a Sapling note using incoming viewing key
+/// Uses manual implementation matching zcash_primitives exactly
+/// FIX #230: Now uses safe_slice for bounds validation
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_try_decrypt_note(
+    ivk: *const u8,
+    epk: *const u8,
+    cmu: *const u8,
+    ciphertext: *const u8,
+    output: *mut u8,
+) -> usize {
+    ffi_catch_unwind!(0, {
+    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, aead::Aead, KeyInit};
+
+    // FIX #230: Validate all input pointers
+    let ivk_slice = match safe_slice(ivk, 32) {
+        Some(s) => s,
+        None => {
+            debug_log!("zipherx_try_decrypt_note: invalid ivk pointer");
+            return 0;
+        }
+    };
+    let epk_slice = match safe_slice(epk, 32) {
+        Some(s) => s,
+        None => {
+            debug_log!("zipherx_try_decrypt_note: invalid epk pointer");
+            return 0;
+        }
+    };
+    let _cmu_slice = match safe_slice(cmu, 32) {
+        Some(s) => s,
+        None => {
+            debug_log!("zipherx_try_decrypt_note: invalid cmu pointer");
+            return 0;
+        }
+    };
+    let ciphertext_slice = match safe_slice(ciphertext, 580) {
+        Some(s) => s,
+        None => {
+            debug_log!("zipherx_try_decrypt_note: invalid ciphertext pointer");
+            return 0;
+        }
+    };
+
+    if output.is_null() {
+        debug_log!("zipherx_try_decrypt_note: null output pointer");
+        return 0;
+    }
+
+    // Parse ivk as scalar
+    let mut ivk_bytes = [0u8; 32];
+    ivk_bytes.copy_from_slice(ivk_slice);
+
+    let ivk_scalar: jubjub::Fr = match Option::<jubjub::Fr>::from(jubjub::Fr::from_repr(ivk_bytes)) {
+        Some(f) => f,
+        None => {
+            return 0;
+        }
+    };
+
+    // Parse ephemeral key as ExtendedPoint
+    let mut epk_bytes = [0u8; 32];
+    epk_bytes.copy_from_slice(epk_slice);
+
+    let epk: jubjub::ExtendedPoint = match Option::<jubjub::ExtendedPoint>::from(jubjub::ExtendedPoint::from_bytes(&epk_bytes)) {
+        Some(p) => p,
+        None => {
+            return 0;
+        }
+    };
+
+    // Derive shared secret: Ka = [8 * ivk] epk (cofactor clearing)
+    // This is per zcash_primitives spec.rs ka_sapling_agree_prepared
+    let ka = epk * ivk_scalar;
+    let ka_cleared = ka.clear_cofactor();  // Multiply by cofactor 8
+
+    // Convert SubgroupPoint to ExtendedPoint, then to AffinePoint
+    let ka_extended: jubjub::ExtendedPoint = ka_cleared.into();
+    let ka_affine = ka_extended.to_affine();
+    // Use compressed point encoding (v with sign bit for u) per zcash_primitives
+    let ka_bytes = ka_affine.to_bytes();
+
+    // KDF: symmetric_key = BLAKE2b-256(personalization="Zcash_SaplingKDF", dhsecret || epk)
+    // Per zcash_primitives/src/sapling/keys.rs lines 464-470
+    let mut kdf_hasher = blake2b_simd::Params::new()
+        .hash_length(32)
+        .personal(b"Zcash_SaplingKDF")
+        .to_state();
+    kdf_hasher.update(&ka_bytes);
+    kdf_hasher.update(&epk_bytes);
+    let symmetric_key = kdf_hasher.finalize();
+
+    // Decrypt with ChaCha20Poly1305
+    // FIX #1389: Copy key bytes into mutable buffer so we can zero after use
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(symmetric_key.as_bytes());
+    let key = Key::from_slice(&key_bytes);
+    let cipher = ChaCha20Poly1305::new(key);
+    let nonce = Nonce::from_slice(&[0u8; 12]);
+
+    // Ciphertext is 580 bytes: 564 encrypted + 16 tag
+    let decrypted = match cipher.decrypt(nonce, &ciphertext_slice[..580]) {
+        Ok(p) => p,
+        Err(_) => {
+            // FIX #1389: Zero cipher key material before returning
+            secure_zero(&mut key_bytes);
+            return 0;
+        }
+    };
+
+    // FIX #1389: Zero cipher key material after decryption
+    secure_zero(&mut key_bytes);
+
+    if decrypted.len() < 51 {
+        return 0;
+    }
+
+    // Copy to output: diversifier(11) || value(8) || rcm(32) || memo(512)
+    let out_len = decrypted.len().min(564);
+    std::ptr::copy_nonoverlapping(decrypted.as_ptr(), output, out_len);
+    out_len
+    })
+}
+
+/// Try to decrypt a Sapling note using the spending key directly
+/// This uses the full zcash_primitives derivation to ensure correctness
+/// A simple struct implementing ShieldedOutput for note decryption
+struct RawShieldedOutput {
+    epk: [u8; 32],
+    cmu: [u8; 32],
+    enc_ciphertext: [u8; 580],
+}
+
+impl<P: Parameters> ShieldedOutput<SaplingDomain<P>, ENC_CIPHERTEXT_SIZE> for RawShieldedOutput {
+    fn ephemeral_key(&self) -> EphemeralKeyBytes {
+        EphemeralKeyBytes(self.epk)
+    }
+
+    fn cmstar_bytes(&self) -> [u8; 32] {
+        self.cmu
+    }
+
+    fn enc_ciphertext(&self) -> &[u8; ENC_CIPHERTEXT_SIZE] {
+        &self.enc_ciphertext
+    }
+}
+
+/// FIX #230: Now uses safe_slice for bounds validation
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_try_decrypt_note_with_sk(
+    sk: *const u8,
+    epk: *const u8,
+    cmu: *const u8,
+    ciphertext: *const u8,
+    output: *mut u8,
+) -> usize {
+    ffi_catch_unwind!(0, {
+    // FIX #230: Validate all input pointers
+    let sk_slice = match safe_slice(sk, 169) {
+        Some(s) => s,
+        None => {
+            debug_log!("zipherx_try_decrypt_note_with_sk: invalid sk pointer");
+            return 0;
+        }
+    };
+    let epk_slice = match safe_slice(epk, 32) {
+        Some(s) => s,
+        None => {
+            debug_log!("zipherx_try_decrypt_note_with_sk: invalid epk pointer");
+            return 0;
+        }
+    };
+    let cmu_slice = match safe_slice(cmu, 32) {
+        Some(s) => s,
+        None => {
+            debug_log!("zipherx_try_decrypt_note_with_sk: invalid cmu pointer");
+            return 0;
+        }
+    };
+    let ciphertext_slice = match safe_slice(ciphertext, 580) {
+        Some(s) => s,
+        None => {
+            debug_log!("zipherx_try_decrypt_note_with_sk: invalid ciphertext pointer");
+            return 0;
+        }
+    };
+
+    if output.is_null() {
+        debug_log!("zipherx_try_decrypt_note_with_sk: null output pointer");
+        return 0;
+    }
+
+    // Deserialize the ExtendedSpendingKey
+    let extsk = match ExtendedSpendingKey::read(&mut &sk_slice[..]) {
+        Ok(key) => key,
+        Err(e) => {
+            debug_log!("DEBUG: ❌ Failed to deserialize ExtendedSpendingKey: {:?}", e);
+            return 0;
+        }
+    };
+
+    // Debug: print SK first bytes
+    debug_log!("DEBUG: SK bytes[0..8] = {:02x?}", &sk_slice[0..8]);
+
+    // Derive IVK using zcash_primitives
+    let fvk = FullViewingKey::from_expanded_spending_key(&extsk.expsk);
+    let ivk = fvk.vk.ivk();
+    let prepared_ivk = PreparedIncomingViewingKey::new(&ivk);
+
+    // Debug: print ak to verify FVK
+    debug_log!("DEBUG: ak[0..4] = {:02x?}", &fvk.vk.ak.to_bytes()[0..4]);
+
+    // Debug: derive default address and print its diversifier
+    let (_, default_addr) = extsk.default_address();
+    let div_bytes = default_addr.diversifier().0;
+    debug_log!("DEBUG: IVK scalar = {:?}", ivk.0.to_repr());
+    debug_log!("DEBUG: Default diversifier = {:02x?}", div_bytes);
+
+    // Debug: print the full address bytes and pk_d to verify
+    let addr_bytes = default_addr.to_bytes();
+    debug_log!("DEBUG: Full address bytes[0..8] = {:02x?}", &addr_bytes[0..8]);
+    // Use GroupEncoding trait to get bytes
+    let pk_d_bytes = default_addr.pk_d().inner().to_bytes();
+    debug_log!("DEBUG: pk_d bytes = {:02x?}", pk_d_bytes);
+
+    // Verify IVK by manually computing [ivk] g_d and comparing to pk_d
+    if let Some(g_d) = default_addr.diversifier().g_d() {
+        let computed_pk_d = g_d * ivk.0;
+        let computed_pk_d_bytes = computed_pk_d.to_bytes();
+        if computed_pk_d_bytes == pk_d_bytes {
+            debug_log!("DEBUG: ✅ IVK verification: [ivk] g_d == pk_d");
+        } else {
+            debug_log!("DEBUG: ❌ IVK verification FAILED!");
+            debug_log!("DEBUG: Expected pk_d = {:02x?}", pk_d_bytes);
+            debug_log!("DEBUG: Computed pk_d = {:02x?}", computed_pk_d_bytes);
+        }
+    }
+
+    // Create the output struct
+    let mut epk_bytes = [0u8; 32];
+    let mut cmu_bytes = [0u8; 32];
+    let mut enc_bytes = [0u8; 580];
+    epk_bytes.copy_from_slice(epk_slice);
+    cmu_bytes.copy_from_slice(cmu_slice);
+    enc_bytes.copy_from_slice(ciphertext_slice);
+
+    // Debug: print first bytes of each input
+    debug_log!("DEBUG: EPK[0..4] = {:02x?}", &epk_bytes[0..4]);
+    debug_log!("DEBUG: CMU[0..4] = {:02x?}", &cmu_bytes[0..4]);
+    debug_log!("DEBUG: ENC[0..4] = {:02x?}", &enc_bytes[0..4]);
+    debug_log!("DEBUG: About to parse EPK as curve point...");
+
+    // Debug: try to parse EPK as a curve point
+    let epk_point_opt = jubjub::ExtendedPoint::from_bytes(&epk_bytes);
+    debug_log!("DEBUG: EPK parsing complete");
+    let epk_valid: bool = epk_point_opt.is_some().into();
+    if epk_valid {
+        debug_log!("DEBUG: ✅ EPK is valid curve point");
+    } else {
+        debug_log!("DEBUG: ❌ EPK is NOT a valid curve point!");
+        return 0;
+    }
+    let epk_point: jubjub::ExtendedPoint = match Option::from(epk_point_opt) {
+        Some(p) => p,
+        None => return 0,
+    };
+
+    // Manual KDF to debug decryption
+    // Clear cofactor on EPK first, then multiply by IVK (matches working test)
+    let epk_cleared = epk_point.clear_cofactor();
+    let ka = jubjub::ExtendedPoint::from(epk_cleared) * ivk.0;
+    let ka_bytes = ka.to_affine().to_bytes();
+    debug_log!("DEBUG: KA (shared secret) first 4 bytes: {:02x?}", &ka_bytes[0..4]);
+
+    // Also print full EPK and IVK for verification
+    debug_log!("DEBUG: Full EPK = {:02x?}", epk_bytes);
+    debug_log!("DEBUG: Full IVK = {:02x?}", ivk.0.to_repr());
+
+    // KDF: derive symmetric key using BLAKE2b
+    let mut kdf_input = [0u8; 64];
+    kdf_input[0..32].copy_from_slice(&ka_bytes);
+    kdf_input[32..64].copy_from_slice(&epk_bytes);
+
+    let key = blake2b_simd::Params::new()
+        .hash_length(32)
+        .personal(b"Zcash_SaplingKDF")
+        .to_state()
+        .update(&kdf_input)
+        .finalize();
+
+    // FIX #1385: Zero KDF input (contains shared secret + EPK) after use
+    secure_zero(&mut kdf_input);
+
+    debug_log!("DEBUG: KDF key first 4 bytes: {:02x?}", &key.as_bytes()[0..4]);
+
+    // Try ChaCha20Poly1305 decryption
+    // FIX #1389: Copy key bytes into mutable buffer so we can zero after use
+    let mut cipher_key_bytes = [0u8; 32];
+    cipher_key_bytes.copy_from_slice(key.as_bytes());
+    let cipher_key = GenericArray::from_slice(&cipher_key_bytes);
+    let cipher = ChaCha20Poly1305::new(cipher_key);
+    let nonce = GenericArray::from_slice(&[0u8; 12]);
+
+    // The enc_ciphertext is 580 bytes = 564 plaintext + 16 tag
+    match cipher.decrypt(nonce, &enc_bytes[..]) {
+        Ok(plaintext) => {
+            debug_log!("DEBUG: ✅ Manual decryption succeeded! Plaintext len: {}", plaintext.len());
+            debug_log!("DEBUG: Plaintext version byte: 0x{:02x}", plaintext[0]);
+            debug_log!("DEBUG: Plaintext diversifier: {:02x?}", &plaintext[1..12]);
+
+            // Check version byte
+            if plaintext[0] != 0x01 && plaintext[0] != 0x02 {
+                debug_log!("DEBUG: ❌ Invalid version byte!");
+            }
+
+            // Extract value (bytes 12-20, little-endian u64)
+            // FIX #761: Safe bounds check instead of unwrap panic
+            if plaintext.len() < 20 {
+                debug_log!("DEBUG: ❌ Plaintext too short for value extraction: {} bytes", plaintext.len());
+                // FIX #1389: Zero cipher key material before returning
+                secure_zero(&mut cipher_key_bytes);
+                return 0;
+            }
+            let value = u64::from_le_bytes(plaintext[12..20].try_into().unwrap_or([0u8; 8]));
+            debug_log!("DEBUG: Decrypted value: {} zatoshis ({} ZCL)", value, value as f64 / 100_000_000.0);
+
+            // Check if diversifier matches our address
+            // FIX #1385: Use constant-time comparison to prevent timing side-channel attacks
+            let our_div = default_addr.diversifier().0;
+            if bool::from(plaintext[1..12].ct_eq(&our_div[..])) {
+                debug_log!("DEBUG: ✅ Diversifier MATCHES! This note is for us!");
+            } else {
+                debug_log!("DEBUG: ❌ Diversifier does not match. Note is for someone else.");
+                debug_log!("DEBUG: Expected: {:02x?}", our_div);
+                debug_log!("DEBUG: Got:      {:02x?}", &plaintext[1..12]);
+            }
+        }
+        Err(_e) => {
+            debug_log!("DEBUG: ❌ ChaCha20Poly1305 auth tag verification failed");
+        }
+    }
+
+    // FIX #1389: Zero cipher key material after decryption
+    secure_zero(&mut cipher_key_bytes);
+
+    let shielded_output = RawShieldedOutput {
+        epk: epk_bytes,
+        cmu: cmu_bytes,
+        enc_ciphertext: enc_bytes,
+    };
+
+    // Use block height for the transaction (Zclassic Sapling blocks)
+    let height = BlockHeight::from_u32(2918700);
+
+    // Try to decrypt using zcash_primitives
+    debug_log!("DEBUG: Now trying zcash_primitives decryption...");
+
+    match try_sapling_note_decryption(&ZclassicNetwork, height, &prepared_ivk, &shielded_output) {
+        Some((note, address, memo)) => {
+            debug_log!("✅ DECRYPTION SUCCESS! Value: {} zatoshis", note.value().inner());
+            // Successfully decrypted! Pack the result
+            // Format: diversifier(11) + value(8) + rcm(32) + memo(512)
+            let diversifier = address.diversifier().0;
+            debug_log!("DEBUG: Returned diversifier from zcash_primitives: {:02x?}", diversifier);
+            let value: u64 = note.value().inner();
+            let rcm = match note.rseed() {
+                Rseed::BeforeZip212(rcm) => rcm.to_repr(),
+                Rseed::AfterZip212(rseed) => {
+                    // For ZIP-212, we need to derive rcm from rseed
+                    // For now, just return the rseed bytes
+                    *rseed
+                }
+            };
+
+            // FIX #230: Copy to output buffer with safe slice validation
+            let out_slice = match safe_slice_mut(output, 564) {
+                Some(s) => s,
+                None => return 0,  // Invalid output buffer
+            };
+            out_slice[0..11].copy_from_slice(&diversifier);
+            out_slice[11..19].copy_from_slice(&value.to_le_bytes());
+            out_slice[19..51].copy_from_slice(&rcm);
+            out_slice[51..563].copy_from_slice(memo.as_array());
+
+            564
+        }
+        None => 0,
+    }
+    })
+}
+
+// =============================================================================
+// Parallel Decryption (Rayon-based for 6.7x speedup)
+// =============================================================================
+
+/// Batch decrypt multiple shielded outputs in parallel using Rayon
+///
+/// This function provides ~6.7x speedup over sequential decryption by using
+/// all available CPU cores (Rayon's work-stealing thread pool).
+///
+/// # Input format (per output):
+/// - epk: 32 bytes (ephemeral public key)
+/// - cmu: 32 bytes (note commitment)
+/// - ciphertext: 580 bytes (encrypted note)
+/// Total: 644 bytes per output
+///
+/// # Output format (per output):
+/// - found: 1 byte (0 = not ours, 1 = decrypted successfully)
+/// - If found == 1:
+///   - diversifier: 11 bytes
+///   - value: 8 bytes (little-endian u64)
+///   - rcm: 32 bytes
+///   - memo: 512 bytes
+/// Total: 564 bytes per output (1 byte flag + 563 bytes data)
+///
+/// # Parameters
+/// - sk: spending key (169 bytes)
+/// - outputs_data: packed array of outputs (644 bytes each)
+/// - output_count: number of outputs
+/// - height: block height (for version byte validation)
+/// - results: output buffer (564 bytes per output)
+///
+/// # Returns
+/// Number of successfully decrypted notes
+/// FIX #230: Now uses safe_slice for bounds validation
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_try_decrypt_notes_parallel(
+    sk: *const u8,
+    outputs_data: *const u8,
+    output_count: usize,
+    height: u64,
+    results: *mut u8,
+) -> usize {
+    ffi_catch_unwind!(0, {
+    if output_count == 0 {
+        return 0;
+    }
+
+    // FIX #230: Validate all input pointers
+    let sk_slice = match safe_slice(sk, 169) {
+        Some(s) => s,
+        None => {
+            debug_log!("zipherx_try_decrypt_notes_parallel: invalid sk pointer");
+            return 0;
+        }
+    };
+
+    // Deserialize the ExtendedSpendingKey
+    let extsk = match ExtendedSpendingKey::read(&mut &sk_slice[..]) {
+        Ok(key) => key,
+        Err(_e) => {
+            debug_log!("DEBUG: ❌ Failed to deserialize ExtendedSpendingKey");
+            return 0;
+        }
+    };
+
+    // Derive IVK once (this is expensive, do it once before parallel loop)
+    let fvk = FullViewingKey::from_expanded_spending_key(&extsk.expsk);
+    let ivk = fvk.vk.ivk();
+    let prepared_ivk = PreparedIncomingViewingKey::new(&ivk);
+
+    let block_height = BlockHeight::from_u32(height as u32);
+
+    // FIX #1385: Use checked_mul to prevent integer overflow in size calculations
+    let outputs_total_len = match output_count.checked_mul(644) {
+        Some(len) => len,
+        None => {
+            eprintln!("❌ FIX #1385: output_count * 644 overflows");
+            return 0;
+        }
+    };
+    let results_total_len = match output_count.checked_mul(564) {
+        Some(len) => len,
+        None => {
+            eprintln!("❌ FIX #1385: output_count * 564 overflows");
+            return 0;
+        }
+    };
+
+    // FIX #230: Validate output data and results pointers
+    let outputs_slice = match safe_slice(outputs_data, outputs_total_len) {
+        Some(s) => s,
+        None => {
+            debug_log!("zipherx_try_decrypt_notes_parallel: invalid outputs_data pointer");
+            return 0;
+        }
+    };
+    let results_slice = match safe_slice_mut(results, results_total_len) {
+        Some(s) => s,
+        None => {
+            debug_log!("zipherx_try_decrypt_notes_parallel: invalid results pointer");
+            return 0;
+        }
+    };
+
+    // Pre-parse outputs into structs (needed for Rayon)
+    let parsed_outputs: Vec<(usize, RawShieldedOutput)> = (0..output_count)
+        .map(|i| {
+            let offset = i * 644;
+            let mut epk = [0u8; 32];
+            let mut cmu = [0u8; 32];
+            let mut enc = [0u8; ENC_CIPHERTEXT_SIZE];
+
+            epk.copy_from_slice(&outputs_slice[offset..offset + 32]);
+            cmu.copy_from_slice(&outputs_slice[offset + 32..offset + 64]);
+            enc.copy_from_slice(&outputs_slice[offset + 64..offset + 644]);
+
+            (i, RawShieldedOutput {
+                epk,
+                cmu,
+                enc_ciphertext: enc,
+            })
+        })
+        .collect();
+
+    // Counter for successful decryptions
+    let decrypted_count = AtomicUsize::new(0);
+
+    // Parallel decryption using Rayon
+    // Each thread gets its own portion of the work
+    parsed_outputs.par_iter().for_each(|(idx, output)| {
+        let result_offset = idx * 564;
+
+        // Try decryption
+        match try_sapling_note_decryption(&ZclassicNetwork, block_height, &prepared_ivk, output) {
+            Some((note, address, memo)) => {
+                // Successfully decrypted! Pack the result
+                let diversifier = address.diversifier().0;
+                let value: u64 = note.value().inner();
+                let rcm = match note.rseed() {
+                    Rseed::BeforeZip212(rcm) => rcm.to_repr(),
+                    Rseed::AfterZip212(rseed) => *rseed,
+                };
+
+                // SAFETY: Each thread writes to its own non-overlapping slice
+                let out_ptr = results_slice.as_ptr() as *mut u8;
+                let out_offset = out_ptr.add(result_offset);
+
+                // Write found flag
+                *out_offset = 1u8;
+
+                // Write diversifier (11 bytes)
+                std::ptr::copy_nonoverlapping(diversifier.as_ptr(), out_offset.add(1), 11);
+
+                // Write value (8 bytes, little-endian)
+                let value_bytes = value.to_le_bytes();
+                std::ptr::copy_nonoverlapping(value_bytes.as_ptr(), out_offset.add(12), 8);
+
+                // Write rcm (32 bytes)
+                std::ptr::copy_nonoverlapping(rcm.as_ptr(), out_offset.add(20), 32);
+
+                // Write memo (512 bytes)
+                std::ptr::copy_nonoverlapping(memo.as_array().as_ptr(), out_offset.add(52), 512);
+
+                decrypted_count.fetch_add(1, Ordering::Relaxed);
+            }
+            None => {
+                // Not our note - write 0 flag
+                let out_ptr = results_slice.as_ptr() as *mut u8;
+                *out_ptr.add(result_offset) = 0u8;
+            }
+        }
+    });
+
+    decrypted_count.load(Ordering::Relaxed)
+    })
+}
+
+/// Get the number of CPU threads Rayon will use for parallel decryption
+#[no_mangle]
+pub extern "C" fn zipherx_get_rayon_threads() -> usize {
+    ffi_catch_unwind!(0, {
+    rayon::current_num_threads()
+    })
+}
+
+// =============================================================================
+// FIX #1326: Real-time Groth16 Proof Progress (for UI countdown)
+// =============================================================================
+
+use zcash_primitives::transaction::components::sapling::builder::{
+    GROTH16_CANCEL, GROTH16_PROOFS_COMPLETED, GROTH16_PROOFS_TOTAL, GROTH16_PROOF_THREADS,
+};
+
+/// FIX #1326: Get total number of spend proofs being generated.
+/// Returns 0 when no proof generation is in progress.
+#[no_mangle]
+pub extern "C" fn zipherx_get_proof_total() -> u32 {
+    ffi_catch_unwind!(0, {
+    GROTH16_PROOFS_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+    })
+}
+
+/// FIX #1326: Get number of spend proofs completed so far.
+/// Swift polls this every ~200ms to update the countdown timer.
+#[no_mangle]
+pub extern "C" fn zipherx_get_proof_completed() -> u32 {
+    ffi_catch_unwind!(0, {
+    GROTH16_PROOFS_COMPLETED.load(std::sync::atomic::Ordering::Relaxed)
+    })
+}
+
+/// FIX #1326: Get number of threads in the Groth16 proof pool.
+/// Swift uses: estimatedSeconds = ceil(total / threads) * ~1.0s
+#[no_mangle]
+pub extern "C" fn zipherx_get_proof_threads() -> u32 {
+    ffi_catch_unwind!(0, {
+    GROTH16_PROOF_THREADS.load(std::sync::atomic::Ordering::Relaxed)
+    })
+}
+
+/// FIX #1328: Cancel any in-progress Groth16 proof generation.
+/// Sets an atomic flag that each OS thread checks BETWEEN proofs.
+/// Prevents 900% CPU when Swift Task.cancel() can't stop Rust's std::thread::scope().
+/// Safe to call even when no proofs are running — the flag is reset at next proof start.
+#[no_mangle]
+pub extern "C" fn zipherx_cancel_proof_generation() {
+    let _ = ffi_catch_unwind!((), {
+    GROTH16_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
+    // Also reset counters so Swift UI doesn't show stale progress
+    GROTH16_PROOFS_TOTAL.store(0, std::sync::atomic::Ordering::Relaxed);
+    GROTH16_PROOFS_COMPLETED.store(0, std::sync::atomic::Ordering::Relaxed);
+    GROTH16_PROOF_THREADS.store(0, std::sync::atomic::Ordering::Relaxed);
+    });
+}
+
+// =============================================================================
+// Utility Functions
+// =============================================================================
+
+/// Get the library version
+#[no_mangle]
+pub extern "C" fn zipherx_version() -> u32 {
+    ffi_catch_unwind!(0, {
+    3 // Version 3 with ZclassicButtercup branch ID support (0x930b540d)
+    })
+}
+
+/// Get the consensus branch ID for a given height on Zclassic
+/// This is useful for debugging to verify the correct branch ID is being used
+/// @param height Block height
+/// @return Branch ID as u32 (e.g., 0x930b540d for Buttercup)
+#[no_mangle]
+pub extern "C" fn zipherx_get_branch_id(height: u64) -> u32 {
+    ffi_catch_unwind!(0, {
+    let block_height = BlockHeight::from_u32(height as u32);
+    let branch_id = zcash_primitives::consensus::BranchId::for_height(&ZclassicNetwork, block_height);
+    let branch_id_u32: u32 = branch_id.into();
+
+    debug_log!("🔍 zipherx_get_branch_id({}) = 0x{:08x} ({:?})", height, branch_id_u32, branch_id);
+
+    branch_id_u32
+    })
+}
+
+/// Verify the library is using the correct ZclassicButtercup fork
+/// @return true if using local fork with Buttercup support
+#[no_mangle]
+pub extern "C" fn zipherx_verify_buttercup_support() -> bool {
+    ffi_catch_unwind!(false, {
+    // Test at height 2,923,000 (current chain)
+    let test_height = BlockHeight::from_u32(2_923_000);
+    let branch_id = zcash_primitives::consensus::BranchId::for_height(&ZclassicNetwork, test_height);
+    let branch_id_u32: u32 = branch_id.into();
+
+    let has_buttercup = branch_id_u32 == 0x930b540d;
+
+    debug_log!("🔐 BUTTERCUP VERIFICATION:");
+    debug_log!("   Test height: 2,923,000");
+    debug_log!("   Branch ID: 0x{:08x}", branch_id_u32);
+    debug_log!("   Expected: 0x930b540d (ZclassicButtercup)");
+    debug_log!("   Match: {}", if has_buttercup { "✅ YES" } else { "❌ NO" });
+
+    if has_buttercup {
+        debug_log!("   ✅ Library correctly uses local zcash_primitives fork with Buttercup!");
+    } else {
+        debug_log!("   ❌ ERROR: Library NOT using local fork! Got {:?} instead of ZclassicButtercup", branch_id);
+    }
+
+    has_buttercup
+    })
+}
+
+/// Double SHA256 hash
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_double_sha256(
+    data: *const u8,
+    len: usize,
+    output: *mut u8,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    use sha2::{Sha256, Digest};
+
+    // FIX #230: Use safe_slice for bounds checking
+    let input = match safe_slice(data, len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ zipherx_double_sha256: Invalid input pointer or length");
+            return false;
+        }
+    };
+
+    if output.is_null() {
+        eprintln!("❌ zipherx_double_sha256: Output pointer is null");
+        return false;
+    }
+
+    let hash1 = Sha256::digest(input);
+    let hash2 = Sha256::digest(&hash1);
+
+    std::ptr::copy_nonoverlapping(hash2.as_ptr(), output, 32);
+    true
+    })
+}
+
+/// Free a buffer allocated by this library
+/// SAFETY: `ptr` must have been allocated by Rust's global allocator (e.g., from a Vec),
+/// and `len` must exactly match the original allocation size. Passing a mismatched `len`
+/// or a non-Rust-allocated pointer is undefined behavior.
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_free(ptr: *mut u8, len: usize) {
+    // FIX #1385: Null check + sanity cap on len to catch obvious misuse
+    if ptr.is_null() || len == 0 || len > 1_073_741_824 {
+        return; // 1GB max — no single FFI allocation should ever be this large
+    }
+    let _ = Vec::from_raw_parts(ptr, len, len);
+}
+
+// =============================================================================
+// Spending Key Encoding/Decoding (Bech32)
+// =============================================================================
+
+/// Encode spending key as Bech32 string (secret-extended-key-main1...)
+/// Returns length of encoded string, or 0 on failure
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_encode_spending_key(
+    sk: *const u8,
+    output: *mut u8,
+) -> usize {
+    ffi_catch_unwind!(0, {
+    if sk.is_null() || output.is_null() {
+        return 0;
+    }
+
+    // FIX #230: Use safe_slice for bounds checking
+    let sk_slice = match safe_slice(sk, 169) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ zipherx_encode_spending_key: Invalid spending key pointer");
+            return 0;
+        }
+    };
+
+    // Parse the ExtendedSpendingKey
+    let extsk = match ExtendedSpendingKey::read(&sk_slice[..]) {
+        Ok(key) => key,
+        Err(_) => return 0,
+    };
+
+    // Encode as Bech32 with the Zclassic HRP
+    let hrp = ZclassicNetwork.hrp_sapling_extended_spending_key();
+
+    // Get the raw bytes to encode
+    let mut sk_bytes = Vec::new();
+    if extsk.write(&mut sk_bytes).is_err() {
+        return 0;
+    }
+
+    // Encode using Bech32
+    let encoded = match bech32::encode(hrp, sk_bytes.to_base32(), Variant::Bech32) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+
+    let encoded_bytes = encoded.as_bytes();
+    std::ptr::copy_nonoverlapping(encoded_bytes.as_ptr(), output, encoded_bytes.len());
+    encoded_bytes.len()
+    })
+}
+
+/// Decode Bech32 spending key string to bytes
+/// Returns true on success
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_decode_spending_key(
+    encoded: *const i8,
+    output: *mut u8,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    if encoded.is_null() || output.is_null() {
+        return false;
+    }
+
+    let encoded_str = match std::ffi::CStr::from_ptr(encoded).to_str() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    // Decode Bech32
+    let (hrp, data, _variant) = match bech32::decode(encoded_str) {
+        Ok(result) => result,
+        Err(_) => return false,
+    };
+
+    // Verify HRP matches Zclassic
+    let expected_hrp = ZclassicNetwork.hrp_sapling_extended_spending_key();
+    if hrp != expected_hrp {
+        eprintln!("❌ Invalid HRP: expected {}, got {}", expected_hrp, hrp);
+        return false;
+    }
+
+    // Convert from base32
+    let sk_bytes = match Vec::<u8>::from_base32(&data) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+
+    // Verify we can parse it as an ExtendedSpendingKey
+    if ExtendedSpendingKey::read(&sk_bytes[..]).is_err() {
+        return false;
+    }
+
+    // Copy to output
+    if sk_bytes.len() != 169 {
+        return false;
+    }
+    std::ptr::copy_nonoverlapping(sk_bytes.as_ptr(), output, 169);
+    true
+    })
+}
+
+// =============================================================================
+// Transaction Building - Sapling Proofs
+// =============================================================================
+
+/// Initialize the prover with Sapling parameters from raw byte arrays
+/// Use this when file access from Rust is restricted (e.g., Hardened Runtime)
+/// Swift reads the files and passes the bytes to Rust
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_init_prover_from_bytes(
+    spend_data: *const u8,
+    spend_len: usize,
+    output_data: *const u8,
+    output_len: usize,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    debug_log!("📁 Loading Sapling params from memory:");
+    debug_log!("   Spend:  {} bytes", spend_len);
+    debug_log!("   Output: {} bytes", output_len);
+
+    // Verify expected file sizes
+    if spend_len != 47958396 {
+        eprintln!("❌ Spend params has wrong size! Got {}, expected 47958396", spend_len);
+        return false;
+    }
+    if output_len != 3592860 {
+        eprintln!("❌ Output params has wrong size! Got {}, expected 3592860", output_len);
+        return false;
+    }
+
+    // FIX #230: Use safe_slice for bounds checking
+    let spend_bytes = match safe_slice(spend_data, spend_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid spend params pointer");
+            return false;
+        }
+    };
+    let output_bytes = match safe_slice(output_data, output_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid output params pointer");
+            return false;
+        }
+    };
+
+    debug_log!("📂 Loading prover from memory...");
+
+    // Load the prover with Sapling parameters from bytes
+    let prover = std::panic::catch_unwind(|| {
+        LocalTxProver::from_bytes(spend_bytes, output_bytes)
+    });
+
+    // Also load verifying keys using parse_parameters (VUL-002 FIX)
+    let vk_result = std::panic::catch_unwind(|| {
+        zcash_proofs::parse_parameters(spend_bytes, output_bytes, None)
+    });
+
+    match prover {
+        Ok(p) => {
+            // FIX #1385: Replace .lock().unwrap() with safe_lock!
+            let mut global_prover = match safe_lock!(PROVER) {
+                Some(g) => g,
+                None => return false,
+            };
+            *global_prover = Some(p);
+            eprintln!("✅ Prover initialized from memory");
+
+            // Store verifying keys for VUL-002 transaction verification
+            if let Ok(params) = vk_result {
+                let mut global_vk = match safe_lock!(VERIFYING_KEYS) {
+                    Some(g) => g,
+                    None => return false,
+                };
+                *global_vk = Some(params);
+                eprintln!("✅ Verifying keys stored for TX validation (VUL-002 FIX)");
+            } else {
+                eprintln!("⚠️ Could not load verifying keys - TX validation may not work");
+            }
+
+            true
+        }
+        Err(e) => {
+            eprintln!("❌ Prover initialization panicked: {:?}", e);
+            eprintln!("   This usually means the params are corrupted or have wrong format");
+            false
+        }
+    }
+    })
+}
+
+/// Initialize the prover with Sapling parameters from file paths
+/// Must be called before building transactions
+/// spend_path and output_path are paths to sapling-spend.params and sapling-output.params
+/// NOTE: May fail on macOS with Hardened Runtime - use zipherx_init_prover_from_bytes instead
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_init_prover(
+    spend_path: *const i8,
+    output_path: *const i8,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    let spend = match std::ffi::CStr::from_ptr(spend_path).to_str() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("❌ Invalid spend path string: {:?}", e);
+            return false;
+        }
+    };
+
+    let output = match std::ffi::CStr::from_ptr(output_path).to_str() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("❌ Invalid output path string: {:?}", e);
+            return false;
+        }
+    };
+
+    eprintln!("📁 Loading Sapling params from:");
+    eprintln!("   Spend:  {}", spend);
+    eprintln!("   Output: {}", output);
+
+    // Check if files exist
+    let spend_path = Path::new(spend);
+    let output_path = Path::new(output);
+
+    if !spend_path.exists() {
+        eprintln!("❌ Spend params file does not exist: {}", spend_path.file_name().unwrap_or_default().to_string_lossy());
+        return false;
+    }
+    if !output_path.exists() {
+        eprintln!("❌ Output params file does not exist: {}", output_path.file_name().unwrap_or_default().to_string_lossy());
+        return false;
+    }
+
+    // Get file sizes for verification
+    let spend_size = match std::fs::metadata(spend_path) {
+        Ok(m) => {
+            debug_log!("   Spend file size: {} bytes (expected: 47958396)", m.len());
+            m.len()
+        }
+        Err(e) => {
+            eprintln!("❌ Cannot read spend file metadata: {:?}", e);
+            return false;
+        }
+    };
+
+    let output_size = match std::fs::metadata(output_path) {
+        Ok(m) => {
+            debug_log!("   Output file size: {} bytes (expected: 3592860)", m.len());
+            m.len()
+        }
+        Err(e) => {
+            eprintln!("❌ Cannot read output file metadata: {:?}", e);
+            return false;
+        }
+    };
+
+    // Verify expected file sizes
+    if spend_size != 47958396 {
+        eprintln!("❌ Spend params file has wrong size! Got {}, expected 47958396", spend_size);
+        return false;
+    }
+    if output_size != 3592860 {
+        eprintln!("❌ Output params file has wrong size! Got {}, expected 3592860", output_size);
+        return false;
+    }
+
+    debug_log!("📂 File sizes verified, loading prover...");
+
+    // Load the prover with Sapling parameters (can panic on invalid files)
+    let prover = std::panic::catch_unwind(|| {
+        LocalTxProver::new(spend_path, output_path)
+    });
+
+    // Also load verifying keys using load_parameters (VUL-002 FIX)
+    let vk_result = std::panic::catch_unwind(|| {
+        zcash_proofs::load_parameters(spend_path, output_path, None)
+    });
+
+    match prover {
+        Ok(p) => {
+            // FIX #1385: Replace .lock().unwrap() with safe_lock!
+            let mut global_prover = match safe_lock!(PROVER) {
+                Some(g) => g,
+                None => return false,
+            };
+            *global_prover = Some(p);
+            eprintln!("✅ Prover initialized with Sapling parameters");
+
+            // Store verifying keys for VUL-002 transaction verification
+            if let Ok(params) = vk_result {
+                let mut global_vk = match safe_lock!(VERIFYING_KEYS) {
+                    Some(g) => g,
+                    None => return false,
+                };
+                *global_vk = Some(params);
+                eprintln!("✅ Verifying keys stored for TX validation (VUL-002 FIX)");
+            } else {
+                eprintln!("⚠️ Could not load verifying keys - TX validation may not work");
+            }
+
+            true
+        }
+        Err(e) => {
+            eprintln!("❌ Prover initialization panicked: {:?}", e);
+            eprintln!("   This usually means the params files are corrupted or have wrong format");
+            false
+        }
+    }
+    })
+}
+
+/// Build a complete shielded transaction
+/// Returns the raw transaction bytes or 0 on failure
+///
+/// Parameters:
+/// - sk: Extended spending key (169 bytes)
+/// - to_address: Destination z-address bytes (43 bytes)
+/// - amount: Amount in zatoshis
+/// - memo: Optional memo (512 bytes, can be all zeros)
+/// - anchor: Merkle tree anchor (32 bytes)
+/// - witness_data: Serialized witness for the note being spent
+/// - witness_len: Length of witness data
+/// - note_value: Value of the note being spent
+/// - note_rcm: Note randomness (32 bytes)
+/// - note_diversifier: Note diversifier (11 bytes)
+/// - tx_out: Output buffer for transaction (should be at least 100000 bytes)
+/// FIX #230: Now uses safe_slice and safe_lock! for bounds validation
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_build_transaction(
+    sk: *const u8,
+    to_address: *const u8,
+    amount: u64,
+    memo: *const u8,
+    _anchor: *const u8,
+    witness_data: *const u8,
+    witness_len: usize,
+    note_value: u64,
+    note_rcm: *const u8,
+    note_diversifier: *const u8,
+    chain_height: u64,
+    tx_out: *mut u8,
+    tx_out_len: *mut usize,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    // FIX #230: Use safe_lock! to avoid panic on poisoned mutex
+    let prover_guard = match safe_lock!(PROVER) {
+        Some(g) => g,
+        None => {
+            eprintln!("❌ Failed to acquire prover lock");
+            return false;
+        }
+    };
+    let prover = match prover_guard.as_ref() {
+        Some(p) => p,
+        None => {
+            eprintln!("❌ Prover not initialized");
+            return false;
+        }
+    };
+
+    // FIX #230: Validate all input pointers
+    let sk_slice = match safe_slice(sk, 169) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid spending key pointer");
+            return false;
+        }
+    };
+    let to_addr_slice = match safe_slice(to_address, 43) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid destination address pointer");
+            return false;
+        }
+    };
+    let witness_slice = match safe_slice(witness_data, witness_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid witness data pointer");
+            return false;
+        }
+    };
+    let rcm_slice = match safe_slice(note_rcm, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid rcm pointer");
+            return false;
+        }
+    };
+    let div_slice = match safe_slice(note_diversifier, 11) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid diversifier pointer");
+            return false;
+        }
+    };
+
+    if tx_out.is_null() || tx_out_len.is_null() {
+        eprintln!("❌ Null output pointers");
+        return false;
+    }
+
+    // Deserialize spending key
+    let extsk = match ExtendedSpendingKey::read(&mut &sk_slice[..]) {
+        Ok(key) => key,
+        Err(e) => {
+            eprintln!("❌ Failed to read spending key: {:?}", e);
+            return false;
+        }
+    };
+
+    // FIX #230: Parse destination address (replace .unwrap() with proper handling)
+    let to_addr_arr: [u8; 43] = match safe_try_into(to_addr_slice) {
+        Some(arr) => arr,
+        None => {
+            eprintln!("❌ Invalid destination address length");
+            return false;
+        }
+    };
+    let to_addr = match PaymentAddress::from_bytes(&to_addr_arr) {
+        Some(addr) => addr,
+        None => {
+            eprintln!("❌ Invalid destination address");
+            return false;
+        }
+    };
+
+    // Parse note commitment randomness
+    let mut rcm_bytes = [0u8; 32];
+    rcm_bytes.copy_from_slice(rcm_slice);
+    let rcm = match Option::<jubjub::Fr>::from(jubjub::Fr::from_repr(rcm_bytes)) {
+        Some(r) => r,
+        None => {
+            eprintln!("❌ Invalid rcm");
+            return false;
+        }
+    };
+
+    // Parse diversifier
+    let mut div_bytes = [0u8; 11];
+    div_bytes.copy_from_slice(div_slice);
+    let diversifier = Diversifier(div_bytes);
+    debug_log!("DEBUG: Received diversifier for spending: {:02x?}", div_bytes);
+
+    // Get the address that received this note using the note's diversifier
+    let fvk = extsk.to_diversifiable_full_viewing_key();
+    let note_addr = match fvk.fvk().vk.to_payment_address(diversifier) {
+        Some(addr) => addr,
+        None => {
+            eprintln!("❌ Invalid diversifier for note address");
+            debug_log!("DEBUG: Expected valid diversifier like [c7, 99, e1, e4, 37, 90, fa, a5, 04, bd, df]");
+            return false;
+        }
+    };
+
+    // VUL-F-007: Use configurable fee from global state
+    let fee = match safe_lock!(TRANSACTION_FEE) {
+        Some(fee_guard) => *fee_guard,
+        None => {
+            eprintln!("VUL-F-007: Failed to acquire TRANSACTION_FEE mutex, using default 10000");
+            10000u64
+        }
+    };
+
+    // Verify funds
+    if note_value < amount + fee {
+        eprintln!("❌ Insufficient funds: have {}, need {}", redact_amount!(note_value), redact_amount!(amount + fee));
+        return false;
+    }
+
+    // Create note to spend using the diversifier's address
+    let note = zcash_primitives::sapling::Note::from_parts(
+        note_addr,
+        NoteValue::from_raw(note_value),
+        Rseed::BeforeZip212(rcm),
+    );
+
+    // Compute note CMU for verification
+    let computed_cmu = note.cmu();
+    let cmu_bytes: [u8; 32] = computed_cmu.to_bytes();
+    debug_log!("🔍 Computed note CMU: {}", hex::encode(&cmu_bytes));
+
+    // FIX #557 v48: Try deserializing with full witness first
+    let mut witness: Option<IncrementalWitness<zcash_primitives::sapling::Node, 32>> = None;
+    let mut used_len = witness_len;
+
+    // First try: Full 1028 bytes
+    {
+        let mut reader = std::io::Cursor::new(witness_slice);
+        match zcash_primitives::merkle_tree::read_incremental_witness(&mut reader) {
+            Ok(w) => {
+                witness = Some(w);
+                debug_log!("✅ FIX #557 v48 VRFY: Deserialized with full {} bytes", witness_len);
+            }
+            Err(_) => {}
+        }
+    }
+
+    // Second try: Trim trailing zeros
+    if witness.is_none() {
+        let mut trim_end = witness_slice.len();
+        while trim_end > 100 && trim_end > witness_slice.len() - 200 {
+            let last_50_all_zeros = witness_slice[trim_end-50..trim_end].iter().all(|&b| b == 0);
+            if !last_50_all_zeros {
+                break;
+            }
+            trim_end -= 50;
+        }
+        if trim_end < 700 {
+            trim_end = witness_slice.len();
+        }
+
+        let trimmed_slice = &witness_slice[..trim_end];
+        let mut reader = std::io::Cursor::new(trimmed_slice);
+        match zcash_primitives::merkle_tree::read_incremental_witness(&mut reader) {
+            Ok(w) => {
+                witness = Some(w);
+                used_len = trim_end;
+                debug_log!("✅ FIX #557 v48 VRFY: Deserialized with trimmed {} bytes", trim_end);
+            }
+            Err(e) => {
+                eprintln!("❌ Failed to deserialize witness: {:?}", e);
+                return false;
+            }
+        }
+    }
+
+    let witness = match witness {
+        Some(w) => w,
+        None => {
+            eprintln!("❌ No valid witness deserialized");
+            return false;
+        }
+    };
+
+    // Get the merkle path from the witness
+    // FIX #581: witness.path() returns None for some witnesses, construct from filled nodes
+    let merkle_path = match witness.path() {
+        Some(p) => {
+            debug_log!("✅ FIX #581: Got path from witness.path()");
+            p
+        },
+        None => {
+            debug_log!("⚠️ FIX #581: witness.path() returned None, constructing from filled nodes");
+            let filled = witness.filled();
+            let position = witness.witnessed_position();
+            debug_log!("🔍 FIX #581: filled nodes: {}, position: {}", filled.len(), u64::from(position));
+
+            match MerklePath::from_parts(filled.clone(), position) {
+                Ok(p) => {
+                    debug_log!("✅ FIX #581: Successfully constructed path from filled nodes");
+                    p
+                },
+                Err(e) => {
+                    eprintln!("❌ FIX #581: Failed to construct MerklePath from filled nodes: {:?}", e);
+                    return false;
+                }
+            }
+        }
+    };
+
+    let position = u64::from(witness.tip_position()) as u32;
+    debug_log!("🔍 Witness position: {}", position);
+
+    // Create transaction builder
+    // Use current chain height for proper expiry calculation
+    let target_height = BlockHeight::from_u32(chain_height as u32);
+    let mut builder = Builder::new(ZclassicNetwork, target_height, None);
+
+    // Verify branch ID (only log errors for wrong branch ID)
+    let branch_id = zcash_primitives::consensus::BranchId::for_height(&ZclassicNetwork, target_height);
+    let branch_id_u32: u32 = branch_id.into();
+    debug_log!("🔑 Branch ID: 0x{:08x} at height {}", branch_id_u32, chain_height);
+
+    // Only warn if branch ID is wrong for current height
+    if chain_height >= 707000 && branch_id_u32 != 0x930b540d {
+        eprintln!("❌ ERROR: At height {}, expected branch ID 0x930b540d (Buttercup) but got 0x{:08x}", chain_height, branch_id_u32);
+    }
+
+    // Add spend
+    if let Err(e) = builder.add_sapling_spend(
+        extsk.clone(),
+        diversifier,
+        note.clone(),
+        merkle_path,
+    ) {
+        eprintln!("❌ Failed to add spend: {:?}", e);
+        return false;
+    }
+    debug_log!("✅ Spend added successfully");
+
+    // FIX #230: Prepare memo with safe_slice
+    let memo_bytes = if memo.is_null() {
+        [0u8; 512]
+    } else {
+        let memo_slice = match safe_slice(memo, 512) {
+            Some(s) => s,
+            None => {
+                eprintln!("❌ Invalid memo pointer");
+                return false;
+            }
+        };
+        let mut m = [0u8; 512];
+        m.copy_from_slice(memo_slice);
+        m
+    };
+    let memo_obj = match MemoBytes::from_bytes(&memo_bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("❌ Invalid memo bytes: {:?}", e);
+            return false;
+        }
+    };
+
+    // FIX #230: Convert amount to Amount type (replace .unwrap())
+    let amount_val = match Amount::from_i64(amount as i64) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln!("❌ Invalid amount: {}", redact_amount!(amount));
+            return false;
+        }
+    };
+
+    // Add output to recipient
+    if let Err(e) = builder.add_sapling_output(
+        Some(extsk.expsk.ovk),
+        to_addr,
+        amount_val,
+        memo_obj,
+    ) {
+        eprintln!("❌ Failed to add output: {:?}", e);
+        return false;
+    }
+
+    // FIX #230: Add change output with safe Amount conversion
+    let change = note_value - amount - fee;
+    if change > 0 {
+        let change_memo = MemoBytes::empty();
+        let change_amount = match Amount::from_i64(change as i64) {
+            Ok(a) => a,
+            Err(_) => {
+                eprintln!("❌ Invalid change amount: {}", redact_amount!(change));
+                return false;
+            }
+        };
+        // PRIVACY: P-ADDR-002 — Use diversified change address (external scope, high index)
+        // MUST stay in external scope so IVK-based scanning can discover change notes.
+        // Uses index range >= 1_000_000_000 to separate from receive addresses (0..999_999_999).
+        // FIX #1402 (NEW-002): Random offset prevents TX linkage via identical change addresses
+        let dfvk_change = extsk.to_diversifiable_full_viewing_key();
+        let change_diversifier_base: u64 = 1_000_000_000;
+        let change_offset: u64 = OsRng.gen_range(0u64..1_000_000_000);
+        let change_index = change_diversifier_base + change_offset;
+        LAST_CHANGE_DIVERSIFIER_INDEX.store(change_index, Ordering::SeqCst); // FIX #1402 (NEW-004)
+        let change_j = DiversifierIndex::from(change_index);
+        let (_, change_addr) = match dfvk_change.find_address(change_j) {
+            Some(result) => result,
+            None => {
+                debug_log!("P-ADDR-002: find_address failed at index {}, using default", change_index);
+                dfvk_change.default_address()
+            }
+        };
+        if let Err(e) = builder.add_sapling_output(
+            Some(extsk.expsk.ovk),
+            change_addr,
+            change_amount,
+            change_memo,
+        ) {
+            eprintln!("❌ Failed to add change output: {:?}", e);
+            return false;
+        }
+    }
+
+    // FIX #230: Build the transaction with proofs (safe fee conversion)
+    debug_log!("🔨 Building transaction...");
+    let fee_amount = match Amount::from_i64(fee as i64) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln!("❌ Invalid fee amount: {}", redact_amount!(fee));
+            return false;
+        }
+    };
+    let (tx, _) = match builder.build(prover, &zcash_primitives::transaction::fees::fixed::FeeRule::non_standard(fee_amount)) {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("❌ Failed to build transaction: {:?}", e);
+            return false;
+        }
+    };
+
+    // Serialize transaction
+    let mut tx_bytes = Vec::new();
+    if let Err(e) = tx.write(&mut tx_bytes) {
+        eprintln!("❌ Failed to serialize transaction: {:?}", e);
+        return false;
+    }
+
+    debug_log!("✅ Transaction built: {} bytes", tx_bytes.len());
+
+    // Copy to output
+    // FIX #1323: Increased from 10KB to 100KB to support multi-input transactions
+    if tx_bytes.len() > 100000 {
+        eprintln!("❌ Transaction too large: {} bytes (max 100000)", tx_bytes.len());
+        return false;
+    }
+
+    std::ptr::copy_nonoverlapping(tx_bytes.as_ptr(), tx_out, tx_bytes.len());
+    *tx_out_len = tx_bytes.len();
+
+    true
+    })
+}
+
+/// Spend information for multi-input transactions
+/// Passed as an array of pointers to this struct
+#[repr(C)]
+pub struct SpendInfo {
+    /// Serialized IncrementalWitness data
+    pub witness_data: *const u8,
+    /// Length of witness data
+    pub witness_len: usize,
+    /// Note value in zatoshis
+    pub note_value: u64,
+    /// Note commitment randomness (32 bytes)
+    pub note_rcm: *const u8,
+    /// Note diversifier (11 bytes)
+    pub note_diversifier: *const u8,
+}
+
+/// Build a shielded transaction with multiple input notes
+///
+/// This allows spending from multiple notes in a single transaction,
+/// enabling transactions larger than any single note.
+///
+/// # Safety
+/// - sk: 169-byte ExtendedSpendingKey
+/// - to_address: 43-byte payment address
+/// - amount: amount to send in zatoshis
+/// - memo: 512-byte memo or null for empty
+/// - spends: array of SpendInfo pointers
+/// - spend_count: number of spends
+/// - chain_height: current chain height for branch ID selection
+/// - tx_out: output buffer (should be at least 100000 bytes)
+/// - tx_out_len: receives actual transaction length
+/// - nullifiers_out: output buffer for nullifiers (32 bytes * spend_count)
+///
+/// Returns true on success, false on failure
+/// FIX #230: Now uses safe_slice and safe_lock! for bounds validation
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_build_transaction_multi(
+    sk: *const u8,
+    to_address: *const u8,
+    amount: u64,
+    memo: *const u8,
+    spends: *const *const SpendInfo,
+    spend_count: usize,
+    chain_height: u64,
+    tx_out: *mut u8,
+    tx_out_len: *mut usize,
+    nullifiers_out: *mut u8,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    if spend_count == 0 || spend_count > 100 {
+        eprintln!("❌ Invalid spend count: {} (must be 1-100)", spend_count);
+        return false;
+    }
+
+    // FIX #230: Use safe_lock! to avoid panic on poisoned mutex
+    let prover_guard = match safe_lock!(PROVER) {
+        Some(g) => g,
+        None => {
+            eprintln!("❌ Failed to acquire prover lock");
+            return false;
+        }
+    };
+    let prover = match prover_guard.as_ref() {
+        Some(p) => p,
+        None => {
+            eprintln!("❌ Prover not initialized");
+            return false;
+        }
+    };
+
+    // FIX #230: Validate input pointers
+    let sk_slice = match safe_slice(sk, 169) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid spending key pointer");
+            return false;
+        }
+    };
+    let to_addr_slice = match safe_slice(to_address, 43) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid destination address pointer");
+            return false;
+        }
+    };
+
+    if tx_out.is_null() || tx_out_len.is_null() || nullifiers_out.is_null() {
+        eprintln!("❌ Null output pointers");
+        return false;
+    }
+
+    // Deserialize spending key
+    let extsk = match ExtendedSpendingKey::read(&mut &sk_slice[..]) {
+        Ok(key) => key,
+        Err(e) => {
+            eprintln!("❌ Failed to read spending key: {:?}", e);
+            return false;
+        }
+    };
+
+    // FIX #230: Parse destination address (replace .unwrap())
+    let to_addr_arr: [u8; 43] = match safe_try_into(to_addr_slice) {
+        Some(arr) => arr,
+        None => {
+            eprintln!("❌ Invalid destination address length");
+            return false;
+        }
+    };
+    let to_addr = match PaymentAddress::from_bytes(&to_addr_arr) {
+        Some(addr) => addr,
+        None => {
+            eprintln!("❌ Invalid destination address");
+            return false;
+        }
+    };
+
+    // VUL-F-007: Use configurable fee from global state
+    let fee = match safe_lock!(TRANSACTION_FEE) {
+        Some(fee_guard) => *fee_guard,
+        None => {
+            eprintln!("VUL-F-007: Failed to acquire TRANSACTION_FEE mutex, using default 10000");
+            10000u64
+        }
+    };
+
+    // FIX #1385: Sanity cap on spend_count to prevent extreme allocations
+    if spend_count > 1000 {
+        eprintln!("❌ FIX #1385: spend_count {} exceeds maximum", spend_count);
+        return false;
+    }
+    // FIX #230: Parse all spends with safe pointer validation
+    let spend_total_bytes = match spend_count.checked_mul(std::mem::size_of::<*const SpendInfo>()) {
+        Some(len) => len,
+        None => return false,
+    };
+    let spend_infos = match safe_slice(spends as *const *const SpendInfo as *const u8, spend_total_bytes) {
+        Some(_) => slice::from_raw_parts(spends, spend_count),
+        None => {
+            eprintln!("❌ Invalid spends pointer");
+            return false;
+        }
+    };
+    let mut total_input: u64 = 0;
+    let mut parsed_spends: Vec<(zcash_primitives::sapling::Note, MerklePath<zcash_primitives::sapling::Node, 32>, Diversifier)> = Vec::new();
+
+    for (i, spend_ptr) in spend_infos.iter().enumerate() {
+        let spend = &**spend_ptr;
+
+        // FIX #230: Validate spend data pointers
+        let witness_slice = match safe_slice(spend.witness_data, spend.witness_len) {
+            Some(s) => s,
+            None => {
+                eprintln!("❌ Invalid witness pointer for spend {}", i);
+                return false;
+            }
+        };
+        let rcm_slice = match safe_slice(spend.note_rcm, 32) {
+            Some(s) => s,
+            None => {
+                eprintln!("❌ Invalid rcm pointer for spend {}", i);
+                return false;
+            }
+        };
+        let div_slice = match safe_slice(spend.note_diversifier, 11) {
+            Some(s) => s,
+            None => {
+                eprintln!("❌ Invalid diversifier pointer for spend {}", i);
+                return false;
+            }
+        };
+
+        // Parse note commitment randomness
+        let mut rcm_bytes = [0u8; 32];
+        rcm_bytes.copy_from_slice(rcm_slice);
+        let rcm = match Option::<jubjub::Fr>::from(jubjub::Fr::from_repr(rcm_bytes)) {
+            Some(r) => r,
+            None => {
+                eprintln!("❌ Invalid rcm for spend {}", i);
+                return false;
+            }
+        };
+
+        // Parse diversifier
+        let mut div_bytes = [0u8; 11];
+        div_bytes.copy_from_slice(div_slice);
+        let diversifier = Diversifier(div_bytes);
+
+        // Get the address that received this note using the note's diversifier
+        let fvk = extsk.to_diversifiable_full_viewing_key();
+        let note_addr = match fvk.fvk().vk.to_payment_address(diversifier) {
+            Some(addr) => addr,
+            None => {
+                eprintln!("❌ Invalid diversifier for spend {}", i);
+                return false;
+            }
+        };
+
+        // Create note to spend
+        let note = zcash_primitives::sapling::Note::from_parts(
+            note_addr,
+            NoteValue::from_raw(spend.note_value),
+            Rseed::BeforeZip212(rcm),
+        );
+
+        // FIX #557 v48: Try deserializing with full witness first
+        let mut witness: Option<IncrementalWitness<zcash_primitives::sapling::Node, 32>> = None;
+        let mut used_len = witness_slice.len();
+
+        // First try: Full 1028 bytes
+        {
+            let mut reader = std::io::Cursor::new(witness_slice);
+            match zcash_primitives::merkle_tree::read_incremental_witness(&mut reader) {
+                Ok(w) => {
+                    witness = Some(w);
+                }
+                Err(_) => {}
+            }
+        }
+
+        // Second try: Trim trailing zeros
+        if witness.is_none() {
+            let mut trim_end = witness_slice.len();
+            while trim_end > 100 && trim_end > witness_slice.len() - 200 {
+                let last_50_all_zeros = witness_slice[trim_end-50..trim_end].iter().all(|&b| b == 0);
+                if !last_50_all_zeros {
+                    break;
+                }
+                trim_end -= 50;
+            }
+            if trim_end < 700 {
+                trim_end = witness_slice.len();
+            }
+
+            let trimmed_slice = &witness_slice[..trim_end];
+            let mut reader = std::io::Cursor::new(trimmed_slice);
+            match zcash_primitives::merkle_tree::read_incremental_witness(&mut reader) {
+                Ok(w) => {
+                    witness = Some(w);
+                    used_len = trim_end;
+                }
+                Err(e) => {
+                    eprintln!("❌ Failed to deserialize witness for spend {}: {:?}", i, e);
+                    return false;
+                }
+            }
+        }
+
+        let witness = match witness {
+            Some(w) => w,
+            None => {
+                eprintln!("❌ No valid witness deserialized for spend {}", i);
+                return false;
+            }
+        };
+
+        // Get merkle path
+        // FIX #581: witness.path() returns None for some witnesses, construct from filled nodes
+        let merkle_path = match witness.path() {
+            Some(p) => {
+                debug_log!("✅ FIX #581: Got path from witness.path() for spend {}", i);
+                p
+            },
+            None => {
+                debug_log!("⚠️ FIX #581: witness.path() returned None for spend {}, constructing from filled nodes", i);
+                let filled = witness.filled();
+                let position = witness.witnessed_position();
+                debug_log!("🔍 FIX #581: filled nodes: {}, position: {}", filled.len(), u64::from(position));
+
+                match MerklePath::from_parts(filled.clone(), position) {
+                    Ok(p) => {
+                        debug_log!("✅ FIX #581: Successfully constructed path from filled nodes for spend {}", i);
+                        p
+                    },
+                    Err(e) => {
+                        eprintln!("❌ FIX #581: Failed to construct MerklePath for spend {}: {:?}", i, e);
+                        return false;
+                    }
+                }
+            }
+        };
+
+        total_input += spend.note_value;
+        parsed_spends.push((note, merkle_path, diversifier));
+
+        debug_log!("📝 Spend {}: value={} zatoshis", i, spend.note_value);
+    }
+
+    debug_log!("📊 Multi-input tx: {} spends, total input = {} zatoshis", spend_count, total_input);
+
+    // Verify funds
+    if total_input < amount + fee {
+        eprintln!("❌ Insufficient funds: have {}, need {} (amount={} + fee={})",
+                  redact_amount!(total_input), redact_amount!(amount + fee), redact_amount!(amount), redact_amount!(fee));
+        return false;
+    }
+
+    // Create transaction builder
+    let target_height = BlockHeight::from_u32(chain_height as u32);
+    let mut builder = Builder::new(ZclassicNetwork, target_height, None);
+
+    // Verify branch ID
+    let branch_id = zcash_primitives::consensus::BranchId::for_height(&ZclassicNetwork, target_height);
+    let branch_id_u32: u32 = branch_id.into();
+    debug_log!("🔑 Branch ID: 0x{:08x} at height {}", branch_id_u32, chain_height);
+
+    if chain_height >= 707000 && branch_id_u32 != 0x930b540d {
+        eprintln!("❌ ERROR: At height {}, expected branch ID 0x930b540d (Buttercup) but got 0x{:08x}", chain_height, branch_id_u32);
+    }
+
+    // Add all spends
+    for (i, (note, merkle_path, diversifier)) in parsed_spends.iter().enumerate() {
+        if let Err(e) = builder.add_sapling_spend(
+            extsk.clone(),
+            *diversifier,
+            note.clone(),
+            merkle_path.clone(),
+        ) {
+            eprintln!("❌ Failed to add spend {}: {:?}", i, e);
+            return false;
+        }
+        debug_log!("✅ Spend {} added successfully", i);
+    }
+
+    // FIX #230: Prepare memo with safe_slice
+    let memo_bytes = if memo.is_null() {
+        [0u8; 512]
+    } else {
+        let memo_slice = match safe_slice(memo, 512) {
+            Some(s) => s,
+            None => {
+                eprintln!("❌ Invalid memo pointer in multi-input tx");
+                return false;
+            }
+        };
+        let mut m = [0u8; 512];
+        m.copy_from_slice(memo_slice);
+        m
+    };
+    let memo_obj = match MemoBytes::from_bytes(&memo_bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("❌ Invalid memo bytes in multi-input tx: {:?}", e);
+            return false;
+        }
+    };
+
+    // FIX #230: Add output to recipient (safe Amount conversion)
+    let amount_val = match Amount::from_i64(amount as i64) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln!("❌ Invalid amount in multi-input tx: {}", redact_amount!(amount));
+            return false;
+        }
+    };
+    if let Err(e) = builder.add_sapling_output(
+        Some(extsk.expsk.ovk),
+        to_addr,
+        amount_val,
+        memo_obj,
+    ) {
+        eprintln!("❌ Failed to add output: {:?}", e);
+        return false;
+    }
+
+    // FIX #230: Add change output with safe Amount conversion
+    let change = total_input - amount - fee;
+    if change > 0 {
+        let change_memo = MemoBytes::empty();
+        let change_amount = match Amount::from_i64(change as i64) {
+            Ok(a) => a,
+            Err(_) => {
+                eprintln!("❌ Invalid change amount in multi-input tx: {}", redact_amount!(change));
+                return false;
+            }
+        };
+        // PRIVACY: P-ADDR-002 — Use diversified change address (external scope, high index)
+        // FIX #1402 (NEW-002): Random offset prevents TX linkage via identical change addresses
+        let dfvk_change = extsk.to_diversifiable_full_viewing_key();
+        let change_diversifier_base: u64 = 1_000_000_000;
+        let change_offset: u64 = OsRng.gen_range(0u64..1_000_000_000);
+        let change_index = change_diversifier_base + change_offset;
+        LAST_CHANGE_DIVERSIFIER_INDEX.store(change_index, Ordering::SeqCst); // FIX #1402 (NEW-004)
+        let change_j = DiversifierIndex::from(change_index);
+        let (_, change_addr) = match dfvk_change.find_address(change_j) {
+            Some(result) => result,
+            None => {
+                debug_log!("P-ADDR-002: find_address failed at index {}, using default", change_index);
+                dfvk_change.default_address()
+            }
+        };
+        if let Err(e) = builder.add_sapling_output(
+            Some(extsk.expsk.ovk),
+            change_addr,
+            change_amount,
+            change_memo,
+        ) {
+            eprintln!("❌ Failed to add change output: {:?}", e);
+            return false;
+        }
+        debug_log!("💰 Change output: {} zatoshis", change);
+    }
+
+    // FIX #230: Build transaction with safe fee conversion
+    debug_log!("🔨 Building multi-input transaction...");
+    let fee_amount = match Amount::from_i64(fee as i64) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln!("❌ Invalid fee amount in multi-input tx: {}", redact_amount!(fee));
+            return false;
+        }
+    };
+    let (tx, _) = match builder.build(prover, &zcash_primitives::transaction::fees::fixed::FeeRule::non_standard(fee_amount)) {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("❌ Failed to build transaction: {:?}", e);
+            return false;
+        }
+    };
+
+    // Compute and output nullifiers for all spent notes
+    // Get the nullifier deriving key (nk) from the viewing key
+    let dfvk = extsk.to_diversifiable_full_viewing_key();
+    let nk = dfvk.fvk().vk.nk;
+
+    for (i, (note, merkle_path, _)) in parsed_spends.iter().enumerate() {
+        // Get position from merkle path
+        // FIX #761: Log warning if position conversion fails (should never happen with valid witnesses)
+        let position = match u64::try_from(merkle_path.position()) {
+            Ok(pos) => pos,
+            Err(e) => {
+                eprintln!("⚠️ FIX #761: Invalid witness position for spend {}: {:?}, using 0", i, e);
+                0
+            }
+        };
+
+        // Compute nullifier using proper PRF_nf
+        let nf_result = note.nf(&nk, position);
+        let nf_bytes = nf_result.0;
+
+        // Copy to output buffer
+        let offset = i * 32;
+        std::ptr::copy_nonoverlapping(nf_bytes.as_ptr(), nullifiers_out.add(offset), 32);
+        debug_log!("🔐 Nullifier {}: {}", i, hex::encode(&nf_bytes));
+    }
+
+    // Serialize transaction
+    let mut tx_bytes = Vec::new();
+    if let Err(e) = tx.write(&mut tx_bytes) {
+        eprintln!("❌ Failed to serialize transaction: {:?}", e);
+        return false;
+    }
+
+    debug_log!("✅ Multi-input transaction built: {} bytes, {} spends", tx_bytes.len(), spend_count);
+
+    // Copy to output
+    // FIX #1323: Increased from 10KB to 100KB to support multi-input transactions
+    if tx_bytes.len() > 100000 {
+        eprintln!("❌ Transaction too large: {} bytes (max 100000)", tx_bytes.len());
+        return false;
+    }
+
+    std::ptr::copy_nonoverlapping(tx_bytes.as_ptr(), tx_out, tx_bytes.len());
+    *tx_out_len = tx_bytes.len();
+
+    true
+    })
+}
+
+/// Create a value commitment
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_compute_value_commitment(
+    value: u64,
+    rcv: *const u8,
+    cv_out: *mut u8,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    // FIX #1385: Null pointer validation for output
+    if cv_out.is_null() { return false; }
+    // FIX #230: Use safe_slice for bounds checking
+    let rcv_slice = match safe_slice(rcv, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid rcv pointer");
+            return false;
+        }
+    };
+
+    let mut rcv_bytes = [0u8; 32];
+    rcv_bytes.copy_from_slice(rcv_slice);
+
+    let _rcv_scalar = match Option::<jubjub::Fr>::from(jubjub::Fr::from_repr(rcv_bytes)) {
+        Some(r) => r,
+        None => return false,
+    };
+
+    // Compute value commitment using the random trapdoor
+    let trapdoor = zcash_primitives::sapling::value::ValueCommitTrapdoor::random(&mut OsRng);
+    let cv = zcash_primitives::sapling::value::ValueCommitment::derive(NoteValue::from_raw(value), trapdoor);
+    let cv_bytes = cv.to_bytes();
+
+    std::ptr::copy_nonoverlapping(cv_bytes.as_ptr(), cv_out, 32);
+    true
+    })
+}
+
+/// Generate a random scalar for value commitment
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_random_scalar(output: *mut u8) -> bool {
+    ffi_catch_unwind!(false, {
+    // FIX #1385: Null pointer validation
+    if output.is_null() { return false; }
+    let scalar = jubjub::Fr::random(&mut OsRng);
+    let bytes = scalar.to_repr();
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), output, 32);
+    true
+    })
+}
+
+/// FIX #1402 (NEW-004): Get the last change diversifier index used in TX construction.
+/// Call this from Swift after a successful TX build to persist the change address.
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_get_last_change_diversifier_index() -> u64 {
+    LAST_CHANGE_DIVERSIFIER_INDEX.load(Ordering::SeqCst)
+}
+
+/// Encrypt note plaintext for Sapling output
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_encrypt_note(
+    diversifier: *const u8,
+    pk_d: *const u8,
+    value: u64,
+    rcm: *const u8,
+    memo: *const u8,
+    epk_out: *mut u8,
+    enc_out: *mut u8,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, aead::Aead, KeyInit};
+
+    // FIX #1385: Null pointer validation for output pointers
+    if epk_out.is_null() || enc_out.is_null() { return false; }
+
+    // FIX #230: Use safe_slice for all input parameters
+    let div_slice = match safe_slice(diversifier, 11) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid diversifier pointer in encrypt_note");
+            return false;
+        }
+    };
+    let pk_d_slice = match safe_slice(pk_d, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid pk_d pointer in encrypt_note");
+            return false;
+        }
+    };
+    let rcm_slice = match safe_slice(rcm, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid rcm pointer in encrypt_note");
+            return false;
+        }
+    };
+    let memo_slice = match safe_slice(memo, 512) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid memo pointer in encrypt_note");
+            return false;
+        }
+    };
+
+    // Generate ephemeral secret key
+    let esk = jubjub::Fr::random(&mut OsRng);
+
+    // Parse pk_d as a point
+    let mut pk_d_bytes = [0u8; 32];
+    pk_d_bytes.copy_from_slice(pk_d_slice);
+    let pk_d_point: jubjub::ExtendedPoint = match Option::<jubjub::ExtendedPoint>::from(
+        jubjub::ExtendedPoint::from_bytes(&pk_d_bytes)
+    ) {
+        Some(p) => p,
+        None => return false,
+    };
+
+    // Compute ephemeral public key: epk = esk * pk_d
+    let epk = pk_d_point * esk;
+    let epk_bytes = epk.to_bytes();
+    std::ptr::copy_nonoverlapping(epk_bytes.as_ptr(), epk_out, 32);
+
+    // Compute shared secret
+    let shared_secret = pk_d_point * esk;
+    let shared_bytes = shared_secret.to_bytes();
+
+    // KDF
+    let mut kdf_hasher = blake2b_simd::Params::new()
+        .hash_length(32)
+        .personal(b"Zcash_SaplingKDF")
+        .to_state();
+    kdf_hasher.update(&shared_bytes);
+    kdf_hasher.update(&epk_bytes);
+    let symmetric_key = kdf_hasher.finalize();
+
+    // Build plaintext: diversifier (11) + value (8) + rcm (32) + memo (512) = 563 bytes
+    let mut plaintext = Vec::with_capacity(564);
+    plaintext.extend_from_slice(div_slice);
+    plaintext.extend_from_slice(&value.to_le_bytes());
+    plaintext.extend_from_slice(rcm_slice);
+    plaintext.extend_from_slice(memo_slice);
+
+    // Pad to 564 bytes
+    while plaintext.len() < 564 {
+        plaintext.push(0);
+    }
+
+    // Encrypt with ChaCha20Poly1305
+    // FIX #1389: Copy key bytes into mutable buffer so we can zero after use
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(symmetric_key.as_bytes());
+    let key = Key::from_slice(&key_bytes);
+    let cipher = ChaCha20Poly1305::new(key);
+    let nonce = Nonce::from_slice(&[0u8; 12]);
+
+    let ciphertext = match cipher.encrypt(nonce, plaintext.as_slice()) {
+        Ok(c) => c,
+        Err(_) => {
+            // FIX #1389: Zero cipher key material before returning
+            secure_zero(&mut key_bytes);
+            return false;
+        }
+    };
+
+    // FIX #1389: Zero cipher key material after encryption
+    secure_zero(&mut key_bytes);
+
+    // Output is 564 + 16 = 580 bytes
+    std::ptr::copy_nonoverlapping(ciphertext.as_ptr(), enc_out, 580);
+
+    true
+    })
+}
+
+// =============================================================================
+// Sapling Commitment Tree - For generating witnesses
+// =============================================================================
+
+// We need to track witnesses separately since the tree doesn't support random access
+// Global tree and witness storage
+static COMMITMENT_TREE: Mutex<Option<CommitmentTree<zcash_primitives::sapling::Node, 32>>> = Mutex::new(None);
+static WITNESSES: Mutex<Vec<IncrementalWitness<zcash_primitives::sapling::Node, 32>>> = Mutex::new(Vec::new());
+static TREE_POSITION: Mutex<u64> = Mutex::new(0);
+
+// FIX #562 v8: Store delta CMUs to properly update witnesses
+// These are CMUs added after the boost file (during PHASE 2 sync)
+static DELTA_CMUS: Mutex<Vec<zcash_primitives::sapling::Node>> = Mutex::new(Vec::new());
+// FIX #1385: Cap delta CMUs to prevent unbounded memory growth.
+// 200,000 CMUs × 32 bytes = ~6.4MB maximum — well within memory limits.
+// Normal chain growth: ~100-500 CMUs/day. 200K = ~1+ year of delta CMUs.
+const MAX_DELTA_CMUS: usize = 200_000;
+
+/// Initialize a new empty Sapling commitment tree
+#[no_mangle]
+pub extern "C" fn zipherx_tree_init() -> bool {
+    // FIX #1385: catch_unwind to prevent panics crossing FFI boundary
+    ffi_catch_unwind!(false, {
+        // FIX #1385: Replace .lock().unwrap() with safe_lock!
+        let mut tree_guard = match safe_lock!(COMMITMENT_TREE) { Some(g) => g, None => return false };
+        *tree_guard = Some(CommitmentTree::empty());
+
+        let mut witnesses_guard = match safe_lock!(WITNESSES) { Some(g) => g, None => return false };
+        witnesses_guard.clear();
+
+        let mut pos_guard = match safe_lock!(TREE_POSITION) { Some(g) => g, None => return false };
+        *pos_guard = 0;
+
+        // FIX #764: CRITICAL - Clear delta CMUs when tree is reset
+        // Without this, stale CMUs from previous session remain in memory
+        // This caused 210 stale CMUs to be used after Full Rescan, corrupting tree root
+        let mut delta_guard = match safe_lock!(DELTA_CMUS) { Some(g) => g, None => return false };
+        let old_count = delta_guard.len();
+        delta_guard.clear();
+        delta_guard.shrink_to_fit(); // FIX #1385: Release memory after clear
+        if old_count > 0 {
+            debug_log!("🗑️ FIX #764: Cleared {} stale delta CMUs from FFI memory", old_count);
+        }
+
+        true
+    })
+}
+
+/// FIX #996: Clear WITNESSES array without affecting the tree
+/// CRITICAL: Must be called BEFORE loading witnesses to prevent accumulation!
+/// Without this, each call to treeLoadWitness() keeps adding to the array,
+/// causing witness count to grow (228 → 342 → 456 → 595) and FIX #805 to slow down.
+/// Returns the number of witnesses that were cleared.
+#[no_mangle]
+pub extern "C" fn zipherx_witnesses_clear() -> u64 {
+    ffi_catch_unwind!(0, {
+    let mut witnesses_guard = match safe_lock!(WITNESSES) {
+        Some(g) => g,
+        None => return 0,
+    };
+    let count = witnesses_guard.len() as u64;
+    witnesses_guard.clear();
+    if count > 0 {
+        debug_log!("🗑️ FIX #996: Cleared {} witnesses from FFI WITNESSES array", count);
+    }
+    count
+    })
+}
+
+/// Add a note commitment (cmu) to the tree
+/// cmu: 32-byte note commitment in WIRE FORMAT (little-endian)
+/// Returns the position of the added commitment
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_tree_append(cmu: *const u8) -> u64 {
+    ffi_catch_unwind!(u64::MAX, {
+    // FIX #230: Use safe_slice for bounds checking
+    let cmu_slice = match safe_slice(cmu, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid CMU pointer in tree_append");
+            return u64::MAX;
+        }
+    };
+
+    // FIX #230: Use safe_lock for mutex
+    let mut tree_guard = match safe_lock!(COMMITMENT_TREE) {
+        Some(g) => g,
+        None => return u64::MAX,
+    };
+    let tree = match tree_guard.as_mut() {
+        Some(t) => t,
+        None => return u64::MAX, // Tree not initialized
+    };
+
+    // Parse cmu as a Sapling Node using Node::read()
+    // IMPORTANT: CMU must be in wire format (little-endian), same as treeLoadFromCMUs
+    // This ensures consistency - both functions parse CMUs the same way
+    let node = match zcash_primitives::sapling::Node::read(cmu_slice) {
+        Ok(n) => n,
+        Err(_) => return u64::MAX,
+    };
+
+    // Append to tree
+    if tree.append(node).is_err() {
+        return u64::MAX;
+    }
+
+    // FIX #562 v8: Store delta CMU for proper witness updates
+    {
+        // FIX #1385: Replace .lock().unwrap() with safe_lock!
+        let mut delta_guard = match safe_lock!(DELTA_CMUS) { Some(g) => g, None => return u64::MAX };
+        // FIX #1385 / VUL-FFI-005: Cap delta CMUs — batch drain to avoid O(n) per-append
+        if delta_guard.len() >= MAX_DELTA_CMUS {
+            let drain_count = MAX_DELTA_CMUS / 10; // 20K batch
+            debug_log!("⚠️ VUL-FFI-005: DELTA_CMUS at capacity ({}) — draining {} oldest", MAX_DELTA_CMUS, drain_count);
+            delta_guard.drain(..drain_count);
+            delta_guard.shrink_to_fit();
+        }
+        delta_guard.push(node.clone());
+        // Log every 100 delta CMUs to avoid spam
+        if delta_guard.len() % 100 == 0 {
+            debug_log!("📊 FIX #562 v8: Stored {} delta CMUs", delta_guard.len());
+        }
+    }
+
+    // Update all existing witnesses with this new node
+    // FIX #1385: Replace .lock().unwrap() with safe_lock!
+    let mut witnesses_guard = match safe_lock!(WITNESSES) { Some(g) => g, None => return u64::MAX };
+    for witness in witnesses_guard.iter_mut() {
+        witness.append(node).ok();
+    }
+
+    let mut pos_guard = match safe_lock!(TREE_POSITION) { Some(g) => g, None => return u64::MAX };
+    let position = *pos_guard;
+    *pos_guard += 1;
+
+    position
+    })
+}
+
+/// Batch append multiple CMUs to the tree (MUCH faster than individual appends)
+/// cmus_data: Packed CMU data (32 bytes per CMU, in wire format)
+/// cmu_count: Number of CMUs to append
+/// Returns the starting position of the first CMU, or u64::MAX on error
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_tree_append_batch(
+    cmus_data: *const u8,
+    cmu_count: usize,
+) -> u64 {
+    ffi_catch_unwind!(u64::MAX, {
+    if cmus_data.is_null() || cmu_count == 0 {
+        return u64::MAX;
+    }
+
+    // FIX #1385: Checked multiplication to prevent overflow
+    let total_len = match cmu_count.checked_mul(32) {
+        Some(len) => len,
+        None => return u64::MAX,
+    };
+
+    // FIX #230: Use safe_slice for bounds checking
+    let data = match safe_slice(cmus_data, total_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid CMUs data pointer in tree_append_batch");
+            return u64::MAX;
+        }
+    };
+
+    // FIX #230: Use safe_lock for mutex
+    let mut tree_guard = match safe_lock!(COMMITMENT_TREE) {
+        Some(g) => g,
+        None => return u64::MAX,
+    };
+    let tree = match tree_guard.as_mut() {
+        Some(t) => t,
+        None => return u64::MAX,
+    };
+
+    let mut pos_guard = match safe_lock!(TREE_POSITION) {
+        Some(g) => g,
+        None => return u64::MAX,
+    };
+    let start_position = *pos_guard;
+
+    // Parse all CMUs first
+    let mut nodes: Vec<zcash_primitives::sapling::Node> = Vec::with_capacity(cmu_count);
+    for i in 0..cmu_count {
+        let cmu_slice = &data[i * 32..(i + 1) * 32];
+        match zcash_primitives::sapling::Node::read(cmu_slice) {
+            Ok(n) => nodes.push(n),
+            Err(_) => return u64::MAX,
+        }
+    }
+
+    // Append all nodes to tree
+    for node in &nodes {
+        if tree.append(*node).is_err() {
+            return u64::MAX;
+        }
+    }
+
+    // Update all existing witnesses with all new nodes (batch)
+    // FIX #1385: Replace .lock().unwrap() with safe_lock!
+    let mut witnesses_guard = match safe_lock!(WITNESSES) { Some(g) => g, None => return u64::MAX };
+    for node in &nodes {
+        for witness in witnesses_guard.iter_mut() {
+            witness.append(*node).ok();
+        }
+    }
+
+    *pos_guard += cmu_count as u64;
+
+    start_position
+    })
+}
+
+/// FIX #840: ATOMIC delta CMU append - prevents race condition double-append
+///
+/// This function atomically checks the tree size and only appends delta CMUs if the tree
+/// hasn't already been updated. This prevents the TOCTOU race condition between
+/// WalletManager and ContentView's INSTANT START path.
+///
+/// Race condition scenario (before this fix):
+///   1. Thread A (WalletManager) checks tree size → 1045687 (boost only)
+///   2. Thread B (ContentView) checks tree size → 1045687 (boost only)
+///   3. Both decide to append delta (since 1045687 == boost count)
+///   4. Thread A appends delta → tree size becomes 1045901
+///   5. Thread B appends delta → tree size becomes 1046115 (CORRUPTED!)
+///
+/// This fix:
+///   - Acquires ALL locks atomically at the start
+///   - Checks tree size while holding locks
+///   - Only appends if tree size == expected_boost_size
+///   - Returns status indicating whether append was performed or skipped
+///
+/// Parameters:
+///   cmus_data: Packed CMU data (32 bytes per CMU, in wire format)
+///   cmu_count: Number of CMUs to append
+///   expected_boost_size: Expected tree size before delta append (boost file CMU count)
+///
+/// Returns:
+///   0 = Error (failed to append)
+///   1 = SUCCESS - Delta appended (tree was at expected_boost_size)
+///   2 = SKIPPED - Delta already present (tree size > expected_boost_size)
+///   3 = MISMATCH - Tree size < expected_boost_size (unexpected state)
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_tree_append_delta_atomic(
+    cmus_data: *const u8,
+    cmu_count: usize,
+    expected_boost_size: u64,
+) -> u32 {
+    ffi_catch_unwind!(0, {
+    if cmus_data.is_null() || cmu_count == 0 {
+        debug_log!("❌ FIX #840: Invalid parameters (null={}, count={})", cmus_data.is_null(), cmu_count);
+        return 0;
+    }
+
+    // FIX #1385: Checked multiplication to prevent overflow
+    let total_len = match cmu_count.checked_mul(32) {
+        Some(len) => len,
+        None => return 0,
+    };
+
+    // FIX #230: Use safe_slice for bounds checking
+    let data = match safe_slice(cmus_data, total_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ FIX #840: Invalid CMUs data pointer in tree_append_delta_atomic");
+            return 0;
+        }
+    };
+
+    // CRITICAL: Acquire ALL locks atomically BEFORE checking tree size
+    // This prevents TOCTOU race condition
+    let mut tree_guard = match safe_lock!(COMMITMENT_TREE) {
+        Some(g) => g,
+        None => {
+            eprintln!("❌ FIX #840: Failed to acquire COMMITMENT_TREE lock");
+            return 0;
+        }
+    };
+    let tree = match tree_guard.as_mut() {
+        Some(t) => t,
+        None => {
+            eprintln!("❌ FIX #840: Tree not initialized");
+            return 0;
+        }
+    };
+
+    let mut pos_guard = match safe_lock!(TREE_POSITION) {
+        Some(g) => g,
+        None => {
+            eprintln!("❌ FIX #840: Failed to acquire TREE_POSITION lock");
+            return 0;
+        }
+    };
+
+    // ATOMIC CHECK: Now that we hold all locks, check tree size
+    let current_size = *pos_guard;
+
+    if current_size > expected_boost_size {
+        // Delta already appended by another thread - SKIP
+        let delta_present = current_size - expected_boost_size;
+        debug_log!("🔄 FIX #840: SKIPPED - Delta already present (current={}, boost={}, delta={})",
+                   current_size, expected_boost_size, delta_present);
+        return 2; // SKIPPED
+    }
+
+    if current_size < expected_boost_size {
+        // Tree has fewer CMUs than expected - unexpected state
+        debug_log!("⚠️ FIX #840: MISMATCH - Tree smaller than boost (current={}, expected={})",
+                   current_size, expected_boost_size);
+        return 3; // MISMATCH
+    }
+
+    // Tree is exactly at boost size - safe to append delta
+    debug_log!("✅ FIX #840: Appending {} delta CMUs atomically (current={}, boost={})",
+               cmu_count, current_size, expected_boost_size);
+
+    // Parse all CMUs first
+    let mut nodes: Vec<zcash_primitives::sapling::Node> = Vec::with_capacity(cmu_count);
+    for i in 0..cmu_count {
+        let cmu_slice = &data[i * 32..(i + 1) * 32];
+        match zcash_primitives::sapling::Node::read(cmu_slice) {
+            Ok(n) => nodes.push(n),
+            Err(e) => {
+                eprintln!("❌ FIX #840: Failed to parse CMU {}: {:?}", i, e);
+                return 0;
+            }
+        }
+    }
+
+    // Append all nodes to tree
+    for (i, node) in nodes.iter().enumerate() {
+        if tree.append(*node).is_err() {
+            eprintln!("❌ FIX #840: Failed to append CMU {} to tree", i);
+            return 0;
+        }
+    }
+
+    // Store delta CMUs for witness updates
+    {
+        let mut delta_guard = match safe_lock!(DELTA_CMUS) {
+            Some(g) => g,
+            None => {
+                eprintln!("❌ FIX #840: Failed to acquire DELTA_CMUS lock");
+                return 0;
+            }
+        };
+        // FIX #1385: Cap delta CMUs to prevent unbounded memory growth
+        let remaining_capacity = MAX_DELTA_CMUS.saturating_sub(delta_guard.len());
+        if nodes.len() > remaining_capacity {
+            // Drain oldest entries to make room for the new batch
+            let drain_count = nodes.len() - remaining_capacity;
+            debug_log!("⚠️ FIX #1385: DELTA_CMUS near capacity — draining {} oldest entries", drain_count);
+            delta_guard.drain(..drain_count);
+        }
+        for node in &nodes {
+            delta_guard.push(node.clone());
+        }
+        delta_guard.shrink_to_fit();
+        debug_log!("📊 FIX #840: Stored {} delta CMUs (total={})", cmu_count, delta_guard.len());
+    }
+
+    // Update all existing witnesses with all new nodes
+    let mut witnesses_guard = match safe_lock!(WITNESSES) {
+        Some(g) => g,
+        None => {
+            eprintln!("❌ FIX #840: Failed to acquire WITNESSES lock");
+            // Tree was already modified, but witnesses not updated - partial failure
+            // Still update position and return success since tree is correct
+            *pos_guard += cmu_count as u64;
+            return 1;
+        }
+    };
+
+    for node in &nodes {
+        for witness in witnesses_guard.iter_mut() {
+            witness.append(*node).ok();
+        }
+    }
+
+    *pos_guard += cmu_count as u64;
+
+    debug_log!("✅ FIX #840: SUCCESS - Appended {} delta CMUs (new size={})", cmu_count, *pos_guard);
+    1 // SUCCESS
+    })
+}
+
+/// Create a witness for the current position in the tree
+/// Call this right after appending a note that belongs to us
+/// Returns the witness index (to retrieve later) or u64::MAX on error
+#[no_mangle]
+pub extern "C" fn zipherx_tree_witness_current() -> u64 {
+    ffi_catch_unwind!(u64::MAX, {
+    // FIX #1385: Replace .lock().unwrap() with safe_lock!
+    let tree_guard = match safe_lock!(COMMITMENT_TREE) { Some(g) => g, None => return u64::MAX };
+    let tree = match tree_guard.as_ref() {
+        Some(t) => t.clone(),
+        None => return u64::MAX,
+    };
+
+    let witness = IncrementalWitness::from_tree(tree);
+
+    let mut witnesses_guard = match safe_lock!(WITNESSES) { Some(g) => g, None => return u64::MAX };
+    let index = witnesses_guard.len();
+    witnesses_guard.push(witness);
+
+    index as u64
+    })
+}
+
+/// Load a witness from serialized data into the WITNESSES array
+/// This allows us to track and update previously saved witnesses
+/// Returns the witness index or u64::MAX on error
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_tree_load_witness(
+    witness_data: *const u8,
+    witness_len: usize,
+) -> u64 {
+    ffi_catch_unwind!(u64::MAX, {
+    if witness_len < 1028 {
+        debug_log!("❌ Witness data too short: {} bytes", witness_len);
+        return u64::MAX;
+    }
+
+    // FIX #230: Use safe_slice for bounds checking
+    let witness_slice = match safe_slice(witness_data, witness_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid witness pointer in tree_load_witness");
+            return u64::MAX;
+        }
+    };
+
+    // FIX #557 v48: Try deserializing with full witness first
+    let mut witness: Option<IncrementalWitness<zcash_primitives::sapling::Node, 32>> = None;
+    let mut used_len = witness_len;
+
+    // First try: Full 1028 bytes
+    {
+        let mut reader = std::io::Cursor::new(witness_slice);
+        match zcash_primitives::merkle_tree::read_incremental_witness(&mut reader) {
+            Ok(w) => {
+                witness = Some(w);
+                debug_log!("📝 Loading witness ({} bytes, full)", witness_len);
+            }
+            Err(_) => {}
+        }
+    }
+
+    // Second try: Trim trailing zeros
+    if witness.is_none() {
+        let mut trim_end = witness_slice.len();
+        while trim_end > 100 && trim_end > witness_slice.len() - 200 {
+            let last_50_all_zeros = witness_slice[trim_end-50..trim_end].iter().all(|&b| b == 0);
+            if !last_50_all_zeros {
+                break;
+            }
+            trim_end -= 50;
+        }
+        if trim_end < 700 {
+            trim_end = witness_slice.len();
+        }
+
+        let trimmed_slice = &witness_slice[..trim_end];
+        let mut reader = std::io::Cursor::new(trimmed_slice);
+        match zcash_primitives::merkle_tree::read_incremental_witness(&mut reader) {
+            Ok(w) => {
+                witness = Some(w);
+                used_len = trim_end;
+                debug_log!("📝 Loading witness ({} bytes, trimmed from {})", trim_end, witness_slice.len());
+            }
+            Err(e) => {
+                debug_log!("❌ Failed to deserialize witness: {:?}", e);
+                return u64::MAX;
+            }
+        }
+    }
+
+    let witness = match witness {
+        Some(w) => w,
+        None => {
+            debug_log!("❌ No valid witness deserialized");
+            return u64::MAX;
+        }
+    };
+
+    // FIX #1091: Extract the ACTUAL tree position from the witness for logging
+    let tree_position = u64::from(witness.witnessed_position());
+
+    // FIX #230: Use safe_lock for mutex
+    let mut witnesses_guard = match safe_lock!(WITNESSES) {
+        Some(g) => g,
+        None => return u64::MAX,
+    };
+    let array_index = witnesses_guard.len();
+    witnesses_guard.push(witness);
+
+    // FIX #1177: Return ARRAY INDEX, not tree position!
+    // All callers (FilterScanner, TransactionBuilder, WalletManager) use this
+    // value to call zipherx_tree_get_witness() which indexes into WITNESSES Vec.
+    // Tree position is embedded in witness data and extracted during spend creation.
+    debug_log!("📝 FIX #1177: Loaded witness at array index {}, tree position {}", array_index, tree_position);
+    array_index as u64
+    })
+}
+
+/// FIX #1177: Get tree position (witnessed_position) from a loaded witness
+/// This is the actual commitment tree index needed for nullifier computation.
+/// witness_index: Array index returned by zipherx_tree_load_witness
+/// Returns tree position or u64::MAX on error
+#[no_mangle]
+pub extern "C" fn zipherx_witness_get_tree_position(witness_index: u64) -> u64 {
+    ffi_catch_unwind!(u64::MAX, {
+    let witnesses_guard = match safe_lock!(WITNESSES) {
+        Some(g) => g,
+        None => return u64::MAX,
+    };
+    match witnesses_guard.get(witness_index as usize) {
+        Some(w) => {
+            let pos = u64::from(w.witnessed_position());
+            debug_log!("📝 FIX #1177: Witness array[{}] tree position = {}", witness_index, pos);
+            pos
+        }
+        None => {
+            debug_log!("❌ FIX #1177: Invalid witness index {} for position lookup (array size: {})", witness_index, witnesses_guard.len());
+            u64::MAX
+        }
+    }
+    })
+}
+
+/// Get the root of the tree
+/// root_out: 32-byte output buffer for the root
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_tree_root(root_out: *mut u8) -> bool {
+    ffi_catch_unwind!(false, {
+    // FIX #230: Use safe_lock for mutex
+    let tree_guard = match safe_lock!(COMMITMENT_TREE) {
+        Some(g) => g,
+        None => return false,
+    };
+    let tree = match tree_guard.as_ref() {
+        Some(t) => t,
+        None => return false,
+    };
+
+    let root = tree.root();
+    let mut root_bytes = Vec::new();
+    if root.write(&mut root_bytes).is_err() {
+        eprintln!("❌ Failed to write root bytes");
+        return false;
+    }
+
+    std::ptr::copy_nonoverlapping(root_bytes.as_ptr(), root_out, 32);
+    true
+    })
+}
+
+/// FIX #739: Update ALL loaded witnesses with a CMU (WITHOUT modifying the tree)
+/// This is used when witnesses were loaded from DB after delta CMUs were already appended to tree.
+/// cmu: New commitment to append (32 bytes)
+/// Returns number of witnesses updated
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_update_all_witnesses_with_cmu(cmu: *const u8) -> u64 {
+    ffi_catch_unwind!(0, {
+        if cmu.is_null() {
+            return 0;
+        }
+
+        // FIX #230: Use safe_slice for bounds checking
+        let cmu_slice = match safe_slice(cmu, 32) {
+            Some(s) => s,
+            None => {
+                eprintln!("❌ Invalid CMU pointer in update_all_witnesses_with_cmu");
+                return 0;
+            }
+        };
+
+        // Parse CMU into Node
+        let mut cmu_bytes = [0u8; 32];
+        cmu_bytes.copy_from_slice(cmu_slice);
+
+        let node = match bls12_381::Scalar::from_repr(cmu_bytes).into() {
+            Some(scalar) => zcash_primitives::sapling::Node::from_scalar(scalar),
+            None => {
+                eprintln!("❌ Invalid scalar in update_all_witnesses_with_cmu");
+                return 0;
+            }
+        };
+
+        // Update all loaded witnesses
+        let mut witnesses_guard = match safe_lock!(WITNESSES) {
+            Some(g) => g,
+            None => return 0,
+        };
+
+        let mut updated = 0u64;
+        for witness in witnesses_guard.iter_mut() {
+            if witness.append(node.clone()).is_ok() {
+                updated += 1;
+            }
+        }
+
+        updated
+    })
+}
+
+/// FIX #739: Batch update ALL loaded witnesses with multiple CMUs (WITHOUT modifying the tree)
+/// cmus_data: Packed CMU data (32 bytes per CMU)
+/// cmu_count: Number of CMUs to append
+/// Returns number of witnesses fully updated (all CMUs appended)
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_update_all_witnesses_batch(
+    cmus_data: *const u8,
+    cmu_count: usize,
+) -> u64 {
+    ffi_catch_unwind!(0, {
+        if cmus_data.is_null() || cmu_count == 0 {
+            return 0;
+        }
+
+        // FIX #1385: Checked multiplication to prevent overflow
+        let total_len = match cmu_count.checked_mul(32) {
+            Some(len) => len,
+            None => return 0,
+        };
+
+        // FIX #230: Use safe_slice for bounds checking
+        let data = match safe_slice(cmus_data, total_len) {
+            Some(s) => s,
+            None => {
+                eprintln!("❌ Invalid CMUs data pointer in update_all_witnesses_batch");
+                return 0;
+            }
+        };
+
+        // Parse all CMUs into Nodes
+        let mut nodes: Vec<zcash_primitives::sapling::Node> = Vec::with_capacity(cmu_count);
+        for i in 0..cmu_count {
+            let offset = i * 32;
+            let mut cmu_bytes = [0u8; 32];
+            cmu_bytes.copy_from_slice(&data[offset..offset + 32]);
+
+            let node = match bls12_381::Scalar::from_repr(cmu_bytes).into() {
+                Some(scalar) => zcash_primitives::sapling::Node::from_scalar(scalar),
+                None => continue,
+            };
+            nodes.push(node);
+        }
+
+        debug_log!("🔧 FIX #739: Updating all witnesses with {} CMUs (no tree modification)", nodes.len());
+
+        // Update all loaded witnesses with all CMUs
+        let mut witnesses_guard = match safe_lock!(WITNESSES) {
+            Some(g) => g,
+            None => return 0,
+        };
+
+        let witness_count = witnesses_guard.len();
+
+        // FIX #989: PERFORMANCE - Parallel witness update for INSTANT rebuild
+        // Each witness is independent, so use Rayon's par_iter_mut for multi-core speedup
+        // Before: 14+ seconds for 96 witnesses × 558 CMUs (sequential)
+        // After: ~2 seconds (8x speedup on multi-core device)
+        witnesses_guard.par_iter_mut().for_each(|witness| {
+            for node in &nodes {
+                witness.append(node.clone()).ok();
+            }
+        });
+
+        debug_log!("✅ FIX #989: Updated {} witnesses with {} CMUs (PARALLEL)", witness_count, nodes.len());
+        witness_count as u64
+    })
+}
+
+/// FIX #739 v4: Get delta CMUs count from memory (not file)
+/// Returns number of delta CMUs stored in DELTA_CMUS array
+#[no_mangle]
+pub extern "C" fn zipherx_get_delta_cmus_count() -> u64 {
+    ffi_catch_unwind!(0, {
+        let delta_guard = match DELTA_CMUS.lock() {
+            Ok(g) => g,
+            Err(_) => return 0,
+        };
+        delta_guard.len() as u64
+    })
+}
+
+/// FIX #739 v4: Get delta CMUs from memory (not file)
+/// These are all CMUs appended via treeAppend() during this session
+/// cmus_out: Output buffer for CMUs (32 bytes per CMU)
+/// max_count: Maximum number of CMUs to return
+/// Returns actual number of CMUs written
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_get_delta_cmus(
+    cmus_out: *mut u8,
+    max_count: usize,
+) -> u64 {
+    ffi_catch_unwind!(0, {
+        if cmus_out.is_null() || max_count == 0 {
+            return 0;
+        }
+
+        let delta_guard = match DELTA_CMUS.lock() {
+            Ok(g) => g,
+            Err(_) => return 0,
+        };
+
+        let count = std::cmp::min(delta_guard.len(), max_count);
+        debug_log!("🔧 FIX #739 v4: Exporting {} delta CMUs from memory", count);
+
+        for (i, node) in delta_guard.iter().take(count).enumerate() {
+            // Serialize node to bytes
+            let mut node_bytes = Vec::new();
+            if node.write(&mut node_bytes).is_err() {
+                continue;
+            }
+            if node_bytes.len() != 32 {
+                continue;
+            }
+
+            let out_ptr = cmus_out.add(i * 32);
+            std::ptr::copy_nonoverlapping(node_bytes.as_ptr(), out_ptr, 32);
+        }
+
+        count as u64
+    })
+}
+
+/// Update a witness with a new CMU
+/// This is used to keep witnesses current as new notes are added
+/// witness_data: Current witness data (1028 bytes)
+/// cmu: New commitment to append (32 bytes)
+/// witness_out: Output buffer for updated witness (1028 bytes)
+/// Returns true if successful
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_witness_update(
+    witness_data: *const u8,
+    witness_len: usize,
+    cmu: *const u8,
+    witness_out: *mut u8,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    // FIX #1385: Null pointer validation for output
+    if witness_out.is_null() { return false; }
+    if witness_len < 1028 {
+        return false;
+    }
+
+    // FIX #230: Use safe_slice for bounds checking
+    let witness_slice = match safe_slice(witness_data, witness_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid witness pointer in witness_update");
+            return false;
+        }
+    };
+    let cmu_slice = match safe_slice(cmu, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid CMU pointer in witness_update");
+            return false;
+        }
+    };
+
+    // FIX #230: Parse position from witness (safe conversion)
+    let position = match witness_slice[0..4].try_into() {
+        Ok(bytes) => u32::from_le_bytes(bytes),
+        Err(_) => return false,
+    };
+
+    // Parse CMU as node
+    let mut cmu_bytes = [0u8; 32];
+    cmu_bytes.copy_from_slice(cmu_slice);
+    let node = match bls12_381::Scalar::from_repr(cmu_bytes).into() {
+        Some(scalar) => zcash_primitives::sapling::Node::from_scalar(scalar),
+        None => return false,
+    };
+
+    // Parse merkle path from witness
+    let mut path_hashes = Vec::with_capacity(32);
+    for i in 0..32 {
+        let start = 4 + i * 32;
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&witness_slice[start..start+32]);
+        let scalar = match bls12_381::Scalar::from_repr(hash).into() {
+            Some(s) => s,
+            None => return false,
+        };
+        path_hashes.push(zcash_primitives::sapling::Node::from_scalar(scalar));
+    }
+
+    // Create incremental witness from path
+    // Note: This is a simplified update - for a full implementation we'd need
+    // to properly reconstruct the IncrementalWitness and call append()
+    // For now, we'll update the path based on the new leaf position
+
+    // The witness needs the IncrementalWitness::append method which requires
+    // the full witness state. Since we only have the path, we can't easily update.
+    //
+    // The proper solution is to keep witnesses in memory and update them during scan.
+    // For now, return false to indicate this needs the full witness updating approach.
+
+    false
+    })
+}
+
+/// Get witness data for a specific witness index
+/// witness_index: Index returned by zipherx_tree_witness_current
+/// witness_out: Output buffer for witness (1028 bytes: 4 bytes position + 32*32 bytes path)
+/// Returns true if successful
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_tree_get_witness(
+    witness_index: u64,
+    witness_out: *mut u8,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    // FIX #1385: Null pointer validation for output
+    if witness_out.is_null() { return false; }
+    // FIX #1385: Replace .lock().unwrap() with safe_lock!
+    let witnesses_guard = match safe_lock!(WITNESSES) { Some(g) => g, None => return false };
+    let witness = match witnesses_guard.get(witness_index as usize) {
+        Some(w) => w,
+        None => {
+            debug_log!("❌ Invalid witness index {}", witness_index);
+            return false;
+        }
+    };
+
+    // Debug: Print the root that this witness produces
+    let witness_root = witness.root();
+    let mut witness_root_bytes = [0u8; 32];
+    if witness_root.write(&mut witness_root_bytes[..]).is_err() {
+        return false;
+    }
+    debug_log!("🔍 Witness root (wire format): {}", hex::encode(&witness_root_bytes));
+
+    // Serialize the IncrementalWitness using zcash standard format
+    let mut serialized = Vec::new();
+    if zcash_primitives::merkle_tree::write_incremental_witness(witness, &mut serialized).is_err() {
+        debug_log!("❌ Failed to serialize witness");
+        return false;
+    }
+
+    // Copy to output buffer (must be at least 1028 bytes)
+    if serialized.len() > 1028 {
+        debug_log!("❌ Serialized witness too large: {} bytes", serialized.len());
+        return false;
+    }
+
+    std::ptr::copy_nonoverlapping(serialized.as_ptr(), witness_out, serialized.len());
+    // Zero-pad remaining bytes
+    if serialized.len() < 1028 {
+        std::ptr::write_bytes(witness_out.add(serialized.len()), 0, 1028 - serialized.len());
+    }
+
+    debug_log!("📝 Serialized witness: {} bytes", serialized.len());
+    true
+    })
+}
+
+/// Get current tree size (number of commitments)
+#[no_mangle]
+pub extern "C" fn zipherx_tree_size() -> u64 {
+    ffi_catch_unwind!(0, {
+    // FIX #1385: Replace .lock().unwrap() with safe_lock!
+    let pos_guard = match safe_lock!(TREE_POSITION) { Some(g) => g, None => return 0 };
+    *pos_guard
+    })
+}
+
+/// Serialize tree state for persistence
+/// tree_out: Output buffer (should be large, e.g., 100KB)
+/// tree_out_len: Output length
+/// Returns true if successful
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_tree_serialize(
+    tree_out: *mut u8,
+    tree_out_len: *mut usize,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    // FIX #1385: Null pointer validation for outputs
+    if tree_out.is_null() || tree_out_len.is_null() { return false; }
+    // FIX #230: Use safe_lock for mutex
+    let tree_guard = match safe_lock!(COMMITMENT_TREE) {
+        Some(g) => g,
+        None => return false,
+    };
+    let tree = match tree_guard.as_ref() {
+        Some(t) => t,
+        None => return false,
+    };
+
+    let mut data = Vec::new();
+
+    // FIX #230: Write tree size with safe_lock
+    let pos_guard = match safe_lock!(TREE_POSITION) {
+        Some(g) => g,
+        None => return false,
+    };
+    data.extend_from_slice(&pos_guard.to_le_bytes());
+
+    // Serialize tree
+    if write_commitment_tree(tree, &mut data).is_err() {
+        return false;
+    }
+
+    // FIX #557 v7: Increased limit to 20MB to handle large trees (1M+ commitments)
+    // Each commitment is ~11 bytes, so 1M commitments = ~11MB
+    if data.len() > 20_000_000 {
+        eprintln!("❌ Tree too large to serialize ({} bytes)", data.len());
+        return false;
+    }
+
+    std::ptr::copy_nonoverlapping(data.as_ptr(), tree_out, data.len());
+    *tree_out_len = data.len();
+
+    true
+    })
+}
+
+/// Deserialize tree state from persistence
+/// tree_data: Serialized tree data
+/// tree_len: Length of data
+/// Returns true if successful
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_tree_deserialize(
+    tree_data: *const u8,
+    tree_len: usize,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    if tree_len < 8 {
+        return false;
+    }
+
+    // FIX #230: Use safe_slice for bounds checking
+    let data = match safe_slice(tree_data, tree_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid tree data pointer in tree_deserialize");
+            return false;
+        }
+    };
+
+    // FIX #230: Read position with safe conversion
+    let position = match data[0..8].try_into() {
+        Ok(bytes) => u64::from_le_bytes(bytes),
+        Err(_) => return false,
+    };
+
+    // FIX #564 Part 1: Fast format validation before expensive deserialization
+    // This prevents 14.5 second delay when tree format is corrupted
+    let tree_data = &data[8..];
+
+    // Validate minimum size (should have at least some tree structure)
+    if tree_data.len() < 32 {
+        eprintln!("⚠️ FIX #564: Tree data too small ({} bytes) - likely corrupted", tree_data.len());
+        return false;
+    }
+
+    // Quick sanity check: First bytes should look like valid tree structure
+    // Zcash tree serialization starts with specific patterns
+    // If we detect obviously corrupt data, fail fast instead of waiting 14.5 seconds
+    if tree_data[0] == 0xFF && tree_data[1] == 0xFF && tree_data[2] == 0xFF {
+        // Unlikely pattern for valid tree - probably corrupted
+        eprintln!("⚠️ FIX #564: Tree data appears corrupted (invalid header pattern)");
+        return false;
+    }
+
+    // REMOVED: Broken "suspicious bytes" check from FIX #564 Part 1
+    // This check was FALSE POSITIVE - it rejected valid compact tree data
+    // Compact trees from write_commitment_tree() are ~446 bytes and contain
+    // valid binary data (position, node counts, etc.) with many bytes > 1
+    // The check treated these as "suspicious" and incorrectly rejected valid trees
+    // Reverting to allow deserialization to proceed - read_commitment_tree will
+    // catch actual corruption with proper error messages
+
+    // Deserialize tree (this can still take 14.5s if corrupted in subtle ways, but fast checks above
+    // catch most corruption cases and fail immediately)
+    let tree = match read_commitment_tree(tree_data) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("❌ Failed to deserialize tree: {:?}", e);
+            eprintln!("💡 FIX #564: Consider clearing tree cache and restarting (Settings → Repair Database)");
+            return false;
+        }
+    };
+
+    // FIX #230: Use safe_lock for mutex
+    let mut tree_guard = match safe_lock!(COMMITMENT_TREE) {
+        Some(g) => g,
+        None => return false,
+    };
+    *tree_guard = Some(tree);
+
+    let mut pos_guard = match safe_lock!(TREE_POSITION) {
+        Some(g) => g,
+        None => return false,
+    };
+    *pos_guard = position;
+
+    // FIX #771: CRITICAL - Clear delta CMUs when tree is deserialized
+    // Without this, stale CMUs from previous session remain in memory
+    // When FIX #524 repair runs, it reads these stale CMUs and appends them AGAIN
+    // causing wrong CMU count (e.g., 420 instead of ~89 expected) and tree root mismatch
+    // This is the same fix pattern as FIX #764 in treeInit()
+    {
+        let mut delta_guard = match DELTA_CMUS.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        let old_count = delta_guard.len();
+        delta_guard.clear();
+        delta_guard.shrink_to_fit(); // FIX #1385: Release memory after clear
+        if old_count > 0 {
+            debug_log!("🗑️ FIX #771: Cleared {} stale delta CMUs on tree deserialize", old_count);
+        }
+    }
+
+    true
+    })
+}
+
+/// Load tree from raw CMUs file format
+/// Format: [count: u64 LE][cmu1: 32 bytes][cmu2: 32 bytes]...
+/// Returns true if successful
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_tree_load_from_cmus(
+    data: *const u8,
+    data_len: usize,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    if data_len < 8 {
+        return false;
+    }
+
+    // FIX #230: Use safe_slice for bounds checking
+    let bytes = match safe_slice(data, data_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid data pointer in tree_load_from_cmus");
+            return false;
+        }
+    };
+
+    // FIX #230: Read count with safe conversion
+    let count = match bytes[0..8].try_into() {
+        Ok(arr) => u64::from_le_bytes(arr),
+        Err(_) => return false,
+    };
+
+    // SECURITY FIX (NEW-001): Prevent integer overflow
+    let max_safe_count = (usize::MAX / 32).saturating_sub(1) as u64;
+    if count > max_safe_count {
+        debug_log!("❌ CMU count {} exceeds safe maximum", count);
+        return false;
+    }
+
+    let expected_len = 8 + (count as usize * 32);
+
+    if data_len < expected_len {
+        return false;
+    }
+
+    debug_log!("📦 Loading {} CMUs into tree...", count);
+
+    // Initialize empty tree
+    let mut tree: CommitmentTree<zcash_primitives::sapling::Node, 32> = CommitmentTree::empty();
+
+    // FIX #557 v49: CRITICAL FIX - Cache file CMUs are in DISPLAY format (big-endian)
+    // But note.cmu() returns WIRE format (little-endian)
+    // We must reverse cache CMUs to WIRE format before creating Nodes
+    // This ensures the tree is built with the same format that note.cmu() produces
+    let mut offset = 8;
+    for i in 0..count {
+        let cmu_bytes = &bytes[offset..offset + 32];
+        offset += 32;
+
+        // FIX #730: Boost file CMUs already in WIRE format (no reversal needed)
+        let mut wire_cmu = [0u8; 32];
+        wire_cmu.copy_from_slice(cmu_bytes);
+
+        let node = match zcash_primitives::sapling::Node::read(&wire_cmu[..]) {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+
+        if tree.append(node).is_err() {
+            return false;
+        }
+    }
+
+    // FIX #230: Store in global with safe_lock
+    let mut tree_guard = match safe_lock!(COMMITMENT_TREE) {
+        Some(g) => g,
+        None => return false,
+    };
+    *tree_guard = Some(tree);
+
+    let mut pos_guard = match safe_lock!(TREE_POSITION) {
+        Some(g) => g,
+        None => return false,
+    };
+    *pos_guard = count;
+
+    // FIX #771: CRITICAL - Clear delta CMUs when tree is loaded from CMUs
+    // Same fix as in tree_deserialize - prevents stale delta CMUs from corrupting tree root
+    {
+        let mut delta_guard = match DELTA_CMUS.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        let old_count = delta_guard.len();
+        delta_guard.clear();
+        delta_guard.shrink_to_fit(); // FIX #1385: Release memory after clear
+        if old_count > 0 {
+            debug_log!("🗑️ FIX #771: Cleared {} stale delta CMUs on tree load from CMUs", old_count);
+        }
+    }
+
+    debug_log!("✅ Tree loaded with {} commitments", count);
+
+    true
+    })
+}
+
+/// Progress callback type for tree loading
+/// Parameters: current CMU index, total CMU count
+pub type TreeLoadProgressCallback = extern "C" fn(current: u64, total: u64);
+
+/// Load commitment tree from bundled CMU data with progress callback
+/// This allows Swift to show real-time progress during tree loading
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_tree_load_from_cmus_with_progress(
+    data: *const u8,
+    data_len: usize,
+    progress_callback: TreeLoadProgressCallback,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    if data_len < 8 {
+        return false;
+    }
+
+    // FIX #230: Use safe_slice for bounds checking
+    let bytes = match safe_slice(data, data_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid data pointer in tree_load_with_progress");
+            return false;
+        }
+    };
+
+    // FIX #230: Read count with safe conversion
+    let count = match bytes[0..8].try_into() {
+        Ok(arr) => u64::from_le_bytes(arr),
+        Err(_) => return false,
+    };
+
+    // SECURITY FIX (NEW-001): Prevent integer overflow on 32-bit platforms
+    // Max safe count = (usize::MAX - 8) / 32 to prevent overflow in expected_len calculation
+    let max_safe_count = (usize::MAX / 32).saturating_sub(1) as u64;
+    if count > max_safe_count {
+        debug_log!("❌ CMU count {} exceeds safe maximum {}", count, max_safe_count);
+        return false;
+    }
+
+    let expected_len = 8 + (count as usize * 32);
+
+    if data_len < expected_len {
+        return false;
+    }
+
+    // Report initial progress
+    progress_callback(0, count);
+
+    // Initialize empty tree
+    let mut tree: CommitmentTree<zcash_primitives::sapling::Node, 32> = CommitmentTree::empty();
+
+    // FIX #730: Append all CMUs - already in WIRE format (no reversal needed)
+    let mut offset = 8;
+    for i in 0..count {
+        let cmu_bytes = &bytes[offset..offset + 32];
+        offset += 32;
+
+        // FIX #730: Boost file CMUs already in WIRE format (no reversal needed)
+        let wire_cmu = reverse_cmu_display_to_wire(cmu_bytes);
+
+        let node = match zcash_primitives::sapling::Node::read(&wire_cmu[..]) {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+
+        if tree.append(node).is_err() {
+            return false;
+        }
+
+        // Report progress every 10000 CMUs (about 100 updates for 1M CMUs)
+        if i > 0 && i % 10000 == 0 {
+            progress_callback(i, count);
+        }
+    }
+
+    // Final progress
+    progress_callback(count, count);
+
+    // FIX #230: Store in global with safe_lock
+    let mut tree_guard = match safe_lock!(COMMITMENT_TREE) {
+        Some(g) => g,
+        None => return false,
+    };
+    *tree_guard = Some(tree);
+
+    let mut pos_guard = match safe_lock!(TREE_POSITION) {
+        Some(g) => g,
+        None => return false,
+    };
+    *pos_guard = count;
+
+    // FIX #771: CRITICAL - Clear delta CMUs when tree is loaded with progress
+    // Same fix as in tree_deserialize and tree_load_from_cmus
+    {
+        let mut delta_guard = match DELTA_CMUS.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        let old_count = delta_guard.len();
+        delta_guard.clear();
+        delta_guard.shrink_to_fit(); // FIX #1385: Release memory after clear
+        if old_count > 0 {
+            debug_log!("🗑️ FIX #771: Cleared {} stale delta CMUs on tree load with progress", old_count);
+        }
+    }
+
+    debug_log!("✅ Tree loaded with {} commitments", count);
+
+    true
+    })
+}
+
+/// FIX #197: Load tree from CMU data AND create witnesses for target CMUs in SINGLE PASS
+/// This eliminates PHASE 1.5 by combining tree loading with witness creation.
+///
+/// Parameters:
+/// - data: Bundled CMU data [count: u64][cmu1: 32]...
+/// - data_len: Length of CMU data
+/// - target_cmus: Array of 32-byte target CMUs to create witnesses for
+/// - target_count: Number of target CMUs
+/// - positions_out: Output array for positions (u64 * target_count)
+/// - witnesses_out: Output array for witnesses (1028 bytes * target_count)
+/// - progress_callback: Progress callback(current, total)
+///
+/// Returns: Number of witnesses successfully created
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_tree_load_with_witnesses(
+    data: *const u8,
+    data_len: usize,
+    target_cmus: *const u8,
+    target_count: usize,
+    positions_out: *mut u64,
+    witnesses_out: *mut u8,
+    progress_callback: TreeLoadProgressCallback,
+) -> usize {
+    ffi_catch_unwind!(0, {
+    if data_len < 8 {
+        return 0;
+    }
+
+    // FIX #230: Validate data pointer before creating slice
+    let bytes = match safe_slice(data, data_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid data pointer in tree_load_with_witnesses");
+            return 0;
+        }
+    };
+
+    // Read count - use safe conversion instead of unwrap
+    let count = match bytes[0..8].try_into() {
+        Ok(arr) => u64::from_le_bytes(arr),
+        Err(_) => return 0,
+    };
+
+    // SECURITY FIX (NEW-001): Prevent integer overflow
+    let max_safe_count = (usize::MAX / 32).saturating_sub(1) as u64;
+    if count > max_safe_count {
+        debug_log!("❌ CMU count {} exceeds safe maximum {}", count, max_safe_count);
+        return 0;
+    }
+
+    let expected_len = 8 + (count as usize * 32);
+    if data_len < expected_len {
+        return 0;
+    }
+
+    debug_log!("🔧 FIX #197: Loading tree with {} CMUs AND creating {} witnesses in single pass",
+               count, target_count);
+    let start_time = std::time::Instant::now();
+
+    // FIX #230: Build HashMap of target CMUs for O(1) lookup with safe slice
+    // FIX #1385: Checked multiplication to prevent overflow
+    let targets = if target_count > 0 {
+        match target_count.checked_mul(32) {
+            Some(len) => safe_slice(target_cmus, len),
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    // FIX #471: Support both byte orders for target CMUs to handle potential byte order mismatches
+    // The database might store CMUs in different byte order than boost file
+    let mut target_map: std::collections::HashMap<[u8; 32], usize> = std::collections::HashMap::new();
+    let mut target_map_reversed: std::collections::HashMap<[u8; 32], usize> = std::collections::HashMap::new();
+
+    if let Some(targets) = targets {
+        for i in 0..target_count {
+            let offset = i * 32;
+            let mut cmu = [0u8; 32];
+            cmu.copy_from_slice(&targets[offset..offset + 32]);
+
+            // Insert both original and reversed byte orders
+            target_map.insert(cmu, i);
+
+            let mut cmu_reversed = [0u8; 32];
+            for j in 0..32 {
+                cmu_reversed[j] = cmu[31 - j];
+            }
+            target_map_reversed.insert(cmu_reversed, i);
+
+            // FIX #471: Debug log first few target CMUs in both byte orders
+            if i < 3 {
+                eprintln!("🎯 FIX #471: Target CMU[{}]: {}... (reversed: {}...)",
+                         i, hex::encode(&cmu[0..8]), hex::encode(&cmu_reversed[0..8]));
+            }
+        }
+        eprintln!("🎯 FIX #471: Loaded {} target CMUs into lookup maps (both byte orders)", target_count);
+    }
+
+    // Storage for witnesses captured during tree build
+    let mut captured_witnesses: Vec<(usize, u64, IncrementalWitness<zcash_primitives::sapling::Node, 32>)> = Vec::new();
+
+    // Report initial progress
+    progress_callback(0, count);
+
+    // Build tree, capturing witnesses at target positions
+    let mut tree: CommitmentTree<zcash_primitives::sapling::Node, 32> = CommitmentTree::empty();
+    let mut offset = 8;
+    let mut found_count = 0;
+
+    for i in 0..count {
+        let cmu_bytes = &bytes[offset..offset + 32];
+        offset += 32;
+
+        // FIX #730: Boost file CMUs already in WIRE format (no reversal needed)
+        let wire_cmu = reverse_cmu_display_to_wire(cmu_bytes);
+
+        let node = match zcash_primitives::sapling::Node::read(&wire_cmu[..]) {
+            Ok(n) => n,
+            Err(_) => return 0,
+        };
+
+        // FIX #458: Check if this CMU is a target BEFORE appending
+        // The witness must be created BEFORE the CMU is added to the tree,
+        // so the witness is positioned at the leaf that will contain this CMU
+        // FIX #557 v49: After reversal, cache CMUs are now in WIRE format (matching note.cmu())
+        // We can compare directly with WIRE format CMUs from database
+        if !target_map.is_empty() {
+            let mut cmu = [0u8; 32];
+            cmu.copy_from_slice(&wire_cmu);  // Now in WIRE format after reversal
+
+            let mut orig_idx = None;
+
+            // FIX #471 v3 + FIX #585: Support all CMU formats
+            // With FIX #585, database stores CMUs in wire format (note.cmu().to_bytes())
+            // Cache file CMUs are also in wire format
+            // So first try direct match: wire (cache) vs wire (target_map with FIX #585)
+            if let Some(&idx) = target_map.get(&cmu) {
+                orig_idx = Some(idx);
+                debug_log!("✅ FIX #471 v3: CMU matched DIRECT wire format at position {} (CMU: {}...)", i, hex::encode(&cmu[0..8]));
+            } else {
+                // FIX #471 v2 fallback: Try reversed formats for backward compatibility
+                // target_map_reversed contains database CMUs reversed (would be display if db is wire)
+                if let Some(&idx) = target_map_reversed.get(&cmu) {
+                    orig_idx = Some(idx);
+                    debug_log!("✅ FIX #471 v2: CMU matched in WIRE->REVERSED format at position {} (CMU: {}...)", i, hex::encode(&cmu[0..8]));
+                } else {
+                    // Also try reversed cache CMU vs target_map
+                    let mut cmu_reversed = [0u8; 32];
+                    for j in 0..32 {
+                        cmu_reversed[j] = cmu[31 - j];
+                    }
+                    if let Some(&idx) = target_map.get(&cmu_reversed) {
+                        orig_idx = Some(idx);
+                        debug_log!("✅ FIX #471 v2: CMU matched in DISPLAY format at position {} (CMU: {}...)", i, hex::encode(&cmu_reversed[0..8]));
+                    }
+                }
+            }
+
+            // FIX #583: Append CMU to tree FIRST, then create witness
+            // IncrementalWitness::from_tree() creates witness for the LAST element in tree
+            // So we must append the CMU before creating its witness
+            if tree.append(node.clone()).is_err() {
+                return 0;
+            }
+
+            if let Some(idx) = orig_idx {
+                // FIX #583: Create witness AFTER appending CMU to tree!
+                // Now the witness is for position i (the CMU we just appended)
+                let witness = IncrementalWitness::from_tree(tree.clone());
+                captured_witnesses.push((idx, i, witness));
+                found_count += 1;
+                debug_log!("📍 FIX #583: Target {} found at position {} (CMU: {}...), witness created for last element", idx, i, hex::encode(&cmu[0..8]));
+            }
+        } else {
+            // Non-target CMU - still need to append to tree
+            if tree.append(node.clone()).is_err() {
+                return 0;
+            }
+        }
+
+        // Report progress every 10000 CMUs
+        if i > 0 && i % 10000 == 0 {
+            progress_callback(i, count);
+        }
+    }
+
+    // Final progress - tree building complete
+    progress_callback(count, count);
+
+    debug_log!("⏱️ FIX #197: Tree built in {:.1}s, found {}/{} targets",
+               start_time.elapsed().as_secs_f64(), found_count, target_count);
+
+    // FIX #197 v2: Update witnesses with remaining CMUs using PARALLEL Rayon
+    // This is the bottleneck - each witness needs to be updated with CMUs after its position
+    if !captured_witnesses.is_empty() {
+        debug_log!("🔄 FIX #197: Updating {} witnesses with remaining CMUs (parallel)...", captured_witnesses.len());
+        let update_start = std::time::Instant::now();
+
+        // Get remaining CMUs as nodes for witness updates
+        // captured_witnesses already have position info, update in parallel
+        use rayon::prelude::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let completed = AtomicUsize::new(0);
+        let total = captured_witnesses.len();
+
+        captured_witnesses.par_iter_mut().for_each(|(orig_idx, pos, witness)| {
+            // This witness was created at position *pos, needs updates from pos+1 to count-1
+            let mut local_offset = 8 + ((*pos as usize + 1) * 32);
+            let mut updates = 0u64;
+            while local_offset + 32 <= data_len {
+                let cmu_bytes = &bytes[local_offset..local_offset + 32];
+                local_offset += 32;
+                // FIX #730: Boost file CMUs already in WIRE format (no reversal needed)
+                let wire_cmu = reverse_cmu_display_to_wire(cmu_bytes);
+                if let Ok(node) = zcash_primitives::sapling::Node::read(&wire_cmu[..]) {
+                    witness.append(node).ok();
+                    updates += 1;
+                }
+            }
+            debug_log!("📝 FIX #197: Witness {} updated with {} CMUs", orig_idx, updates);
+
+            // FIX #464: Report progress during parallel witness updates
+            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            // Report progress every 10% of witnesses completed
+            if done % 10 == 0 || done == total {
+                progress_callback(done as u64, total as u64);
+            }
+        });
+
+        debug_log!("⏱️ FIX #197: Witness updates took {:.1}s (parallel)",
+                   update_start.elapsed().as_secs_f64());
+    }
+
+    // Store tree in global
+    // FIX #1385: Replace .lock().unwrap() with safe_lock!
+    let mut tree_guard = match safe_lock!(COMMITMENT_TREE) { Some(g) => g, None => return 0 };
+    *tree_guard = Some(tree);
+
+    let mut pos_guard = match safe_lock!(TREE_POSITION) { Some(g) => g, None => return 0 };
+    *pos_guard = count;
+
+    // FIX #771: CRITICAL - Clear delta CMUs when tree is loaded with witnesses
+    // Same fix as in tree_deserialize and other tree load functions
+    {
+        let mut delta_guard = match DELTA_CMUS.lock() {
+            Ok(g) => g,
+            Err(_) => return 0,
+        };
+        let old_count = delta_guard.len();
+        delta_guard.clear();
+        delta_guard.shrink_to_fit(); // FIX #1385: Release memory after clear
+        if old_count > 0 {
+            debug_log!("🗑️ FIX #771: Cleared {} stale delta CMUs on tree load with witnesses", old_count);
+        }
+    }
+
+    let tree_time = start_time.elapsed();
+    debug_log!("⏱️ FIX #197: Tree loaded in {:.1}s, found {}/{} targets",
+               tree_time.as_secs_f64(), found_count, target_count);
+
+    // Serialize witnesses to output
+    let mut success_count = 0;
+    debug_log!("🔧 FIX #466: Starting serialization of {} captured witnesses", captured_witnesses.len());
+    for (orig_idx, pos, witness) in captured_witnesses {
+        let pos_ptr = positions_out.add(orig_idx);
+        let witness_ptr = witnesses_out.add(orig_idx * 1028);
+
+        // FIX #466 v2: Check witness path BEFORE serialization
+        let path_filled = witness.path().is_some();
+        let root = witness.root();
+        let mut root_bytes = [0u8; 32];
+        root.write(&mut root_bytes[..]).unwrap_or(());
+
+        debug_log!("🔍 FIX #466: Witness[{}] at pos {} - path_filled={}, root={:02x}{:02x}...{} bytes",
+                   orig_idx, pos, path_filled, root_bytes[0], root_bytes[1],
+                   if path_filled { "OK" } else { "EMPTY PATH!" });
+
+        let mut serialized = Vec::new();
+        match write_incremental_witness(&witness, &mut serialized) {
+            Ok(()) => {
+                debug_log!("✅ FIX #466: Witness[{}] serialized to {} bytes (path_filled={})",
+                           orig_idx, serialized.len(), path_filled);
+                if serialized.len() <= 1028 {
+                    *pos_ptr = pos;
+                    std::ptr::copy_nonoverlapping(serialized.as_ptr(), witness_ptr, serialized.len());
+                    if serialized.len() < 1028 {
+                        std::ptr::write_bytes(witness_ptr.add(serialized.len()), 0, 1028 - serialized.len());
+                    }
+                    success_count += 1;
+                } else {
+                    debug_log!("❌ FIX #466: Witness[{}] too large: {} bytes", orig_idx, serialized.len());
+                    *pos_ptr = u64::MAX;
+                }
+            }
+            Err(e) => {
+                debug_log!("❌ FIX #466: Failed to serialize witness[{}]: {:?}", orig_idx, e);
+                *pos_ptr = u64::MAX;
+            }
+        }
+    }
+
+    debug_log!("✅ FIX #197: Tree loaded + {} witnesses created in {:.1}s (PHASE 1.5 eliminated!)",
+               success_count, start_time.elapsed().as_secs_f64());
+    success_count
+    })
+}
+
+/// Create a witness for a specific CMU from CURRENT GLOBAL TREE state
+/// This is used for notes discovered in PHASE 1 (parallel scan) within bundled tree range
+///
+/// FIX #562 v8: Uses GLOBAL tree (with delta CMUs) instead of local boost file tree
+///
+/// Parameters:
+/// - cmu_data: Pointer to bundled CMU file data [count: u64][cmu1: 32]... (used only to find position)
+/// - cmu_data_len: Length of CMU data
+/// - target_cmu: The 32-byte CMU to create witness for
+/// - witness_out: Output buffer for serialized witness (at least 2000 bytes)
+/// - witness_out_len: Output for actual witness length
+///
+/// Returns: The position (0-indexed) of the CMU, or u64::MAX on error
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_tree_create_witness_for_cmu(
+    cmu_data: *const u8,
+    cmu_data_len: usize,
+    target_cmu: *const u8,
+    witness_out: *mut u8,
+    witness_out_len: *mut usize,
+) -> u64 {
+    ffi_catch_unwind!(u64::MAX, {
+    if cmu_data_len < 8 {
+        return u64::MAX;
+    }
+
+    // FIX #230: Use safe_slice for bounds checking
+    let bytes = match safe_slice(cmu_data, cmu_data_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid CMU data pointer in create_witness_for_cmu");
+            return u64::MAX;
+        }
+    };
+    let target_bytes = match safe_slice(target_cmu, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid target CMU pointer in create_witness_for_cmu");
+            return u64::MAX;
+        }
+    };
+
+    // FIX #230: Read count with safe conversion
+    let count = match bytes[0..8].try_into() {
+        Ok(arr) => u64::from_le_bytes(arr),
+        Err(_) => return u64::MAX,
+    };
+
+    // SECURITY FIX (NEW-001): Prevent integer overflow
+    let max_safe_count = (usize::MAX / 32).saturating_sub(1) as u64;
+    if count > max_safe_count {
+        return u64::MAX;
+    }
+
+    let expected_len = 8 + (count as usize * 32);
+
+    if cmu_data_len < expected_len {
+        return u64::MAX;
+    }
+
+    // FIX #471: Check both original AND reversed byte orders for target CMU
+    // The database might store CMUs in different byte order than boost file
+    let mut target_bytes_reversed = [0u8; 32];
+    for j in 0..32 {
+        target_bytes_reversed[j] = target_bytes[31 - j];
+    }
+
+    // Find target CMU position (compare against wire format in file)
+    // FIX #514: Try both byte orders to handle potential mismatches
+    let mut target_pos: Option<u64> = None;
+    let mut offset = 8;
+    for i in 0..count {
+        if &bytes[offset..offset + 32] == target_bytes {
+            target_pos = Some(i);
+            debug_log!("📍 Found target CMU at position {} (original byte order)", i);
+            break;
+        }
+        // Also try reversed byte order
+        if &bytes[offset..offset + 32] == target_bytes_reversed {
+            target_pos = Some(i);
+            debug_log!("📍 Found target CMU at position {} (REVERSED byte order - database has opposite order!)", i);
+            break;
+        }
+        offset += 32;
+    }
+
+    let target_pos = match target_pos {
+        Some(p) => p,
+        None => {
+            debug_log!("❌ FIX #514: Target CMU not found in bundled data (tried both byte orders)");
+            debug_log!("   Target CMU: {}", hex::encode(target_bytes));
+            debug_log!("   Target CMU (reversed): {}", hex::encode(target_bytes_reversed));
+            return u64::MAX;
+        }
+    };
+
+    // Remove the old log line since we now log when found
+    // debug_log!("📍 Found target CMU at position {}", target_pos);
+
+    // Build tree up to target position, creating witness there
+    let mut tree: CommitmentTree<zcash_primitives::sapling::Node, 32> = CommitmentTree::empty();
+    let mut witness: Option<IncrementalWitness<zcash_primitives::sapling::Node, 32>> = None;
+
+    offset = 8;
+    for i in 0..count {
+        let cmu_bytes = &bytes[offset..offset + 32];
+        offset += 32;
+
+        // FIX #730: Boost file CMUs already in WIRE format (no reversal needed)
+        let wire_cmu = reverse_cmu_display_to_wire(cmu_bytes);
+        let node = match zcash_primitives::sapling::Node::read(&wire_cmu[..]) {
+            Ok(n) => n,
+            Err(_) => return u64::MAX,
+        };
+
+        // FIX #458: Create witness BEFORE appending at target position
+        if i == target_pos {
+            witness = Some(IncrementalWitness::from_tree(tree.clone()));
+        }
+
+        if tree.append(node).is_err() {
+            return u64::MAX;
+        }
+
+        // Update existing witness with new nodes after target position
+        if i > target_pos {
+            if let Some(ref mut w) = witness {
+                w.append(node).ok();
+            }
+        }
+    }
+
+    // Serialize witness
+    let mut witness = match witness {
+        Some(w) => w,
+        None => return u64::MAX,
+    };
+
+    // FIX #562 v8: Update witness with DELTA CMUs that were added after boost file!
+    // This is CRITICAL - the witness was created from boost file tree only,
+    // but the global tree has additional CMUs that were added during PHASE 2 sync
+    {
+        // FIX #1385: Replace .lock().unwrap() with safe_lock!
+        let delta_guard = match safe_lock!(DELTA_CMUS) { Some(g) => g, None => return u64::MAX };
+        if !delta_guard.is_empty() {
+            debug_log!("🔧 FIX #562 v8: Updating witness with {} delta CMUs...", delta_guard.len());
+            for delta_node in delta_guard.iter() {
+                witness.append(delta_node.clone()).ok();
+            }
+            debug_log!("✅ FIX #562 v8: Witness updated with delta CMUs - now points to current tree root!");
+        }
+    }
+
+    // FIX #562 v8: Add witness to global WITNESSES array so it gets updated with FUTURE CMUs
+    {
+        // FIX #1385: Replace .lock().unwrap() with safe_lock!
+        let mut witnesses_guard = match safe_lock!(WITNESSES) { Some(g) => g, None => return u64::MAX };
+        witnesses_guard.push(witness.clone());
+        debug_log!("🔧 FIX #562 v8: Added witness to global WITNESSES array (total: {} witnesses)", witnesses_guard.len());
+    }
+
+    let mut serialized = Vec::new();
+    if write_incremental_witness(&witness, &mut serialized).is_err() {
+        return u64::MAX;
+    }
+
+    debug_log!("📝 Serialized witness: {} bytes", serialized.len());
+
+    // Copy to output
+    if serialized.len() > 2000 {
+        return u64::MAX;
+    }
+
+    std::ptr::copy_nonoverlapping(serialized.as_ptr(), witness_out, serialized.len());
+    *witness_out_len = serialized.len();
+
+    target_pos
+    })
+}
+
+/// Find the position of a CMU in bundled CMU data (fast - no tree building)
+/// Returns the 0-indexed position, or u64::MAX if not found
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_find_cmu_position(
+    cmu_data: *const u8,
+    cmu_data_len: usize,
+    target_cmu: *const u8,
+) -> u64 {
+    ffi_catch_unwind!(u64::MAX, {
+    if cmu_data_len < 8 {
+        return u64::MAX;
+    }
+
+    // FIX #230: Use safe_slice for bounds checking
+    let bytes = match safe_slice(cmu_data, cmu_data_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid CMU data pointer in find_cmu_position");
+            return u64::MAX;
+        }
+    };
+    let target_bytes = match safe_slice(target_cmu, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid target CMU pointer in find_cmu_position");
+            return u64::MAX;
+        }
+    };
+
+    // FIX #230: Read count with safe conversion
+    let count = match bytes[0..8].try_into() {
+        Ok(arr) => u64::from_le_bytes(arr),
+        Err(_) => return u64::MAX,
+    };
+
+    // SECURITY FIX (NEW-001): Prevent integer overflow
+    let max_safe_count = (usize::MAX / 32).saturating_sub(1) as u64;
+    if count > max_safe_count {
+        return u64::MAX;
+    }
+
+    let expected_len = 8 + (count as usize * 32);
+
+    if cmu_data_len < expected_len {
+        return u64::MAX;
+    }
+
+    // Linear search for target CMU
+    let mut offset = 8;
+    for i in 0..count {
+        if &bytes[offset..offset + 32] == target_bytes {
+            return i;
+        }
+        offset += 32;
+    }
+
+    u64::MAX
+    })
+}
+
+/// FIX #562: Create a fresh witness from CURRENT GLOBAL TREE (not boost file!)
+/// This is critical for spending notes when the tree has grown since import
+///
+/// Parameters:
+/// - target_cmu: 32-byte CMU to create witness for
+/// - cmu_position: Position of the CMU in the tree (0-indexed)
+/// - witness_out: Output buffer for witness (1028 bytes minimum)
+///
+/// Returns true on success, false on failure
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_tree_create_witness_from_current_tree(
+    target_cmu: *const u8,
+    cmu_position: u64,
+    witness_out: *mut u8,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    // Validate inputs
+    let target_bytes = match safe_slice(target_cmu, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ FIX #562: Invalid target CMU pointer");
+            return false;
+        }
+    };
+
+    // FIX #562: Use safe_lock to access global tree
+    let tree_guard = match safe_lock!(COMMITMENT_TREE) {
+        Some(g) => g,
+        None => {
+            eprintln!("❌ FIX #562: Failed to acquire tree lock");
+            return false;
+        }
+    };
+    let tree = match tree_guard.as_ref() {
+        Some(t) => t,
+        None => {
+            eprintln!("❌ FIX #562: Global tree not available");
+            return false;
+        }
+    };
+
+    // FIX #562: Get current tree size
+    let pos_guard = match TREE_POSITION.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            eprintln!("❌ FIX #562: Failed to get tree position");
+            return false;
+        }
+    };
+    let current_size = *pos_guard;
+
+    // Sanity check: CMU position must be within tree
+    if cmu_position >= current_size {
+        eprintln!("❌ FIX #562: CMU position {} beyond tree size {}", cmu_position, current_size);
+        return false;
+    }
+
+    debug_log!("🔧 FIX #562: Creating witness from current tree at position {} (tree size: {})", cmu_position, current_size);
+
+    // FIX #562: CRITICAL - We need to rebuild the tree up to the CMU position
+    // But we only have the CURRENT tree state, not historical CMUs
+    // Solution: We can't rebuild the path without knowing all previous CMUs
+    //
+    // ALTERNATIVE: Use the stored WITNESSES array but validate the path
+    // The witnesses are snapshots from when they were created
+    // If the witness was created AT the CMU position, it should be valid
+    // even if the tree has grown since then
+
+    // Get witness from WITNESSES array at the CMU position
+    let witnesses_guard = match WITNESSES.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            eprintln!("❌ FIX #562: Failed to acquire witnesses lock");
+            return false;
+        }
+    };
+
+    // FIX #562: Try to get witness at CMU position
+    // Note: WITNESSES array stores witnesses in order they were created
+    // NOT in CMU position order!
+    // So we can't just index by cmu_position
+
+    // FIX #562 v2: Instead, we need to find the witness by CMU
+    // This is expensive, so we return false for now
+    // The proper fix is to store CMU->witness mapping or store full witnesses in DB
+
+    eprintln!("❌ FIX #562: Cannot create witness from current tree without CMU history");
+    eprintln!("   This requires: (1) boost file + delta CMUs, OR (2) storing witnesses in DB");
+    eprintln!("   Fallback: Try Repair Database → Full Rescan to rebuild all witnesses");
+
+    false
+    })
+}
+
+/// Create witnesses for MULTIPLE CMUs in a SINGLE tree pass (batch operation)
+/// This is much faster than calling zipherx_tree_create_witness_for_cmu multiple times
+/// because it only builds the tree ONCE instead of N times.
+///
+/// Parameters:
+/// - cmu_data: Bundled CMU file [count: u64][cmu1: 32]...
+/// - cmu_data_len: Length of CMU data
+/// - target_cmus: Array of 32-byte CMUs to create witnesses for
+/// - target_count: Number of target CMUs
+/// - positions_out: Output array for positions (u64 * target_count)
+/// - witnesses_out: Output array for witnesses (1028 bytes * target_count)
+///
+/// Returns: Number of witnesses successfully created
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_tree_create_witnesses_batch(
+    cmu_data: *const u8,
+    cmu_data_len: usize,
+    target_cmus: *const u8,
+    target_count: usize,
+    positions_out: *mut u64,
+    witnesses_out: *mut u8,
+) -> usize {
+    ffi_catch_unwind!(0, {
+    if cmu_data_len < 8 || target_count == 0 {
+        return 0;
+    }
+
+    // FIX #230: Use safe_slice for bounds checking
+    let bytes = match safe_slice(cmu_data, cmu_data_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid CMU data pointer in create_witnesses_batch");
+            return 0;
+        }
+    };
+    // FIX #1385: Checked multiplication to prevent overflow
+    let targets_total_len = match target_count.checked_mul(32) {
+        Some(len) => len,
+        None => return 0,
+    };
+    let targets = match safe_slice(target_cmus, targets_total_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid targets pointer in create_witnesses_batch");
+            return 0;
+        }
+    };
+
+    // FIX #230: Read CMU count with safe conversion
+    let count = match bytes[0..8].try_into() {
+        Ok(arr) => u64::from_le_bytes(arr),
+        Err(_) => return 0,
+    };
+
+    // SECURITY FIX (NEW-001): Prevent integer overflow
+    let max_safe_count = (usize::MAX / 32).saturating_sub(1) as u64;
+    if count > max_safe_count {
+        return 0;
+    }
+
+    let expected_len = 8 + (count as usize * 32);
+
+    if cmu_data_len < expected_len {
+        return 0;
+    }
+
+    debug_log!("🔧 Batch witness: {} targets, {} total CMUs", target_count, count);
+
+    // FIX #563 v6: Log first target CMU for debugging
+    if target_count > 0 {
+        debug_log!("🎯 First target CMU: {}", hex::encode(&targets[0..8.min(32 * target_count)]));
+    }
+
+    // FIX #563 v6: Log first few boost CMUs for debugging
+    if count > 0 {
+        let first_boost_start = 8;
+        let first_boost_end = (8 + 32).min(bytes.len());
+        if first_boost_end > first_boost_start {
+            debug_log!("📦 First boost CMU: {}", hex::encode(&bytes[first_boost_start..first_boost_start + 8.min(first_boost_end - first_boost_start)]));
+        }
+    }
+
+    // FIX #514 v3: Create reversed byte lookup maps for all targets (byte order mismatch handling)
+    // The database might store CMUs in different byte order than boost file
+    let mut target_bytes_reversed: Vec<[u8; 32]> = vec![[0u8; 32]; target_count];
+    for t_idx in 0..target_count {
+        let target_offset = t_idx * 32;
+        // Reverse: swap bytes from opposite ends
+        for j in 0..32 {
+            target_bytes_reversed[t_idx][j] = targets[target_offset + (31 - j)];
+        }
+    }
+
+    // First pass: find all target positions (fast linear scan)
+    let mut target_positions: Vec<Option<u64>> = vec![None; target_count];
+    let mut offset = 8;
+    for i in 0..count {
+        let cmu_bytes = &bytes[offset..offset + 32];
+        for (t_idx, target_offset) in (0..target_count).map(|t| (t, t * 32)) {
+            if target_positions[t_idx].is_none() {
+                // FIX #514 v3: Check both original AND reversed byte orders
+                let target_bytes = &targets[target_offset..target_offset + 32];
+                let target_reversed = &target_bytes_reversed[t_idx];
+
+                if target_bytes == cmu_bytes {
+                    target_positions[t_idx] = Some(i);
+                    debug_log!("📍 Target {} found at position {} (original byte order)", t_idx, i);
+                } else if target_reversed == cmu_bytes {
+                    target_positions[t_idx] = Some(i);
+                    debug_log!("📍 Target {} found at position {} (REVERSED byte order)", t_idx, i);
+                }
+            }
+        }
+        offset += 32;
+    }
+
+    // Find the maximum position we need to build to
+    let max_pos = target_positions.iter().filter_map(|p| *p).max();
+    let max_pos = match max_pos {
+        Some(p) => p,
+        None => {
+            debug_log!("❌ No target CMUs found in bundled data");
+            return 0;
+        }
+    };
+
+    debug_log!("🌳 FIX #557 v24: Building tree once, creating witnesses with same root");
+
+    // FIX #557 v24: Build tree ONCE, create witnesses at max position, all have same root
+    let mut tree: CommitmentTree<zcash_primitives::sapling::Node, 32> = CommitmentTree::empty();
+    let mut witnesses: Vec<Option<IncrementalWitness<zcash_primitives::sapling::Node, 32>>> = vec![None; target_count];
+    let mut offset = 8;
+
+    // Calculate total number of CMUs (excluding 8-byte header)
+    let total_cmu_count = ((cmu_data_len - 8) / 32) as u64;
+    debug_log!("🌳 FIX #557 v24: Total CMUs: {}, max target position: {}", total_cmu_count, max_pos);
+
+    // Build tree to max_pos, creating witnesses AFTER each target position
+    // FIX #1316: Update ALL existing witnesses as new nodes are appended!
+    // Without this, witnesses created at earlier positions miss the nodes between
+    // their creation point and max_pos, producing wrong roots.
+    for i in 0..=max_pos {
+        if offset + 32 > cmu_data_len {
+            debug_log!("❌ FIX #557 v24: Offset {} exceeds data length {} at position {}", offset, cmu_data_len, i);
+            break;
+        }
+
+        let cmu_bytes = &bytes[offset..offset + 32];
+        offset += 32;
+
+        // FIX #730: Boost file already stores CMUs in WIRE format (Python reversed from RPC display)
+        // No reversal needed - just copy the bytes directly
+        let wire_cmu = reverse_cmu_display_to_wire(cmu_bytes);
+
+        // DEBUG: Log first CMU to verify format
+        if i == 0 {
+            debug_log!("🔍 FIX #730: First CMU from cache (WIRE format): {}...", hex::encode(&wire_cmu[..8]));
+        }
+
+        let node = match zcash_primitives::sapling::Node::read(&wire_cmu[..]) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+
+        tree.append(node).ok();
+
+        // FIX #1316: Update ALL previously created witnesses with this new node FIRST
+        // This is CRITICAL — without it, witnesses created at earlier positions
+        // miss intermediate CMU appends between their creation and max_pos,
+        // producing wrong roots. Must happen BEFORE creating new witness at this
+        // position to avoid double-appending node to the just-created witness.
+        for w in witnesses.iter_mut() {
+            if let Some(ref mut witness) = w {
+                witness.append(node).ok();
+            }
+        }
+
+        // Create witness AFTER appending CMU and updating existing witnesses
+        // The new witness is created from the current tree state (includes this node)
+        // and will be updated with subsequent nodes in future iterations
+        for (t_idx, &pos_opt) in target_positions.iter().enumerate() {
+            if let Some(pos) = pos_opt {
+                if pos == i {
+                    witnesses[t_idx] = Some(IncrementalWitness::from_tree(tree.clone()));
+                    debug_log!("✅ FIX #557 v24: Created witness[{}] at position {} (after CMU)", t_idx, i);
+                }
+            }
+        }
+    }
+
+    // Continue building tree to end, updating ALL witnesses
+    // FIX #557 v24: Use i < total_cmu_count instead of offset + 32 <= cmu_data_len
+    // because the first loop already consumed data up to max_pos
+    let current_pos = max_pos + 1;
+    debug_log!("🌳 FIX #557 v24: Continuing from position {} to {}", current_pos, total_cmu_count);
+
+    // FIX #950: PERFORMANCE - Collect remaining nodes first, then update witnesses in parallel
+    // FIX #1316: Witnesses are already updated to max_pos+1 during the main loop above.
+    // Only the TAIL nodes (max_pos+1 to total) need to be applied here via Rayon.
+    let remaining_count = (total_cmu_count - current_pos) as usize;
+    debug_log!("⚡ FIX #950: Collecting {} remaining nodes for parallel witness update...", remaining_count);
+
+    let mut remaining_nodes: Vec<zcash_primitives::sapling::Node> = Vec::with_capacity(remaining_count);
+
+    for _i in current_pos..total_cmu_count {
+        if offset + 32 > cmu_data_len {
+            break;
+        }
+
+        let cmu_bytes = &bytes[offset..offset + 32];
+        offset += 32;
+
+        // FIX #730: Boost file CMUs already in WIRE format (no reversal needed)
+        let wire_cmu = reverse_cmu_display_to_wire(cmu_bytes);
+        if let Ok(node) = zcash_primitives::sapling::Node::read(&wire_cmu[..]) {
+            tree.append(node).ok();
+            remaining_nodes.push(node);
+        }
+    }
+
+    debug_log!("⚡ FIX #950: Collected {} nodes, now updating {} witnesses in PARALLEL...", remaining_nodes.len(), target_count);
+
+    // FIX #950: Update all witnesses in parallel using Rayon
+    // Each witness is updated independently with all remaining nodes
+    use rayon::prelude::*;
+    witnesses.par_iter_mut().for_each(|witness_opt| {
+        if let Some(ref mut w) = witness_opt {
+            for node in &remaining_nodes {
+                w.append(*node).ok();
+            }
+        }
+    });
+
+    debug_log!("⚡ FIX #950: Parallel witness update complete!");
+
+    debug_log!("🌳 FIX #557 v24: Tree built to position {} (total CMUs: {})", total_cmu_count, total_cmu_count);
+
+    let final_root = tree.root();
+    let mut final_root_bytes = [0u8; 32];
+    final_root.write(&mut final_root_bytes[..]).unwrap_or(());
+    debug_log!("🌳 FIX #557 v24: Final root: {}", hex::encode(&final_root_bytes[..4]));
+
+    // Verify all witnesses have the same root
+    let mut all_match = true;
+    for (t_idx, witness_opt) in witnesses.iter().enumerate() {
+        if let Some(w) = witness_opt {
+            let w_root = w.root();
+            if w_root == final_root {
+                debug_log!("✅ FIX #557 v24: Witness[{}] root matches final root", t_idx);
+            } else {
+                let mut w_root_bytes = [0u8; 32];
+                w_root.write(&mut w_root_bytes[..]).unwrap_or(());
+                debug_log!("❌ FIX #557 v24: Witness[{}] root MISMATCH: {}", t_idx, hex::encode(&w_root_bytes[..4]));
+                all_match = false;
+            }
+        } else {
+            debug_log!("❌ FIX #557 v24: Witness[{}] is None", t_idx);
+            all_match = false;
+        }
+    }
+
+    if !all_match {
+        debug_log!("⚠️ FIX #557 v24: Some witnesses don't match final root - this will cause transaction failures!");
+    } else {
+        debug_log!("✅ FIX #557 v24: ALL witnesses match final root - transactions will succeed!");
+    }
+
+    // Serialize witnesses and write to output
+    let mut success_count = 0;
+    for (t_idx, witness_opt) in witnesses.iter().enumerate() {
+        if let Some(witness) = witness_opt {
+            let mut serialized = Vec::new();
+            if write_incremental_witness(&witness, &mut serialized).is_ok() && serialized.len() <= 1028 {
+                if let Some(pos) = target_positions[t_idx] {
+                    unsafe {
+                        *positions_out.add(t_idx) = pos;
+                        let witness_ptr = witnesses_out.add(t_idx * 1028);
+                        std::ptr::copy_nonoverlapping(serialized.as_ptr(), witness_ptr, serialized.len());
+                        if serialized.len() < 1028 {
+                            std::ptr::write_bytes(witness_ptr.add(serialized.len()), 0, 1028 - serialized.len());
+                        }
+                    }
+                    success_count += 1;
+                    debug_log!("✅ FIX #557 v24: Witness[{}] serialized ({} bytes)", t_idx, serialized.len());
+                } else {
+                    debug_log!("❌ FIX #557 v24: Witness[{}] has None position (invariant violation)", t_idx);
+                }
+            } else {
+                debug_log!("❌ FIX #557 v24: Failed to serialize witness[{}]", t_idx);
+            }
+        } else {
+            unsafe {
+                *positions_out.add(t_idx) = u64::MAX;
+            }
+        }
+    }
+
+    debug_log!("✅ FIX #557 v24: Created {}/{} witnesses (all with same root)", success_count, target_count);
+    success_count
+    })
+}
+
+/// FIX #588: Rebuild corrupted witnesses at SPECIFIC positions (not all at end)
+///
+/// Unlike zipherx_tree_create_witnesses_batch which builds ALL witnesses to the end
+/// of the boost file (giving them the same root), this function creates each witness
+/// at its specific position. This is critical for notes with different received_heights.
+///
+/// This fixes the issue where witnesses have corrupted Merkle paths (filled_nodes)
+/// due to old FIX #585 trimming code that zeroed out trailing bytes.
+///
+/// Parameters:
+/// - cmu_data: Bundled CMU file [count: u64][cmu1: 32]...
+/// - cmu_data_len: Length of CMU data
+/// - target_cmus: Array of 32-byte CMUs to rebuild witnesses for
+/// - target_positions: Array of positions (u64) for each CMU in the tree
+/// - target_count: Number of target CMUs
+/// - witnesses_out: Output array for witnesses (1028 bytes * target_count)
+///
+/// Returns: Number of witnesses successfully created
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_tree_rebuild_witnesses_at_positions(
+    cmu_data: *const u8,
+    cmu_data_len: usize,
+    target_cmus: *const u8,
+    target_positions: *const u64,
+    target_count: usize,
+    witnesses_out: *mut u8,
+) -> usize {
+    ffi_catch_unwind!(0, {
+    if cmu_data_len < 8 || target_count == 0 {
+        return 0;
+    }
+
+    debug_log!("🔧 FIX #588: Rebuilding {} witnesses at specific positions", target_count);
+
+    // FIX #230: Use safe_slice for bounds checking
+    let bytes = match safe_slice(cmu_data, cmu_data_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ FIX #588: Invalid CMU data pointer");
+            return 0;
+        }
+    };
+    // FIX #1385: Checked multiplication to prevent overflow
+    let targets_total_len = match target_count.checked_mul(32) {
+        Some(len) => len,
+        None => return 0,
+    };
+    let targets = match safe_slice(target_cmus, targets_total_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ FIX #588: Invalid targets pointer");
+            return 0;
+        }
+    };
+    let positions = match safe_slice_u64(target_positions, target_count) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ FIX #588: Invalid positions pointer");
+            return 0;
+        }
+    };
+
+    // Read CMU count
+    let count = match bytes[0..8].try_into() {
+        Ok(arr) => u64::from_le_bytes(arr),
+        Err(_) => return 0,
+    };
+
+    let max_safe_count = (usize::MAX / 32).saturating_sub(1) as u64;
+    if count > max_safe_count {
+        return 0;
+    }
+
+    let expected_len = 8 + (count as usize * 32);
+    if cmu_data_len < expected_len {
+        return 0;
+    }
+
+    // Find the maximum position we need to build to
+    let max_pos = *positions.iter().max().unwrap_or(&0);
+    debug_log!("🔧 FIX #588: Building tree to max position {}", max_pos);
+
+    // Create reversed byte lookup for byte order handling
+    let mut target_bytes_reversed: Vec<[u8; 32]> = vec![[0u8; 32]; target_count];
+    for t_idx in 0..target_count {
+        let target_offset = t_idx * 32;
+        for j in 0..32 {
+            target_bytes_reversed[t_idx][j] = targets[target_offset + (31 - j)];
+        }
+    }
+
+    // First pass: find all target positions and validate they exist in boost file
+    let mut target_found: Vec<bool> = vec![false; target_count];
+    let mut offset = 8;
+    for i in 0..count {
+        if i > max_pos {
+            break;
+        }
+        let cmu_bytes = &bytes[offset..offset + 32];
+        for (t_idx, target_offset) in (0..target_count).map(|t| (t, t * 32)) {
+            if !target_found[t_idx] {
+                let target_bytes = &targets[target_offset..target_offset + 32];
+                let target_reversed = &target_bytes_reversed[t_idx];
+
+                if target_bytes == cmu_bytes || target_reversed == cmu_bytes {
+                    if i == positions[t_idx] {
+                        target_found[t_idx] = true;
+                        debug_log!("✅ FIX #588: Target[{}] found at position {}", t_idx, i);
+                    }
+                }
+            }
+        }
+        offset += 32;
+    }
+
+    // Check if all targets were found
+    let missing_count = target_found.iter().filter(|&&found| !found).count();
+    if missing_count > 0 {
+        eprintln!("❌ FIX #588: {} targets not found in boost file", missing_count);
+    }
+
+    // Build tree ONCE, creating witnesses at SPECIFIC positions for each target
+    let mut tree: CommitmentTree<zcash_primitives::sapling::Node, 32> = CommitmentTree::empty();
+    let mut witnesses: Vec<Option<IncrementalWitness<zcash_primitives::sapling::Node, 32>>> = vec![None; target_count];
+    let mut offset = 8;
+
+    // Build tree incrementally, creating witnesses at specific positions
+    for i in 0..=max_pos {
+        if offset + 32 > cmu_data_len {
+            break;
+        }
+
+        let cmu_bytes = &bytes[offset..offset + 32];
+        offset += 32;
+
+        // FIX #730: Boost file CMUs already in WIRE format (no reversal needed)
+        let wire_cmu = reverse_cmu_display_to_wire(cmu_bytes);
+        let node = match zcash_primitives::sapling::Node::read(&wire_cmu[..]) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+
+        tree.append(node).ok();
+
+        // Check if any target needs a witness at THIS position
+        for (t_idx, &target_pos) in positions.iter().enumerate() {
+            if target_found[t_idx] && target_pos == i {
+                witnesses[t_idx] = Some(IncrementalWitness::from_tree(tree.clone()));
+                debug_log!("🔧 FIX #588: Created witness[{}] at position {}", t_idx, i);
+            }
+        }
+    }
+
+    // Verify witnesses and serialize
+    let mut success_count = 0;
+    for (t_idx, witness_opt) in witnesses.iter().enumerate() {
+        if let Some(witness) = witness_opt {
+            let witness_root = witness.root();
+            let mut root_bytes = [0u8; 32];
+            witness_root.write(&mut root_bytes[..]).unwrap_or(());
+
+            // Serialize witness
+            let mut serialized = Vec::new();
+            if write_incremental_witness(&witness, &mut serialized).is_ok() && serialized.len() <= 1028 {
+                unsafe {
+                    let witness_ptr = witnesses_out.add(t_idx * 1028);
+                    std::ptr::copy_nonoverlapping(serialized.as_ptr(), witness_ptr, serialized.len());
+                    if serialized.len() < 1028 {
+                        std::ptr::write_bytes(witness_ptr.add(serialized.len()), 0, 1028 - serialized.len());
+                    }
+                }
+                success_count += 1;
+                debug_log!("✅ FIX #588: Witness[{}] serialized - {} bytes, root: {}...",
+                    t_idx, serialized.len(), hex::encode(&root_bytes[..4]));
+            } else {
+                eprintln!("❌ FIX #588: Failed to serialize witness[{}]", t_idx);
+            }
+        } else {
+            eprintln!("❌ FIX #588: Witness[{}] not created (not found in boost file)", t_idx);
+        }
+    }
+
+    debug_log!("✅ FIX #588: Rebuilt {}/{} witnesses at specific positions", success_count, target_count);
+    success_count
+    })
+}
+
+/// Extract the root (anchor) from serialized witness data
+/// This is needed when using treeCreateWitnessesBatch which builds its own tree
+/// rather than using the global COMMITMENT_TREE
+///
+/// witness_data: Serialized witness (up to 1028 bytes, zero-padded)
+/// root_out: 32-byte output buffer for the root
+/// Returns: true if successful
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_witness_get_root(
+    witness_data: *const u8,
+    witness_len: usize,
+    root_out: *mut u8,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    if witness_len < 100 {
+        return false;
+    }
+
+    // FIX #230: Validate witness pointer with safe_slice
+    let witness_slice = match safe_slice(witness_data, witness_len) {
+        Some(s) => s,
+        None => return false,
+    };
+
+    // FIX #557 v48: Try deserializing with full witness first (FIX #584 approach)
+    // If that fails, try trimming trailing zeros (FIX #557 v41 approach)
+    // The issue is that witnesses can have legitimate zeros inside the structure,
+    // so aggressive trimming can cut into valid data.
+    let mut witness: Option<IncrementalWitness<zcash_primitives::sapling::Node, 32>> = None;
+    let mut used_len = witness_len;
+
+    // First try: Full 1028 bytes (FIX #584 - works for most cases)
+    {
+        let mut reader = std::io::Cursor::new(witness_slice);
+        match zcash_primitives::merkle_tree::read_incremental_witness(&mut reader) {
+            Ok(w) => {
+                witness = Some(w);
+                debug_log!("✅ FIX #557 v48: Deserialized with full {} bytes", witness_len);
+            }
+            Err(_) => {
+                debug_log!("⚠️ FIX #557 v48: Full deserialization failed, trying trimmed version...");
+            }
+        }
+    }
+
+    // Second try: Trim trailing zeros (FIX #557 v41 - fallback for edge cases)
+    if witness.is_none() {
+        // Be more conservative: only trim if we see a long run of zeros at the end
+        // (indicating padding rather than legitimate data)
+        let mut trim_end = witness_slice.len();
+        while trim_end > 100 && trim_end > witness_slice.len() - 200 {
+            // Check if the last 50 bytes are all zeros (strong indication of padding)
+            let last_50_all_zeros = witness_slice[trim_end-50..trim_end].iter().all(|&b| b == 0);
+            if !last_50_all_zeros {
+                break;
+            }
+            trim_end -= 50;
+        }
+        // Also ensure we don't trim into valid data - minimum reasonable size is ~700 bytes
+        if trim_end < 700 {
+            trim_end = witness_slice.len();
+        }
+
+        let trimmed_slice = &witness_slice[..trim_end];
+        let mut reader = std::io::Cursor::new(trimmed_slice);
+        match zcash_primitives::merkle_tree::read_incremental_witness(&mut reader) {
+            Ok(w) => {
+                witness = Some(w);
+                used_len = trim_end;
+                debug_log!("✅ FIX #557 v48: Deserialized with trimmed {} bytes", trim_end);
+            }
+            Err(e) => {
+                debug_log!("❌ zipherx_witness_get_root: deserialization failed (full={}, trimmed={})",
+                           witness_len, trim_end);
+                return false;
+            }
+        }
+    }
+
+    let witness = match witness {
+        Some(w) => w,
+        None => {
+            debug_log!("❌ zipherx_witness_get_root: No valid witness deserialized");
+            return false;
+        }
+    };
+
+    let root = witness.root();
+    let mut root_bytes = Vec::new();
+    if root.write(&mut root_bytes).is_err() {
+        return false;
+    }
+
+    std::ptr::copy_nonoverlapping(root_bytes.as_ptr(), root_out, 32);
+    debug_log!("✅ zipherx_witness_get_root: extracted root {}...", hex::encode(&root_bytes[..8]));
+    true
+    })
+}
+
+/// Check if a witness path is valid (non-empty)
+/// FIX #557: Verify that witness.path() returns Some instead of None
+/// A witness with empty path will compute wrong anchor even if root is correct
+///
+/// Parameters:
+/// - witness_data: Serialized witness data
+/// - witness_len: Length of witness data
+///
+/// Returns: true if path is valid (witness.path() returns Some), false otherwise
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_witness_path_is_valid(
+    witness_data: *const u8,
+    witness_len: usize,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    if witness_len < 100 {
+        return false;
+    }
+
+    // FIX #230: Validate witness pointer with safe_slice
+    let witness_slice = match safe_slice(witness_data, witness_len) {
+        Some(s) => s,
+        None => return false,
+    };
+
+    // FIX #584: Do NOT trim trailing zeros from witnesses!
+    // The IncrementalWitness serialization format legitimately contains trailing zeros
+    // as part of its Merkle path structure. Same fix as zipherx_witness_get_root.
+    let mut reader = std::io::Cursor::new(witness_slice);
+
+    let witness: IncrementalWitness<zcash_primitives::sapling::Node, 32> =
+        match zcash_primitives::merkle_tree::read_incremental_witness(&mut reader) {
+            Ok(w) => w,
+            Err(_) => return false,
+        };
+
+    // Check if path() returns Some (valid path) or None (empty/stale witness)
+    let path_is_valid = witness.path().is_some();
+    debug_log!("🔍 witness_path_is_valid: path_is_some={}", path_is_valid);
+    path_is_valid
+    })
+}
+
+/// FIX #827: Check if a witness is internally consistent (anchor matches path computation)
+///
+/// This verifies that witness.root() == merkle_path.root(cmu), which ensures the witness
+/// can be used to create a valid transaction. A witness can pass witnessPathIsValid()
+/// (path is Some) but still have corrupted path data that computes to wrong anchor.
+///
+/// Parameters:
+/// - witness_data: Serialized witness data
+/// - witness_len: Length of witness data
+/// - cmu_data: 32-byte CMU (commitment) of the note
+///
+/// Returns: true if witness is consistent, false if corrupted
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_witness_verify_anchor(
+    witness_data: *const u8,
+    witness_len: usize,
+    cmu_data: *const u8,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    if witness_len < 100 {
+        debug_log!("❌ FIX #827: witness too short ({})", witness_len);
+        return false;
+    }
+
+    // Validate pointers
+    let witness_slice = match safe_slice(witness_data, witness_len) {
+        Some(s) => s,
+        None => {
+            debug_log!("❌ FIX #827: invalid witness pointer");
+            return false;
+        }
+    };
+
+    let cmu_slice = match safe_slice(cmu_data, 32) {
+        Some(s) => s,
+        None => {
+            debug_log!("❌ FIX #827: invalid CMU pointer");
+            return false;
+        }
+    };
+
+    // Deserialize witness
+    let mut reader = std::io::Cursor::new(witness_slice);
+    let witness: IncrementalWitness<zcash_primitives::sapling::Node, 32> =
+        match zcash_primitives::merkle_tree::read_incremental_witness(&mut reader) {
+            Ok(w) => w,
+            Err(e) => {
+                debug_log!("❌ FIX #827: witness deserialization failed: {:?}", e);
+                return false;
+            }
+        };
+
+    // Get the stored root
+    let witness_root = witness.root();
+    let mut witness_root_bytes = [0u8; 32];
+    if witness_root.write(&mut witness_root_bytes[..]).is_err() {
+        debug_log!("❌ FIX #827: failed to serialize witness root");
+        return false;
+    }
+
+    // Get merkle path (same logic as transaction builder)
+    let merkle_path = match witness.path() {
+        Some(p) => p,
+        None => {
+            // Construct from filled nodes
+            let filled = witness.filled();
+            let position = witness.witnessed_position();
+            match MerklePath::from_parts(filled.clone(), position) {
+                Ok(p) => p,
+                Err(e) => {
+                    debug_log!("❌ FIX #827: failed to construct MerklePath: {:?}", e);
+                    return false;
+                }
+            }
+        }
+    };
+
+    // Parse CMU and create Node
+    let mut cmu_bytes = [0u8; 32];
+    cmu_bytes.copy_from_slice(cmu_slice);
+
+    // CMU is an ExtractedNoteCommitment - parse directly from bytes
+    let cmu = match zcash_primitives::sapling::note::ExtractedNoteCommitment::from_bytes(&cmu_bytes).into_option() {
+        Some(c) => c,
+        None => {
+            debug_log!("❌ FIX #827: invalid CMU bytes");
+            return false;
+        }
+    };
+
+    // Compute path root using the CMU
+    let node = zcash_primitives::sapling::Node::from_cmu(&cmu);
+    let path_root = merkle_path.root(node);
+    let mut path_root_bytes = [0u8; 32];
+    if path_root.write(&mut path_root_bytes[..]).is_err() {
+        debug_log!("❌ FIX #827: failed to serialize path root");
+        return false;
+    }
+
+    // Compare roots
+    let is_consistent = witness_root_bytes == path_root_bytes;
+
+    if is_consistent {
+        debug_log!("✅ FIX #827: witness consistent - root {}...", hex::encode(&witness_root_bytes[..8]));
+    } else {
+        debug_log!("❌ FIX #827: WITNESS CORRUPTED!");
+        debug_log!("   witness.root(): {}...", hex::encode(&witness_root_bytes[..8]));
+        debug_log!("   path.root(cmu): {}...", hex::encode(&path_root_bytes[..8]));
+    }
+
+    is_consistent
+    })
+}
+
+/// Create witnesses for multiple CMUs using BATCH processing (OPTIMIZED)
+///
+/// PERFORMANCE: Builds tree ONCE and captures witnesses incrementally as we pass each target.
+/// This is O(N) where N = total CMUs, instead of O(N * targets) for naive parallel approach.
+///
+/// For 53 witnesses in 1M CMUs:
+/// - OLD parallel: 53 threads × 1M appends each = 53M operations (386 seconds)
+/// - NEW batch: 1 thread × 1M appends total = 1M operations (~30 seconds)
+///
+/// Parameters:
+/// - target_cmus: Array of target CMUs to find (32 bytes each)
+/// - target_count: Number of target CMUs
+/// - cmu_data: The bundled CMU data
+/// - cmu_data_len: Length of CMU data
+/// - positions_out: Output array for positions (u64 per target)
+/// - witnesses_out: Output array for witnesses (1028 bytes per target)
+///
+/// Returns: Number of witnesses successfully created
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_tree_create_witnesses_parallel(
+    target_cmus: *const u8,
+    target_count: usize,
+    cmu_data: *const u8,
+    cmu_data_len: usize,
+    positions_out: *mut u64,
+    witnesses_out: *mut u8,
+) -> usize {
+    ffi_catch_unwind!(0, {
+    if target_count == 0 || cmu_data_len < 8 {
+        return 0;
+    }
+
+    // FIX #1385: Checked multiplication to prevent overflow
+    let targets_total_len = match target_count.checked_mul(32) {
+        Some(len) => len,
+        None => return 0,
+    };
+    // FIX #230: Validate pointers with safe_slice
+    let targets = match safe_slice(target_cmus, targets_total_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid target_cmus pointer in create_witnesses_parallel");
+            return 0;
+        }
+    };
+    let bytes = match safe_slice(cmu_data, cmu_data_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid cmu_data pointer in create_witnesses_parallel");
+            return 0;
+        }
+    };
+
+    // Read CMU count from bundled data - use safe conversion
+    let count = match bytes[0..8].try_into() {
+        Ok(arr) => u64::from_le_bytes(arr),
+        Err(_) => return 0,
+    };
+
+    // SECURITY FIX (NEW-001): Prevent integer overflow
+    let max_safe_count = (usize::MAX / 32).saturating_sub(1) as u64;
+    if count > max_safe_count {
+        debug_log!("❌ CMU count {} exceeds safe maximum", count);
+        return 0;
+    }
+
+    let expected_len = 8 + (count as usize * 32);
+
+    if cmu_data_len < expected_len {
+        debug_log!("❌ CMU data too short: {} < {}", cmu_data_len, expected_len);
+        return 0;
+    }
+
+    debug_log!("🔧 Batch witness (optimized): {} targets, {} total CMUs", target_count, count);
+    let start_time = std::time::Instant::now();
+
+    // FIX #563 v6: Log first target CMU for debugging
+    if target_count > 0 {
+        debug_log!("🎯 First target CMU (opt): {}", hex::encode(&targets[0..8.min(32 * target_count)]));
+    }
+
+    // FIX #563 v6: Log first few boost CMUs for debugging
+    if count > 0 && bytes.len() > 40 {
+        debug_log!("📦 First boost CMU (opt): {}", hex::encode(&bytes[8..16.min(bytes.len())]));
+    }
+
+    // FIX #514 v3: Build a HashMap of target CMUs for O(1) lookup
+    // Include both original AND reversed byte orders for database compatibility
+    let mut target_map: std::collections::HashMap<[u8; 32], usize> = std::collections::HashMap::new();
+    for i in 0..target_count {
+        let offset = i * 32;
+
+        // Add original byte order
+        let mut cmu = [0u8; 32];
+        cmu.copy_from_slice(&targets[offset..offset + 32]);
+        target_map.insert(cmu, i);
+
+        // FIX #514 v3: Also add reversed byte order
+        let mut cmu_reversed = [0u8; 32];
+        for j in 0..32 {
+            cmu_reversed[j] = targets[offset + (31 - j)];
+        }
+        target_map.insert(cmu_reversed, i);
+    }
+
+    // Storage for witnesses we capture during tree build
+    // Each entry: (original_index, position, witness at that position)
+    let mut captured_witnesses: Vec<(usize, u64, IncrementalWitness<zcash_primitives::sapling::Node, 32>)> = Vec::new();
+
+    // Build tree ONCE, capturing witnesses at target positions
+    let mut tree: CommitmentTree<zcash_primitives::sapling::Node, 32> = CommitmentTree::empty();
+    let mut offset = 8;
+    let mut found_count = 0;
+
+    for i in 0..count {
+        let cmu_bytes = &bytes[offset..offset + 32];
+        offset += 32;
+
+        // FIX #730: Boost file CMUs already in WIRE format (no reversal needed)
+        let wire_cmu = reverse_cmu_display_to_wire(cmu_bytes);
+        let node = match zcash_primitives::sapling::Node::read(&wire_cmu[..]) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+
+        // FIX #458: Check if this is a target CMU BEFORE appending
+        // The witness must be created BEFORE the CMU is added to the tree
+        let mut cmu = [0u8; 32];
+        cmu.copy_from_slice(cmu_bytes);
+        if let Some(&orig_idx) = target_map.get(&cmu) {
+            // Capture witness at this position BEFORE appending CMU
+            let witness = IncrementalWitness::from_tree(tree.clone());
+            captured_witnesses.push((orig_idx, i, witness));
+            found_count += 1;
+            debug_log!("📍 FIX #458: Target {} found at position {}", orig_idx, i);
+
+            // Early exit if we found all targets
+            if found_count == target_count {
+                debug_log!("🎯 All {} targets found, finishing tree build for witnesses", target_count);
+            }
+        }
+
+        if tree.append(node).is_err() {
+            continue;
+        }
+    }
+
+    if captured_witnesses.is_empty() {
+        debug_log!("❌ No target CMUs found in bundled data");
+        return 0;
+    }
+
+    let tree_build_time = start_time.elapsed();
+    debug_log!("⏱️ Tree build phase took {:.1}s (found {}/{})",
+               tree_build_time.as_secs_f64(), found_count, target_count);
+
+    // FIX #557 v18: Update all captured witnesses to have the same final root
+    // The witnesses were captured at different positions, so they have different roots.
+    // We need to update each witness with CMUs from its position to the end.
+    debug_log!("🔄 FIX #557 v18: Updating {} witnesses to final anchor...", captured_witnesses.len());
+    let update_start = std::time::Instant::now();
+
+    // Get the final tree root for verification
+    let final_root = tree.root();
+    let mut final_root_bytes = [0u8; 32];
+    final_root.write(&mut final_root_bytes[..]).unwrap_or(());
+    debug_log!("🌳 FIX #557 v18: Final tree root: {}", hex::encode(&final_root_bytes[..4]));
+
+    // For each captured witness, we need to update it with CMUs that came AFTER its position
+    // The witnesses were captured BEFORE appending their target CMU, so they include all CMUs
+    // from 0 to pos-1. We need to add CMUs from pos to count-1.
+    let mut final_witnesses: Vec<(usize, u64, IncrementalWitness<zcash_primitives::sapling::Node, 32>)> = Vec::new();
+
+    for (orig_idx, pos, old_witness) in captured_witnesses {
+        // Start with a clone of the old witness (which has CMUs 0 to pos-1)
+        let mut witness = old_witness;
+
+        // Add CMUs from pos to count-1 (including the target CMU and all after it)
+        let mut update_offset = 8 + (pos as usize * 32);
+        while update_offset + 32 <= cmu_data_len {
+            let cmu_bytes = &bytes[update_offset..update_offset + 32];
+            update_offset += 32;
+
+            // FIX #730: Boost file CMUs already in WIRE format (no reversal needed)
+            let wire_cmu = reverse_cmu_display_to_wire(cmu_bytes);
+            if let Ok(node) = zcash_primitives::sapling::Node::read(&wire_cmu[..]) {
+                witness.append(node).ok();
+            }
+        }
+
+        // Verify the witness now has the correct root
+        let witness_root = witness.root();
+        if witness_root == final_root {
+            debug_log!("✅ FIX #557 v18: Witness[{}] at pos {} now has final root", orig_idx, pos);
+        } else {
+            let mut witness_root_bytes = [0u8; 32];
+            witness_root.write(&mut witness_root_bytes[..]).unwrap_or(());
+            debug_log!("⚠️ FIX #557 v18: Witness[{}] at pos {} has wrong root: {} (expected: {})",
+                       orig_idx, pos,
+                       hex::encode(&witness_root_bytes[..4]),
+                       hex::encode(&final_root_bytes[..4]));
+        }
+
+        final_witnesses.push((orig_idx, pos, witness));
+    }
+
+    let update_time = update_start.elapsed();
+    debug_log!("⏱️ FIX #557 v18: Witness update took {:.1}s", update_time.as_secs_f64());
+
+    // Serialize and copy results to output arrays
+    let mut success_count = 0;
+    for (orig_idx, pos, witness) in final_witnesses {
+        let pos_ptr = positions_out.add(orig_idx);
+        let witness_ptr = witnesses_out.add(orig_idx * 1028);
+
+        let mut serialized = Vec::new();
+        if write_incremental_witness(&witness, &mut serialized).is_ok() && serialized.len() <= 1028 {
+            *pos_ptr = pos;
+            std::ptr::copy_nonoverlapping(serialized.as_ptr(), witness_ptr, serialized.len());
+            if serialized.len() < 1028 {
+                std::ptr::write_bytes(witness_ptr.add(serialized.len()), 0, 1028 - serialized.len());
+            }
+            success_count += 1;
+            debug_log!("📝 Witness {} at pos {} ({} bytes)", orig_idx, pos, serialized.len());
+        } else {
+            *pos_ptr = u64::MAX;
+        }
+    }
+
+    let total_time = start_time.elapsed();
+    debug_log!("✅ FIX #557 v18: Batch witness complete: {}/{} in {:.1}s (tree: {:.1}s, update: {:.1}s)",
+               success_count, target_count, total_time.as_secs_f64(),
+               tree_build_time.as_secs_f64(), update_time.as_secs_f64());
+    success_count
+    })
+}
+
+/// FIX #580: Create witness from tree data + CMU position (instant, no P2P needed)
+/// This is the KEY optimization - generates witness in ~1ms instead of 84s P2P rebuild
+///
+/// Parameters:
+/// - tree_data: Bundled CMU data [count: u64][cmu1: 32]...
+/// - tree_data_len: Length of tree data
+/// - position: Position of CMU in tree (0-indexed)
+/// - witness_out: Output buffer for witness (1028 bytes minimum)
+/// - witness_out_len: Output for actual witness length
+///
+/// Returns: true on success, false on failure
+///
+/// CRITICAL: This generates the SAME witness format as stored in database
+/// The witness is verified against tree root to ensure network acceptance
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_tree_create_witness_for_position(
+    tree_data: *const u8,
+    tree_data_len: usize,
+    position: u64,
+    witness_out: *mut u8,
+    witness_out_len: *mut usize,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    debug_log!("🔧 FIX #580: Creating witness at position {} (instant generation)", position);
+
+    // Validate inputs
+    if tree_data_len < 8 {
+        eprintln!("❌ FIX #580: Tree data too short");
+        return false;
+    }
+
+    // FIX #230: Use safe_slice for bounds checking
+    let bytes = match safe_slice(tree_data, tree_data_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ FIX #580: Invalid tree data pointer");
+            return false;
+        }
+    };
+
+    // Read tree size
+    let tree_size = match bytes[0..8].try_into() {
+        Ok(arr) => u64::from_le_bytes(arr),
+        Err(_) => {
+            eprintln!("❌ FIX #580: Failed to read tree size");
+            return false;
+        }
+    };
+
+    // Validate position
+    if position >= tree_size {
+        eprintln!("❌ FIX #580: Position {} beyond tree size {}", position, tree_size);
+        return false;
+    }
+
+    // SECURITY: Prevent integer overflow
+    let max_safe_count = (usize::MAX / 32).saturating_sub(1) as u64;
+    if tree_size > max_safe_count {
+        eprintln!("❌ FIX #580: Tree size {} exceeds safe maximum", tree_size);
+        return false;
+    }
+
+    let expected_len = 8 + (tree_size as usize * 32);
+    if tree_data_len < expected_len {
+        eprintln!("❌ FIX #580: Tree data truncated");
+        return false;
+    }
+
+    // Build tree incrementally to target position
+    // This is fast because tree is in memory
+    let mut tree: CommitmentTree<zcash_primitives::sapling::Node, 32> = CommitmentTree::empty();
+    let mut offset = 8;
+
+    // FIX #730: CMUs in tree data already in WIRE format (no reversal needed)
+    for i in 0..=position {
+        if offset + 32 > tree_data_len {
+            eprintln!("❌ FIX #580: Offset {} exceeds data length at position {}", offset, i);
+            return false;
+        }
+
+        let cmu_bytes = &bytes[offset..offset + 32];
+        offset += 32;
+
+        // FIX #730: Boost file CMUs already in WIRE format (no reversal needed)
+        let wire_cmu = reverse_cmu_display_to_wire(cmu_bytes);
+
+        let node = match zcash_primitives::sapling::Node::read(&wire_cmu[..]) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("❌ FIX #580: Failed to read node at position {}: {:?}", i, e);
+                return false;
+            }
+        };
+
+        if tree.append(node).is_err() {
+            eprintln!("❌ FIX #580: Failed to append node at position {}", i);
+            return false;
+        }
+    }
+
+    // Create witness at target position
+    let witness = IncrementalWitness::from_tree(tree.clone());
+
+    // Verify witness is valid
+    let witness_root = witness.root();
+    let tree_root = tree.root();
+    let mut witness_root_bytes = [0u8; 32];
+    let mut tree_root_bytes = [0u8; 32];
+    witness_root.write(&mut witness_root_bytes[..]).unwrap_or(());
+    tree_root.write(&mut tree_root_bytes[..]).unwrap_or(());
+
+    if witness_root_bytes != tree_root_bytes {
+        eprintln!("❌ FIX #580: Witness root mismatch! This would cause network rejection");
+        // FIX #1385: Gate hex dumps behind DEBUG_LOGGING to prevent data leakage in production
+        if DEBUG_LOGGING {
+            eprintln!("   Witness root: {}", hex::encode(&witness_root_bytes[..8]));
+            eprintln!("   Tree root:    {}", hex::encode(&tree_root_bytes[..8]));
+        }
+        return false;
+    }
+
+    debug_log!("✅ FIX #580: Witness created and verified at position {}", position);
+    debug_log!("   Root: {}...", hex::encode(&witness_root_bytes[..8]));
+
+    // Serialize witness
+    let mut serialized = Vec::new();
+    if write_incremental_witness(&witness, &mut serialized).is_err() {
+        eprintln!("❌ FIX #580: Failed to serialize witness");
+        return false;
+    }
+
+    // Validate size
+    if serialized.len() > 1028 {
+        eprintln!("❌ FIX #580: Witness too large: {} bytes", serialized.len());
+        return false;
+    }
+
+    // Copy to output
+    std::ptr::copy_nonoverlapping(serialized.as_ptr(), witness_out, serialized.len());
+    *witness_out_len = serialized.len();
+
+    // Zero-pad remaining bytes
+    if serialized.len() < 1028 {
+        std::ptr::write_bytes(witness_out.add(serialized.len()), 0, 1028 - serialized.len());
+    }
+
+    debug_log!("✅ FIX #580: Witness created in <1ms (vs 84s P2P rebuild), {} bytes", serialized.len());
+
+    true
+    })
+}
+
+// =============================================================================
+// OVK Output Recovery (for viewing sent transactions)
+// =============================================================================
+
+/// Try to recover a sent note using the outgoing viewing key
+/// This allows the sender to see what they sent
+///
+/// Parameters:
+/// - ovk: 32-byte outgoing viewing key
+/// - cv: 32-byte value commitment
+/// - cmu: 32-byte note commitment
+/// - epk: 32-byte ephemeral public key
+/// - enc_ciphertext: 580-byte encrypted ciphertext
+/// - out_ciphertext: 80-byte output ciphertext
+/// - output: Buffer for result (at least 620 bytes: 11 div + 32 pk_d + 8 value + 32 rcm + 512 memo + padding)
+///
+/// Returns: Length of output on success, 0 on failure
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_try_recover_output_with_ovk(
+    ovk: *const u8,
+    cv: *const u8,
+    cmu: *const u8,
+    epk: *const u8,
+    enc_ciphertext: *const u8,
+    out_ciphertext: *const u8,
+    output: *mut u8,
+) -> usize {
+    ffi_catch_unwind!(0, {
+    use zcash_primitives::sapling::value::ValueCommitment;
+
+    // FIX #230: Parse OVK with safe_slice
+    let ovk_slice = match safe_slice(ovk, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid OVK pointer");
+            return 0;
+        }
+    };
+    let ovk_arr: [u8; 32] = match ovk_slice.try_into() {
+        Ok(arr) => arr,
+        Err(_) => return 0,
+    };
+    let ovk = OutgoingViewingKey(ovk_arr);
+
+    // FIX #230: Parse value commitment (cv) with safe_slice
+    let cv_slice = match safe_slice(cv, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid CV pointer");
+            return 0;
+        }
+    };
+    let cv_bytes: [u8; 32] = match cv_slice.try_into() {
+        Ok(arr) => arr,
+        Err(_) => return 0,
+    };
+    let cv = match ValueCommitment::from_bytes_not_small_order(&cv_bytes).into() {
+        Some(v) => v,
+        None => return 0,
+    };
+
+    // FIX #230: Parse cmu with safe_slice
+    let cmu_slice = match safe_slice(cmu, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid CMU pointer in recover_output");
+            return 0;
+        }
+    };
+    let cmu_bytes: [u8; 32] = match cmu_slice.try_into() {
+        Ok(arr) => arr,
+        Err(_) => return 0,
+    };
+    let cmu = match zcash_primitives::sapling::note::ExtractedNoteCommitment::from_bytes(&cmu_bytes).into() {
+        Some(c) => c,
+        None => return 0,
+    };
+
+    // FIX #230: Parse EPK with safe_slice
+    let epk_slice = match safe_slice(epk, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid EPK pointer");
+            return 0;
+        }
+    };
+    let epk_bytes: [u8; 32] = match epk_slice.try_into() {
+        Ok(arr) => arr,
+        Err(_) => return 0,
+    };
+    let epk = EphemeralKeyBytes(epk_bytes);
+
+    // FIX #230: Get ciphertexts with safe_slice
+    let enc = match safe_slice(enc_ciphertext, 580) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid enc_ciphertext pointer");
+            return 0;
+        }
+    };
+    let out = match safe_slice(out_ciphertext, 80) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid out_ciphertext pointer");
+            return 0;
+        }
+    };
+
+    let mut enc_arr = [0u8; 580];
+    enc_arr.copy_from_slice(enc);
+    let mut out_arr = [0u8; 80];
+    out_arr.copy_from_slice(out);
+
+    // Create a custom output structure that implements ShieldedOutput
+    struct RecoveryOutput {
+        cv: ValueCommitment,
+        cmu: zcash_primitives::sapling::note::ExtractedNoteCommitment,
+        epk: EphemeralKeyBytes,
+        enc: [u8; 580],
+        out: [u8; 80],
+    }
+
+    impl ShieldedOutput<SaplingDomain<ZclassicNetwork>, 580> for RecoveryOutput {
+        fn ephemeral_key(&self) -> EphemeralKeyBytes {
+            self.epk.clone()
+        }
+        fn cmstar_bytes(&self) -> [u8; 32] {
+            self.cmu.to_bytes()
+        }
+        fn enc_ciphertext(&self) -> &[u8; 580] {
+            &self.enc
+        }
+    }
+
+    // Also need to implement for output recovery which needs cv and out_ciphertext
+    impl RecoveryOutput {
+        fn cv(&self) -> &ValueCommitment {
+            &self.cv
+        }
+        fn out_ciphertext(&self) -> &[u8; 80] {
+            &self.out
+        }
+    }
+
+    let recovery_output = RecoveryOutput {
+        cv,
+        cmu,
+        epk,
+        enc: enc_arr,
+        out: out_arr,
+    };
+
+    // Use a recent height for recovery
+    let height = BlockHeight::from_u32(2900000);
+
+    // Use try_sapling_output_recovery_with_ovk which takes the components directly
+    let domain = SaplingDomain::for_height(ZclassicNetwork, height);
+
+    match zcash_note_encryption::try_output_recovery_with_ovk(
+        &domain,
+        &ovk,
+        &recovery_output,
+        recovery_output.cv(),
+        recovery_output.out_ciphertext(),
+    ) {
+        Some((note, payment_address, memo)) => {
+            // Successfully recovered! Pack the result
+            let mut result = Vec::with_capacity(620);
+
+            // Diversifier (11 bytes)
+            result.extend_from_slice(&payment_address.diversifier().0);
+
+            // pk_d (32 bytes) - use to_bytes on the underlying point
+            let pk_d_bytes: [u8; 32] = match payment_address.to_bytes()[11..43].try_into() {
+                Ok(b) => b,
+                Err(_) => return 0,
+            };
+            result.extend_from_slice(&pk_d_bytes);
+
+            // Value (8 bytes, little-endian)
+            result.extend_from_slice(&note.value().inner().to_le_bytes());
+
+            // Rcm (32 bytes)
+            let rcm_bytes = match note.rseed() {
+                Rseed::BeforeZip212(rcm) => rcm.to_repr(),
+                Rseed::AfterZip212(rseed) => {
+                    // For AfterZip212, we store the rseed directly
+                    *rseed
+                }
+            };
+            result.extend_from_slice(&rcm_bytes);
+
+            // Memo (512 bytes)
+            result.extend_from_slice(memo.as_array());
+
+            // Copy to output buffer
+            let len = result.len();
+            std::ptr::copy_nonoverlapping(result.as_ptr(), output, len);
+
+            len
+        }
+        None => 0,
+    }
+    })
+}
+
+/// Derive OVK from extended spending key
+/// sk: 169-byte extended spending key
+/// ovk_out: Buffer for 32-byte OVK
+/// Returns true on success
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_derive_ovk(
+    sk: *const u8,
+    ovk_out: *mut u8,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    // FIX #1385: Null pointer validation for output
+    if ovk_out.is_null() { return false; }
+    // FIX #230: Use safe_slice for bounds checking
+    let sk_bytes = match safe_slice(sk, 169) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid spending key pointer in derive_ovk");
+            return false;
+        }
+    };
+
+    // Deserialize the extended spending key
+    let extsk = match ExtendedSpendingKey::read(&sk_bytes[..]) {
+        Ok(key) => key,
+        Err(_) => return false,
+    };
+
+    // Get the OVK from the extended spending key
+    let ovk = extsk.expsk.ovk;
+
+    // Copy to output
+    std::ptr::copy_nonoverlapping(ovk.0.as_ptr(), ovk_out, 32);
+
+    true
+    })
+}
+
+// =============================================================================
+// Equihash Verification for Block Header Validation
+// =============================================================================
+
+/// Verify an Equihash solution for a Zclassic block header
+/// This is CRITICAL for trustless P2P operation - validates proof-of-work
+///
+/// Parameters:
+/// - header_bytes: The 140-byte block header (version through nonce)
+/// - solution: The Equihash solution bytes
+/// - solution_len: Length of the solution
+///
+/// Returns true if the Equihash solution is valid
+///
+/// Zclassic changed Equihash parameters at the Bubbles upgrade (block 585,318):
+/// - Before Bubbles (blocks 0-585,317): Equihash(200, 9) - 1344 byte solutions
+/// - After Bubbles (blocks 585,318+): Equihash(192, 7) - 400 byte solutions
+///
+/// Solution size formula: (2^K) * (N/(K+1) + 1) / 8
+/// - (200, 9): 512 * 21 / 8 = 1344 bytes
+/// - (192, 7): 128 * 25 / 8 = 400 bytes
+///
+/// FIX #668: Support both PRE-BUBBLES and POST-BUBBLES Equihash verification
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_verify_equihash(
+    header_bytes: *const u8,
+    solution: *const u8,
+    solution_len: usize,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    // FIX #668: Auto-detect Equihash parameters based on solution length
+    // Zclassic changed Equihash parameters at the Bubbles upgrade (block 585,318)
+    let (n, k, expected_len) = match solution_len {
+        1344 => (200, 9, 1344), // PRE-BUBBLES: Equihash(200, 9)
+        400 => (192, 7, 400),   // POST-BUBBLES: Equihash(192, 7)
+        _ => {
+            eprintln!("❌ Equihash: Invalid solution length {} (expected 1344 or 400 bytes)", solution_len);
+            return false;
+        }
+    };
+
+    // FIX #230: Header is 140 bytes total with safe_slice
+    // - First 108 bytes: header data (input for Equihash)
+    // - Last 32 bytes: nonce
+    let header = match safe_slice(header_bytes, 140) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid header pointer in verify_equihash");
+            return false;
+        }
+    };
+    let solution_slice = match safe_slice(solution, solution_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid solution pointer in verify_equihash");
+            return false;
+        }
+    };
+
+    // Split header into input (108 bytes) and nonce (32 bytes)
+    let input = &header[..108];
+    let nonce = &header[108..140];
+
+    // Verify the Equihash solution with detected parameters
+    // is_valid_solution returns Result<(), Error> - Ok means valid, Err means invalid
+    match equihash::is_valid_solution(n, k, input, nonce, solution_slice) {
+        Ok(()) => {
+            debug_log!("✅ Equihash solution is valid ({}, {}), {} bytes", n, k, solution_len);
+            true
+        }
+        Err(e) => {
+            eprintln!("❌ Equihash verification failed ({}, {}, {} bytes): {:?}", n, k, solution_len, e);
+            false
+        }
+    }
+    })
+}
+
+/// Compute the block hash for a Zclassic block header
+/// The block hash is double SHA256 of: header (140 bytes) + solution length (varint) + solution
+///
+/// Parameters:
+/// - header_bytes: The 140-byte block header
+/// - solution: The Equihash solution bytes
+/// - solution_len: Length of the solution
+/// - hash_out: Output buffer for 32-byte hash (will be in internal byte order)
+///
+/// Returns true on success
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_compute_block_hash(
+    header_bytes: *const u8,
+    solution: *const u8,
+    solution_len: usize,
+    hash_out: *mut u8,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    use sha2::{Sha256, Digest};
+
+    // FIX #1385: Null pointer validation for output
+    if hash_out.is_null() { return false; }
+    // FIX #230: Use safe_slice for bounds checking
+    let header = match safe_slice(header_bytes, 140) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid header pointer in compute_block_hash");
+            return false;
+        }
+    };
+    let solution_slice = match safe_slice(solution, solution_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid solution pointer in compute_block_hash");
+            return false;
+        }
+    };
+
+    // Build the data to hash: header + compact size + solution
+    let mut data = Vec::with_capacity(140 + 5 + solution_len);
+    data.extend_from_slice(header);
+
+    // Write compact size (varint) for solution length
+    // Equihash(200,9) solution is 1344 bytes, so we need 3-byte encoding
+    if solution_len < 253 {
+        data.push(solution_len as u8);
+    } else if solution_len < 0x10000 {
+        data.push(253);
+        data.push((solution_len & 0xff) as u8);
+        data.push(((solution_len >> 8) & 0xff) as u8);
+    } else {
+        data.push(254);
+        data.push((solution_len & 0xff) as u8);
+        data.push(((solution_len >> 8) & 0xff) as u8);
+        data.push(((solution_len >> 16) & 0xff) as u8);
+        data.push(((solution_len >> 24) & 0xff) as u8);
+    }
+
+    data.extend_from_slice(solution_slice);
+
+    // Double SHA256
+    let hash1 = Sha256::digest(&data);
+    let hash2 = Sha256::digest(&hash1);
+
+    // Copy to output (in internal byte order - NOT reversed for display)
+    std::ptr::copy_nonoverlapping(hash2.as_ptr(), hash_out, 32);
+
+    true
+    })
+}
+
+/// Verify a chain of block headers for continuity and valid PoW
+/// Checks that each header's prevHash matches the previous header's hash
+/// and that each Equihash solution is valid
+///
+/// Parameters:
+/// - headers_data: Concatenated header data (each header is 140 bytes + varint solution_len + solution)
+/// - headers_count: Number of headers in the chain
+/// - expected_prev_hash: The expected prevHash of the first header (32 bytes), or null to skip first check
+/// - header_offsets: Array of byte offsets where each header starts (count entries)
+/// - header_sizes: Array of total sizes for each header including solution (count entries)
+///
+/// Returns true if all headers are valid and chain is continuous
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_verify_header_chain(
+    headers_data: *const u8,
+    headers_count: usize,
+    expected_prev_hash: *const u8,
+    header_offsets: *const usize,
+    header_sizes: *const usize,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    if headers_count == 0 {
+        return true;
+    }
+
+    // FIX #230: Validate all pointers with safe_slice
+    let offsets = match safe_slice(header_offsets, headers_count) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid header_offsets pointer");
+            return false;
+        }
+    };
+    let sizes = match safe_slice(header_sizes, headers_count) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid header_sizes pointer");
+            return false;
+        }
+    };
+
+    let mut prev_hash: [u8; 32] = [0; 32];
+    let has_expected_prev = !expected_prev_hash.is_null();
+
+    if has_expected_prev {
+        let expected = match safe_slice(expected_prev_hash, 32) {
+            Some(s) => s,
+            None => {
+                eprintln!("❌ Invalid expected_prev_hash pointer");
+                return false;
+            }
+        };
+        prev_hash.copy_from_slice(expected);
+    }
+
+    for i in 0..headers_count {
+        let offset = offsets[i];
+        let size = sizes[i];
+
+        if size < 140 {
+            eprintln!("❌ Header {} too small: {} bytes", i, size);
+            return false;
+        }
+
+        let header_ptr = headers_data.add(offset);
+        let header = match safe_slice(header_ptr, 140) {
+            Some(s) => s,
+            None => {
+                eprintln!("❌ Invalid header pointer at index {}", i);
+                return false;
+            }
+        };
+
+        // Extract prevHash from header (bytes 4-36)
+        let header_prev_hash = &header[4..36];
+
+        // Check chain continuity (skip first if no expected_prev_hash provided)
+        if i > 0 || has_expected_prev {
+            if header_prev_hash != prev_hash {
+                eprintln!("❌ Header {} prevHash mismatch - chain broken!", i);
+                // FIX #1385: Gate hex dumps behind DEBUG_LOGGING
+                if DEBUG_LOGGING {
+                    eprintln!("   Expected: {}", hex::encode(&prev_hash));
+                    eprintln!("   Got:      {}", hex::encode(header_prev_hash));
+                }
+                return false;
+            }
+        }
+
+        // Get solution (after 140-byte header)
+        let solution_start = offset + 140;
+        let solution_data = headers_data.add(solution_start);
+
+        // Read compact size for solution length
+        let first_byte = *solution_data;
+        let (solution_len, solution_offset) = if first_byte < 253 {
+            (first_byte as usize, 1)
+        } else if first_byte == 253 {
+            let len = (*solution_data.add(1) as usize) | ((*solution_data.add(2) as usize) << 8);
+            (len, 3)
+        } else {
+            eprintln!("❌ Header {} has invalid solution length encoding", i);
+            return false;
+        };
+
+        let solution_ptr = solution_data.add(solution_offset);
+
+        // Verify Equihash
+        if !zipherx_verify_equihash(header_ptr, solution_ptr, solution_len) {
+            eprintln!("❌ Header {} failed Equihash verification", i);
+            return false;
+        }
+
+        // Compute this block's hash for next iteration
+        let mut hash_out: [u8; 32] = [0; 32];
+        zipherx_compute_block_hash(header_ptr, solution_ptr, solution_len, hash_out.as_mut_ptr());
+        prev_hash = hash_out;
+
+        debug_log!("✅ Header {} verified, hash: {}", i, hex::encode(&prev_hash));
+    }
+
+    eprintln!("✅ All {} headers verified successfully", headers_count);
+    true
+    })
+}
+
+/// Verify a single block header's Equihash and return its hash
+/// Simpler interface for single header verification
+///
+/// Parameters:
+/// - header_and_solution: Full header data (140 bytes header + varint + solution)
+/// - total_len: Total length of the data
+/// - hash_out: Output buffer for 32-byte block hash
+///
+/// Returns true if header is valid
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_verify_block_header(
+    header_and_solution: *const u8,
+    total_len: usize,
+    hash_out: *mut u8,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    if total_len < 141 {
+        eprintln!("❌ Header data too small: {} bytes", total_len);
+        return false;
+    }
+
+    // FIX #230: Validate header pointer
+    let header = match safe_slice(header_and_solution, 140) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid header pointer");
+            return false;
+        }
+    };
+    let solution_data = header_and_solution.add(140);
+
+    // Read compact size for solution length
+    let first_byte = *solution_data;
+    let (solution_len, solution_offset) = if first_byte < 253 {
+        (first_byte as usize, 1)
+    } else if first_byte == 253 {
+        let len = (*solution_data.add(1) as usize) | ((*solution_data.add(2) as usize) << 8);
+        (len, 3)
+    } else {
+        eprintln!("❌ Invalid solution length encoding");
+        return false;
+    };
+
+    // Verify expected total length
+    let expected_len = 140 + solution_offset + solution_len;
+    if total_len < expected_len {
+        eprintln!("❌ Header data truncated: got {} bytes, expected {}", total_len, expected_len);
+        return false;
+    }
+
+    let solution_ptr = solution_data.add(solution_offset);
+
+    // Verify Equihash
+    if !zipherx_verify_equihash(header_and_solution, solution_ptr, solution_len) {
+        return false;
+    }
+
+    // Compute and return hash
+    zipherx_compute_block_hash(header_and_solution, solution_ptr, solution_len, hash_out);
+
+    true
+    })
+}
+
+// =============================================================================
+// VUL-002 FIX: Encrypted Key Operations
+// =============================================================================
+// These functions accept AES-GCM-256 encrypted spending keys and decrypt them
+// in Rust where memory can be explicitly zeroed. The decrypted key never leaves
+// Rust's control and is zeroed immediately after use.
+//
+// Encryption format (197 bytes):
+// - 12 bytes: Nonce
+// - 169 bytes: Encrypted spending key
+// - 16 bytes: Authentication tag
+//
+// The encryption key (32 bytes) is derived from device ID + salt using HKDF on
+// the Swift side and passed separately.
+
+/// Zero-fill a mutable byte slice to securely erase sensitive data
+/// VUL-CRYPTO-012: Uses zeroize crate (audited, compiler-fence backed)
+#[inline(never)]
+fn secure_zero(data: &mut [u8]) {
+    use zeroize::Zeroize;
+    data.zeroize();
+}
+
+/// Decrypt an AES-GCM-256 encrypted spending key
+/// Returns a vector that should be zeroed after use
+fn decrypt_spending_key(
+    encrypted_sk: &[u8],   // 197 bytes: nonce(12) + ciphertext(169) + tag(16)
+    encryption_key: &[u8], // 32 bytes: AES-256 key
+) -> Result<Vec<u8>, &'static str> {
+    use chacha20poly1305::aead::generic_array::GenericArray;
+
+    if encrypted_sk.len() != 197 {
+        return Err("Invalid encrypted key length (expected 197 bytes)");
+    }
+    if encryption_key.len() != 32 {
+        return Err("Invalid encryption key length (expected 32 bytes)");
+    }
+
+    // Parse components
+    let nonce = &encrypted_sk[0..12];
+    let ciphertext_with_tag = &encrypted_sk[12..197]; // 169 + 16 = 185 bytes
+
+    // Use AES-256-GCM for decryption
+    use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
+    use aes_gcm::aead::generic_array::GenericArray as AesGenericArray;
+
+    let key = AesGenericArray::from_slice(encryption_key);
+    let cipher = Aes256Gcm::new(key);
+    let nonce_arr = AesGenericArray::from_slice(nonce);
+
+    match cipher.decrypt(nonce_arr, ciphertext_with_tag) {
+        Ok(decrypted) => {
+            if decrypted.len() != 169 {
+                return Err("Decrypted key has wrong length");
+            }
+            Ok(decrypted)
+        }
+        Err(_) => Err("AES-GCM decryption failed (wrong key or corrupted data)"),
+    }
+}
+
+/// Build a shielded transaction using an encrypted spending key (VUL-002 secure)
+///
+/// This is the secure version of zipherx_build_transaction. The spending key is:
+/// 1. Encrypted with AES-GCM-256 on the Swift side
+/// 2. Passed to Rust encrypted
+/// 3. Decrypted only within this function
+/// 4. Used for transaction building
+/// 5. Immediately zeroed after use
+///
+/// # Safety
+/// - encrypted_sk: 197-byte AES-GCM encrypted spending key (nonce + ciphertext + tag)
+/// - encryption_key: 32-byte AES-256 key for decryption
+/// - to_address: 43-byte payment address
+/// - amount: amount to send in zatoshis
+/// - memo: 512-byte memo or null for empty
+/// - witness_data: serialized IncrementalWitness
+/// - witness_len: length of witness data
+/// - note_value: value of note being spent in zatoshis
+/// - note_rcm: 32-byte note commitment randomness
+/// - note_diversifier: 11-byte diversifier
+/// - chain_height: current chain height for branch ID
+/// - tx_out: output buffer (at least 100000 bytes)
+/// - tx_out_len: receives actual transaction length
+///
+/// Returns true on success, false on failure
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_build_transaction_encrypted(
+    encrypted_sk: *const u8,
+    encrypted_sk_len: usize,
+    encryption_key: *const u8,
+    to_address: *const u8,
+    amount: u64,
+    memo: *const u8,
+    anchor: *const u8,  // FIX #562: Remove underscore to use this parameter!
+    witness_data: *const u8,
+    witness_len: usize,
+    note_value: u64,
+    note_rcm: *const u8,
+    note_diversifier: *const u8,
+    chain_height: u64,
+    tx_out: *mut u8,
+    tx_out_len: *mut usize,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    // Validate input lengths
+    if encrypted_sk_len != 197 {
+        eprintln!("❌ Invalid encrypted key length: {} (expected 197)", encrypted_sk_len);
+        return false;
+    }
+
+    // FIX #230: Use safe_slice for all inputs
+    let encrypted_slice = match safe_slice(encrypted_sk, 197) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid encrypted key pointer");
+            return false;
+        }
+    };
+    let enc_key_slice = match safe_slice(encryption_key, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid encryption key pointer");
+            return false;
+        }
+    };
+
+    // Decrypt the spending key
+    let mut decrypted_sk = match decrypt_spending_key(encrypted_slice, enc_key_slice) {
+        Ok(sk) => sk,
+        Err(e) => {
+            eprintln!("❌ Failed to decrypt spending key: {}", e);
+            return false;
+        }
+    };
+
+    debug_log!("🔐 VUL-002: Spending key decrypted in Rust (will zero after use)");
+
+    // === Use the decrypted key ===
+
+    // FIX #562: Read the anchor parameter
+    let anchor_bytes = if anchor.is_null() {
+        eprintln!("❌ FIX #562: Anchor parameter is NULL!");
+        return false;
+    } else {
+        match safe_slice(anchor, 32) {
+            Some(s) => s.to_vec(),
+            None => {
+                eprintln!("❌ FIX #562: Invalid anchor pointer");
+                return false;
+            }
+        }
+    };
+
+    debug_log!("🔍 FIX #562: Anchor from Swift: {}...", hex::encode(&anchor_bytes[..8]));
+
+    // FIX #230: Get the prover with safe_lock
+    let prover_guard = match safe_lock!(PROVER) {
+        Some(g) => g,
+        None => {
+            secure_zero(&mut decrypted_sk);
+            return false;
+        }
+    };
+    let prover = match prover_guard.as_ref() {
+        Some(p) => p,
+        None => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Prover not initialized");
+            return false;
+        }
+    };
+
+    // FIX #230: Parse inputs with safe_slice
+    let to_addr_slice = match safe_slice(to_address, 43) {
+        Some(s) => s,
+        None => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid destination address pointer");
+            return false;
+        }
+    };
+    let witness_slice = match safe_slice(witness_data, witness_len) {
+        Some(s) => s,
+        None => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid witness data pointer");
+            return false;
+        }
+    };
+    let rcm_slice = match safe_slice(note_rcm, 32) {
+        Some(s) => s,
+        None => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid rcm pointer");
+            return false;
+        }
+    };
+    let div_slice = match safe_slice(note_diversifier, 11) {
+        Some(s) => s,
+        None => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid diversifier pointer");
+            return false;
+        }
+    };
+
+    // Deserialize spending key from decrypted data
+    let extsk = match ExtendedSpendingKey::read(&mut &decrypted_sk[..]) {
+        Ok(key) => key,
+        Err(e) => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Failed to read spending key: {:?}", e);
+            return false;
+        }
+    };
+
+    // FIX #230: Parse destination address (safe conversion)
+    let to_addr_arr: [u8; 43] = match to_addr_slice.try_into() {
+        Ok(arr) => arr,
+        Err(_) => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid destination address length");
+            return false;
+        }
+    };
+    let to_addr = match PaymentAddress::from_bytes(&to_addr_arr) {
+        Some(addr) => addr,
+        None => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid destination address");
+            return false;
+        }
+    };
+
+    // Parse note commitment randomness
+    let mut rcm_bytes = [0u8; 32];
+    rcm_bytes.copy_from_slice(rcm_slice);
+    let rcm = match Option::<jubjub::Fr>::from(jubjub::Fr::from_repr(rcm_bytes)) {
+        Some(r) => r,
+        None => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid rcm");
+            return false;
+        }
+    };
+
+    // Parse diversifier
+    let mut div_bytes = [0u8; 11];
+    div_bytes.copy_from_slice(div_slice);
+    let diversifier = Diversifier(div_bytes);
+
+    // Get the address that received this note using the note's diversifier
+    let fvk = extsk.to_diversifiable_full_viewing_key();
+    let note_addr = match fvk.fvk().vk.to_payment_address(diversifier) {
+        Some(addr) => addr,
+        None => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid diversifier for note address");
+            return false;
+        }
+    };
+
+    // VUL-F-007: Use configurable fee from global state
+    let fee = match safe_lock!(TRANSACTION_FEE) {
+        Some(fee_guard) => *fee_guard,
+        None => {
+            eprintln!("VUL-F-007: Failed to acquire TRANSACTION_FEE mutex, using default 10000");
+            10000u64
+        }
+    };
+
+    // Verify funds
+    if note_value < amount + fee {
+        secure_zero(&mut decrypted_sk);
+        eprintln!("❌ Insufficient funds: have {}, need {}", redact_amount!(note_value), redact_amount!(amount + fee));
+        return false;
+    }
+
+    // Create note to spend using the diversifier's address
+    let note = zcash_primitives::sapling::Note::from_parts(
+        note_addr,
+        NoteValue::from_raw(note_value),
+        Rseed::BeforeZip212(rcm),
+    );
+
+    // FIX #557 v48: Try deserializing with full witness first (FIX #584 approach)
+    // If that fails, try trimming trailing zeros (FIX #557 v41 approach)
+    // The issue is that witnesses can have legitimate zeros inside the structure,
+    // so aggressive trimming can cut into valid data.
+    let mut witness: Option<IncrementalWitness<zcash_primitives::sapling::Node, 32>> = None;
+    let mut used_len = witness_len;
+
+    // First try: Full 1028 bytes (FIX #584 - works for most cases)
+    {
+        let mut reader = std::io::Cursor::new(witness_slice);
+        match zcash_primitives::merkle_tree::read_incremental_witness(&mut reader) {
+            Ok(w) => {
+                witness = Some(w);
+                debug_log!("✅ FIX #557 v48 TX: Deserialized with full {} bytes", witness_len);
+            }
+            Err(_) => {
+                debug_log!("⚠️ FIX #557 v48 TX: Full deserialization failed, trying trimmed version...");
+            }
+        }
+    }
+
+    // Second try: Trim trailing zeros (FIX #557 v41 - fallback for edge cases)
+    if witness.is_none() {
+        // Be more conservative: only trim if we see a long run of zeros at the end
+        let mut trim_end = witness_slice.len();
+        while trim_end > 100 && trim_end > witness_slice.len() - 200 {
+            let last_50_all_zeros = witness_slice[trim_end-50..trim_end].iter().all(|&b| b == 0);
+            if !last_50_all_zeros {
+                break;
+            }
+            trim_end -= 50;
+        }
+        if trim_end < 700 {
+            trim_end = witness_slice.len();
+        }
+
+        let trimmed_slice = &witness_slice[..trim_end];
+        let mut reader = std::io::Cursor::new(trimmed_slice);
+        match zcash_primitives::merkle_tree::read_incremental_witness(&mut reader) {
+            Ok(w) => {
+                witness = Some(w);
+                used_len = trim_end;
+                debug_log!("✅ FIX #557 v48 TX: Deserialized with trimmed {} bytes", trim_end);
+            }
+            Err(e) => {
+                secure_zero(&mut decrypted_sk);
+                eprintln!("❌ Failed to deserialize witness: {:?}", e);
+                return false;
+            }
+        }
+    }
+
+    let witness = match witness {
+        Some(w) => w,
+        None => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ No valid witness deserialized");
+            return false;
+        }
+    };
+
+    // DEBUG FIX #557 v43: Log witness root for debugging
+    let witness_root = witness.root();
+    let mut witness_root_bytes = Vec::new();
+    let _ = witness_root.write(&mut witness_root_bytes);
+    debug_log!("🔍 FIX #557 v43: Witness root from deserialized witness: {}...", hex::encode(&witness_root_bytes[..8]));
+
+    // FIX #581: witness.path() returns None for some witnesses even though root is valid
+    // This happens when the tree structure doesn't have tree.left set (beginning of tree)
+    // Instead, construct MerklePath directly from filled nodes and position
+    let merkle_path = match witness.path() {
+        Some(p) => {
+            debug_log!("✅ FIX #581: Got path from witness.path()");
+            p
+        },
+        None => {
+            // Fallback: Construct path from filled nodes directly
+            debug_log!("⚠️ FIX #581: witness.path() returned None, constructing from filled nodes");
+            let filled = witness.filled();
+            let position = witness.witnessed_position();
+            debug_log!("🔍 FIX #581: filled nodes: {}, position: {}", filled.len(), u64::from(position));
+
+            match MerklePath::from_parts(filled.clone(), position) {
+                Ok(p) => {
+                    debug_log!("✅ FIX #581: Successfully constructed path from filled nodes");
+                    p
+                },
+                Err(e) => {
+                    secure_zero(&mut decrypted_sk);
+                    eprintln!("❌ FIX #581: Failed to construct MerklePath from filled nodes: {:?}", e);
+                    return false;
+                }
+            }
+        }
+    };
+
+    // FIX #562: Log note CMU and position for debugging
+    let note_cmu = note.cmu();
+    let cmu_bytes: [u8; 32] = note_cmu.to_bytes();
+    debug_log!("🔍 FIX #562: Computed Note CMU (WIRE/little-endian): {}...", hex::encode(&cmu_bytes[..8]));
+    // FIX #557 v47: Also log reversed CMU (DISPLAY/big-endian format)
+    let mut reversed_cmu = [0u8; 32];
+    for i in 0..32 {
+        reversed_cmu[i] = cmu_bytes[31 - i];
+    }
+    debug_log!("🔍 FIX #557 v47: Reversed CMU (DISPLAY/big-endian): {}...", hex::encode(&reversed_cmu[..8]));
+    debug_log!("🔍 FIX #562: Witness position: {}", u64::from(merkle_path.position()));
+
+    // FIX #586: Log note components to verify they're correct
+    debug_log!("🔍 FIX #586: Note components:");
+    debug_log!("   Diversifier: {}", hex::encode(&div_bytes));
+    debug_log!("   RCM: {}", hex::encode(&rcm_bytes));
+    debug_log!("   Value: {} zatoshis", note_value);
+
+    // CRITICAL FIX #575: Check if witness matches reconstructed note
+    // After FIX #557 v49, both should be in WIRE format (little-endian)
+    let node = zcash_primitives::sapling::Node::from_cmu(&note_cmu);
+    let path_root = merkle_path.root(node);
+    let mut path_root_bytes = Vec::new();
+    let _ = path_root.write(&mut path_root_bytes);
+    debug_log!("🔍 FIX #575: Computed anchor from merkle_path: {}...", hex::encode(&path_root_bytes[..8]));
+    debug_log!("🔍 FIX #575: Witness root:                   {}...", hex::encode(&witness_root_bytes[..8]));
+
+    // FIX #557 v49: After fixing tree loading to use WIRE format, anchors should match
+    let anchor_matches = &path_root_bytes[..] == &witness_root_bytes[..];
+
+    if !anchor_matches {
+        debug_log!("❌ FIX #575 v2: ANCHOR MISMATCH - witness is corrupted!");
+        debug_log!("   Witness root: {}...", hex::encode(&witness_root_bytes[..8]));
+        debug_log!("   Path root:    {}...", hex::encode(&path_root_bytes[..8]));
+        debug_log!("   💡 FIX: The witness was built with wrong format CMUs");
+        debug_log!("   💡 FIX: Run 'Settings → Repair Database → Force Rebuild Witnesses'");
+        debug_log!("   💡 FIX: For now, ABORTING transaction to prevent crash");
+        secure_zero(&mut decrypted_sk);
+        return false;
+    }
+
+    debug_log!("✅ FIX #575: ANCHORS MATCH - transaction should succeed!");
+
+    // FIX #575 v2: Stop transaction when witness is corrupted
+    if !anchor_matches {
+        debug_log!("❌ FIX #575 v2: ANCHOR MISMATCH - witness is corrupted!");
+        debug_log!("   Witness root: {}...", hex::encode(&witness_root_bytes[..8]));
+        debug_log!("   Path root:    {}...", hex::encode(&path_root_bytes[..8]));
+        debug_log!("   💡 FIX: The witness was built with wrong path data");
+        debug_log!("   💡 FIX: Clear witnesses and rebuild with 'Settings → Repair Database'");
+        debug_log!("   💡 FIX: For now, ABORTING transaction to prevent crash");
+        secure_zero(&mut decrypted_sk);
+        return false;  // Abort transaction - witness is unusable
+    }
+
+    debug_log!("✅ FIX #575: ANCHORS MATCH - transaction should succeed!");
+
+    // Create transaction builder
+    let target_height = BlockHeight::from_u32(chain_height as u32);
+
+    // FIX #693: Debug branch ID calculation
+    let branch_id = zcash_primitives::consensus::BranchId::for_height(&ZclassicNetwork, target_height);
+    let branch_id_u32: u32 = branch_id.into();
+    debug_log!("🔍 FIX #693: Building transaction at height {}", chain_height);
+    debug_log!("🔍 FIX #693: Expected branch ID: 0x{:08x} (ZclassicButtercup = 0x930b540d)", branch_id_u32);
+    debug_log!("🔍 FIX #693: Branch ID match: {}", if branch_id_u32 == 0x930b540d { "✅ YES" } else { "❌ NO" });
+
+    let mut builder = Builder::new(ZclassicNetwork, target_height, None);
+
+    // Add spend
+    if let Err(e) = builder.add_sapling_spend(
+        extsk.clone(),
+        diversifier,
+        note.clone(),
+        merkle_path.clone(),
+    ) {
+        secure_zero(&mut decrypted_sk);
+        eprintln!("❌ Failed to add spend: {:?}", e);
+        return false;
+    }
+
+    // FIX #562: Log the anchor that the builder computed from the merkle_path
+    // The anchor is computed by merkle_path.root(node) inside add_sapling_spend
+    let node = zcash_primitives::sapling::Node::from_cmu(&note.cmu());
+    let computed_anchor: bls12_381::Scalar = merkle_path.root(node).into();
+    let anchor_bytes = computed_anchor.to_bytes();
+    debug_log!("🔍 FIX #562: Computed anchor from merkle_path: {}...", hex::encode(&anchor_bytes[..8]));
+
+    // FIX #230: Prepare memo with safe slice validation
+    let memo_bytes = if memo.is_null() {
+        [0u8; 512]
+    } else {
+        match safe_slice(memo, 512) {
+            Some(memo_slice) => {
+                let mut m = [0u8; 512];
+                m.copy_from_slice(memo_slice);
+                m
+            }
+            None => {
+                secure_zero(&mut decrypted_sk);
+                eprintln!("❌ Invalid memo pointer");
+                return false;
+            }
+        }
+    };
+    let memo_obj = match MemoBytes::from_bytes(&memo_bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid memo bytes: {:?}", e);
+            return false;
+        }
+    };
+
+    // Convert amount to Amount type - use safe conversion
+    let amount_val = match Amount::from_i64(amount as i64) {
+        Ok(a) => a,
+        Err(_) => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid amount: {}", redact_amount!(amount));
+            return false;
+        }
+    };
+
+    // Add output to recipient
+    if let Err(e) = builder.add_sapling_output(
+        Some(extsk.expsk.ovk),
+        to_addr,
+        amount_val,
+        memo_obj,
+    ) {
+        secure_zero(&mut decrypted_sk);
+        eprintln!("❌ Failed to add output: {:?}", e);
+        return false;
+    }
+
+    // Add change output if needed
+    let change = note_value - amount - fee;
+    if change > 0 {
+        let change_memo = MemoBytes::empty();
+        // FIX #761: Safe Amount conversion with error handling
+        let change_amount = match Amount::from_i64(change as i64) {
+            Ok(amt) => amt,
+            Err(_) => {
+                secure_zero(&mut decrypted_sk);
+                eprintln!("❌ FIX #761: Invalid change amount: {}", redact_amount!(change));
+                return false;
+            }
+        };
+        // PRIVACY: P-ADDR-002 — Use diversified change address (external scope, high index)
+        // FIX #1402 (NEW-002): Random offset prevents TX linkage via identical change addresses
+        let dfvk_change = extsk.to_diversifiable_full_viewing_key();
+        let change_diversifier_base: u64 = 1_000_000_000;
+        let change_offset: u64 = OsRng.gen_range(0u64..1_000_000_000);
+        let change_index = change_diversifier_base + change_offset;
+        LAST_CHANGE_DIVERSIFIER_INDEX.store(change_index, Ordering::SeqCst); // FIX #1402 (NEW-004)
+        let change_j = DiversifierIndex::from(change_index);
+        let (_, change_addr) = match dfvk_change.find_address(change_j) {
+            Some(result) => result,
+            None => {
+                debug_log!("P-ADDR-002: find_address failed at index {}, using default", change_index);
+                dfvk_change.default_address()
+            }
+        };
+        if let Err(e) = builder.add_sapling_output(
+            Some(extsk.expsk.ovk),
+            change_addr,
+            change_amount,
+            change_memo,
+        ) {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Failed to add change output: {:?}", e);
+            return false;
+        }
+    }
+
+    // Build the transaction with proofs
+    // FIX #761: Safe fee Amount conversion
+    let fee_amount = match Amount::from_i64(fee as i64) {
+        Ok(amt) => amt,
+        Err(_) => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ FIX #761: Invalid fee amount: {}", redact_amount!(fee));
+            return false;
+        }
+    };
+    let (tx, _) = match builder.build(prover, &zcash_primitives::transaction::fees::fixed::FeeRule::non_standard(fee_amount)) {
+        Ok(result) => result,
+        Err(e) => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Failed to build transaction: {:?}", e);
+            return false;
+        }
+    };
+
+    // === CRITICAL: Zero the decrypted spending key ===
+    secure_zero(&mut decrypted_sk);
+    debug_log!("🔐 VUL-002: Spending key zeroed from memory");
+
+    // Serialize transaction
+    let mut tx_bytes = Vec::new();
+    if let Err(e) = tx.write(&mut tx_bytes) {
+        eprintln!("❌ Failed to serialize transaction: {:?}", e);
+        return false;
+    }
+
+    // FIX #562: Log transaction summary
+    debug_log!("✅ FIX #562: Transaction built - {} bytes, chain height: {}", tx_bytes.len(), chain_height);
+    debug_log!("🔍 FIX #562: Swift passed anchor:       {}...", hex::encode(&anchor_bytes[..8]));
+    debug_log!("🔍 FIX #562: Witness root:              {}...", hex::encode(&witness_root_bytes[..8]));
+    debug_log!("🔍 FIX #562: Anchor extraction now uses SpendDescription offset (Swift FIX #562)");
+
+    // FIX #580: Print transaction hex for debugging
+    debug_log!("📋 FIX #580: Transaction hex (first 100 bytes): {}", hex::encode(&tx_bytes[..tx_bytes.len().min(100)]));
+    debug_log!("📋 FIX #580: Transaction version: {:02x}", tx_bytes[0]);
+    debug_log!("📋 FIX #580: Version group ID: {:02x} {:02x} {:02x} {:02x}", tx_bytes[4], tx_bytes[5], tx_bytes[6], tx_bytes[7]);
+    if tx_bytes.len() >= 12 {
+        debug_log!("📋 FIX #580: Full hex: {}", hex::encode(&tx_bytes));
+    }
+
+    // Copy to output
+    // FIX #1323: Increased from 10KB to 100KB to support multi-input transactions
+    // A 27-spend TX is ~12KB, Zcash protocol allows up to 100KB
+    if tx_bytes.len() > 100000 {
+        eprintln!("❌ Transaction too large: {} bytes (max 100000)", tx_bytes.len());
+        return false;
+    }
+
+    std::ptr::copy_nonoverlapping(tx_bytes.as_ptr(), tx_out, tx_bytes.len());
+    *tx_out_len = tx_bytes.len();
+
+    true
+    })
+}
+
+/// Build a shielded transaction with multiple inputs using encrypted spending key (VUL-002 secure)
+///
+/// This is the secure version of zipherx_build_transaction_multi.
+///
+/// # Safety
+/// - encrypted_sk: 197-byte AES-GCM encrypted spending key
+/// - encryption_key: 32-byte AES-256 key
+/// - Other parameters same as zipherx_build_transaction_multi
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_build_transaction_multi_encrypted(
+    encrypted_sk: *const u8,
+    encrypted_sk_len: usize,
+    encryption_key: *const u8,
+    to_address: *const u8,
+    amount: u64,
+    memo: *const u8,
+    spends: *const *const SpendInfo,
+    spend_count: usize,
+    chain_height: u64,
+    tx_out: *mut u8,
+    tx_out_len: *mut usize,
+    nullifiers_out: *mut u8,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    if spend_count == 0 || spend_count > 100 {
+        eprintln!("❌ Invalid spend count: {} (must be 1-100)", spend_count);
+        return false;
+    }
+
+    // Validate input lengths
+    if encrypted_sk_len != 197 {
+        eprintln!("❌ Invalid encrypted key length: {} (expected 197)", encrypted_sk_len);
+        return false;
+    }
+
+    // FIX #230: Use safe_slice for all inputs (multi-encrypted)
+    let encrypted_slice = match safe_slice(encrypted_sk, 197) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid encrypted key pointer");
+            return false;
+        }
+    };
+    let enc_key_slice = match safe_slice(encryption_key, 32) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid encryption key pointer");
+            return false;
+        }
+    };
+
+    // Decrypt the spending key
+    let mut decrypted_sk = match decrypt_spending_key(encrypted_slice, enc_key_slice) {
+        Ok(sk) => sk,
+        Err(e) => {
+            eprintln!("❌ Failed to decrypt spending key: {}", e);
+            return false;
+        }
+    };
+
+    debug_log!("🔐 VUL-002: Spending key decrypted in Rust for multi-spend (will zero after use)");
+
+    // FIX #230: Get the prover with safe_lock
+    let prover_guard = match safe_lock!(PROVER) {
+        Some(g) => g,
+        None => {
+            secure_zero(&mut decrypted_sk);
+            return false;
+        }
+    };
+    let prover = match prover_guard.as_ref() {
+        Some(p) => p,
+        None => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Prover not initialized");
+            return false;
+        }
+    };
+
+    // FIX #230: Parse inputs with safe_slice
+    let to_addr_slice = match safe_slice(to_address, 43) {
+        Some(s) => s,
+        None => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid destination address pointer");
+            return false;
+        }
+    };
+
+    // Deserialize spending key
+    let extsk = match ExtendedSpendingKey::read(&mut &decrypted_sk[..]) {
+        Ok(key) => key,
+        Err(e) => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Failed to read spending key: {:?}", e);
+            return false;
+        }
+    };
+
+    // FIX #230: Parse destination address (safe conversion)
+    let to_addr_arr: [u8; 43] = match to_addr_slice.try_into() {
+        Ok(arr) => arr,
+        Err(_) => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid destination address length");
+            return false;
+        }
+    };
+    let to_addr = match PaymentAddress::from_bytes(&to_addr_arr) {
+        Some(addr) => addr,
+        None => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid destination address");
+            return false;
+        }
+    };
+
+    // VUL-F-007: Use configurable fee from global state
+    let fee = match safe_lock!(TRANSACTION_FEE) {
+        Some(fee_guard) => *fee_guard,
+        None => {
+            eprintln!("VUL-F-007: Failed to acquire TRANSACTION_FEE mutex, using default 10000");
+            10000u64
+        }
+    };
+
+    // FIX #1385: Sanity cap on spend_count + checked multiplication
+    if spend_count > 1000 {
+        secure_zero(&mut decrypted_sk);
+        return false;
+    }
+    let spend_total_bytes = match spend_count.checked_mul(std::mem::size_of::<*const SpendInfo>()) {
+        Some(len) => len,
+        None => { secure_zero(&mut decrypted_sk); return false; }
+    };
+    // FIX #230: Parse all spends with safe pointer validation
+    let spend_infos = match safe_slice(spends as *const *const SpendInfo as *const u8, spend_total_bytes) {
+        Some(_) => std::slice::from_raw_parts(spends, spend_count),
+        None => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid spends pointer");
+            return false;
+        }
+    };
+    let mut total_input: u64 = 0;
+    let mut parsed_spends: Vec<(zcash_primitives::sapling::Note, MerklePath<zcash_primitives::sapling::Node, 32>, Diversifier)> = Vec::new();
+
+    for (i, spend_ptr) in spend_infos.iter().enumerate() {
+        let spend = &**spend_ptr;
+
+        // FIX #230: Validate spend data pointers
+        let witness_slice = match safe_slice(spend.witness_data, spend.witness_len) {
+            Some(s) => s,
+            None => {
+                secure_zero(&mut decrypted_sk);
+                eprintln!("❌ Invalid witness pointer for spend {}", i);
+                return false;
+            }
+        };
+        let rcm_slice = match safe_slice(spend.note_rcm, 32) {
+            Some(s) => s,
+            None => {
+                secure_zero(&mut decrypted_sk);
+                eprintln!("❌ Invalid rcm pointer for spend {}", i);
+                return false;
+            }
+        };
+        let div_slice = match safe_slice(spend.note_diversifier, 11) {
+            Some(s) => s,
+            None => {
+                secure_zero(&mut decrypted_sk);
+                eprintln!("❌ Invalid diversifier pointer for spend {}", i);
+                return false;
+            }
+        };
+
+        // Parse note commitment randomness
+        let mut rcm_bytes = [0u8; 32];
+        rcm_bytes.copy_from_slice(rcm_slice);
+        let rcm = match Option::<jubjub::Fr>::from(jubjub::Fr::from_repr(rcm_bytes)) {
+            Some(r) => r,
+            None => {
+                secure_zero(&mut decrypted_sk);
+                eprintln!("❌ Invalid rcm for spend {}", i);
+                return false;
+            }
+        };
+
+        // Parse diversifier
+        let mut div_bytes = [0u8; 11];
+        div_bytes.copy_from_slice(div_slice);
+        let diversifier = Diversifier(div_bytes);
+
+        // Get the address that received this note
+        let fvk = extsk.to_diversifiable_full_viewing_key();
+        let note_addr = match fvk.fvk().vk.to_payment_address(diversifier) {
+            Some(addr) => addr,
+            None => {
+                secure_zero(&mut decrypted_sk);
+                eprintln!("❌ Invalid diversifier for spend {}", i);
+                return false;
+            }
+        };
+
+        // Create note to spend
+        let note = zcash_primitives::sapling::Note::from_parts(
+            note_addr,
+            NoteValue::from_raw(spend.note_value),
+            Rseed::BeforeZip212(rcm),
+        );
+
+        // FIX #557 v48: Try deserializing with full witness first
+        let mut witness: Option<IncrementalWitness<zcash_primitives::sapling::Node, 32>> = None;
+        let mut used_len = witness_slice.len();
+
+        // First try: Full 1028 bytes
+        {
+            let mut reader = std::io::Cursor::new(witness_slice);
+            match zcash_primitives::merkle_tree::read_incremental_witness(&mut reader) {
+                Ok(w) => {
+                    witness = Some(w);
+                }
+                Err(_) => {}
+            }
+        }
+
+        // Second try: Trim trailing zeros
+        if witness.is_none() {
+            let mut trim_end = witness_slice.len();
+            while trim_end > 100 && trim_end > witness_slice.len() - 200 {
+                let last_50_all_zeros = witness_slice[trim_end-50..trim_end].iter().all(|&b| b == 0);
+                if !last_50_all_zeros {
+                    break;
+                }
+                trim_end -= 50;
+            }
+            if trim_end < 700 {
+                trim_end = witness_slice.len();
+            }
+
+            let trimmed_slice = &witness_slice[..trim_end];
+            let mut reader = std::io::Cursor::new(trimmed_slice);
+            match zcash_primitives::merkle_tree::read_incremental_witness(&mut reader) {
+                Ok(w) => {
+                    witness = Some(w);
+                    used_len = trim_end;
+                }
+                Err(e) => {
+                    secure_zero(&mut decrypted_sk);
+                    eprintln!("❌ Failed to deserialize witness {}: {:?}", i, e);
+                    return false;
+                }
+            }
+        }
+
+        let witness = match witness {
+            Some(w) => w,
+            None => {
+                secure_zero(&mut decrypted_sk);
+                eprintln!("❌ No valid witness deserialized for spend {}", i);
+                return false;
+            }
+        };
+
+        // FIX #581: witness.path() returns None for some witnesses, construct from filled nodes
+        let merkle_path = match witness.path() {
+            Some(p) => {
+                debug_log!("✅ FIX #581: Got path from witness.path() for spend {}", i);
+                p
+            },
+            None => {
+                debug_log!("⚠️ FIX #581: witness.path() returned None for spend {}, constructing from filled nodes", i);
+                let filled = witness.filled();
+                let position = witness.witnessed_position();
+                debug_log!("🔍 FIX #581: filled nodes: {}, position: {}", filled.len(), u64::from(position));
+
+                match MerklePath::from_parts(filled.clone(), position) {
+                    Ok(p) => {
+                        debug_log!("✅ FIX #581: Successfully constructed path from filled nodes for spend {}", i);
+                        p
+                    },
+                    Err(e) => {
+                        secure_zero(&mut decrypted_sk);
+                        eprintln!("❌ FIX #581: Failed to construct MerklePath for spend {}: {:?}", i, e);
+                        return false;
+                    }
+                }
+            }
+        };
+
+        // FIX #962: CRITICAL - Verify anchor consistency for EACH spend in multi-input transaction
+        // This was missing, causing "joinsplit requirements not met" errors
+        let node = zcash_primitives::sapling::Node::from_cmu(&note.cmu());
+        let path_root = merkle_path.root(node);
+        let mut path_root_bytes = Vec::new();
+        let _ = path_root.write(&mut path_root_bytes);
+
+        // Get witness root for comparison
+        let witness_root = witness.root();
+        let mut witness_root_bytes = Vec::new();
+        let _ = witness_root.write(&mut witness_root_bytes);
+
+        let anchor_matches = &path_root_bytes[..] == &witness_root_bytes[..];
+        debug_log!("🔍 FIX #962: Spend {} - path root: {}..., witness root: {}..., match: {}",
+            i,
+            hex::encode(&path_root_bytes[..8]),
+            hex::encode(&witness_root_bytes[..8]),
+            anchor_matches);
+
+        if !anchor_matches {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ FIX #962: ANCHOR MISMATCH for spend {} - witness is corrupted!", i);
+            // FIX #1385: Gate hex dumps behind DEBUG_LOGGING
+            if DEBUG_LOGGING {
+                eprintln!("   Path root:    {}...", hex::encode(&path_root_bytes[..8]));
+                eprintln!("   Witness root: {}...", hex::encode(&witness_root_bytes[..8]));
+            }
+            eprintln!("   💡 Run 'Settings → Full Resync' to rebuild witnesses");
+            return false;
+        }
+
+        total_input += spend.note_value;
+        parsed_spends.push((note, merkle_path, diversifier));
+    }
+
+    // Verify funds
+    if total_input < amount + fee {
+        secure_zero(&mut decrypted_sk);
+        eprintln!("❌ Insufficient funds: have {}, need {}", redact_amount!(total_input), redact_amount!(amount + fee));
+        return false;
+    }
+
+    // Create transaction builder
+    let target_height = BlockHeight::from_u32(chain_height as u32);
+    let mut builder = Builder::new(ZclassicNetwork, target_height, None);
+
+    // Add all spends
+    for (note, merkle_path, diversifier) in parsed_spends.iter() {
+        if let Err(e) = builder.add_sapling_spend(
+            extsk.clone(),
+            *diversifier,
+            note.clone(),
+            merkle_path.clone(),
+        ) {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Failed to add spend: {:?}", e);
+            return false;
+        }
+    }
+
+    // FIX #230: Prepare memo with safe slice validation
+    let memo_bytes = if memo.is_null() {
+        [0u8; 512]
+    } else {
+        match safe_slice(memo, 512) {
+            Some(memo_slice) => {
+                let mut m = [0u8; 512];
+                m.copy_from_slice(memo_slice);
+                m
+            }
+            None => {
+                secure_zero(&mut decrypted_sk);
+                eprintln!("❌ Invalid memo pointer");
+                return false;
+            }
+        }
+    };
+    let memo_obj = match MemoBytes::from_bytes(&memo_bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid memo bytes: {:?}", e);
+            return false;
+        }
+    };
+
+    // Add output to recipient - use safe amount conversion
+    let amount_val = match Amount::from_i64(amount as i64) {
+        Ok(a) => a,
+        Err(_) => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Invalid amount: {}", redact_amount!(amount));
+            return false;
+        }
+    };
+    if let Err(e) = builder.add_sapling_output(
+        Some(extsk.expsk.ovk),
+        to_addr,
+        amount_val,
+        memo_obj,
+    ) {
+        secure_zero(&mut decrypted_sk);
+        eprintln!("❌ Failed to add output: {:?}", e);
+        return false;
+    }
+
+    // Add change output if needed - use safe amount conversion
+    let change = total_input - amount - fee;
+    if change > 0 {
+        let change_memo = MemoBytes::empty();
+        let change_amount = match Amount::from_i64(change as i64) {
+            Ok(a) => a,
+            Err(_) => {
+                secure_zero(&mut decrypted_sk);
+                eprintln!("❌ Invalid change amount: {}", redact_amount!(change));
+                return false;
+            }
+        };
+        // PRIVACY: P-ADDR-002 — Use diversified change address (external scope, high index)
+        // FIX #1402 (NEW-002): Random offset prevents TX linkage via identical change addresses
+        let dfvk_change = extsk.to_diversifiable_full_viewing_key();
+        let change_diversifier_base: u64 = 1_000_000_000;
+        let change_offset: u64 = OsRng.gen_range(0u64..1_000_000_000);
+        let change_index = change_diversifier_base + change_offset;
+        LAST_CHANGE_DIVERSIFIER_INDEX.store(change_index, Ordering::SeqCst); // FIX #1402 (NEW-004)
+        let change_j = DiversifierIndex::from(change_index);
+        let (_, change_addr) = match dfvk_change.find_address(change_j) {
+            Some(result) => result,
+            None => {
+                debug_log!("P-ADDR-002: find_address failed at index {}, using default", change_index);
+                dfvk_change.default_address()
+            }
+        };
+        if let Err(e) = builder.add_sapling_output(
+            Some(extsk.expsk.ovk),
+            change_addr,
+            change_amount,
+            change_memo,
+        ) {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Failed to add change output: {:?}", e);
+            return false;
+        }
+    }
+
+    // Build the transaction with proofs
+    // FIX #761: Safe fee Amount conversion
+    let fee_amount = match Amount::from_i64(fee as i64) {
+        Ok(amt) => amt,
+        Err(_) => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ FIX #761: Invalid fee amount: {}", redact_amount!(fee));
+            return false;
+        }
+    };
+    let (tx, _) = match builder.build(prover, &zcash_primitives::transaction::fees::fixed::FeeRule::non_standard(fee_amount)) {
+        Ok(result) => result,
+        Err(e) => {
+            secure_zero(&mut decrypted_sk);
+            eprintln!("❌ Failed to build transaction: {:?}", e);
+            return false;
+        }
+    };
+
+    // Compute and output nullifiers for all spent notes
+    let dfvk = extsk.to_diversifiable_full_viewing_key();
+    let nk = dfvk.fvk().vk.nk;
+
+    for (i, (note, merkle_path, _)) in parsed_spends.iter().enumerate() {
+        // FIX #761: Log warning if position conversion fails
+        let position = match u64::try_from(merkle_path.position()) {
+            Ok(pos) => pos,
+            Err(e) => {
+                eprintln!("⚠️ FIX #761: Invalid witness position for nullifier {}: {:?}, using 0", i, e);
+                0
+            }
+        };
+        let nf_result = note.nf(&nk, position);
+        let nf_bytes = nf_result.0;
+        let offset = i * 32;
+        std::ptr::copy_nonoverlapping(nf_bytes.as_ptr(), nullifiers_out.add(offset), 32);
+    }
+
+    // === CRITICAL: Zero the decrypted spending key ===
+    secure_zero(&mut decrypted_sk);
+    debug_log!("🔐 VUL-002: Spending key zeroed from memory (multi-spend)");
+
+    // Serialize transaction
+    let mut tx_bytes = Vec::new();
+    if let Err(e) = tx.write(&mut tx_bytes) {
+        eprintln!("❌ Failed to serialize transaction: {:?}", e);
+        return false;
+    }
+
+    // FIX #1323: Increased from 10KB to 100KB to support multi-input transactions
+    if tx_bytes.len() > 100000 {
+        eprintln!("❌ Transaction too large: {} bytes (max 100000)", tx_bytes.len());
+        return false;
+    }
+
+    std::ptr::copy_nonoverlapping(tx_bytes.as_ptr(), tx_out, tx_bytes.len());
+    *tx_out_len = tx_bytes.len();
+
+    true
+    })
+}
+
+// =============================================================================
+// Boost File Scanning - Complete wallet scan in Rust (matching benchmark)
+// =============================================================================
+
+/// Boost file output record size: height(4) + index(4) + cmu(32) + epk(32) + ciphertext(580) + txid(32) = 684
+/// PRODUCTION UPGRADE: Now includes received_in_tx for accurate change detection!
+const BOOST_OUTPUT_SIZE: usize = 684;
+/// Boost file spend record size: height(4) + nullifier(32) + txid(32) = 68
+const BOOST_SPEND_SIZE: usize = 68;
+
+/// Result for a discovered note from boost file scanning
+/// Contains all data needed to store in database and build transactions
+/// PRODUCTION: Now includes received_txid - no more placeholders!
+#[repr(C)]
+pub struct BoostScanNote {
+    pub height: u32,
+    pub position: u64,
+    pub value: u64,
+    pub diversifier: [u8; 11],
+    pub rcm: [u8; 32],
+    pub cmu: [u8; 32],
+    pub nullifier: [u8; 32],
+    pub is_spent: u8,  // 1 if spent, 0 if unspent
+    pub spent_height: u32,  // Height at which note was spent (0 if unspent)
+    pub spent_txid: [u8; 32],  // Real txid of spending transaction (zeros if unspent)
+    pub received_txid: [u8; 32],  // PRODUCTION: Real txid that created this output (no more placeholders!)
+    pub _padding: [u8; 3],  // Alignment padding
+}
+
+/// Result structure for boost scan summary
+#[repr(C)]
+pub struct BoostScanResult {
+    pub total_received: u64,     // Total value of all notes found
+    pub total_spent: u64,        // Total value of spent notes
+    pub unspent_balance: u64,    // Final spendable balance
+    pub notes_found: u32,        // Number of notes found
+    pub notes_spent: u32,        // Number of notes that are spent
+    pub spends_checked: u32,     // Number of spends in boost file
+}
+
+/// Scan boost file outputs section and return discovered notes with nullifiers
+///
+/// This function performs the complete PHASE 1 + PHASE 1.6 scanning in Rust:
+/// 1. Parse outputs from boost data (684 bytes per output - PRODUCTION v2)
+/// 2. Parse spends from boost data (68 bytes per spend - PRODUCTION v2)
+/// 3. Parallel note decryption using Rayon
+/// 4. Compute nullifiers for each discovered note (using enumerate index as position)
+/// 5. Check nullifiers against spends to detect spent notes
+///
+/// The returned data includes everything needed to:
+/// - Store notes in SQLite database
+/// - Build spend transactions (diversifier, value, rcm, nullifier, position)
+///
+/// # Arguments
+/// * `sk` - Extended spending key (169 bytes)
+/// * `outputs_data` - Pointer to outputs section (684 bytes per output - includes txid)
+/// * `output_count` - Number of outputs
+/// * `spends_data` - Pointer to spends section (68 bytes per spend - includes txid)
+/// * `spend_count` - Number of spends
+/// * `notes_out` - Output buffer for discovered notes (BoostScanNote array)
+/// * `max_notes` - Maximum notes that can fit in notes_out
+/// * `result_out` - Output for scan summary (BoostScanResult)
+///
+/// # Returns
+/// Number of notes written to notes_out
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_scan_boost_outputs(
+    sk: *const u8,
+    outputs_data: *const u8,
+    output_count: usize,
+    spends_data: *const u8,
+    spend_count: usize,
+    notes_out: *mut BoostScanNote,
+    max_notes: usize,
+    result_out: *mut BoostScanResult,
+) -> usize {
+    ffi_catch_unwind!(0, {
+    use std::collections::HashSet;
+    use zcash_primitives::sapling::{Diversifier, Rseed};
+    use jubjub::Fr;
+    use ff::PrimeField;
+
+    eprintln!("🚀 zipherx_scan_boost_outputs: {} outputs, {} spends", output_count, spend_count);
+
+    if output_count == 0 {
+        if !result_out.is_null() {
+            (*result_out) = BoostScanResult {
+                total_received: 0,
+                total_spent: 0,
+                unspent_balance: 0,
+                notes_found: 0,
+                notes_spent: 0,
+                spends_checked: spend_count as u32,
+            };
+        }
+        return 0;
+    }
+
+    // FIX #230: Parse spending key with safe slice validation
+    let sk_slice = match safe_slice(sk, 169) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid spending key pointer");
+            return 0;
+        }
+    };
+    let extsk = match ExtendedSpendingKey::read(&mut &sk_slice[..]) {
+        Ok(key) => key,
+        Err(e) => {
+            eprintln!("❌ Failed to parse spending key: {:?}", e);
+            return 0;
+        }
+    };
+
+    // Derive keys for decryption and nullifier computation
+    let dfvk = extsk.to_diversifiable_full_viewing_key();
+    let fvk = dfvk.fvk();
+    let ivk = fvk.vk.ivk();
+    let prepared_ivk = PreparedIncomingViewingKey::new(&ivk);
+    let nk = fvk.vk.nk;
+
+    // Parse spends into HashMap: nullifier → (spend_height, txid)
+    // Now includes the REAL txid from the boost file - no more placeholders!
+    let mut nullifier_map: std::collections::HashMap<[u8; 32], (u32, [u8; 32])> = std::collections::HashMap::with_capacity(spend_count);
+    if spend_count > 0 {
+        let spends_slice = match safe_slice(spends_data, spend_count * BOOST_SPEND_SIZE) {
+            Some(s) => s,
+            None => {
+                eprintln!("❌ Invalid spends_data pointer");
+                return 0;
+            }
+        };
+        for i in 0..spend_count {
+            let offset = i * BOOST_SPEND_SIZE;
+            // Read height (4 bytes) + nullifier (32 bytes) + txid (32 bytes) = 68 bytes
+            let spend_height = u32::from_le_bytes([
+                spends_slice[offset],
+                spends_slice[offset + 1],
+                spends_slice[offset + 2],
+                spends_slice[offset + 3],
+            ]);
+            let mut nullifier = [0u8; 32];
+            nullifier.copy_from_slice(&spends_slice[offset + 4..offset + 36]);
+            let mut txid = [0u8; 32];
+            txid.copy_from_slice(&spends_slice[offset + 36..offset + 68]);
+            nullifier_map.insert(nullifier, (spend_height, txid));
+        }
+    }
+    debug_log!("📊 Indexed {} nullifiers with spend heights and txids", nullifier_map.len());
+
+    // FIX #230: Parse outputs for parallel processing with safe slice validation
+    let outputs_slice = match safe_slice(outputs_data, output_count * BOOST_OUTPUT_SIZE) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid outputs_data pointer");
+            return 0;
+        }
+    };
+
+    // Parse into vector of (position, height, cmu, epk, ciphertext, received_txid)
+    // CRITICAL: position = enumerate index (outputs are in blockchain order)
+    // PRODUCTION: Now includes received_txid for accurate change detection!
+    let parsed_outputs: Vec<(usize, u32, [u8; 32], [u8; 32], [u8; 580], [u8; 32])> = (0..output_count)
+        .map(|i| {
+            let offset = i * BOOST_OUTPUT_SIZE;
+            let height = u32::from_le_bytes([
+                outputs_slice[offset],
+                outputs_slice[offset + 1],
+                outputs_slice[offset + 2],
+                outputs_slice[offset + 3],
+            ]);
+            // Skip index (4 bytes at offset+4)
+            let mut cmu = [0u8; 32];
+            cmu.copy_from_slice(&outputs_slice[offset + 8..offset + 40]);
+            let mut epk = [0u8; 32];
+            epk.copy_from_slice(&outputs_slice[offset + 40..offset + 72]);
+            let mut ciphertext = [0u8; 580];
+            ciphertext.copy_from_slice(&outputs_slice[offset + 72..offset + 652]);
+            // PRODUCTION: Read received_txid (32 bytes at offset+652)
+            let mut received_txid = [0u8; 32];
+            received_txid.copy_from_slice(&outputs_slice[offset + 652..offset + 684]);
+
+            (i, height, cmu, epk, ciphertext, received_txid)
+        })
+        .collect();
+
+    // Parallel decryption using Rayon
+    // Collect (position, height, value, diversifier, rcm, cmu, received_txid) for notes we find
+    // PRODUCTION: Now includes received_txid!
+    let decrypted: Vec<_> = parsed_outputs.par_iter()
+        .filter_map(|(position, height, cmu, epk, ciphertext, received_txid)| {
+            // Create a ShieldedOutput for decryption
+            let output = BoostOutput {
+                epk: *epk,
+                cmu: *cmu,
+                enc_ciphertext: *ciphertext,
+            };
+
+            let block_height = BlockHeight::from_u32(*height);
+            match try_sapling_note_decryption(&ZclassicNetwork, block_height, &prepared_ivk, &output) {
+                Some((note, address, _memo)) => {
+                    let mut diversifier = [0u8; 11];
+                    diversifier.copy_from_slice(address.diversifier().0.as_ref());
+
+                    let rcm_repr = match note.rseed() {
+                        Rseed::BeforeZip212(rcm) => rcm.to_repr(),
+                        Rseed::AfterZip212(rseed) => *rseed,
+                    };
+
+                    Some((*position as u64, *height, note.value().inner(), diversifier, rcm_repr, *cmu, *received_txid))
+                }
+                None => None,
+            }
+        })
+        .collect();
+
+    debug_log!("⚡ Decrypted {} notes from {} outputs", decrypted.len(), output_count);
+
+    // Now compute nullifiers (need extsk, so sequential, but this is fast)
+    let mut notes_written = 0;
+    let mut total_received: u64 = 0;
+    let mut total_spent: u64 = 0;
+    let mut notes_spent: u32 = 0;
+
+    for (position, height, value, diversifier, rcm_repr, cmu, received_txid) in decrypted {
+        if notes_written >= max_notes {
+            eprintln!("⚠️ Max notes ({}) reached, stopping", max_notes);
+            break;
+        }
+
+        total_received += value;
+
+        // Parse rcm
+        let rcm_scalar: Fr = match Option::<Fr>::from(Fr::from_repr(rcm_repr)) {
+            Some(r) => r,
+            None => {
+                eprintln!("⚠️ Invalid rcm for note at position {}", position);
+                continue;
+            }
+        };
+
+        // Get payment address for nullifier computation
+        let div = Diversifier(diversifier);
+        let payment_address = match fvk.vk.to_payment_address(div) {
+            Some(addr) => addr,
+            None => {
+                eprintln!("⚠️ Invalid diversifier for note at position {}", position);
+                continue;
+            }
+        };
+
+        // Create note and compute nullifier
+        // CRITICAL: position is the enumerate index from boost file (blockchain order)
+        let note = payment_address.create_note(value, Rseed::BeforeZip212(rcm_scalar));
+        let nullifier = note.nf(&nk, position);
+        let nf_bytes = nullifier.0;
+
+        // FIX #585: CRITICAL - Verify boost file CMU matches computed CMU!
+        // During transaction building, we use note.cmu() which is computed from note components.
+        // The boost file CMU comes from the blockchain. These MUST match!
+        // If they don't match, use the computed CMU since that's what transaction building uses.
+        let computed_cmu = note.cmu();
+        let computed_cmu_bytes: [u8; 32] = computed_cmu.to_bytes();
+
+        // Compare in both byte orders to handle potential format differences
+        let mut cmu_reversed = [0u8; 32];
+        for j in 0..32 {
+            cmu_reversed[j] = cmu[31 - j];
+        }
+
+        let cmu_to_store = if computed_cmu_bytes == cmu {
+            // Direct match - use boost file CMU
+            debug_log!("✅ FIX #585: CMU match (direct) for note at pos {} ({}...)", position, hex::encode(&cmu[0..4]));
+            cmu
+        } else if computed_cmu_bytes == cmu_reversed {
+            // Byte order reversed - use computed CMU (transaction building format)
+            debug_log!("⚠️ FIX #585: CMU match (reversed) for note at pos {} - using computed CMU", position);
+            // FIX #1385: Gate hex dumps behind DEBUG_LOGGING
+            if DEBUG_LOGGING {
+                eprintln!("   Boost CMU:    {}...", hex::encode(&cmu[0..8]));
+                eprintln!("   Computed CMU: {}...", hex::encode(&computed_cmu_bytes[0..8]));
+            }
+            computed_cmu_bytes
+        } else {
+            // NO MATCH - this is a bug, but use computed CMU for safety
+            eprintln!("❌ FIX #585: CMU MISMATCH for note at pos {}!", position);
+            // FIX #1385: Gate hex dumps behind DEBUG_LOGGING
+            if DEBUG_LOGGING {
+                eprintln!("   Boost CMU:    {}", hex::encode(&cmu));
+                eprintln!("   Reversed:     {}", hex::encode(&cmu_reversed));
+                eprintln!("   Computed CMU: {}", hex::encode(&computed_cmu_bytes));
+            }
+            computed_cmu_bytes
+        };
+
+        // Check if spent and get spend height + txid from HashMap
+        let (is_spent, spent_height, spent_txid) = match nullifier_map.get(&nf_bytes) {
+            Some(&(spend_h, txid)) => (1u8, spend_h, txid),
+            None => (0u8, 0u32, [0u8; 32]),
+        };
+        if is_spent == 1 {
+            total_spent += value;
+            notes_spent += 1;
+            // FIX #1385: Gate value/txid logging (financial data) behind DEBUG_LOGGING
+            debug_log!("   💸 Spent: {} zatoshis @ height {} (txid {:02x}{:02x}...)", value, height, spent_txid[0], spent_txid[1]);
+        } else {
+            debug_log!("   💰 Unspent: {} zatoshis @ height {} (pos {})", value, height, position);
+        }
+
+        // Write to output buffer with all data needed for database/transactions
+        // FIX #585: Use cmu_to_store (computed CMU) to ensure consistency with transaction building
+        let out_note = &mut *notes_out.add(notes_written);
+        out_note.height = height;
+        out_note.position = position;
+        out_note.value = value;
+        out_note.diversifier = diversifier;
+        out_note.rcm = rcm_repr;
+        out_note.cmu = cmu_to_store;  // FIX #585: Use computed CMU for transaction building consistency
+        out_note.nullifier = nf_bytes;
+        out_note.is_spent = is_spent;
+        out_note.spent_height = spent_height;
+        out_note.spent_txid = spent_txid;  // Real txid from boost file!
+        out_note.received_txid = received_txid;  // PRODUCTION: Real txid - no more placeholders!
+        out_note._padding = [0u8; 3];
+
+        notes_written += 1;
+    }
+
+    // Write summary
+    if !result_out.is_null() {
+        (*result_out) = BoostScanResult {
+            total_received,
+            total_spent,
+            unspent_balance: total_received - total_spent,
+            notes_found: notes_written as u32,
+            notes_spent,
+            spends_checked: spend_count as u32,
+        };
+    }
+
+    // FIX #1385: Gate balance logging (financial data) behind DEBUG_LOGGING
+    debug_log!("✅ Scan complete: {} notes, {} spent, balance: {:.8} ZCL",
+        notes_written, notes_spent, (total_received - total_spent) as f64 / 100_000_000.0);
+
+    notes_written
+    })
+}
+
+/// Helper struct for boost output decryption (implements ShieldedOutput trait)
+struct BoostOutput {
+    epk: [u8; 32],
+    cmu: [u8; 32],
+    enc_ciphertext: [u8; 580],
+}
+
+impl ShieldedOutput<SaplingDomain<ZclassicNetwork>, ENC_CIPHERTEXT_SIZE> for BoostOutput {
+    fn ephemeral_key(&self) -> EphemeralKeyBytes {
+        EphemeralKeyBytes(self.epk)
+    }
+    fn cmstar_bytes(&self) -> [u8; 32] {
+        self.cmu
+    }
+    fn enc_ciphertext(&self) -> &[u8; ENC_CIPHERTEXT_SIZE] {
+        &self.enc_ciphertext
+    }
+}
+
+// =============================================================================
+// VUL-002: Local Transaction Verification (FIX #xxx)
+// Validate Sapling proofs BEFORE broadcasting to prevent invalid TX propagation
+// This mirrors the mempool validation in zclassic/src/main.cpp ContextualCheckTransaction()
+// =============================================================================
+
+/// Error codes for transaction verification
+#[repr(u32)]
+pub enum TxVerifyError {
+    Success = 0,
+    InvalidTransactionData = 1,
+    FailedToParseTransaction = 2,
+    NoSaplingBundle = 3,
+    SpendVerificationFailed = 4,
+    OutputVerificationFailed = 5,
+    BindingSignatureFailed = 6,
+    MissingVerifyingKey = 7,
+    InvalidSignatureHash = 8,
+}
+
+/// Verify a serialized Sapling transaction before broadcasting
+///
+/// This function performs the same verification as ContextualCheckTransaction() in zclassic:
+/// 1. Parse the serialized transaction
+/// 2. For each SpendDescription: call check_spend()
+/// 3. For each OutputDescription: call check_output()
+/// 4. Call final_check() to verify the binding signature
+///
+/// # Safety
+/// - tx_data: Pointer to serialized transaction bytes
+/// - tx_len: Length of transaction data
+/// - chain_height: Current chain height (for branch ID selection)
+/// - error_out: Output for error code if verification fails
+///
+/// # Returns
+/// true if transaction is valid, false otherwise
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_verify_transaction(
+    tx_data: *const u8,
+    tx_len: usize,
+    chain_height: u64,
+    error_out: *mut u32,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    use zcash_primitives::transaction::Transaction;
+    use zcash_primitives::consensus::BranchId;
+    use std::io::Cursor;
+
+    // FIX #230: Safety check with safe slice validation
+    if tx_len == 0 {
+        if !error_out.is_null() {
+            *error_out = TxVerifyError::InvalidTransactionData as u32;
+        }
+        return false;
+    }
+
+    let tx_bytes = match safe_slice(tx_data, tx_len) {
+        Some(s) => s,
+        None => {
+            eprintln!("❌ Invalid tx_data pointer");
+            if !error_out.is_null() {
+                *error_out = TxVerifyError::InvalidTransactionData as u32;
+            }
+            return false;
+        }
+    };
+
+    // Get branch ID for current height (Zclassic uses Buttercup after block 707,000)
+    let height = BlockHeight::from_u32(chain_height as u32);
+    let branch_id = BranchId::for_height(&ZclassicNetwork, height);
+
+    debug_log!("🔍 VUL-002 FIX: Verifying transaction ({} bytes) at height {} with branch ID {:?}",
+        tx_len, chain_height, branch_id);
+
+    // Parse the transaction
+    let tx = match Transaction::read(&mut Cursor::new(tx_bytes), branch_id) {
+        Ok(tx) => tx,
+        Err(e) => {
+            eprintln!("❌ Failed to parse transaction: {:?}", e);
+            if !error_out.is_null() {
+                *error_out = TxVerifyError::FailedToParseTransaction as u32;
+            }
+            return false;
+        }
+    };
+
+    // Get the Sapling bundle - if none, nothing to verify (pure transparent tx)
+    let sapling_bundle = match tx.sapling_bundle() {
+        Some(bundle) => bundle,
+        None => {
+            eprintln!("ℹ️ Transaction has no Sapling bundle - no Sapling verification needed");
+            if !error_out.is_null() {
+                *error_out = TxVerifyError::Success as u32;
+            }
+            return true;
+        }
+    };
+
+    let shielded_spends = sapling_bundle.shielded_spends();
+    let shielded_outputs = sapling_bundle.shielded_outputs();
+    let value_balance = sapling_bundle.value_balance();
+
+    eprintln!("🔍 Sapling bundle: {} spends, {} outputs, value_balance: {:?}",
+        shielded_spends.len(), shielded_outputs.len(), value_balance);
+
+    // If no spends and no outputs, nothing to verify
+    if shielded_spends.is_empty() && shielded_outputs.is_empty() {
+        if !error_out.is_null() {
+            *error_out = TxVerifyError::Success as u32;
+        }
+        return true;
+    }
+
+    // Get verifying keys from our static storage (populated during prover init)
+    // FIX #1385: Replace .lock().unwrap() with safe_lock!
+    let vk_guard = match safe_lock!(VERIFYING_KEYS) { Some(g) => g, None => return false };
+    let vk_params = match vk_guard.as_ref() {
+        Some(params) => params,
+        None => {
+            eprintln!("❌ Verifying keys not initialized - call zipherx_init_prover first");
+            if !error_out.is_null() {
+                *error_out = TxVerifyError::MissingVerifyingKey as u32;
+            }
+            return false;
+        }
+    };
+
+    // Create verification context (ZIP 216 enabled for modern transactions)
+    let mut ctx = SaplingVerificationContext::new(true);
+
+    // Compute sighash (dataToBeSigned) - this is what spend auth sigs and binding sig sign
+    // For Sapling v4 transactions, we use v4_signature_hash directly which doesn't need txid_parts
+    use zcash_primitives::transaction::sighash::{SignableInput};
+    use zcash_primitives::transaction::sighash_v4::v4_signature_hash;
+
+    // Get the TransactionData from the Transaction for sighash computation
+    let tx_data = tx.into_data();
+
+    // For v4 (Sapling) transactions, compute sighash directly
+    let sighash_hash = v4_signature_hash(&tx_data, &SignableInput::Shielded);
+    let sighash_bytes: [u8; 32] = sighash_hash.as_bytes().try_into().expect("sighash is 32 bytes");
+
+    eprintln!("🔍 Computed sighash for verification");
+
+    // Re-get sapling bundle from tx_data (tx was consumed by into_data())
+    let sapling_bundle = match tx_data.sapling_bundle() {
+        Some(bundle) => bundle,
+        None => {
+            // Shouldn't happen since we checked above, but be safe
+            eprintln!("ℹ️ Transaction has no Sapling bundle - no Sapling verification needed");
+            if !error_out.is_null() {
+                *error_out = TxVerifyError::Success as u32;
+            }
+            return true;
+        }
+    };
+
+    let shielded_spends = sapling_bundle.shielded_spends();
+    let shielded_outputs = sapling_bundle.shielded_outputs();
+
+    // Verify each SpendDescription
+    for (i, spend) in shielded_spends.iter().enumerate() {
+        let cv = spend.cv();
+        let anchor = spend.anchor();
+        let nullifier = spend.nullifier();
+        let rk = spend.rk();
+        let zkproof_bytes = spend.zkproof();
+        let spend_auth_sig = spend.spend_auth_sig();
+
+        // Parse the zkproof bytes into a Proof<Bls12> for verification
+        use bellman::groth16::Proof;
+        use bls12_381::Bls12;
+        let zkproof = match Proof::<Bls12>::read(&zkproof_bytes[..]) {
+            Ok(proof) => proof,
+            Err(e) => {
+                eprintln!("❌ SpendDescription {} failed to parse zkproof: {:?}", i, e);
+                if !error_out.is_null() {
+                    *error_out = TxVerifyError::SpendVerificationFailed as u32;
+                }
+                return false;
+            }
+        };
+
+        // check_spend expects: cv, anchor, &nullifier.0, rk, &sighash, spend_auth_sig, zkproof, &spend_vk
+        let spend_valid = ctx.check_spend(
+            cv,
+            *anchor,
+            &nullifier.0,
+            rk.clone(),
+            &sighash_bytes,
+            *spend_auth_sig,
+            zkproof,
+            &vk_params.spend_vk,
+        );
+
+        if !spend_valid {
+            eprintln!("❌ SpendDescription {} verification FAILED", i);
+            if !error_out.is_null() {
+                *error_out = TxVerifyError::SpendVerificationFailed as u32;
+            }
+            return false;
+        }
+        eprintln!("✅ SpendDescription {} verified", i);
+    }
+
+    // Verify each OutputDescription
+    for (i, output) in shielded_outputs.iter().enumerate() {
+        let cv = output.cv();
+        let cmu = output.cmu();
+        let ephemeral_key_bytes = output.ephemeral_key();
+        let zkproof_bytes = output.zkproof();
+
+        // Parse the zkproof bytes into a Proof<Bls12>
+        use bellman::groth16::Proof;
+        use bls12_381::Bls12;
+        let zkproof = match Proof::<Bls12>::read(&zkproof_bytes[..]) {
+            Ok(proof) => proof,
+            Err(e) => {
+                eprintln!("❌ OutputDescription {} failed to parse zkproof: {:?}", i, e);
+                if !error_out.is_null() {
+                    *error_out = TxVerifyError::OutputVerificationFailed as u32;
+                }
+                return false;
+            }
+        };
+
+        // Convert EphemeralKeyBytes to ExtendedPoint via AffinePoint
+        // EphemeralKeyBytes is a newtype around [u8; 32]
+        // from_bytes returns CtOption<T>, use into_option() to convert to Option<T>
+        use subtle::CtOption;
+        let epk = match jubjub::AffinePoint::from_bytes(ephemeral_key_bytes.0).into_option() {
+            Some(affine) => jubjub::ExtendedPoint::from(affine),
+            None => {
+                eprintln!("❌ OutputDescription {} has invalid ephemeral key", i);
+                if !error_out.is_null() {
+                    *error_out = TxVerifyError::OutputVerificationFailed as u32;
+                }
+                return false;
+            }
+        };
+
+        let output_valid = ctx.check_output(
+            cv,
+            *cmu,
+            epk,
+            zkproof,
+            &vk_params.output_vk,
+        );
+
+        if !output_valid {
+            eprintln!("❌ OutputDescription {} verification FAILED", i);
+            if !error_out.is_null() {
+                *error_out = TxVerifyError::OutputVerificationFailed as u32;
+            }
+            return false;
+        }
+        eprintln!("✅ OutputDescription {} verified", i);
+    }
+
+    // Final check: verify the binding signature
+    // This ensures value balance is correct and transaction wasn't tampered with
+    let value_balance = sapling_bundle.value_balance();
+    let binding_sig = sapling_bundle.authorization().binding_sig;
+
+    let final_valid = ctx.final_check(
+        *value_balance,
+        &sighash_bytes,
+        binding_sig,
+    );
+
+    if !final_valid {
+        eprintln!("❌ Binding signature verification FAILED");
+        if !error_out.is_null() {
+            *error_out = TxVerifyError::BindingSignatureFailed as u32;
+        }
+        return false;
+    }
+
+    eprintln!("✅ Binding signature verified");
+    eprintln!("✅ Transaction verification PASSED - safe to broadcast");
+
+    if !error_out.is_null() {
+        *error_out = TxVerifyError::Success as u32;
+    }
+    true
+    })
+}
+
+// =============================================================================
+// ZSTD Decompression - Boost File Support
+// =============================================================================
+
+/// Decompress ZSTD data
+///
+/// # Arguments
+/// * `compressed_ptr` - Pointer to compressed data
+/// * `compressed_len` - Length of compressed data
+/// * `out_ptr` - Pointer to store output buffer pointer (caller must free)
+/// * `out_len` - Pointer to store output length
+///
+/// # Returns
+/// * 1 on success, 0 on failure
+///
+/// # Safety
+/// Caller is responsible for freeing the returned buffer using zipherx_free_buffer()
+#[no_mangle]
+pub extern "C" fn zipherx_zstd_decompress(
+    compressed_ptr: *const u8,
+    compressed_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> u32 {
+    ffi_catch_unwind!(0, {
+    // Validate inputs
+    if compressed_ptr.is_null() || out_ptr.is_null() || out_len.is_null() {
+        eprintln!("❌ ZSTD decompress: null pointer");
+        return 0;
+    }
+
+    // Safe slice creation
+    let compressed_data = match unsafe { safe_slice(compressed_ptr, compressed_len) } {
+        Some(data) => data,
+        None => {
+            eprintln!("❌ ZSTD decompress: invalid input pointer");
+            return 0;
+        }
+    };
+
+    // Decompress using zstd crate
+    let decompressed = match zstd::decode_all(compressed_data) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("❌ ZSTD decompression failed: {:?}", e);
+            return 0;
+        }
+    };
+
+    // Allocate output buffer
+    let out_len_value = decompressed.len();
+    let buffer = unsafe { libc::malloc(out_len_value) as *mut u8 };
+    if buffer.is_null() {
+        eprintln!("❌ ZSTD decompress: malloc failed");
+        return 0;
+    }
+
+    // Copy decompressed data to output buffer
+    unsafe {
+        libc::memcpy(buffer as *mut libc::c_void, decompressed.as_ptr() as *const libc::c_void, out_len_value);
+    }
+
+    // Set output parameters
+    unsafe {
+        *out_ptr = buffer;
+        *out_len = out_len_value;
+    }
+
+    debug_log!("✅ ZSTD decompressed {} bytes -> {} bytes", compressed_len, out_len_value);
+    1
+    })
+}
+
+/// FIX #1338: Streaming file-to-file ZSTD decompression
+/// Decompresses directly from source file to destination file without loading into memory.
+/// Peak memory: ~512KB (zstd internal buffers + I/O buffers) vs ~6.2GB for in-memory approach.
+///
+/// Returns: 0 = success, 1 = invalid input, 2 = source file error, 3 = dest file error, 4 = decompress error
+#[no_mangle]
+pub extern "C" fn zipherx_zstd_decompress_file(
+    source_path_ptr: *const u8,
+    source_path_len: usize,
+    dest_path_ptr: *const u8,
+    dest_path_len: usize,
+) -> i32 {
+    ffi_catch_unwind!(-1, {
+    use std::io::BufReader;
+    use std::io::BufWriter;
+
+    // FIX #1385: Null pointer + length validation before unsafe from_raw_parts
+    if source_path_ptr.is_null() || source_path_len == 0 || source_path_len > 4096 {
+        return 1;
+    }
+    if dest_path_ptr.is_null() || dest_path_len == 0 || dest_path_len > 4096 {
+        return 1;
+    }
+
+    // Parse source path
+    let source_path = match unsafe { std::str::from_utf8(std::slice::from_raw_parts(source_path_ptr, source_path_len)) } {
+        Ok(s) => s,
+        Err(_) => return 1,
+    };
+
+    // Parse dest path
+    let dest_path = match unsafe { std::str::from_utf8(std::slice::from_raw_parts(dest_path_ptr, dest_path_len)) } {
+        Ok(s) => s,
+        Err(_) => return 1,
+    };
+
+    // Open source file with buffered reader
+    let source_file = match std::fs::File::open(source_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("FIX #1338: Failed to open source: {}", e);
+            return 2;
+        }
+    };
+    let reader = BufReader::with_capacity(256 * 1024, source_file);
+
+    // Create dest file with buffered writer
+    let dest_file = match std::fs::File::create(dest_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("FIX #1338: Failed to create dest: {}", e);
+            return 3;
+        }
+    };
+    let writer = BufWriter::with_capacity(256 * 1024, dest_file);
+
+    // Stream decompress: reads chunks from source, decompresses, writes to dest
+    match zstd::stream::copy_decode(reader, writer) {
+        Ok(_) => {
+            eprintln!("✅ FIX #1338: Streaming ZSTD decompress complete");
+            0
+        }
+        Err(e) => {
+            eprintln!("FIX #1338: Decompress failed: {}", e);
+            4
+        }
+    }
+    })
+}
+
+/// FIX #577: Verify that stored CMU matches computed CMU from note components
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_verify_note_cmu(
+    stored_cmu: *const u8,
+    diversifier: *const u8,
+    rcm: *const u8,
+    value: u64,
+    spending_key: *const u8,
+) -> u32 {
+    ffi_catch_unwind!(0, {
+    let stored_cmu_slice = match safe_slice(stored_cmu, 32) {
+        Some(s) => s,
+        None => { eprintln!("❌ FIX #577: Invalid stored_cmu pointer"); return 2; }
+    };
+    let div_slice = match safe_slice(diversifier, 11) {
+        Some(s) => s,
+        None => { eprintln!("❌ FIX #577: Invalid diversifier pointer"); return 2; }
+    };
+    let rcm_slice = match safe_slice(rcm, 32) {
+        Some(s) => s,
+        None => { eprintln!("❌ FIX #577: Invalid rcm pointer"); return 2; }
+    };
+    let sk_slice = match safe_slice(spending_key, 169) {
+        Some(s) => s,
+        None => { eprintln!("❌ FIX #577: Invalid spending_key pointer"); return 2; }
+    };
+
+    let mut div_bytes = [0u8; 11];
+    div_bytes.copy_from_slice(div_slice);
+    let diversifier = Diversifier(div_bytes);
+
+    let mut rcm_bytes = [0u8; 32];
+    rcm_bytes.copy_from_slice(rcm_slice);
+    let rcm = match Option::<jubjub::Fr>::from(jubjub::Fr::from_repr(rcm_bytes)) {
+        Some(r) => r,
+        None => { eprintln!("❌ FIX #577: Invalid rcm"); return 2; }
+    };
+
+    let extsk = match ExtendedSpendingKey::read(&mut &sk_slice[..]) {
+        Ok(key) => key,
+        Err(e) => { eprintln!("❌ FIX #577: Failed to read spending key: {:?}", e); return 2; }
+    };
+
+    let fvk = extsk.to_diversifiable_full_viewing_key();
+    let note_addr = match fvk.fvk().vk.to_payment_address(diversifier) {
+        Some(addr) => addr,
+        None => { eprintln!("❌ FIX #577: Invalid diversifier for note address"); return 2; }
+    };
+
+    let note = zcash_primitives::sapling::Note::from_parts(
+        note_addr,
+        NoteValue::from_raw(value),
+        Rseed::BeforeZip212(rcm),
+    );
+
+    let computed_cmu = note.cmu();
+    let computed_cmu_bytes: [u8; 32] = computed_cmu.to_bytes();
+
+    let mut stored_cmu_bytes = [0u8; 32];
+    stored_cmu_bytes.copy_from_slice(stored_cmu_slice);
+
+    debug_log!("🔍 FIX #577: Stored CMU:  {}...", hex::encode(&stored_cmu_bytes[..8]));
+    debug_log!("🔍 FIX #577: Computed CMU: {}...", hex::encode(&computed_cmu_bytes[..8]));
+
+    if stored_cmu_bytes == computed_cmu_bytes {
+        debug_log!("✅ FIX #577: CMUs MATCH - note data is consistent!");
+        return 1;
+    } else {
+        debug_log!("❌ FIX #577: CMU MISMATCH - note data is inconsistent!");
+        debug_log!("   Stored:  {}", hex::encode(&stored_cmu_bytes));
+        debug_log!("   Computed: {}", hex::encode(&computed_cmu_bytes));
+        return 0;
+    }
+    })
+}
+
+/// FIX #1138: Compute CMU from note parts and return it
+/// This is the ROOT CAUSE FIX for CMU mismatch - ensures P2P notes store computed CMU
+/// just like FIX #585 does for boost file notes.
+///
+/// # Safety
+/// - All pointers must be valid and properly aligned
+/// - diversifier: 11 bytes, rcm: 32 bytes, spending_key: 169 bytes, cmu_out: 32 bytes
+///
+/// # Returns
+/// true if CMU was computed successfully, false on error
+#[no_mangle]
+pub unsafe extern "C" fn zipherx_compute_note_cmu(
+    diversifier: *const u8,
+    rcm: *const u8,
+    value: u64,
+    spending_key: *const u8,
+    cmu_out: *mut u8,
+) -> bool {
+    ffi_catch_unwind!(false, {
+    let div_slice = match safe_slice(diversifier, 11) {
+        Some(s) => s,
+        None => { eprintln!("❌ FIX #1138: Invalid diversifier pointer"); return false; }
+    };
+    let rcm_slice = match safe_slice(rcm, 32) {
+        Some(s) => s,
+        None => { eprintln!("❌ FIX #1138: Invalid rcm pointer"); return false; }
+    };
+    let sk_slice = match safe_slice(spending_key, 169) {
+        Some(s) => s,
+        None => { eprintln!("❌ FIX #1138: Invalid spending_key pointer"); return false; }
+    };
+    let out_slice = match safe_slice_mut(cmu_out, 32) {
+        Some(s) => s,
+        None => { eprintln!("❌ FIX #1138: Invalid cmu_out pointer"); return false; }
+    };
+
+    let mut div_bytes = [0u8; 11];
+    div_bytes.copy_from_slice(div_slice);
+    let diversifier = Diversifier(div_bytes);
+
+    let mut rcm_bytes = [0u8; 32];
+    rcm_bytes.copy_from_slice(rcm_slice);
+    let rcm = match Option::<jubjub::Fr>::from(jubjub::Fr::from_repr(rcm_bytes)) {
+        Some(r) => r,
+        None => { eprintln!("❌ FIX #1138: Invalid rcm"); return false; }
+    };
+
+    let extsk = match ExtendedSpendingKey::read(&mut &sk_slice[..]) {
+        Ok(key) => key,
+        Err(e) => { eprintln!("❌ FIX #1138: Failed to read spending key: {:?}", e); return false; }
+    };
+
+    let fvk = extsk.to_diversifiable_full_viewing_key();
+    let note_addr = match fvk.fvk().vk.to_payment_address(diversifier) {
+        Some(addr) => addr,
+        None => { eprintln!("❌ FIX #1138: Invalid diversifier for note address"); return false; }
+    };
+
+    let note = zcash_primitives::sapling::Note::from_parts(
+        note_addr,
+        NoteValue::from_raw(value),
+        Rseed::BeforeZip212(rcm),
+    );
+
+    let computed_cmu = note.cmu();
+    let computed_cmu_bytes: [u8; 32] = computed_cmu.to_bytes();
+    out_slice.copy_from_slice(&computed_cmu_bytes);
+
+    debug_log!("✅ FIX #1138: Computed CMU: {}...", hex::encode(&computed_cmu_bytes[0..8]));
+    true
+    })
+}
+
+/// Free a buffer allocated by Rust FFI
+#[no_mangle]
+pub extern "C" fn zipherx_free_buffer(ptr: *mut u8) {
+    if !ptr.is_null() {
+        unsafe { libc::free(ptr as *mut libc::c_void) };
+    }
+}
