@@ -1,0 +1,678 @@
+import SwiftUI
+
+#if os(macOS)
+
+/// Send view for Full Node wallet.dat mode
+struct RPCSendView: View {
+    @EnvironmentObject var themeManager: ThemeManager
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var rpcWallet = RPCWalletOperations.shared
+
+    let addresses: [WalletAddress]
+    // FIX #286 v17: Callback when transaction is successfully sent
+    // FIX #1412: Pass sent amount (zatoshis) so parent can display it directly
+    var onSendSuccess: ((UInt64) -> Void)?
+
+    @State private var selectedFromAddress: WalletAddress?
+    @State private var toAddress: String = ""
+    @State private var amount: String = ""
+    @State private var memo: String = ""
+
+    @State private var isSending = false
+    @State private var errorMessage: String?
+    @State private var successTxid: String?
+
+    @State private var showingConfirmation = false
+
+    private var theme: AppTheme { themeManager.currentTheme }
+
+    // FIX #286 v3: Show ALL addresses but sort by balance (highest first)
+    // Don't filter - user needs to see all their addresses
+    private var sortedAddresses: [WalletAddress] {
+        addresses.sorted { $0.balance > $1.balance }
+    }
+
+    // Keep filter for send validation - can only send from addresses with balance
+    private var addressesWithBalance: [WalletAddress] {
+        addresses.filter { $0.balance > 0 }
+    }
+
+    // FIX #286 + FIX #1453 + FIX #1455: Validate receiver address (z or t address)
+    private var isValidReceiverAddress: Bool {
+        guard !toAddress.isEmpty else { return false }
+        // FIX #1455: Sprout z-addresses (zc...) — NOT supported, reject early
+        if toAddress.hasPrefix("zc") {
+            return false
+        }
+        // Sapling z-address validation — FFI does full Bech32 decode + checksum + 43-byte payload
+        if toAddress.hasPrefix("zs1") || toAddress.hasPrefix("zs") {
+            return ZipherXFFI.validateAddress(toAddress)
+        }
+        // FIX #1455: T-address validation — length + Base58 character set check
+        if toAddress.hasPrefix("t1") || toAddress.hasPrefix("t3") {
+            guard toAddress.count >= 34 && toAddress.count <= 35 else { return false }
+            // Base58 alphabet: no 0, O, I, l
+            let base58Chars = CharacterSet(charactersIn: "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+            return toAddress.unicodeScalars.allSatisfy { base58Chars.contains($0) }
+        }
+        return false
+    }
+
+    // FIX #286 + FIX #1453 + FIX #1455: Error message for invalid address
+    private var addressValidationError: String? {
+        guard !toAddress.isEmpty else { return nil }
+        if !isValidReceiverAddress {
+            // FIX #1455: Specific Sprout detection
+            if toAddress.hasPrefix("zc") {
+                return "Sprout z-address (pre-Sapling) — only Sapling zs1... addresses supported"
+            } else if toAddress.hasPrefix("zs") {
+                return "Invalid z-address (Bech32 checksum verification failed)"
+            } else if toAddress.hasPrefix("t") {
+                return "Invalid t-address format (must be 34-35 Base58 characters)"
+            } else {
+                return "Address must start with 'zs1' (shielded) or 't1'/'t3' (transparent)"
+            }
+        }
+        return nil
+    }
+
+    /// FIX #1274: Robust amount normalization — handles comma, spaces, thousands separators
+    private func normalizeAmount(_ input: String) -> String {
+        var s = input.trimmingCharacters(in: .whitespaces)
+        // Remove spaces (thousands separator in some locales: "1 234.56")
+        s = s.replacingOccurrences(of: " ", with: "")
+        // If both comma and period exist, comma is thousands sep: "1,234.56" → "1234.56"
+        // If only comma exists, it's the decimal sep: "2,5" → "2.5"
+        if s.contains(",") && s.contains(".") {
+            // Period is decimal, comma is thousands: "1,234.56" → "1234.56"
+            s = s.replacingOccurrences(of: ",", with: "")
+        } else {
+            // Comma is decimal separator: "2,5" → "2.5"
+            s = s.replacingOccurrences(of: ",", with: ".")
+        }
+        return s
+    }
+
+    private var canSend: Bool {
+        guard let from = selectedFromAddress else { return false }
+        guard !toAddress.isEmpty else { return false }
+        guard isValidReceiverAddress else { return false }  // FIX #286: Validate address
+        // FIX #1274: Use robust normalization for amount parsing
+        let normalized = normalizeAmount(amount)
+        guard let amountValue = Double(normalized), amountValue > 0 else { return false }
+        // FIX #1391: Use round() to avoid floating point truncation (0.0012 → 119999 instead of 120000)
+        let amountZatoshis = UInt64(round(amountValue * 100_000_000))
+        return amountZatoshis <= from.balance
+    }
+
+    private var isZToZ: Bool {
+        guard let from = selectedFromAddress else { return false }
+        return from.isShielded && (toAddress.hasPrefix("zs") || toAddress.hasPrefix("zc"))
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack {
+                Text("Send ZCL")
+                    .font(theme.titleFont)
+                    .foregroundColor(theme.textPrimary)
+
+                Spacer()
+
+                Button("Cancel") {
+                    dismiss()
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(theme.primaryColor)
+            }
+            .padding()
+            .background(theme.surfaceColor)
+
+            Divider()
+                .background(theme.borderColor)
+
+            // Form
+            ScrollView {
+                VStack(spacing: 20) {
+                    // From address picker
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("From")
+                            .font(theme.captionFont)
+                            .foregroundColor(theme.textSecondary)
+
+                        Menu {
+                            // FIX #286 v3: Show ALL addresses sorted by balance
+                            // Note: macOS Menu doesn't support complex views, use simple Text
+                            ForEach(sortedAddresses) { address in
+                                Button(action: {
+                                    selectedFromAddress = address
+                                }) {
+                                    // FIX #286 v3: Simple text format with balance indicator
+                                    let icon = address.isShielded ? "🛡️" : "👁️"
+                                    let addr = truncateAddress(address.address)
+                                    let bal = formatBalance(address.balance)
+                                    let noFunds = address.balance == 0 ? " ⚠️" : ""
+                                    Text("\(icon) \(addr) — \(bal)\(noFunds)")
+                                }
+                            }
+
+                            if sortedAddresses.isEmpty {
+                                Text("No addresses found")
+                            }
+                        } label: {
+                            HStack {
+                                if let selected = selectedFromAddress {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        HStack {
+                                            Image(systemName: selected.isShielded ? "shield.fill" : "eye.fill")
+                                                .foregroundColor(theme.primaryColor)
+                                            Text(truncateAddress(selected.address))
+                                                .font(theme.monoFont)
+                                                .foregroundColor(theme.textPrimary)
+                                        }
+                                        Text("Balance: \(formatBalance(selected.balance))")
+                                            .font(theme.captionFont)
+                                            .foregroundColor(theme.textSecondary)
+                                    }
+                                } else {
+                                    Text("Select address...")
+                                        .foregroundColor(theme.textSecondary)
+                                }
+
+                                Spacer()
+
+                                Image(systemName: "chevron.down")
+                                    .foregroundColor(theme.textSecondary)
+                            }
+                            .padding()
+                            .background(theme.surfaceColor)
+                            .cornerRadius(theme.cornerRadius)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: theme.cornerRadius)
+                                    .stroke(theme.borderColor, lineWidth: theme.borderWidth)
+                            )
+                        }
+
+                        // FIX #286 v3: Warning if selected address has 0 balance
+                        if let selected = selectedFromAddress, selected.balance == 0 {
+                            HStack(spacing: 4) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .font(.system(size: 12))
+                                Text("This address has no balance")
+                                    .font(theme.captionFont)
+                            }
+                            .foregroundColor(theme.warningColor)
+                        }
+                    }
+
+                    // To address
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("To")
+                            .font(theme.captionFont)
+                            .foregroundColor(theme.textSecondary)
+
+                        TextField("Recipient address (z or t)", text: $toAddress)
+                            .textFieldStyle(.plain)
+                            .font(theme.monoFont)
+                            .foregroundColor(theme.textPrimary)
+                            .padding()
+                            .background(theme.surfaceColor)
+                            .cornerRadius(theme.cornerRadius)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: theme.cornerRadius)
+                                    .stroke(addressValidationError != nil ? theme.errorColor : theme.borderColor, lineWidth: theme.borderWidth)
+                            )
+
+                        // FIX #286: Show address validation error
+                        if let validationError = addressValidationError {
+                            HStack(spacing: 4) {
+                                Image(systemName: "exclamationmark.circle.fill")
+                                    .font(.system(size: 12))
+                                Text(validationError)
+                                    .font(theme.captionFont)
+                            }
+                            .foregroundColor(theme.errorColor)
+                        } else if isValidReceiverAddress {
+                            HStack(spacing: 4) {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .font(.system(size: 12))
+                                Text(toAddress.hasPrefix("zs") || toAddress.hasPrefix("zc") ? "Valid z-address" : "Valid t-address")
+                                    .font(theme.captionFont)
+                            }
+                            .foregroundColor(theme.successColor)
+                        }
+                    }
+
+                    // Amount
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("Amount")
+                                .font(theme.captionFont)
+                                .foregroundColor(theme.textSecondary)
+
+                            Spacer()
+
+                            if let from = selectedFromAddress {
+                                Button("Max") {
+                                    // Subtract fee (0.0001 ZCL)
+                                    let maxAmount = max(0, Int64(from.balance) - 10000)
+                                    amount = String(format: "%.8f", Double(maxAmount) / 100_000_000)
+                                }
+                                .font(theme.captionFont)
+                                .foregroundColor(theme.primaryColor)
+                            }
+                        }
+
+                        HStack {
+                            TextField("0.00000000", text: $amount)
+                                .textFieldStyle(.plain)
+                                .font(theme.monoFont)
+                                .foregroundColor(theme.textPrimary)
+                                .padding()
+
+                            Text("ZCL")
+                                .font(theme.bodyFont)
+                                .foregroundColor(theme.textSecondary)
+                                .padding(.trailing)
+                        }
+                        .background(theme.surfaceColor)
+                        .cornerRadius(theme.cornerRadius)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: theme.cornerRadius)
+                                .stroke(theme.borderColor, lineWidth: theme.borderWidth)
+                        )
+                    }
+
+                    // Memo (only for z-to-z)
+                    if isZToZ {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Memo (optional, encrypted)")
+                                .font(theme.captionFont)
+                                .foregroundColor(theme.textSecondary)
+
+                            TextField("Private message...", text: $memo)
+                                .textFieldStyle(.plain)
+                                .font(theme.bodyFont)
+                                .foregroundColor(theme.textPrimary)
+                                .padding()
+                                .background(theme.surfaceColor)
+                                .cornerRadius(theme.cornerRadius)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: theme.cornerRadius)
+                                        .stroke(theme.borderColor, lineWidth: theme.borderWidth)
+                                )
+                        }
+                    }
+
+                    // Fee info
+                    HStack {
+                        Text("Network Fee")
+                            .font(theme.bodyFont)
+                            .foregroundColor(theme.textSecondary)
+
+                        Spacer()
+
+                        Text("0.0001 ZCL")
+                            .font(theme.monoFont)
+                            .foregroundColor(theme.textPrimary)
+                    }
+                    .padding()
+                    .background(theme.surfaceColor)
+                    .cornerRadius(theme.cornerRadius)
+
+                    // Error message
+                    if let error = errorMessage {
+                        HStack {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundColor(theme.errorColor)
+                            Text(error)
+                                .font(theme.bodyFont)
+                                .foregroundColor(theme.errorColor)
+                        }
+                        .padding()
+                        .background(theme.errorColor.opacity(0.1))
+                        .cornerRadius(theme.cornerRadius)
+                    }
+
+                    // Success message
+                    if let txid = successTxid {
+                        VStack(spacing: 8) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.system(size: 40))
+                                .foregroundColor(theme.successColor)
+
+                            Text("Transaction Sent!")
+                                .font(theme.titleFont)
+                                .foregroundColor(theme.successColor)
+
+                            Text("TxID: \(truncateTxid(txid))")
+                                .font(theme.monoFont)
+                                .foregroundColor(theme.textSecondary)
+
+                            Button("Copy TxID") {
+                                // FIX #1360: TASK 12 — Use ClipboardManager with 60s expiry for txids
+                                ClipboardManager.copyWithAutoExpiry(txid, seconds: 60)
+                            }
+                            .buttonStyle(System7ButtonStyle())
+                        }
+                        .padding()
+                        .frame(maxWidth: .infinity)
+                        .background(theme.successColor.opacity(0.1))
+                        .cornerRadius(theme.cornerRadius)
+                    }
+                }
+                .padding()
+            }
+
+            Divider()
+                .background(theme.borderColor)
+
+            // Footer
+            HStack {
+                Spacer()
+
+                if successTxid != nil {
+                    Button("Done") {
+                        dismiss()
+                    }
+                    .buttonStyle(System7ButtonStyle())
+                } else {
+                    Button(isSending ? "Sending..." : "Send") {
+                        showingConfirmation = true
+                    }
+                    .buttonStyle(System7ButtonStyle())
+                    .disabled(!canSend || isSending)
+                }
+
+                Spacer()
+            }
+            .padding()
+            .background(theme.surfaceColor)
+        }
+        .frame(minWidth: 450, minHeight: 500)
+        .background(theme.backgroundColor)
+        // FIX #286 v17: Custom confirmation sheet that shows FULL addresses (not truncated)
+        .sheet(isPresented: $showingConfirmation) {
+            confirmationSheet
+        }
+    }
+
+    // MARK: - FIX #286 v17: Confirmation Sheet with FULL Addresses
+
+    private var confirmationSheet: some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack {
+                Text("⚠️ Confirm Transaction")
+                    .font(theme.titleFont)
+                    .foregroundColor(theme.warningColor)
+                Spacer()
+            }
+            .padding()
+            .background(theme.surfaceColor)
+
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    // Amount section — FIX #1274: Show properly formatted amount
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("AMOUNT")
+                            .font(theme.captionFont)
+                            .foregroundColor(theme.textSecondary)
+                        if let val = Double(normalizeAmount(amount)) {
+                            Text(String(format: "%.8f ZCL", val))
+                                .font(.system(size: 24, weight: .bold, design: .monospaced))
+                                .foregroundColor(theme.primaryColor)
+                        } else {
+                            Text("\(amount) ZCL")
+                                .font(.system(size: 24, weight: .bold, design: .monospaced))
+                                .foregroundColor(theme.primaryColor)
+                        }
+                    }
+
+                    Divider()
+
+                    // From address — FULL address displayed (SECURITY: no scroll, no truncation)
+                    if let from = selectedFromAddress {
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text("FROM")
+                                    .font(theme.captionFont)
+                                    .foregroundColor(theme.textSecondary)
+                                Spacer()
+                                Image(systemName: from.isShielded ? "shield.fill" : "eye.fill")
+                                    .foregroundColor(theme.primaryColor)
+                                    .font(.system(size: 12))
+                            }
+                            Text(from.address)
+                                .font(.system(size: 13, weight: .medium, design: .monospaced))
+                                .foregroundColor(theme.textPrimary)
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .padding(10)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(theme.backgroundColor)
+                                .cornerRadius(4)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 4)
+                                        .stroke(theme.primaryColor.opacity(0.3), lineWidth: 1)
+                                )
+
+                            Text("Balance: \(formatBalance(from.balance))")
+                                .font(theme.captionFont)
+                                .foregroundColor(theme.textSecondary)
+                        }
+                    }
+
+                    Divider()
+
+                    // To address — FULL address displayed (SECURITY: no scroll, no truncation)
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text("TO")
+                                .font(theme.captionFont)
+                                .foregroundColor(theme.textSecondary)
+                            Spacer()
+                            let isZAddr = toAddress.hasPrefix("zs") || toAddress.hasPrefix("zc")
+                            Image(systemName: isZAddr ? "shield.fill" : "eye.fill")
+                                .foregroundColor(theme.primaryColor)
+                                .font(.system(size: 12))
+                        }
+                        Text(toAddress)
+                            .font(.system(size: 13, weight: .medium, design: .monospaced))
+                            .foregroundColor(theme.textPrimary)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(10)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(theme.backgroundColor)
+                            .cornerRadius(4)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 4)
+                                    .stroke(theme.primaryColor.opacity(0.3), lineWidth: 1)
+                            )
+                    }
+
+                    Divider()
+
+                    // Fee
+                    HStack {
+                        Text("Network Fee")
+                            .font(theme.bodyFont)
+                            .foregroundColor(theme.textSecondary)
+                        Spacer()
+                        Text("0.0001 ZCL")
+                            .font(theme.monoFont)
+                            .foregroundColor(theme.textPrimary)
+                    }
+
+                    // Total — FIX #1274: Use normalized amount (handles comma/space locales)
+                    HStack {
+                        Text("Total")
+                            .font(theme.titleFont)
+                            .foregroundColor(theme.textPrimary)
+                        Spacer()
+                        if let amountValue = Double(normalizeAmount(amount)) {
+                            Text(String(format: "%.8f ZCL", amountValue + 0.0001))
+                                .font(.system(size: 16, weight: .bold, design: .monospaced))
+                                .foregroundColor(theme.errorColor)
+                        }
+                    }
+                    .padding(.top, 8)
+
+                    // Warning
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(theme.warningColor)
+                        Text("This transaction cannot be reversed. Please verify all details.")
+                            .font(theme.captionFont)
+                            .foregroundColor(theme.warningColor)
+                    }
+                    .padding()
+                    .background(theme.warningColor.opacity(0.1))
+                    .cornerRadius(8)
+                }
+                .padding()
+            }
+
+            Divider()
+
+            // Action buttons
+            HStack(spacing: 16) {
+                Button("Cancel") {
+                    showingConfirmation = false
+                }
+                .buttonStyle(System7ButtonStyle())
+
+                Spacer()
+
+                Button(action: {
+                    showingConfirmation = false
+                    Task {
+                        await sendTransaction()
+                    }
+                }) {
+                    HStack {
+                        Image(systemName: "arrow.up.circle.fill")
+                        Text("Confirm Send")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(theme.primaryColor)
+            }
+            .padding()
+            .background(theme.surfaceColor)
+        }
+        // FIX #1274: Wide enough for full z-address display without scrolling
+        .frame(minWidth: 650, idealWidth: 700, minHeight: 550)
+        .background(theme.backgroundColor)
+    }
+
+    // MARK: - Actions
+
+    private func sendTransaction() async {
+        guard let from = selectedFromAddress else { return }
+        // FIX #1274: Use robust amount normalization (handles comma, spaces, thousands seps)
+        let normalizedAmount = normalizeAmount(amount)
+        guard let amountValue = Double(normalizedAmount) else {
+            await MainActor.run {
+                errorMessage = "Invalid amount"
+                isSending = false
+            }
+            return
+        }
+
+        // FIX #1267: Require biometric/passcode auth before sending (was completely missing)
+        // FIX #1391: Use round() to avoid floating point truncation
+        let zatoshis = UInt64(round(amountValue * 100_000_000))
+        let authSuccess = await withCheckedContinuation { continuation in
+            BiometricAuthManager.shared.authenticateForSend(amount: zatoshis) { success, error in
+                if !success {
+                    print("🔐 FIX #1267: Send auth failed in full node mode: \(error?.localizedDescription ?? "cancelled")")
+                }
+                continuation.resume(returning: success)
+            }
+        }
+        guard authSuccess else {
+            await MainActor.run {
+                errorMessage = "Authentication required to send transaction"
+            }
+            return
+        }
+
+        await MainActor.run {
+            isSending = true
+            errorMessage = nil
+        }
+
+        do {
+            // FIX #1391: Use round() to avoid floating point truncation (0.0012 → 119999 instead of 120000)
+            let amountZatoshis = UInt64(round(amountValue * 100_000_000))
+            let txid: String
+
+            if from.isShielded {
+                txid = try await rpcWallet.sendFromZ(
+                    from: from.address,
+                    to: toAddress,
+                    amount: amountZatoshis,
+                    memo: memo.isEmpty ? nil : memo
+                )
+            } else {
+                txid = try await rpcWallet.sendFromT(
+                    from: from.address,
+                    to: toAddress,
+                    amount: amountZatoshis
+                )
+            }
+
+            await MainActor.run {
+                successTxid = txid
+                isSending = false
+                // FIX #286 v17: Notify parent view to refresh
+                // FIX #1412: Pass sent amount for direct display
+                onSendSuccess?(amountZatoshis)
+            }
+        } catch {
+            // FIX #1404: Provide more descriptive error messages for common RPC failures
+            let rawError = error.localizedDescription
+            print("⚠️ FIX #1404: Full node send failed — \(rawError)")
+            let userMessage: String
+            if rawError.lowercased().contains("invalid amount") {
+                userMessage = "Send failed: The daemon rejected the amount. This usually means the previous transaction's change hasn't confirmed yet (needs 1 confirmation). Wait for the next block and try again."
+            } else if rawError.lowercased().contains("insufficient") {
+                userMessage = "Send failed: Insufficient funds. Your available balance may be lower if a previous transaction is still pending confirmation."
+            } else {
+                userMessage = rawError
+            }
+            await MainActor.run {
+                errorMessage = userMessage
+                isSending = false
+            }
+        }
+    }
+
+    // MARK: - Helpers
+
+    private func formatBalance(_ zatoshis: UInt64) -> String {
+        let zcl = Double(zatoshis) / 100_000_000.0
+        return String(format: "%.8f ZCL", zcl)
+    }
+
+    private func truncateAddress(_ address: String) -> String {
+        if address.count > 20 {
+            return "\(address.prefix(10))...\(address.suffix(8))"
+        }
+        return address
+    }
+
+    private func truncateTxid(_ txid: String) -> String {
+        if txid.count > 20 {
+            return "\(txid.prefix(8))...\(txid.suffix(8))"
+        }
+        return txid
+    }
+}
+
+#endif
