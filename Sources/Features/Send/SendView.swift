@@ -498,12 +498,16 @@ struct SendView: View {
         }
         .onChange(of: memo) { _ in
             BiometricAuthManager.shared.recordUserActivity() // FIX #1432: Prevent auto-lock while typing
-            // FIX #1258: Do NOT invalidate or re-prepare on memo change.
-            // Pre-build happens once when amount is entered. Memo is included
-            // at actual send time — if memo differs from prepared TX, the send
-            // path falls through to performSendTransaction() which builds with
-            // the final memo. This prevents a wasteful 2-4s Groth16 rebuild
-            // every time the user types in the memo field.
+            // FIX M-009: Invalidate prepared transaction when memo changes to prevent stale
+            // memo reuse. The send path checks memo equality before using the instant-send
+            // path (lines ~1155), but explicit invalidation here ensures the UI correctly
+            // reflects "not ready" state and a fresh pre-build is triggered with the new memo.
+            // Note: FIX #1258 argued against this; FIX M-009 supersedes it for security.
+            // triggerPreparationIfNeeded() re-builds only when input is fully valid, so the
+            // Groth16 rebuild is not triggered on every keystroke — only after debounce.
+            preparedTransaction = nil
+            PreparedTransaction.cached = nil
+            triggerPreparationIfNeeded()
         }
         .onAppear {
             // FIX #1327: Restore from static cache immediately when Send window opens.

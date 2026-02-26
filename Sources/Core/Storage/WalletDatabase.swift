@@ -1471,6 +1471,15 @@ final class WalletDatabase {
             }
         }
 
+        // FIX M-001: Migration 19 — Add public_key column to chat_contacts for identity binding
+        // Stores the verified X25519 public key (32 bytes) captured on first handshake (Trust On First Use).
+        // Subsequent connections from the same onion address MUST present the same key.
+        let chatContactCols = getTableColumns("chat_contacts")
+        if !chatContactCols.contains("public_key") {
+            sqlite3_exec(db, "ALTER TABLE chat_contacts ADD COLUMN public_key BLOB;", nil, nil, nil)
+            print("📂 FIX M-001 Migration 19: Added public_key to chat_contacts")
+        }
+
         // PRIVACY: P-DB-001 — Migration 18: Diversified address tracking for address rotation
         let divAddrColumns = getTableColumns("diversified_addresses")
         if divAddrColumns.isEmpty {
@@ -1672,35 +1681,13 @@ final class WalletDatabase {
         let address = String(cString: sqlite3_column_text(stmt, 3))
         let birthday = UInt64(sqlite3_column_int64(stmt, 4))
 
-        // Security audit TASK 2: Get spending key from Secure Enclave / Keychain
-        // VUL-U-002: Use secure key retrieval with automatic zeroing
-        let spendingKey: Data
-        let secureKey: SecureData?
-        do {
-            secureKey = try SecureKeyStorage.shared.retrieveSpendingKeySecure()
-            defer { secureKey?.zero() }
-            spendingKey = secureKey?.data ?? Data()
-        } catch {
-            print("⚠️ TASK 2: Failed to retrieve spending key from SecureKeyStorage: \(error)")
-            // Fallback: try DB (for migration period)
-            let skPtr = sqlite3_column_blob(stmt, 1)
-            let skLen = sqlite3_column_bytes(stmt, 1)
-            if skLen > 0, let ptr = skPtr {
-                let dbKey = Data(bytes: ptr, count: Int(skLen))
-                if dbKey.allSatisfy({ $0 == 0 }) {
-                    // Key is zeroed in DB and not in SecureKeyStorage — can't recover
-                    print("❌ TASK 2: Spending key zeroed in DB and not in SecureKeyStorage")
-                    return nil
-                }
-                spendingKey = dbKey
-            } else {
-                return nil
-            }
-        }
+        // FIX H-003: spendingKey is no longer loaded into the Account struct.
+        // All callers retrieve the spending key directly from SecureKeyStorage, so there
+        // is no reason to materialise it in an ARC-heap object here.  Pass nil always.
 
         return Account(
             accountId: id,
-            spendingKey: spendingKey,
+            spendingKey: nil,
             viewingKey: Data(bytes: vkPtr!, count: Int(vkLen)),
             address: address,
             birthdayHeight: birthday
@@ -8983,23 +8970,27 @@ final class WalletDatabase {
     // status update (online/offline transitions trigger saveContact with the local struct).
     // FIX #1531: Added is_blocked parameter — was completely missing from INSERT/UPDATE,
     // so blocked status was never persisted. After restart, is_blocked always defaulted to 0.
-    func saveChatContact(onionAddress: String, nickname: String?, isBlocked: Bool, unreadCount: Int, lastMessageTime: Int64?) {
+    func saveChatContact(onionAddress: String, nickname: String?, isBlocked: Bool, unreadCount: Int, lastMessageTime: Int64?, publicKey: Data? = nil) {
         guard db != nil else { return }
+        // FIX M-001: Include public_key in INSERT/UPDATE.
+        // COALESCE ensures we never overwrite a stored key with NULL (caller may not always pass it).
         let sql = """
-            INSERT INTO chat_contacts (onion_address, nickname, is_blocked, unread_count, last_message_time)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO chat_contacts (onion_address, nickname, is_blocked, unread_count, last_message_time, public_key)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(onion_address) DO UPDATE SET
                 nickname = COALESCE(excluded.nickname, nickname),
                 is_blocked = excluded.is_blocked,
                 unread_count = excluded.unread_count,
-                last_message_time = COALESCE(excluded.last_message_time, last_message_time);
+                last_message_time = COALESCE(excluded.last_message_time, last_message_time),
+                public_key = COALESCE(excluded.public_key, public_key);
         """
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
         defer { sqlite3_finalize(stmt) }
-        sqlite3_bind_text(stmt, 1, onionAddress, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        sqlite3_bind_text(stmt, 1, onionAddress, -1, SQLITE_TRANSIENT)
         if let nick = nickname {
-            sqlite3_bind_text(stmt, 2, nick, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+            sqlite3_bind_text(stmt, 2, nick, -1, SQLITE_TRANSIENT)
         } else {
             sqlite3_bind_null(stmt, 2)
         }
@@ -9009,6 +9000,14 @@ final class WalletDatabase {
             sqlite3_bind_int64(stmt, 5, time)
         } else {
             sqlite3_bind_null(stmt, 5)
+        }
+        // FIX M-001: Bind public key blob (param 6)
+        if let keyData = publicKey {
+            keyData.withUnsafeBytes { ptr in
+                sqlite3_bind_blob(stmt, 6, ptr.baseAddress, Int32(keyData.count), SQLITE_TRANSIENT)
+            }
+        } else {
+            sqlite3_bind_null(stmt, 6)
         }
         sqlite3_step(stmt)
     }
@@ -9026,21 +9025,30 @@ final class WalletDatabase {
         sqlite3_step(stmt)
     }
 
-    func loadChatContacts() -> [(onionAddress: String, nickname: String?, isBlocked: Bool, unreadCount: Int, lastMessageTime: Int64?)] {
+    func loadChatContacts() -> [(onionAddress: String, nickname: String?, isBlocked: Bool, unreadCount: Int, lastMessageTime: Int64?, publicKey: Data?)] {
         guard db != nil else { return [] }
-        let sql = "SELECT onion_address, nickname, is_blocked, unread_count, last_message_time FROM chat_contacts ORDER BY last_message_time DESC;"
+        // FIX M-001: Include public_key in SELECT (column index 5)
+        let sql = "SELECT onion_address, nickname, is_blocked, unread_count, last_message_time, public_key FROM chat_contacts ORDER BY last_message_time DESC;"
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
         defer { sqlite3_finalize(stmt) }
 
-        var results: [(String, String?, Bool, Int, Int64?)] = []
+        var results: [(String, String?, Bool, Int, Int64?, Data?)] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
             let onion = String(cString: sqlite3_column_text(stmt, 0))
             let nick = sqlite3_column_type(stmt, 1) != SQLITE_NULL ? String(cString: sqlite3_column_text(stmt, 1)) : nil
             let blocked = sqlite3_column_int(stmt, 2) != 0
             let unread = Int(sqlite3_column_int(stmt, 3))
             let lastTime = sqlite3_column_type(stmt, 4) != SQLITE_NULL ? sqlite3_column_int64(stmt, 4) : nil
-            results.append((onion, nick, blocked, unread, lastTime))
+            // FIX M-001: Read stored public key blob
+            var pubKey: Data?
+            if sqlite3_column_type(stmt, 5) != SQLITE_NULL {
+                let byteCount = Int(sqlite3_column_bytes(stmt, 5))
+                if byteCount > 0, let bytes = sqlite3_column_blob(stmt, 5) {
+                    pubKey = Data(bytes: bytes, count: byteCount)
+                }
+            }
+            results.append((onion, nick, blocked, unread, lastTime, pubKey))
         }
         return results
     }
@@ -9341,7 +9349,7 @@ final class WalletDatabase {
 
 struct Account {
     let accountId: Int64  // FIX #557 v8: Renamed from 'id' to avoid SwiftUI .id() modifier conflict
-    let spendingKey: Data
+    let spendingKey: Data?  // FIX H-003: Always nil — never populated. Use SecureKeyStorage.withSpendingKey() instead.
     let viewingKey: Data
     let address: String
     let birthdayHeight: UInt64

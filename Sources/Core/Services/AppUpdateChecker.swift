@@ -166,8 +166,18 @@ class AppUpdateChecker: ObservableObject {
     }
 
     /// Open the release URL in the default browser
+    /// FIX M-008: Validate URL domain to prevent MITM redirect to phishing site
     func openReleaseURL() {
         guard let info = updateAvailable, let url = URL(string: info.url) else { return }
+
+        // FIX M-008: Only allow GitHub URLs from our org
+        guard let host = url.host?.lowercased(),
+              (host == "github.com" || host.hasSuffix(".github.com")),
+              url.path.lowercased().hasPrefix("/zipherpunk/zipherx") else {
+            print("⚠️ FIX M-008: Blocked non-GitHub release URL: \(url.host ?? "nil")")
+            return
+        }
+
         #if os(macOS)
         NSWorkspace.shared.open(url)
         #else

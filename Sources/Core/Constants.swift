@@ -123,9 +123,9 @@ enum ZipherXConstants {
     /// FIX #1551: User-configurable via Settings → Network → Consensus Threshold
     static var consensusThreshold: Int {
         let stored = UserDefaults.standard.integer(forKey: "ZipherX_ConsensusThreshold")
-        // Range 2-8: minimum 2 for basic consensus, max 8 for high-security
+        // FIX M-015: Minimum 3 for Byzantine fault tolerance (was 2, too low for consensus)
         // Default 3 when not set (UserDefaults returns 0 for unset integer keys)
-        return (stored >= 2 && stored <= 8) ? stored : 3
+        return (stored >= 3 && stored <= 8) ? stored : 3
     }
 
     /// Reduced consensus threshold for degraded network conditions.

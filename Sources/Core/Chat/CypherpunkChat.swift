@@ -310,6 +310,7 @@ struct ChatContact: Codable, Identifiable, Hashable {
     var isBlocked: Bool             // FIX #1433: Contact is blocked (no incoming messages)
     var addedAt: Date               // When contact was added
     var notes: String?              // User notes about contact
+    var publicKeyData: Data?        // FIX M-001: X25519 public key (32 bytes), verified on handshake
 
     init(onionAddress: String, nickname: String) {
         self.id = UUID().uuidString
@@ -322,6 +323,7 @@ struct ChatContact: Codable, Identifiable, Hashable {
         self.isBlocked = false
         self.addedAt = Date()
         self.notes = nil
+        self.publicKeyData = nil
     }
 
     /// Display name (nickname or truncated onion address)
@@ -347,6 +349,7 @@ struct ChatContact: Codable, Identifiable, Hashable {
         isBlocked = try container.decodeIfPresent(Bool.self, forKey: .isBlocked) ?? false
         addedAt = try container.decodeIfPresent(Date.self, forKey: .addedAt) ?? Date()
         notes = try container.decodeIfPresent(String.self, forKey: .notes)
+        publicKeyData = try container.decodeIfPresent(Data.self, forKey: .publicKeyData)
     }
 
     func hash(into hasher: inout Hasher) {

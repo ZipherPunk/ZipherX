@@ -20,7 +20,32 @@ struct ContentView: View {
     @State private var lastActivityTime: Date = Date()  // Track user activity
     @State private var inactivityTimer: Timer?  // Timer to check inactivity
     @State private var wasInBackground: Bool = false  // FIX #258: Track if we were in background
-    @State private var hasAcceptedDisclaimer: Bool = UserDefaults.standard.bool(forKey: "hasAcceptedDisclaimer")
+    // FIX M-016: Disclaimer state in Keychain (not UserDefaults) to prevent bypass on macOS
+    private static func disclaimerAcceptedFromKeychain() -> Bool {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "com.zipherx.disclaimer",
+            kSecAttrAccount as String: "accepted",
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var result: AnyObject?
+        return SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess
+    }
+
+    static func saveDisclaimerAcceptedToKeychain() {
+        let data = Data([1])
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "com.zipherx.disclaimer",
+            kSecAttrAccount as String: "accepted",
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        ]
+        SecItemAdd(query as CFDictionary, nil)
+    }
+
+    @State private var hasAcceptedDisclaimer: Bool = ContentView.disclaimerAcceptedFromKeychain() || UserDefaults.standard.bool(forKey: "hasAcceptedDisclaimer")
 
     // Screenshot protection setting (enabled by default)
     @AppStorage("screenshotProtectionEnabled") private var screenshotProtectionEnabled: Bool = true
@@ -2962,6 +2987,20 @@ struct ContentView: View {
             DispatchQueue.main.async {
                 for window in NSApplication.shared.windows {
                     window.sharingType = enabled ? .none : .readOnly
+                }
+            }
+        }
+        // FIX L-006: Apply sharingType = .none to any NSWindow that becomes key after
+        // onAppear (e.g. detached panels, auxiliary windows). On macOS, SwiftUI .sheet
+        // modifiers present within the same NSWindow so they are already covered by the
+        // onAppear loop above. This observer catches any newly-spawned windows so no
+        // window escapes screenshot protection.
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
+            if screenshotProtectionEnabled {
+                DispatchQueue.main.async {
+                    for window in NSApplication.shared.windows {
+                        window.sharingType = .none
+                    }
                 }
             }
         }

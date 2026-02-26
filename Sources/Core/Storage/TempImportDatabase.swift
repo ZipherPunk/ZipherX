@@ -18,27 +18,34 @@ actor TempImportDatabase {
 
     private var db: OpaquePointer?
     private let dbPath: String
-    private let lock = NSLock()
+    // FIX M-010: Removed NSLock — actor provides mutual exclusion. NSLock inside actor blocks cooperative thread pool.
 
     private init() {
-        let paths = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true)
-        let documentsDirectory = paths[0]
-        self.dbPath = (documentsDirectory as NSString).appendingPathComponent("wallet_temp.db")
+        // FIX M-011: Use Caches directory instead of Documents — prevents iCloud/iTunes backup of temp data
+        let paths = NSSearchPathForDirectoriesInDomains(.cachesDirectory, .userDomainMask, true)
+        let cachesDirectory = paths[0]
+        self.dbPath = (cachesDirectory as NSString).appendingPathComponent("wallet_temp.db")
         openDatabase()
     }
 
     private func openDatabase() {
-        guard sqlite3_open(dbPath, &db) == SQLITE_OK else {
-            print("❌ TempImportDatabase: Failed to open database at \(dbPath)")
+        // FIX M-010: Use SQLITE_OPEN_FULLMUTEX for thread safety without NSLock
+        let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
+        guard sqlite3_open_v2(dbPath, &db, flags, nil) == SQLITE_OK else {
+            print("❌ TempImportDatabase: Failed to open database")
             return
         }
+
+        // FIX M-011: Exclude from backups
+        var fileURL = URL(fileURLWithPath: dbPath)
+        var resourceValues = URLResourceValues()
+        resourceValues.isExcludedFromBackup = true
+        try? fileURL.setResourceValues(resourceValues)
 
         // Enable WAL mode for concurrent access
         executeSQL("PRAGMA journal_mode=WAL;")
         executeSQL("PRAGMA synchronous=NORMAL;")
         executeSQL("PRAGMA cache_size=32000;")  // 32MB cache
-
-        print("✅ TempImportDatabase: Opened at \(dbPath)")
     }
 
     /// Create all temp tables for parallel import
@@ -325,9 +332,6 @@ actor TempImportDatabase {
     // MARK: - Private Helper Methods
 
     private func executeSQL(_ sql: String) {
-        lock.lock()
-        defer { lock.unlock() }
-
         guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
             let error = String(cString: sqlite3_errmsg(db)!)
             print("❌ TempImportDatabase SQL error: \(error)")
@@ -336,9 +340,6 @@ actor TempImportDatabase {
     }
 
     private func executeSQLThrowing(_ sql: String) throws {
-        lock.lock()
-        defer { lock.unlock() }
-
         guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
             let error = String(cString: sqlite3_errmsg(db)!)
             throw TempImportError.queryFailed(error)
@@ -346,9 +347,6 @@ actor TempImportDatabase {
     }
 
     private func prepareSQL(_ sql: String) throws -> OpaquePointer {
-        lock.lock()
-        defer { lock.unlock() }
-
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
             let error = String(cString: sqlite3_errmsg(db)!)

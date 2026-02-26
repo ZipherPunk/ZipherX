@@ -442,8 +442,14 @@ struct AddNodeSheet: View {
     private func addNode() {
         let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
         let nodePort = UInt16(port) ?? 8033
+        // FIX L-005: Sanitize node label — max 50 chars, alphanumeric + basic punctuation only.
+        // Prevents control characters, unicode injection, and overly long labels from being
+        // stored or displayed in the node list.
+        let sanitizedLabel = String(label.prefix(50)).filter {
+            $0.isLetter || $0.isNumber || $0 == " " || $0 == "-" || $0 == "_" || $0 == "."
+        }
 
-        if networkManager.addCustomNode(host: trimmedHost, port: nodePort, label: label) {
+        if networkManager.addCustomNode(host: trimmedHost, port: nodePort, label: sanitizedLabel) {
             isPresented = false
         } else {
             errorMessage = "Invalid address format or node already exists"
@@ -659,7 +665,11 @@ struct EditNodeSheet: View {
         var updatedNode = node
         updatedNode.host = host.trimmingCharacters(in: .whitespacesAndNewlines)
         updatedNode.port = UInt16(port) ?? 8033
-        updatedNode.label = label.isEmpty ? updatedNode.host : label
+        // FIX L-005: Sanitize node label — max 50 chars, alphanumeric + basic punctuation only.
+        let rawLabel = label.isEmpty ? updatedNode.host : label
+        updatedNode.label = String(rawLabel.prefix(50)).filter {
+            $0.isLetter || $0.isNumber || $0 == " " || $0 == "-" || $0 == "_" || $0 == "."
+        }
 
         if updatedNode.isValid {
             _ = networkManager.updateCustomNode(updatedNode)

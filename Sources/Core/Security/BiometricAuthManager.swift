@@ -236,19 +236,7 @@ final class BiometricAuthManager: ObservableObject {
 
         print("🔐 authenticateForSend: amount=\(amount.redactedAmount)")
 
-        #if DEBUG
-        // UAT mode: bypass send auth for test amounts (<= 0.0019 ZCL = 190000 zatoshis)
-        // Enable via: defaults write com.zipherpunk.zipherx.mac uatModeEnabled -bool true
-        let uatEnabled = UserDefaults.standard.bool(forKey: "uatModeEnabled")
-        if uatEnabled {
-            print("🔐 WARNING: UAT mode is ENABLED (uatModeEnabled=true)")
-        }
-        if uatEnabled && amount <= 190000 {
-            print("🧪 [UAT] Send auth bypassed for \(amount.redactedAmount)")
-            completion(true, nil)
-            return
-        }
-        #endif
+        // FIX H-006: UAT bypass REMOVED — no authentication bypass under any circumstance
 
         // Check if biometric auth is enabled in settings
         let biometricEnabled = UserDefaults.standard.bool(forKey: "useBiometricAuth")
@@ -432,17 +420,7 @@ final class BiometricAuthManager: ObservableObject {
     /// FIX #1273: App unlock is ALWAYS mandatory — uses biometric if enabled, passcode otherwise.
     /// Never bypasses, never auto-passes. The app MUST NOT proceed without successful auth.
     func authenticateForAppUnlock(completion: @escaping (Bool, Error?) -> Void) {
-        #if DEBUG
-        // UAT mode: bypass app unlock for automated testing
-        // Enable via: defaults write com.zipherpunk.zipherx.mac uatModeEnabled -bool true
-        if UserDefaults.standard.bool(forKey: "uatModeEnabled") {
-            print("🧪 [UAT] App unlock bypassed (uatModeEnabled=true)")
-            unlockApp()
-            isAuthInProgress = false
-            completion(true, nil)
-            return
-        }
-        #endif
+        // FIX H-006: UAT bypass REMOVED — no authentication bypass under any circumstance
 
         // FIX #1273: Prevent double-prompting if auth is already in progress
         // FIX #1281: Call completion with false instead of silently dropping it.

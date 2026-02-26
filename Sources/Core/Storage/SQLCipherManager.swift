@@ -326,9 +326,11 @@ final class SQLCipherManager {
         // SQLCipher syntax: PRAGMA key = "x'..hex..'";
         // The hex blob must be wrapped in double quotes
         let hex = "\"x'" + keyData.map { String(format: "%02x", $0) }.joined() + "'\""
-        // Log key fingerprint (first 4 bytes) for debugging
+        // FIX L-001: Never log key material (even partial fingerprint) in release builds
+        #if DEBUG
         let fingerprint = keyData.prefix(4).map { String(format: "%02x", $0) }.joined()
         print("🔑 Key fingerprint: \(fingerprint)...")
+        #endif
         return hex
     }
 
@@ -569,9 +571,9 @@ final class SQLCipherManager {
             kSecValueData as String: data
         ]
 
-        #if os(iOS)
+        // FIX H-004: Apply ThisDeviceOnly on ALL platforms — prevents iCloud Keychain sync
+        // (was iOS-only, missed by FIX #1491 which fixed DatabaseEncryption.swift but not this file)
         addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        #endif
 
         let status = SecItemAdd(addQuery as CFDictionary, nil)
         guard status == errSecSuccess else {

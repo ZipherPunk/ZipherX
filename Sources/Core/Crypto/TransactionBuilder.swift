@@ -587,6 +587,14 @@ final class TransactionBuilder {
             throw TransactionError.dustOutput(amount: amount, threshold: ZipherXConstants.dustThreshold)
         }
 
+        // FIX M-014: Prevent UInt64 overflow — amount + fee must not exceed MAX_MONEY or overflow UInt64.
+        // Without this check, a near-UInt64.max amount + DEFAULT_FEE wraps to 0, bypassing
+        // the insufficient-funds check and producing a zero-value transaction.
+        let maxSendable: UInt64 = 2_100_000_000_000_000  // MAX_MONEY (21M ZCL * 10^8 zatoshis)
+        guard amount <= maxSendable, amount <= maxSendable - ZipherXConstants.defaultFee else {
+            throw TransactionError.invalidAmount
+        }
+
         guard let toAddressBytes = ZipherXFFI.decodeAddress(to) else {
             throw TransactionError.invalidAddress
         }
@@ -2817,6 +2825,7 @@ enum TransactionError: LocalizedError {
     case cmuMismatch  // FIX #1137: Stored CMU doesn't match CMU computed from note parts
     case anchorNotOnChain  // FIX #1224: Anchor not found in any blockchain header
     case deltaCMUsFetchFailed(blockRange: UInt64)  // FIX #1225: P2P fetch failed, cannot create witnesses with stale data
+    case invalidAmount  // FIX M-014: Amount exceeds MAX_MONEY or would overflow UInt64 when adding fee
 
     var errorDescription: String? {
         switch self {
@@ -2824,6 +2833,8 @@ enum TransactionError: LocalizedError {
             return "Invalid z-address"
         case .insufficientFunds:
             return "Insufficient funds"
+        case .invalidAmount:
+            return "Invalid amount: exceeds maximum supply or would overflow when adding fee"
         case .proofGenerationFailed:
             return "Failed to generate zero-knowledge proof"
         case .signingFailed:

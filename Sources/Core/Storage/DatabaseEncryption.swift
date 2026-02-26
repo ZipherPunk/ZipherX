@@ -211,18 +211,19 @@ final class DatabaseEncryption {
 
     /// Get or create encryption salt (stored in keychain)
     private func getOrCreateSalt() throws -> Data {
+        // FIX L-002: Hold lock for entire operation to prevent TOCTOU race.
+        // Without this, two concurrent callers could both find salt==nil, both generate
+        // a new salt, and store different values — producing an inconsistent derived key.
         lock.lock()
+        defer { lock.unlock() }
+
         if let salt = self.salt {
-            lock.unlock()
             return salt
         }
-        lock.unlock()
 
         // Try to retrieve from keychain
         if let existingSalt = try? loadSaltFromKeychain() {
-            lock.lock()
             self.salt = existingSalt
-            lock.unlock()
             return existingSalt
         }
 
@@ -238,9 +239,7 @@ final class DatabaseEncryption {
 
         // Store in keychain
         try saveSaltToKeychain(newSalt)
-        lock.lock()
         self.salt = newSalt
-        lock.unlock()
         return newSalt
     }
 

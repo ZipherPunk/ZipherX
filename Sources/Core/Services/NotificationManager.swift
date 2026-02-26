@@ -51,8 +51,9 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         let userInfo = response.notification.request.content.userInfo
-        print("📬 Notification tapped: \(userInfo)")
+        print("📬 Notification tapped")
         // Could navigate to transaction details here
+        _ = userInfo  // retain for future navigation handling
         completionHandler()
     }
 
@@ -90,22 +91,16 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         // Suppress notifications during initial wallet sync (historical txs)
         guard !shouldSuppressNotifications else { return }
 
-        let zcl = Double(amount) / 100_000_000.0
-        print("🔔 Notification: +\(amount.redactedAmount) incoming (mempool)")
+        print("🔔 Notification: incoming ZCL (mempool)")
 
         let content = UNMutableNotificationContent()
         content.title = "Incoming ZCL"
 
-        // Build body with amount and pending status
-        var body = String(format: "+%.8f ZCL\n⏳ Awaiting confirmation", zcl)
-        if let memo = memo, !memo.isEmpty {
-            // Truncate memo for notification if too long
-            let truncatedMemo = memo.count > 100 ? String(memo.prefix(100)) + "..." : memo
-            body += "\n📝 \(truncatedMemo)"
-        }
-        content.body = body
+        // FIX M-006: Generic body — never reveal amount or memo in notifications
+        content.body = "You have an incoming ZCL transaction\n⏳ Awaiting confirmation"
         content.sound = .default
-        content.userInfo = ["type": "received", "txid": txid, "amount": amount, "memo": memo ?? ""]
+        // FIX M-006: Omit amount and memo from userInfo to prevent lock-screen leakage
+        content.userInfo = ["type": "received", "txid": txid]
 
         let request = UNNotificationRequest(
             identifier: "received-\(txid)",
@@ -125,8 +120,7 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         // Suppress notifications during initial wallet sync (historical txs)
         guard !shouldSuppressNotifications else { return }
 
-        let zcl = Double(amount) / 100_000_000.0
-        print("🔔 Notification: +\(amount.redactedAmount) confirmed")
+        print("🔔 Notification: ZCL confirmed")
 
         // Remove the pending "Incoming" notification for this txid
         // This replaces the "Awaiting confirmation" message with "Received"
@@ -135,17 +129,12 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         let content = UNMutableNotificationContent()
         content.title = "⛏️ ZCL Received"
 
-        // Build body with amount and cypherpunk message
+        // FIX M-006: Generic body — never reveal amount or memo in notifications
         let cypherpunkMessage = cypherpunkMessages.randomElement() ?? cypherpunkMessages[0]
-        var body = String(format: "+%.8f ZCL\n%@", zcl, cypherpunkMessage)
-        if let memo = memo, !memo.isEmpty {
-            // Truncate memo for notification if too long
-            let truncatedMemo = memo.count > 100 ? String(memo.prefix(100)) + "..." : memo
-            body += "\n📝 \(truncatedMemo)"
-        }
-        content.body = body
+        content.body = "ZCL received and confirmed\n\(cypherpunkMessage)"
         content.sound = .default
-        content.userInfo = ["type": "received_confirmed", "txid": txid, "amount": amount, "memo": memo ?? ""]
+        // FIX M-006: Omit amount and memo from userInfo to prevent lock-screen leakage
+        content.userInfo = ["type": "received_confirmed", "txid": txid]
 
         let request = UNNotificationRequest(
             identifier: "received-confirmed-\(txid)",
@@ -165,15 +154,16 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         // Suppress notifications during initial wallet sync (historical txs)
         guard !shouldSuppressNotifications else { return }
 
-        let zcl = Double(amount) / 100_000_000.0
-        print("🔔 Notification: -\(amount.redactedAmount) confirmed")
+        print("🔔 Notification: TX confirmed")
 
         let content = UNMutableNotificationContent()
         content.title = "⛏️ Transaction Mined"
+        // FIX M-006: Generic body — never reveal amount in notifications
         let cypherpunkMessage = cypherpunkMessages.randomElement() ?? cypherpunkMessages[0]
-        content.body = String(format: "-%.8f ZCL\n%@", zcl, cypherpunkMessage)
+        content.body = "Transaction confirmed\n\(cypherpunkMessage)"
         content.sound = .default
-        content.userInfo = ["type": "confirmed", "txid": txid, "amount": amount]
+        // FIX M-006: Omit amount from userInfo to prevent lock-screen leakage
+        content.userInfo = ["type": "confirmed", "txid": txid]
 
         let request = UNNotificationRequest(
             identifier: "confirmed-\(txid)",
@@ -193,27 +183,17 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         // Note: notifySent is NOT suppressed during sync because user explicitly initiates sends
         // This is intentional - user should always see confirmation of their own actions
 
-        let zcl = Double(amount) / 100_000_000.0
-        print("🔔 NOTIFICATION: notifySent called")
-        print("   amount=\(amount.redactedAmount)")
-        print("   txid=\(txid.prefix(16))...")
-        // PRIVACY: P-META-003 — Redact memo content from logs
-        print("   memo=\(LogRedaction.redactMemo(memo))")
-        print("   >>> Sending SENT notification (tx broadcast)")
+        // FIX M-006: Replaced verbose multi-line logging that exposed amount/memo
+        print("🔔 Notification: sent TX")
 
         let content = UNMutableNotificationContent()
         content.title = "ZCL Sent"
 
-        // Build body with optional memo
-        var body = String(format: "-%.8f ZCL", zcl)
-        if let memo = memo, !memo.isEmpty {
-            // Truncate memo for notification if too long
-            let truncatedMemo = memo.count > 100 ? String(memo.prefix(100)) + "..." : memo
-            body += "\n📝 \(truncatedMemo)"
-        }
-        content.body = body
+        // FIX M-006: Generic body — never reveal amount or memo in notifications
+        content.body = "ZCL transaction sent successfully"
         content.sound = .default
-        content.userInfo = ["type": "sent", "txid": txid, "amount": amount, "memo": memo ?? ""]
+        // FIX M-006: Omit amount and memo from userInfo to prevent lock-screen leakage
+        content.userInfo = ["type": "sent", "txid": txid]
 
         let request = UNNotificationRequest(
             identifier: "sent-\(txid)",
@@ -230,17 +210,16 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
 
     /// FIX #174: Notify when external wallet spends our funds
     func notifyExternalWalletSpend(amount: UInt64, txid: String) {
-        let zcl = Double(amount) / 100_000_000.0
-        print("🚨 NOTIFICATION: notifyExternalWalletSpend called")
-        print("   amount=\(amount.redactedAmount)")
-        print("   txid=\(txid.prefix(16))...")
-        print("   >>> ALERT: External wallet spent our funds!")
+        // FIX M-006: Replaced verbose multi-line logging that exposed amount
+        print("🚨 Notification: external wallet spend detected")
 
         let content = UNMutableNotificationContent()
         content.title = "⚠️ External Wallet Spend Detected"
-        content.body = String(format: "Another wallet spent %.8f ZCL from your address.\nThis was NOT sent by ZipherX!", zcl)
+        // FIX M-006: Generic body — never reveal amount in notifications
+        content.body = "Another wallet spent ZCL from your address.\nThis was NOT sent by ZipherX!"
         content.sound = .defaultCritical // Use critical sound to get attention
-        content.userInfo = ["type": "external_spend", "txid": txid, "amount": amount]
+        // FIX M-006: Omit amount from userInfo to prevent lock-screen leakage
+        content.userInfo = ["type": "external_spend", "txid": txid]
 
         let request = UNNotificationRequest(
             identifier: "external-spend-\(txid)",

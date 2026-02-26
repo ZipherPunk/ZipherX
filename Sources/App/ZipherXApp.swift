@@ -19,7 +19,8 @@ struct ZipherXApp: App {
     @State private var hasCheckedDaemon = false
     @State private var showModeSelection = false
     #endif
-    @State private var hasAcceptedDisclaimer = UserDefaults.standard.bool(forKey: "hasAcceptedDisclaimer")
+    // FIX M-016: Read disclaimer state from Keychain (with UserDefaults migration fallback)
+    @State private var hasAcceptedDisclaimer = ContentView.disclaimerAcceptedFromKeychain() || UserDefaults.standard.bool(forKey: "hasAcceptedDisclaimer")
 
     /// Whether mode selection screen should be shown (macOS only, when daemon detected)
     private var needsModeSelection: Bool {

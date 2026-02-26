@@ -1222,6 +1222,9 @@ final class ChatManager: ObservableObject {
 
         listener = try NWListener(using: params, on: NWEndpoint.Port(integerLiteral: CYPHERPUNK_CHAT_PORT))
 
+        // FIX M-002: Limit concurrent connections to prevent DoS via Tor
+        listener?.newConnectionLimit = 50
+
         listener?.newConnectionHandler = { [weak self] connection in
             Task { @MainActor in
                 await self?.handleIncomingConnection(connection)
@@ -1303,6 +1306,40 @@ final class ChatManager: ObservableObject {
             return
         }
 
+        // FIX M-003: Reject duplicate onion address if existing session is active
+        // Prevents session hijacking where attacker claims same onion as existing peer
+        if let existingPeer = peers[onionAddress], await existingPeer.getState() == .connected {
+            print("💬 FIX M-003: Rejected duplicate connection from \(onionAddress.prefix(16))... — active session exists")
+            connection.cancel()
+            return
+        }
+
+        // FIX M-001: Verify public key matches stored contact identity (Trust On First Use)
+        // Once a contact's public key is captured on first handshake, all future connections
+        // from the same onion address MUST present the identical key. A mismatch means the
+        // peer does not control the original identity (impersonation or key compromise).
+        if let existingContact = contacts.first(where: { $0.onionAddress == onionAddress }) {
+            if let storedKey = existingContact.publicKeyData {
+                if Data(pubKeyData) != storedKey {
+                    print("🚨 FIX M-001: IDENTITY MISMATCH — \(onionAddress.prefix(16))... sent different public key. Rejecting.")
+                    connection.cancel()
+                    return
+                }
+                // Key matches — identity confirmed, no action needed.
+            } else {
+                // First handshake for this contact — capture and store the key (TOFU).
+                var updatedContact = existingContact
+                updatedContact.publicKeyData = Data(pubKeyData)
+                if let idx = contacts.firstIndex(where: { $0.onionAddress == onionAddress }) {
+                    contacts[idx] = updatedContact
+                }
+                saveContact(updatedContact)
+                print("💬 FIX M-001: Captured public key for \(onionAddress.prefix(16))... (Trust On First Use, incoming)")
+            }
+        }
+        // Note: if the contact does not exist yet (brand-new peer), the auto-add block below
+        // creates the contact with publicKeyData set, establishing the binding on first contact.
+
         // Create or update peer
         let peer = ChatPeer(onionAddress: onionAddress, connection: connection)
         try? await peer.setTheirPublicKey(theirPublicKey)
@@ -1338,11 +1375,13 @@ final class ChatManager: ObservableObject {
         // Without this check, our own .onion address would appear in contacts list!
         if !contacts.contains(where: { $0.onionAddress == onionAddress }) &&
            onionAddress != ourOnionAddress {
-            let contact = ChatContact(onionAddress: onionAddress, nickname: "")
+            // FIX M-001: Capture public key immediately on auto-add (TOFU on first ever connection)
+            var contact = ChatContact(onionAddress: onionAddress, nickname: "")
+            contact.publicKeyData = Data(pubKeyData)
             contacts.append(contact)
             conversations[onionAddress] = ChatConversation(contact: contact)
             database.saveContact(contact)
-            print("💬 Auto-added contact: \(onionAddress.prefix(16))...")
+            print("💬 Auto-added contact: \(onionAddress.prefix(16))... (FIX M-001: key captured at creation)")
         }
 
         updateContactOnlineStatus(onionAddress, isOnline: true)
@@ -1421,6 +1460,30 @@ final class ChatManager: ObservableObject {
         let pubKeyData = response.prefix(32)
         let theirPublicKey = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: pubKeyData)
         try await peer.setTheirPublicKey(theirPublicKey)
+
+        // FIX M-001: Verify public key matches stored contact identity (Trust On First Use, outgoing)
+        // The onion address we dialed is the authoritative identifier; the key returned in the
+        // handshake response must match the key we captured on first connection.
+        let peerOnion = await peer.onionAddress
+        if let existingContact = contacts.first(where: { $0.onionAddress == peerOnion }) {
+            if let storedKey = existingContact.publicKeyData {
+                if Data(pubKeyData) != storedKey {
+                    print("🚨 FIX M-001: IDENTITY MISMATCH on outgoing key exchange — \(peerOnion.prefix(16))... returned different public key. Rejecting.")
+                    await peer.connection.cancel()
+                    throw ChatError.encryptionFailed("FIX M-001: Public key mismatch — identity binding violation")
+                }
+                // Key matches — identity confirmed.
+            } else {
+                // First outgoing handshake — capture and store the key (TOFU).
+                var updatedContact = existingContact
+                updatedContact.publicKeyData = Data(pubKeyData)
+                if let idx = contacts.firstIndex(where: { $0.onionAddress == peerOnion }) {
+                    contacts[idx] = updatedContact
+                }
+                saveContact(updatedContact)
+                print("💬 FIX M-001: Captured public key for \(peerOnion.prefix(16))... (Trust On First Use, outgoing)")
+            }
+        }
 
         // FIX #238: Verify the returned onion address matches what we expected
         // This prevents connecting to wrong hidden service (e.g., iOS→Sim going to macOS)
@@ -2173,10 +2236,13 @@ final class ChatManager: ObservableObject {
             return
         }
 
-        // Save to ChatFiles directory
+        // FIX H-001: Sanitize fileName to prevent path traversal attacks
+        // Strip directory components and ".." sequences — only keep the final filename
+        let safeName = URL(fileURLWithPath: transfer.fileName).lastPathComponent
+            .replacingOccurrences(of: "..", with: "_")
         let fileURL = chatFilesDirectory
-            .appendingPathComponent("files")
-            .appendingPathComponent("\(fileId)_\(transfer.fileName)")
+            .appendingPathComponent("files", isDirectory: true)
+            .appendingPathComponent("\(fileId)_\(safeName)")
 
         do {
             try FileManager.default.createDirectory(
@@ -2205,9 +2271,12 @@ final class ChatManager: ObservableObject {
 
     /// Get saved file URL for a file message
     func getSavedFileURL(for fileId: String, fileName: String) -> URL? {
+        // FIX H-001: Sanitize fileName to prevent path traversal
+        let safeName = URL(fileURLWithPath: fileName).lastPathComponent
+            .replacingOccurrences(of: "..", with: "_")
         let fileURL = chatFilesDirectory
-            .appendingPathComponent("files")
-            .appendingPathComponent("\(fileId)_\(fileName)")
+            .appendingPathComponent("files", isDirectory: true)
+            .appendingPathComponent("\(fileId)_\(safeName)")
         return FileManager.default.fileExists(atPath: fileURL.path) ? fileURL : nil
     }
 
@@ -2857,13 +2926,15 @@ class ChatDatabase {
     // MARK: - Contacts (SQLCipher)
 
     // FIX #1531: Pass isBlocked to persist blocked status across restarts
+    // FIX M-001: Pass publicKeyData to persist identity binding
     func saveContact(_ contact: ChatContact) {
         WalletDatabase.shared.saveChatContact(
             onionAddress: contact.onionAddress,
             nickname: contact.nickname.isEmpty ? nil : contact.nickname,
             isBlocked: contact.isBlocked,
             unreadCount: contact.unreadCount,
-            lastMessageTime: nil
+            lastMessageTime: nil,
+            publicKey: contact.publicKeyData
         )
         // FIX #1486: Checkpoint WAL immediately after contact save.
         // On iOS, app can be force-killed before applicationDidEnterBackground fires.
@@ -2877,6 +2948,8 @@ class ChatDatabase {
             var contact = ChatContact(onionAddress: row.onionAddress, nickname: row.nickname ?? "")
             contact.unreadCount = row.unreadCount
             contact.isBlocked = row.isBlocked
+            // FIX M-001: Restore persisted public key for identity verification
+            contact.publicKeyData = row.publicKey
             return contact
         }
     }

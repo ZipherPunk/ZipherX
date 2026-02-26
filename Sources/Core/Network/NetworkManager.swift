@@ -5476,12 +5476,27 @@ public final class NetworkManager: ObservableObject {
         // looking up Zclassic seed nodes. User can enable in Settings → Network → DNS Seeds.
         let dnsEnabled = UserDefaults.standard.bool(forKey: "useDNSSeeds")
         if dnsEnabled {
-            // User explicitly enabled DNS seeds — resolve them
-            for seed in dnsSeedsZCL {
-                let resolved = await resolveDNSSeed(seed)
-                addresses.append(contentsOf: resolved)
+            // FIX M-004: Block DNS seed resolution when Tor is enabled but not yet connected.
+            // Prevents real IP leak to DNS seed operators during Tor bootstrap window.
+            // resolveDNSSeed() already guards against Tor-connected state (FIX #1490), but
+            // that check passes when torConnected=false — i.e. the bootstrap window where
+            // Tor is enabled/starting but the SOCKS5 proxy is not yet ready. An IP leak
+            // here would let DNS seed operators observe our real IP during every startup.
+            let torEnabled = UserDefaults.standard.bool(forKey: "torEnabled") ||
+                             UserDefaults.standard.bool(forKey: "useTor")
+            let torModeEnabled = await TorManager.shared.mode == .enabled
+            let torConnected = await TorManager.shared.connectionState.isConnected
+            if (torEnabled || torModeEnabled) && !torConnected {
+                print("🧅 FIX M-004: Skipping DNS resolution — Tor enabled but not connected (prevents IP leak during bootstrap window)")
+                // Hardcoded seed IPs (added above) are used instead — no DNS resolution needed
+            } else {
+                // User explicitly enabled DNS seeds — resolve them
+                for seed in dnsSeedsZCL {
+                    let resolved = await resolveDNSSeed(seed)
+                    addresses.append(contentsOf: resolved)
+                }
+                print("🌐 DNS Seeds: Resolved \(addresses.count) addresses from DNS seeds")
             }
-            print("🌐 DNS Seeds: Resolved \(addresses.count) addresses from DNS seeds")
         } else {
             print("🌐 DNS Seeds: Disabled (Settings → Network → DNS Seeds to enable)")
         }

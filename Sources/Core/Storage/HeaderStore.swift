@@ -18,7 +18,22 @@ final class HeaderStore {
     // FIX #1253: In-memory cache of delta sapling roots (loaded from delta_sapling_roots.bin at startup).
     // These are finalsaplingroots from post-boost blocks stored in the delta bundle.
     // containsSaplingRoot() checks this Set (O(1)) before falling back to headers table SQL query.
-    var deltaSaplingRoots: Set<Data> = []
+    // FIX H-005: Thread-safe access via rootsLock — was unsynchronized across WalletManager/DeltaCMUManager/callers
+    private var _deltaSaplingRoots: Set<Data> = []
+    private let rootsLock = NSLock()
+
+    var deltaSaplingRoots: Set<Data> {
+        get {
+            rootsLock.lock()
+            defer { rootsLock.unlock() }
+            return _deltaSaplingRoots
+        }
+        set {
+            rootsLock.lock()
+            _deltaSaplingRoots = newValue
+            rootsLock.unlock()
+        }
+    }
 
     private init() {
         dbPath = AppDirectories.database.appendingPathComponent("zipherx_headers.db").path

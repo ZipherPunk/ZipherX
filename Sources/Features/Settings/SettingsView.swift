@@ -19,9 +19,53 @@ enum PINSecurity {
     private static let maxAttempts = 5
     private static let lockoutDuration: TimeInterval = 300 // 5 minutes
 
-    /// UserDefaults keys for rate limiting
+    /// FIX H-007: PIN lockout state stored in Keychain (not UserDefaults) to prevent bypass on macOS
+    private static let keychainService = "com.zipherx.pin.lockout"
     private static let failedAttemptsKey = "pinFailedAttempts"
     private static let lockoutEndKey = "pinLockoutEnd"
+
+    private static func saveLockoutValue(_ value: Int, key: String) {
+        let data = withUnsafeBytes(of: value) { Data($0) }
+        let deleteQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: key
+        ]
+        SecItemDelete(deleteQuery as CFDictionary)
+        let addQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: key,
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        ]
+        SecItemAdd(addQuery as CFDictionary, nil)
+    }
+
+    private static func loadLockoutValue(key: String) -> Int {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: key,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var result: AnyObject?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data, data.count == MemoryLayout<Int>.size else {
+            return 0
+        }
+        return data.withUnsafeBytes { $0.load(as: Int.self) }
+    }
+
+    private static func removeLockoutValue(key: String) {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: key
+        ]
+        SecItemDelete(query as CFDictionary)
+    }
 
     /// Legacy hash PIN using SHA256 with fixed salt (for migration only)
     /// Security audit TASK 14: Kept for backwards compatibility during migration to PBKDF2
@@ -181,7 +225,7 @@ enum PINSecurity {
 
     /// Check if PIN verification is currently locked out
     static func isLockedOut() -> Bool {
-        let lockoutEnd = UserDefaults.standard.double(forKey: lockoutEndKey)
+        let lockoutEnd = Double(loadLockoutValue(key: lockoutEndKey))
         if lockoutEnd > 0 && Date().timeIntervalSince1970 < lockoutEnd {
             return true
         }
@@ -190,14 +234,14 @@ enum PINSecurity {
 
     /// Get remaining lockout time in seconds
     static func remainingLockoutTime() -> TimeInterval {
-        let lockoutEnd = UserDefaults.standard.double(forKey: lockoutEndKey)
+        let lockoutEnd = Double(loadLockoutValue(key: lockoutEndKey))
         let remaining = lockoutEnd - Date().timeIntervalSince1970
         return max(0, remaining)
     }
 
     /// Get number of failed attempts
     static func failedAttempts() -> Int {
-        return UserDefaults.standard.integer(forKey: failedAttemptsKey)
+        return loadLockoutValue(key: failedAttemptsKey)
     }
 
     /// Verify PIN against stored hash with rate limiting
@@ -214,19 +258,19 @@ enum PINSecurity {
 
         if success {
             // Reset failed attempts on success
-            UserDefaults.standard.set(0, forKey: failedAttemptsKey)
-            UserDefaults.standard.removeObject(forKey: lockoutEndKey)
+            saveLockoutValue(0, key: failedAttemptsKey)
+            removeLockoutValue(key: lockoutEndKey)
             return (true, false, maxAttempts)
         } else {
             // Increment failed attempts
-            var attempts = UserDefaults.standard.integer(forKey: failedAttemptsKey)
+            var attempts = loadLockoutValue(key: failedAttemptsKey)
             attempts += 1
-            UserDefaults.standard.set(attempts, forKey: failedAttemptsKey)
+            saveLockoutValue(attempts, key: failedAttemptsKey)
 
             // Check if lockout should be triggered
             if attempts >= maxAttempts {
                 let lockoutEnd = Date().timeIntervalSince1970 + lockoutDuration
-                UserDefaults.standard.set(lockoutEnd, forKey: lockoutEndKey)
+                saveLockoutValue(Int(lockoutEnd), key: lockoutEndKey)
                 print("⚠️ SECURITY: PIN lockout triggered after \(attempts) failed attempts")
                 return (false, true, 0)
             }
@@ -256,8 +300,8 @@ enum PINSecurity {
 
     /// Reset lockout (for testing or admin purposes)
     static func resetLockout() {
-        UserDefaults.standard.set(0, forKey: failedAttemptsKey)
-        UserDefaults.standard.removeObject(forKey: lockoutEndKey)
+        saveLockoutValue(0, key: failedAttemptsKey)
+        removeLockoutValue(key: lockoutEndKey)
     }
 }
 
@@ -1732,7 +1776,7 @@ Both binaries must be installed to /usr/local/bin:
                             .foregroundColor(consensusThresholdColor)
                             .frame(minWidth: 20)
 
-                        Stepper("", value: $consensusThresholdSetting, in: 2...8)
+                        Stepper("", value: $consensusThresholdSetting, in: 3...8)
                             .labelsHidden()
                             .onChange(of: consensusThresholdSetting) { newValue in
                                 UserDefaults.standard.set(newValue, forKey: "ZipherX_ConsensusThreshold")

@@ -52,10 +52,18 @@ final class MnemonicGenerator {
               onesCount >= totalBits / 4,                  // >= 25% ones
               onesCount <= (totalBits * 3) / 4             // <= 75% ones
         else {
+            // FIX L-004: Zero entropy before throwing to prevent memory forensics recovery
+            entropy.resetBytes(in: 0..<entropy.count)
             throw MnemonicError.randomGenerationFailed
         }
 
-        return try entropyToMnemonic(entropy)
+        let words = try entropyToMnemonic(entropy)
+        // FIX L-004: Zero entropy after use — prevents memory forensics from recovering
+        // seed material. Swift Data is value-type but heap-allocated; zeroing the buffer
+        // before releasing it reduces the forensic window. Both error paths above also zero
+        // before throwing so all paths are covered.
+        entropy.resetBytes(in: 0..<entropy.count)
+        return words
     }
 
     /// Convert entropy to mnemonic words
@@ -91,40 +99,61 @@ final class MnemonicGenerator {
 
     /// Validate a mnemonic phrase
     func validateMnemonic(_ words: [String]) -> Bool {
+        #if DEBUG
         Swift.print("🔍 VALIDATE [1]: Starting validation for \(words.count) words")
+        #endif
 
         // Check word count
         guard [12, 15, 18, 21, 24].contains(words.count) else {
+            #if DEBUG
             Swift.print("❌ VALIDATE: Invalid word count")
+            #endif
             return false
         }
+        #if DEBUG
         Swift.print("🔍 VALIDATE [2]: Word count OK")
+        #endif
 
         // Check all words are in wordlist
+        #if DEBUG
         Swift.print("🔍 VALIDATE [3]: Checking words against wordlist (size: \(Self.wordlist.count))...")
+        #endif
         for (idx, word) in words.enumerated() {
             let lowered = word.lowercased()
             if !Self.wordlist.contains(lowered) {
-                Swift.print("❌ VALIDATE: Word '\(word)' not in wordlist at index \(idx)")
+                // FIX M-005: NEVER log the actual word, not even in DEBUG builds
+                Swift.print("❌ VALIDATE: Word at index \(idx) not in wordlist")
                 return false
             }
         }
+        #if DEBUG
         Swift.print("🔍 VALIDATE [4]: All words found in wordlist")
+        #endif
 
         // Verify checksum
+        #if DEBUG
         Swift.print("🔍 VALIDATE [5]: Converting to entropy...")
+        #endif
         guard let entropy = try? mnemonicToEntropy(words) else {
+            #if DEBUG
             Swift.print("❌ VALIDATE: mnemonicToEntropy failed")
+            #endif
             return false
         }
+        #if DEBUG
         Swift.print("🔍 VALIDATE [6]: Entropy obtained (\(entropy.count) bytes)")
+        #endif
 
         // Recalculate checksum
+        #if DEBUG
         Swift.print("🔍 VALIDATE [7]: Computing checksum...")
+        #endif
         let hash = SHA256.hash(data: entropy)
         let hashData = Data(hash)
         let expectedChecksum = hashData.toBitArray().prefix(words.count / 3)
+        #if DEBUG
         Swift.print("🔍 VALIDATE [8]: Expected checksum computed")
+        #endif
 
         // Get actual checksum from mnemonic
         var bits: [Bool] = []
@@ -136,13 +165,19 @@ final class MnemonicGenerator {
         }
 
         let entropyBitCount = (words.count * 11) - (words.count / 3)
+        #if DEBUG
         Swift.print("🔍 VALIDATE [9]: bits.count=\(bits.count), entropyBitCount=\(entropyBitCount)")
+        #endif
 
         let actualChecksum = bits.suffix(from: entropyBitCount)
+        #if DEBUG
         Swift.print("🔍 VALIDATE [10]: Comparing checksums...")
+        #endif
 
         let result = Array(expectedChecksum) == Array(actualChecksum)
+        #if DEBUG
         Swift.print("🔍 VALIDATE [11]: Result = \(result)")
+        #endif
         return result
     }
 
@@ -215,6 +250,15 @@ final class MnemonicGenerator {
         guard result == kCCSuccess else {
             throw MnemonicError.pbkdfFailed
         }
+
+        // FIX L-004 (partial): mnemonicString and salt are Swift String values — Swift strings
+        // are immutable and their UTF-8 backing buffers are managed by the runtime with no
+        // guaranteed zeroing on deallocation. passwordData and saltData (Data copies) also
+        // cannot be zeroed after the withUnsafeBytes closures complete without unsafe pointer
+        // tricks. This is a known Swift limitation for in-memory secret handling.
+        // Mitigation: derivedKey (the 64-byte seed) is the actual secret passed out; callers
+        // should zero it after use. The mnemonic itself is the root secret and must be
+        // handled in secure memory by the caller (SecureKeyStorage / Secure Enclave).
 
         return derivedKey
     }

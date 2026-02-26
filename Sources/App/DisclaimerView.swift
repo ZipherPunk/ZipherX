@@ -534,6 +534,8 @@ struct DisclaimerView: View {
                 UserDefaults.standard.set(true, forKey: "hasAcceptedDisclaimer")
                 UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "disclaimerAcceptedTimestamp")
                 UserDefaults.standard.set(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0", forKey: "disclaimerAcceptedVersion")
+                // FIX M-016: Persist acceptance in Keychain to prevent bypass via UserDefaults deletion
+                ContentView.saveDisclaimerAcceptedToKeychain()
 
                 withAnimation(.easeInOut(duration: 0.3)) {
                     hasAcceptedDisclaimer = true

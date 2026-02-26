@@ -1008,9 +1008,22 @@ struct ConversationView: View {
             )
             // FIX #1504: Record activity when scrolling/tapping in chat conversation.
             // Resets inactivity timer so lock screen doesn't trigger while user is reading.
+            // FIX L-007: Also catch passive drag-scrolling (no tap, just reading).
+            // simultaneousGesture preserves ScrollView's own scroll handling.
             .onTapGesture {
                 NotificationCenter.default.post(name: .userActivityInSheet, object: nil)
             }
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { _ in
+                        NotificationCenter.default.post(name: .userActivityInSheet, object: nil)
+                    }
+            )
+            // FIX M-007: Blur message content when screen recording or screenshot is active.
+            // The banner overlay is applied separately (.overlay) so it remains visible above the blur.
+            .blur(radius: (showRecordingBanner || showScreenshotBanner) ? 20 : 0)
+            .animation(.easeInOut(duration: 0.3), value: showRecordingBanner)
+            .animation(.easeInOut(duration: 0.3), value: showScreenshotBanner)
 
             Divider()
                 .background(theme.accentColor.opacity(0.2))

@@ -979,11 +979,11 @@ public final class PeerManager: ObservableObject {
         addressLock.unlock()
     }
 
-    /// Check if we should bypass Tor due to Sybil attack
+    /// FIX H-002: NEVER bypass Tor — deanonymization risk outweighs connectivity.
+    /// Old behavior: returned true after 10 Sybil rejections → caused Tor daemon shutdown → clearnet IP exposure.
+    /// New behavior: always returns false. Callers should surface alert to user instead of deanonymizing.
     public func shouldBypassTorForSybil() -> Bool {
-        addressLock.lock()
-        defer { addressLock.unlock() }
-        return consecutiveSybilRejections >= SYBIL_BYPASS_THRESHOLD && connectedPeerCount == 0
+        return false  // FIX H-002: Never bypass Tor for privacy safety
     }
 
     /// Complete Sybil bypass (mark as active)
