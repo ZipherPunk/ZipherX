@@ -1333,7 +1333,7 @@ final class ChatManager: ObservableObject {
                 if let idx = contacts.firstIndex(where: { $0.onionAddress == onionAddress }) {
                     contacts[idx] = updatedContact
                 }
-                self.saveContact(updatedContact)
+                database.saveContact(updatedContact)
                 print("💬 FIX M-001: Captured public key for \(onionAddress.prefix(16))... (Trust On First Use, incoming)")
             }
         }
@@ -1480,7 +1480,7 @@ final class ChatManager: ObservableObject {
                 if let idx = contacts.firstIndex(where: { $0.onionAddress == peerOnion }) {
                     contacts[idx] = updatedContact
                 }
-                self.saveContact(updatedContact)
+                database.saveContact(updatedContact)
                 print("💬 FIX M-001: Captured public key for \(peerOnion.prefix(16))... (Trust On First Use, outgoing)")
             }
         }
