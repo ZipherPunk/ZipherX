@@ -1655,11 +1655,12 @@ final class ChatManager: ObservableObject {
 
                 // FIX #223: Send push notification when not viewing this conversation
                 let senderName = message.nickname ?? contacts.first(where: { $0.onionAddress == message.fromOnion })?.displayName ?? String(message.fromOnion.prefix(8)) + "..."
-                let preview = message.type == .text ? message.content : nil
+                // AUDIT FIX: Never pass plaintext content to notifications — E2E encryption
+                // is undermined if decrypted text appears on lock screen or Notification Center.
                 NotificationManager.shared.notifyChatMessage(
                     from: senderName,
                     type: message.type.rawValue,
-                    preview: preview
+                    preview: nil
                 )
             }
 

@@ -137,7 +137,10 @@ private actor TransactionTrackingState {
 
 /// Timeout helper for async operations
 func withTimeout<T>(seconds: Double, operation: @escaping () async throws -> T) async throws -> T {
-    try await withThrowingTaskGroup(of: T.self) { group in
+    // AUDIT FIX: withThrowingTaskGroup waits for ALL children even after cancelAll().
+    // Per FIX #858 pattern: must throw to exit the group immediately, otherwise the
+    // sleep task blocks return for the full timeout duration on every successful call.
+    let result: T = try await withThrowingTaskGroup(of: T.self) { group in
         group.addTask {
             try await operation()
         }
@@ -145,11 +148,17 @@ func withTimeout<T>(seconds: Double, operation: @escaping () async throws -> T) 
             try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
             throw NetworkError.timeout
         }
-        // Return first result, cancel the other
-        let result = try await group.next()!
+        // First to complete wins
+        guard let result = try await group.next() else {
+            throw NetworkError.timeout
+        }
+        // Cancel remaining child and throw to exit group immediately
         group.cancelAll()
+        // Drain remaining tasks to prevent group from waiting
+        while let _ = try? await group.next() {}
         return result
     }
+    return result
 }
 
 /// Multi-Peer Network Manager for Zclassic

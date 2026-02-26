@@ -170,7 +170,7 @@ struct System7MenuBar: View {
     }
 
     // Timer for logo rotation
-    private let rotationTimer = Timer.publish(every: 0.03, on: .main, in: .common).autoconnect()
+    private let rotationTimer = Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()
 
     var body: some View {
         HStack {
@@ -1106,7 +1106,7 @@ struct CypherpunkSyncView: View {
     @State private var enterButtonMessage: String = ""  // Store button message to prevent re-randomization
 
     // Timer for logo rotation (fast during sync)
-    private let logoRotationTimer = Timer.publish(every: 0.03, on: .main, in: .common).autoconnect()
+    private let logoRotationTimer = Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()
 
     // MARK: - ZClassic History Story (shown during sync)
     // A cypherpunk tale of freedom, forks, and fighting the 20% tax
@@ -1875,7 +1875,7 @@ struct CypherpunkMainView: View {
     // Periodic mempool check for incoming transactions (every 15 seconds)
     private let mempoolCheckTimer = Timer.publish(every: 15, on: .main, in: .common).autoconnect()
     // Logo rotation timer
-    private let logoRotationTimer = Timer.publish(every: 0.03, on: .main, in: .common).autoconnect()
+    private let logoRotationTimer = Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()
 
     // Logo rotation speed: 1.0 = normal, 3.0 = fast (during tx/sync)
     private var currentRotationSpeed: Double {
