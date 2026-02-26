@@ -21,7 +21,7 @@ struct ContentView: View {
     @State private var inactivityTimer: Timer?  // Timer to check inactivity
     @State private var wasInBackground: Bool = false  // FIX #258: Track if we were in background
     // FIX M-016: Disclaimer state in Keychain (not UserDefaults) to prevent bypass on macOS
-    private static func disclaimerAcceptedFromKeychain() -> Bool {
+    static func disclaimerAcceptedFromKeychain() -> Bool {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "com.zipherx.disclaimer",
