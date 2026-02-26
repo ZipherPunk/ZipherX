@@ -80,6 +80,13 @@ final class HeaderStore {
             }
         }
 
+        // AUDIT FIX 5.7: Exclude header DB from iCloud/iTunes backup
+        // Matches WalletDatabase.swift:509 and TempImportDatabase.swift:42
+        var dbURL = URL(fileURLWithPath: dbPath)
+        var resourceValues = URLResourceValues()
+        resourceValues.isExcludedFromBackup = true
+        try? dbURL.setResourceValues(resourceValues)
+
         try createTables()
         print("📂 HeaderStore opened successfully")
     }

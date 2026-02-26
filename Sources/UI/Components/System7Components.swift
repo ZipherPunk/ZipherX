@@ -2818,6 +2818,9 @@ struct CypherpunkMainView: View {
 
 struct MatrixRainBackground: View {
     @State private var columns: [MatrixColumn] = []
+    // AUDIT FIX 3.6: Use Timer.publish instead of leaked Timer.scheduledTimer
+    // SwiftUI manages .onReceive subscription lifecycle — auto-cancelled on view removal
+    private let timer = Timer.publish(every: 0.05, on: .main, in: .common).autoconnect()
 
     var body: some View {
         GeometryReader { geometry in
@@ -2840,7 +2843,15 @@ struct MatrixRainBackground: View {
             }
             .onAppear {
                 setupColumns(in: geometry.size)
-                startAnimation()
+            }
+            .onReceive(timer) { _ in
+                for i in columns.indices {
+                    columns[i].y += columns[i].speed
+                    if columns[i].y > screenHeight + 200 {
+                        columns[i].y = CGFloat.random(in: -300...(-100))
+                        columns[i].characters = generateMatrixChars()
+                    }
+                }
             }
         }
     }
@@ -2872,17 +2883,6 @@ struct MatrixRainBackground: View {
         #endif
     }
 
-    private func startAnimation() {
-        Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in
-            for i in columns.indices {
-                columns[i].y += columns[i].speed
-                if columns[i].y > screenHeight + 200 {
-                    columns[i].y = CGFloat.random(in: -300...(-100))
-                    columns[i].characters = generateMatrixChars()
-                }
-            }
-        }
-    }
 }
 
 struct MatrixColumn: Identifiable {

@@ -3085,9 +3085,13 @@ public final class Peer {
         }
 
         // FIX #1333: Store unsolicited TX hashes for mempool scanner fallback
+        // AUDIT FIX 6.9: Cap array at 1,000 to prevent memory exhaustion from malicious inv flood
         if !txHashes.isEmpty {
             unsolicitedTxLock.lock()
             unsolicitedTxHashes.append(contentsOf: txHashes)
+            if unsolicitedTxHashes.count > 1000 {
+                unsolicitedTxHashes.removeFirst(unsolicitedTxHashes.count - 1000)
+            }
             unsolicitedTxLock.unlock()
             print("🔮 FIX #1333: [\(host)] Unsolicited inv with \(txHashes.count) TX hash(es) — requesting full TX via getdata")
 

@@ -133,6 +133,12 @@ final class DebugLogger {
         backupPreviousLogAndCreateNew()
         isInitialized = true
 
+        // AUDIT FIX 4.9: Exclude log directory from iCloud/iTunes backup
+        var logDirURL = logsDirectory
+        var resourceValues = URLResourceValues()
+        resourceValues.isExcludedFromBackup = true
+        try? logDirURL.setResourceValues(resourceValues)
+
         // Log session start header
         logSessionStart()
     }
