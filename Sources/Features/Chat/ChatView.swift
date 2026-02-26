@@ -904,6 +904,8 @@ struct ConversationView: View {
     @State private var showAttachmentOptions = false
     @State private var showPhotosPicker = false  // FIX #1566: Separate state — PhotosPicker inside Menu doesn't open
     #endif
+    // Voice call coming soon
+    @State private var showCallComingSoon = false
     // FIX #1574: Timer tick to dismiss warmup banner when circuits ready
     @State private var circuitCheckTick: Bool = false
 
@@ -1110,6 +1112,12 @@ struct ConversationView: View {
         } message: {
             Text("\"\(fileTooLargeName)\" exceeds the 2 MB limit.\n\nPlease choose a smaller file.")
         }
+        // Voice call coming soon
+        .alert("Encrypted Voice Calls", isPresented: $showCallComingSoon) {
+            Button("Can't wait!", role: .cancel) {}
+        } message: {
+            Text("Our cypherpunk engineers are still wiring up the audio circuits through Tor onion layers.\n\nEnd-to-end encrypted voice calls over .onion — coming soon to a privacy wallet near you.")
+        }
         // FIX #1540: Voice call overlay — shown when call is active, incoming, or outgoing
         // FIX #1567: ALSO added to ContentView for calls arriving outside chat.
         // This one handles calls while the chat sheet is open (separate modal hierarchy).
@@ -1306,15 +1314,13 @@ struct ConversationView: View {
 
             // Actions
             HStack(spacing: 16) {
-                // FIX #1540: Voice call button
+                // FIX #1540: Voice call button (temporarily disabled — audio engine WIP)
                 Button(action: {
-                    Task {
-                        let _ = await voiceCallManager.startCall(to: contact.onionAddress)
-                    }
+                    showCallComingSoon = true
                 }) {
                     Image(systemName: "phone.fill")
                         .font(.system(size: 18))
-                        .foregroundColor(theme.accentColor)
+                        .foregroundColor(theme.accentColor.opacity(0.5))
                 }
                 .buttonStyle(.plain)
 
@@ -2004,11 +2010,27 @@ struct MessageBubble: View {
                     #if os(macOS)
                     NSWorkspace.shared.activateFileViewerSelecting([url])
                     #else
-                    // iOS: share sheet
-                    let activityVC = UIActivityViewController(activityItems: [url], applicationActivities: nil)
-                    if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-                       let rootVC = windowScene.windows.first?.rootViewController {
-                        rootVC.present(activityVC, animated: true)
+                    // FIX #1591: iOS file open — walk to topmost presented VC.
+                    // Old code used rootViewController directly which fails silently when
+                    // SwiftUI sheets or navigation are presenting on top of root.
+                    print("📎 FIX #1591: Opening file: \(url.lastPathComponent)")
+                    if let windowScene = UIApplication.shared.connectedScenes
+                        .compactMap({ $0 as? UIWindowScene })
+                        .first(where: { $0.activationState == .foregroundActive }),
+                       let rootVC = windowScene.windows.first(where: { $0.isKeyWindow })?.rootViewController {
+                        var topVC = rootVC
+                        while let presented = topVC.presentedViewController {
+                            topVC = presented
+                        }
+                        let activityVC = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+                        // iPad requires popover source or crashes
+                        if let popover = activityVC.popoverPresentationController {
+                            popover.sourceView = topVC.view
+                            popover.sourceRect = CGRect(x: topVC.view.bounds.midX, y: topVC.view.bounds.midY, width: 0, height: 0)
+                        }
+                        topVC.present(activityVC, animated: true)
+                    } else {
+                        print("📎 FIX #1591: Cannot find foreground window scene for file open")
                     }
                     #endif
                 }) {

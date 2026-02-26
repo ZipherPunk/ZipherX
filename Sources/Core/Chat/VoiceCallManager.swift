@@ -657,6 +657,7 @@ final class VoiceCallManager: ObservableObject {
         // FIX #1540: Capture constants locally — audio tap runs on audio thread, NOT MainActor
         let localSampleRate = sampleRate
         let localFrameDurationMs = frameDurationMs
+        let localInputSampleRate = inputFormat.sampleRate
 
         // FIX #1587: Use format:nil — AVAudioEngine uses the node's native output format.
         // This is safe because startAudioCapture() is ONLY called after hwReady=true (iOS)
@@ -664,7 +665,11 @@ final class VoiceCallManager: ObservableObject {
         // Previous attempt to pass non-nil tapFormat crashed when node couldn't convert from 0 Hz.
         print("📞 FIX #1587: Installing tap with format=nil (inputFormat=\(inputFormat))")
         hasTapInstalled = true  // FIX #1573: Track tap installation
-        inputNode.installTap(onBus: 0, bufferSize: AVAudioFrameCount(localSampleRate * Double(localFrameDurationMs) / 1000.0), format: nil) { [weak self] buffer, time in
+        // FIX #1590: bufferSize MUST use native input rate, not target 16kHz.
+        // Old: 16000 * 20/1000 = 320 → iOS delivers 4800 frames (100ms at 48kHz) regardless.
+        // New: 48000 * 20/1000 = 960 → requests correct 20ms at native rate.
+        // iOS may still deliver larger buffers — dynamic converter below handles any size.
+        inputNode.installTap(onBus: 0, bufferSize: AVAudioFrameCount(localInputSampleRate * Double(localFrameDurationMs) / 1000.0), format: nil) { [weak self] buffer, time in
             guard let self = self else { return }
 
             // FIX #1587: Log first audio frame to confirm tap is working
@@ -672,15 +677,20 @@ final class VoiceCallManager: ObservableObject {
                 print("📞 FIX #1587: ✅ First audio frame captured! (frames=\(buffer.frameLength), sr=\(buffer.format.sampleRate), ch=\(buffer.format.channelCount))")
             }
 
-            // FIX #1573: Send every other frame (25fps instead of 50fps) to halve Tor bandwidth.
-            // Combined with Int16 encoding: 640 bytes × 25fps = ~16KB/s vs original ~85KB/s.
+            // FIX #1590: Do NOT skip frames. iOS delivers ~100ms buffers (10fps) due to 48kHz
+            // hardware — skipping every other loses 50% of audio → crackling/choppy voice.
+            // With Int16 encoding, bandwidth is ~32KB/s raw (~44KB/s base64), safely under
+            // Tor's 50-200KB/s practical throughput. (Old FIX #1573 skip was for 20ms/50fps.)
             self.tapCallbackCount += 1
-            if self.tapCallbackCount % 2 == 0 { return }  // Skip even frames
 
             // Convert to target format if needed
             let outputBuffer: AVAudioPCMBuffer
             if let conv = converter {
-                guard let converted = AVAudioPCMBuffer(pcmFormat: captureFormat, frameCapacity: AVAudioFrameCount(localSampleRate * Double(localFrameDurationMs) / 1000.0)) else { return }
+                // FIX #1590: Output capacity MUST match actual input size after rate conversion.
+                // Old: fixed 320 frames (20ms at 16kHz) — but input can be 4800 frames at 48kHz
+                // which converts to 1600 frames at 16kHz. Old buffer held only 20% → 80% audio lost.
+                let outputFrameCount = AVAudioFrameCount(Double(buffer.frameLength) * localSampleRate / buffer.format.sampleRate) + 1
+                guard let converted = AVAudioPCMBuffer(pcmFormat: captureFormat, frameCapacity: outputFrameCount) else { return }
                 var error: NSError?
                 // FIX #1573: Use inputConsumed flag — returning .haveData every time causes
                 // the converter to process the same buffer twice → garbled/zero-length output.
@@ -700,10 +710,10 @@ final class VoiceCallManager: ObservableObject {
                 outputBuffer = buffer
             }
 
-            // FIX #1573: Convert Float32 → Int16 before sending. Halves bandwidth:
-            // Float32: 320 samples × 4 bytes = 1280 bytes → base64 = 1708 bytes → ~85 KB/s
-            // Int16:   320 samples × 2 bytes = 640 bytes  → base64 = 856 bytes  → ~43 KB/s
-            // Tor hidden services have ~50-200 KB/s practical throughput — must stay under.
+            // FIX #1573: Convert Float32 → Int16 before sending. Halves bandwidth.
+            // FIX #1590: With 48kHz→16kHz conversion, each ~100ms tap delivers ~1600 samples.
+            // Int16: 1600 × 2 = 3200 bytes → base64 ≈ 4267 bytes × 10fps ≈ 44 KB/s.
+            // Tor hidden services have ~50-200 KB/s practical throughput — safely under.
             guard let channelData = outputBuffer.floatChannelData?[0] else { return }
             let frameCount = Int(outputBuffer.frameLength)
             var int16Samples = [Int16](repeating: 0, count: frameCount)

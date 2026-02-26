@@ -2650,7 +2650,11 @@ class NodeManagementViewModel: ObservableObject {
             configTxIndex = configDict["txindex"] == "1"
             configListenOnion = configDict["listenonion"] != "0"
             configGen = configDict["gen"] == "1"
-            configDebug = configDict["debug"] == "1"
+            // FIX #1592: debug=mempool, debug=net, debug=tor etc. are ALL valid debug modes.
+            // Old code: == "1" only matched debug=1, treating category-specific logging as OFF.
+            // When user saved, it wrote debug=0 + debuglogfile=0 — destroying both settings.
+            let debugVal = configDict["debug"] ?? "0"
+            configDebug = !debugVal.isEmpty && debugVal != "0"
 
             configHasUnsavedChanges = false
         } catch {
@@ -2663,6 +2667,15 @@ class NodeManagementViewModel: ObservableObject {
     }
 
     func markConfigChanged() {
+        // FIX #1592: Compute debug change value — preserve category if original was "mempool"/"net"/etc.
+        let debugChangeValue: String
+        if configDebug {
+            let orig = originalConfig["debug"] ?? "0"
+            debugChangeValue = (!orig.isEmpty && orig != "0") ? orig : "1"
+        } else {
+            debugChangeValue = "0"
+        }
+
         // Check if any values differ from original
         let currentValues: [String: String] = [
             "port": configPort,
@@ -2676,7 +2689,7 @@ class NodeManagementViewModel: ObservableObject {
             "txindex": configTxIndex ? "1" : "0",
             "listenonion": configListenOnion ? "1" : "0",
             "gen": configGen ? "1" : "0",
-            "debug": configDebug ? "1" : "0"
+            "debug": debugChangeValue
         ]
 
         configHasUnsavedChanges = currentValues.contains { key, value in
@@ -2744,7 +2757,15 @@ class NodeManagementViewModel: ObservableObject {
             updateSetting("txindex", configTxIndex ? "1" : "0")
             updateSetting("listenonion", configListenOnion ? "1" : "0")
             updateSetting("gen", configGen ? "1" : "0")
-            updateSetting("debug", configDebug ? "1" : "0")
+            // FIX #1592: Preserve original debug category (mempool, net, tor, etc.) when toggle stays ON.
+            // Only write "1" (all categories) when user explicitly enables from OFF state.
+            if configDebug {
+                let originalDebugVal = originalConfig["debug"] ?? "0"
+                let hasSpecificCategory = !originalDebugVal.isEmpty && originalDebugVal != "0" && originalDebugVal != "1"
+                updateSetting("debug", hasSpecificCategory ? originalDebugVal : "1")
+            } else {
+                updateSetting("debug", "0")
+            }
             // IMPORTANT: Zclassic requires debuglogfile=1 to actually write to debug.log
             // (disabled by default for privacy in Zclassic source)
             updateSetting("debuglogfile", configDebug ? "1" : "0")

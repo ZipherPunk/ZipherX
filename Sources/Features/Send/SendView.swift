@@ -548,6 +548,30 @@ struct SendView: View {
                 Spacer()
 
                 #if os(iOS)
+                // FIX #1593: Paste button — z-addresses are 78+ chars, paste must work reliably
+                Button(action: {
+                    if let clipboard = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines), !clipboard.isEmpty {
+                        recipientAddress = clipboard
+                    }
+                }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "doc.on.clipboard")
+                            .font(.system(size: 12))
+                        Text("Paste")
+                            .font(theme.captionFont)
+                    }
+                    .foregroundColor(theme.buttonText)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(theme.buttonBackground)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: theme.cornerRadius)
+                            .stroke(theme.borderColor, lineWidth: theme.borderWidth)
+                    )
+                    .cornerRadius(theme.cornerRadius)
+                }
+                .buttonStyle(.plain)
+
                 // QR Code scanner button (iOS only)
                 Button(action: {
                     showQRScanner = true

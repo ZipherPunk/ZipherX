@@ -431,13 +431,25 @@ struct AddTrustedPeerSheet: View {
         NavigationView {
             Form {
                 Section {
-                    TextField("Host (IP or .onion)", text: $host)
-                        .font(.system(.body, design: .monospaced))
-                        .autocapitalization(.none)
-                        .disableAutocorrection(true)
-                        .onChange(of: host) { newValue in
-                            isOnion = newValue.hasSuffix(".onion")
+                    // FIX #1593: Paste button for iOS — reliable clipboard paste
+                    HStack {
+                        TextField("Host (IP or .onion)", text: $host)
+                            .font(.system(.body, design: .monospaced))
+                            .autocapitalization(.none)
+                            .disableAutocorrection(true)
+                            .onChange(of: host) { newValue in
+                                isOnion = newValue.hasSuffix(".onion")
+                            }
+                        Button(action: {
+                            if let clipboard = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines), !clipboard.isEmpty {
+                                host = clipboard
+                            }
+                        }) {
+                            Image(systemName: "doc.on.clipboard")
+                                .foregroundColor(.accentColor)
                         }
+                        .buttonStyle(.plain)
+                    }
 
                     TextField("Port", text: $port)
                         .font(.system(.body, design: .monospaced))

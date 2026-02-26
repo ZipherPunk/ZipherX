@@ -368,10 +368,23 @@ struct AddNodeSheet: View {
         NavigationView {
             Form {
                 Section {
-                    TextField("Address (IP or .onion)", text: $host)
-                        .font(.system(.body, design: .monospaced))
-                        .autocapitalization(.none)
-                        .disableAutocorrection(true)
+                    // FIX #1593: Paste button for iOS — SwiftUI TextField long-press paste
+                    // is unreliable in Form/Sheet context. Explicit button guarantees paste works.
+                    HStack {
+                        TextField("Address (IP or .onion)", text: $host)
+                            .font(.system(.body, design: .monospaced))
+                            .autocapitalization(.none)
+                            .disableAutocorrection(true)
+                        Button(action: {
+                            if let clipboard = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines), !clipboard.isEmpty {
+                                host = clipboard
+                            }
+                        }) {
+                            Image(systemName: "doc.on.clipboard")
+                                .foregroundColor(theme.accentColor)
+                        }
+                        .buttonStyle(.plain)
+                    }
 
                     TextField("Port", text: $port)
                         .font(.system(.body, design: .monospaced))
@@ -547,10 +560,22 @@ struct EditNodeSheet: View {
         NavigationView {
             Form {
                 Section {
-                    TextField("Address", text: $host)
-                        .font(.system(.body, design: .monospaced))
-                        .autocapitalization(.none)
-                        .disableAutocorrection(true)
+                    // FIX #1593: Paste button for iOS
+                    HStack {
+                        TextField("Address", text: $host)
+                            .font(.system(.body, design: .monospaced))
+                            .autocapitalization(.none)
+                            .disableAutocorrection(true)
+                        Button(action: {
+                            if let clipboard = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines), !clipboard.isEmpty {
+                                host = clipboard
+                            }
+                        }) {
+                            Image(systemName: "doc.on.clipboard")
+                                .foregroundColor(.accentColor)
+                        }
+                        .buttonStyle(.plain)
+                    }
 
                     TextField("Port", text: $port)
                         .font(.system(.body, design: .monospaced))
