@@ -1,0 +1,97 @@
+[package]
+name = "zipherx-ffi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "zipherx_ffi"
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+bip0039 = "0.12"
+rand_core = "0.6"
+libc = "0.2"
+blake2b_simd = "1.0"
+hex = "0.4"
+bech32 = "0.9"
+
+# Real Zcash/Sapling cryptography
+# Using local fork with Zclassic Buttercup branch ID support
+zcash_primitives = { path = "../zcash_primitives_zcl" }
+zcash_proofs = { path = "../zcash_proofs_zcl" }
+zcash_address = "0.3"
+zcash_note_encryption = "0.4"
+incrementalmerkletree = "0.5"
+jubjub = "0.10"
+group = "0.13"
+ff = "0.13"
+chacha20poly1305 = "0.10"
+aes-gcm = "0.10"
+rand = "0.8"
+rayon = "1.8"
+sha2 = "0.10"
+sha3 = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dirs = "5.0"
+ureq = { version = "2.9", features = ["json"] }
+base64 = "0.21"
+bls12_381 = "0.8"
+equihash = "0.2"
+# FIX #1329: Re-enable bellman multicore for single-input speed (~0.78s vs 6s without).
+# Multi-input parallel path uses local 1-thread rayon pools to avoid contention.
+bellman = "0.14"
+subtle = "2.5"
+zeroize = { version = "1.7", features = ["derive"] }
+
+# Arti - Rust implementation of Tor for embedded use
+# onion-service-client: connecting to .onion addresses
+# onion-service-service: hosting a .onion hidden service (ZipherX becomes discoverable!)
+# experimental-api: enables launch_onion_service_with_hsid for persistent .onion addresses
+arti-client = { version = "0.37", default-features = false, features = ["tokio", "rustls", "onion-service-client", "onion-service-service", "experimental-api"] }
+tor-rtcompat = { version = "0.37", features = ["tokio", "rustls"] }
+tor-hsservice = "0.37"
+tor-hscrypto = "0.37"
+tor-llcrypto = "0.37"
+tor-cell = "0.37"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+tor-proto = "0.37"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "io-util", "net", "macros", "fs"] }
+once_cell = "1.19"
+url = "2.5"
+futures = "0.3"
+
+# FIX #342: Fast HTTP downloads using reqwest (replaces slow Swift URLSession)
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "stream"] }
+tokio-util = { version = "0.7", features = ["io"] }
+
+# ZSTD decompression for boost files
+zstd = "0.13"
+
+[[bin]]
+name = "verify_tree"
+path = "src/bin/verify_tree.rs"
+
+[[bin]]
+name = "bench_decrypt"
+path = "src/bin/bench_decrypt.rs"
+
+[[bin]]
+name = "verify_balance"
+path = "src/bin/verify_balance.rs"
+
+[[bin]]
+name = "build_tree_from_cmus"
+path = "src/bin/build_tree_from_cmus.rs"
+
+[profile.release]
+lto = true
+# FIX #199: Use opt-level 3 for maximum speed (Groth16 proofs, witness computation)
+# Previous: "z" (size optimization) - ~30% slower for crypto operations
+opt-level = 3
+
+[patch.crates-io]
+# Override all zcash_primitives dependencies to use our local fork with Zclassic Buttercup support
+zcash_primitives = { path = "../zcash_primitives_zcl" }
+# FIX #1326: Local fork with parallel spend proof generation (spend_proof_detached)
+zcash_proofs = { path = "../zcash_proofs_zcl" }

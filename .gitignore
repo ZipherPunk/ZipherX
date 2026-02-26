@@ -1,0 +1,240 @@
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+*.xcworkspace
+!default.xcworkspace
+xcuserdata/
+*.xccheckout
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Rust
+Libraries/zipherx-ffi/target/
+Libraries/librustzcash/target/
+**/*.rs.bk
+Cargo.lock
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# CocoaPods
+Pods/
+Podfile.lock
+
+# Swift Package Manager
+.build/
+Package.resolved
+
+# Sapling parameters (large files)
+*.params
+
+# Sensitive data
+*.p12
+*.mobileprovision
+*.env
+secrets/
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# Test outputs
+*.log
+*.tmp
+Libraries/librustzcash/
+
+# SQLCipher build artifacts (xcframework is kept)
+Libraries/sqlcipher-src/
+Libraries/sqlcipher-build/
+
+# Commitment tree files (now hosted in ZipherX_Boost public repo)
+Resources/commitment_tree.bin
+Resources/commitment_tree.bin.zst
+Resources/commitment_tree_serialized.bin
+Resources/commitment_tree_manifest.json
+
+# Boost cache files (downloaded at runtime, not in repo)
+Resources/BoostCache/*.bin
+Resources/BoostCache/*.bin.zst
+Resources/BoostCache/headers.db
+
+# Large shielded outputs data files (hosted externally)
+Resources/shielded_outputs.bin
+Resources/shielded_outputs.bin.zst
+Resources/shielded_outputs_manifest.json
+Resources/block_timestamps.bin
+Sources/Resources/shielded_outputs.bin
+
+# Build artifacts for FFI and static libraries (not needed in repo - build from source)
+Libraries/zipherx-ffi/libzipherx_ffi_ios.a
+Libraries/libzipherx_ffi.a
+Libraries/ZipherXFFI.xcframework/*/libzipherx_ffi.a
+**/*.xcframework/**/*.a
+
+# Tools directory (private scripts, not for public repo)
+Tools/
+scripts/tools/
+
+# Documentation directories (private analysis, never public)
+docs/
+Docs/
+
+# Claude Code settings and docs (never commit)
+.claude/
+CLAUDE.md
+CLAUDE_FULL_BACKUP.md
+GPT.md
+
+# Private session/debug/analysis docs (never commit)
+SESSION_SUMMARY*.md
+ANCHOR_MISMATCH_ANALYSIS.md
+TRANSACTION_DEBUGGING.md
+COMPACT_BLOCK_IMPLEMENTATION_PLAN.md
+HEADER_SYNC_IMPLEMENTATION_PLAN.md
+QUICK_FIX.md
+ZipherX-iOS-Wallet-Architecture.md
+*_ANALYSIS.md
+*_SUMMARY.md
+*_PROMPT.md
+*_FINDINGS.md
+ESCALATION_*.md
+LOG_ANALYSIS_*.md
+FIX_*.md
+MIGRATION_*.md
+BROADCAST_*.md
+CODEBASE_*.md
+ADDING_PARALLEL*.md
+BOOST_FILE_*.md
+TOR_ISSUES*.md
+TREE_ROOT_*.md
+COMPLETE_FIX*.md
+
+# Security audits (never commit to public repo)
+*AUDIT*.md
+*AUDIT*.html
+SECURITY_AUDIT*.md
+SECURITY_AUDIT*.html
+
+# Claude backup docs
+CLAUDE_BACKUP*.md
+
+# Test/debug scripts (development only, never commit)
+test_*.py
+test_*.sh
+test_*.swift
+test_*.rs
+test_*.cpp
+test_decrypt
+test_decrypt_new
+test_decrypt_rust/
+check_*.py
+check_*.sh
+check_*.swift
+analyze_*.py
+analyze_*.sh
+diagnose_*.py
+verify_*.py
+verify_*.sh
+verify_*.swift
+scan_zclassic_peers*.py
+get_block_headers.py
+encode_key.py
+decode_key.py
+decrypt_key.py
+decrypt_key.swift
+convert_to_bech32.py
+extract_witness_roots.swift
+validate_witnesses.swift
+monitor_*.sh
+watch_*.sh
+prepare_test.sh
+quick_test.sh
+run_all_tests.sh
+scripts/
+
+# Rust FFI test binaries (dev tools, not needed for build)
+Libraries/zipherx-ffi/src/bin/test_*
+Libraries/zipherx-ffi/src/bin/verify_*
+Libraries/zipherx-ffi/verify_*.rs
+Libraries/zipherx-ffi/tt
+Libraries/zipherx-ffi/.cargo/
+Libraries/zipherx-ffi/src/lib.rs.bak
+
+# Test Rust target directories
+test_decrypt_rust/target/
+**/target/
+
+# Local backup and test files (development only)
+*.backup
+*.bak
+validate_anchor.py
+zipherx_wallet.db
+
+# Performance docs (internal)
+PERFORMANCE_*.md
+PERFORMANCE_*.html
+STARTUP_*.md
+
+# Database files (never commit - contain wallet data or are generated at runtime)
+*.db
+!Libraries/**/*.db
+Resources/Binaries/*.db
+
+# External Zclassic node (C++ fork of Zcash/Bitcoin - not ZipherX code)
+zclassic-fork/
+
+# Claude-generated fix documentation (local only)
+ZIPHERX_FIXES_SUMMARY.md
+ZIPHERX_FIXES_SUMMARY.html
+
+# Claude Code Team Manager (private orchestration scripts)
+scripts/claude_team.sh
+scripts/team_orchestrator.py
+scripts/orchestrator_dashboard.py
+scripts/dashboard.html
+logs/
+logs/claude_team/
+logs/orchestrator/
+~/.claude/teams/
+
+# Orchestrator agent output files
+*.agent_output
+.orchestrator_state.json
+
+# Documentation files that should not be public
+DISCLAIMER.md
+Package.swift
+BUG_FIXES.md
+ANALYSIS.md
+
+# Rust FFI debug binaries (contain developer wallet data — NEVER commit)
+Libraries/zipherx-ffi/src/bin/verify_nullifier.rs
+Libraries/zipherx-ffi/src/bin/verify_nullifier_full.rs
+Libraries/zipherx-ffi/src/bin/find_cmu_position.rs
+Libraries/zipherx-ffi/src/bin/export_serialized_tree.rs
+Libraries/zipherx-ffi/src/bin/verify_balance.rs
+Libraries/zipherx-ffi/src/bin/bench_boost_scan.rs
+Libraries/zipherx-ffi/src/bin/bench_decrypt.rs
+Libraries/zipherx-ffi/src/bin/build_tree_from_cmus.rs
+Libraries/zipherx-ffi/src/bin/regenerate_boost_tree.rs
+Libraries/zipherx-ffi/src/bin/serialize_tree.rs
+Libraries/zipherx-ffi/src/bin/verify_tree.rs
+Libraries/zipherx-ffi/src/bin/verify_tree_correct.rs
+Libraries/zipherx-ffi/src/bin/verify_tree_no_reverse.rs
+
+# Tests (development only, not for public repo)
+Tests/
+
+# Zcash proofs library (build artifact)
+Libraries/zcash_proofs_zcl/
