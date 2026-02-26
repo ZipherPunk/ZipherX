@@ -2533,6 +2533,8 @@ Both binaries must be installed to /usr/local/bin:
                 .stroke(theme.textPrimary, lineWidth: 1)
         )
         .onAppear {
+            // FIX #1576: Re-sync toggle state from UserDefaults when view reappears
+            debugLoggingEnabled = DebugLogger.shared.isEnabled
             updateDebugLogSize()
         }
         // FIX #1442: Privacy warning before enabling debug logs

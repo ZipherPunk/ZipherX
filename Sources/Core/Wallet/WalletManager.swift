@@ -545,17 +545,12 @@ final class WalletManager: ObservableObject {
             // Without this, PHASE 2 starts from old lastScannedHeight (e.g., 2989053)
             // instead of boost end (2988797), missing all CMUs in between.
             // The delta bundle won't have CMUs for the skipped range → tree root mismatch!
+            // FIX #1577: Use resetLastScannedHeightToBoostHeight() to bypass FIX #1075 regression guard.
             let currentLastScanned = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
             if currentLastScanned > bundledEndHeight {
                 print("🔧 FIX #737: Resetting lastScannedHeight from \(currentLastScanned) to \(bundledEndHeight)")
                 print("   This ensures PHASE 2 re-scans all blocks from boost end to rebuild delta bundle")
-                // Get block hash from HeaderStore for the boost end height
-                if let header = try? HeaderStore.shared.getHeader(at: bundledEndHeight) {
-                    try? WalletDatabase.shared.updateLastScannedHeight(bundledEndHeight, hash: header.blockHash)
-                } else {
-                    // Fallback: use empty hash if header not available (will be validated on next sync)
-                    try? WalletDatabase.shared.updateLastScannedHeight(bundledEndHeight, hash: Data(count: 32))
-                }
+                try? WalletDatabase.shared.resetLastScannedHeightToBoostHeight(bundledEndHeight)
                 // FIX #737 v2: Set flag to prevent FIX #569 from overwriting the reset
                 self.pendingDeltaRescan = true
                 print("🔧 FIX #737 v2: Set pendingDeltaRescan flag to block FIX #569 height update")
@@ -1679,16 +1674,18 @@ final class WalletManager: ObservableObject {
         DeltaCMUManager.shared.clearDeltaBundle(force: true)
 
         // FIX #737: Reset lastScannedHeight to boost file end for full rescan
+        // FIX #1577: Use resetLastScannedHeightToBoostHeight() to bypass FIX #1075 regression guard.
+        // updateLastScannedHeight() silently blocks regression (height < current), so the reset never
+        // actually wrote to DB → PHASE 2 started from old height → missed all delta CMUs.
         let currentLastScanned = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
         if currentLastScanned > bundledEndHeight {
             print("🔧 FIX #737: Resetting lastScannedHeight from \(currentLastScanned) to \(bundledEndHeight)")
-            if let header = try? HeaderStore.shared.getHeader(at: bundledEndHeight) {
-                try? WalletDatabase.shared.updateLastScannedHeight(bundledEndHeight, hash: header.blockHash)
-            } else {
-                try? WalletDatabase.shared.updateLastScannedHeight(bundledEndHeight, hash: Data(count: 32))
-            }
+            try? WalletDatabase.shared.resetLastScannedHeightToBoostHeight(bundledEndHeight)
             self.pendingDeltaRescan = true
         }
+
+        // FIX #1577: Reset repair attempts counter — delta is starting fresh
+        UserDefaults.standard.set(0, forKey: "DeltaBundleGlobalRepairAttempts")
 
         // FIX #533: Reload FFI tree from boost file
         do {

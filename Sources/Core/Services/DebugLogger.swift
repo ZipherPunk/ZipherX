@@ -94,18 +94,16 @@ final class DebugLogger {
     /// FIX #1376: Debug logging can be disabled by the user from Settings.
     /// When disabled, log file writes are suppressed (console output still works).
     /// FIX #1455: Default to DISABLED on fresh install for privacy (no sensitive data in logs).
-    /// FIX #1594: Always disabled in RELEASE builds (beta/production). No logging overhead.
-    /// User can explicitly enable in Settings for troubleshooting (DEBUG builds only).
+    /// FIX #1576: Respects UserDefaults in all builds — user can enable from Settings for troubleshooting.
     var isEnabled: Bool {
         get {
-            #if !DEBUG
-            return false  // FIX #1594: Always disabled in release/beta builds
-            #else
+            // FIX #1594: Default to DISABLED on fresh install (privacy).
+            // FIX #1576: Removed #if !DEBUG guard — user can explicitly enable from Settings
+            // for troubleshooting in all builds. Default-off handles fresh installs.
             if UserDefaults.standard.object(forKey: "debugLoggingEnabled") == nil {
                 return false  // Fresh install: always off
             }
             return UserDefaults.standard.bool(forKey: "debugLoggingEnabled")
-            #endif
         }
         set {
             UserDefaults.standard.set(newValue, forKey: "debugLoggingEnabled")
