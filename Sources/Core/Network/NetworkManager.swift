@@ -6213,8 +6213,8 @@ public final class NetworkManager: ObservableObject {
         // FIX #837: Internal reject wait reduced from 15s to 2s, so timeouts can be shorter
         // Direct mode: 10s lock + 2s reject = 12s max, so 15s per-peer is enough
         let torEnabled = await TorManager.shared.mode == .enabled
-        let perPeerTimeout: UInt64 = torEnabled ? 45_000_000_000 : 15_000_000_000  // FIX #837: 15s direct, 45s Tor
-        let overallTimeout: UInt64 = torEnabled ? 90_000_000_000 : 30_000_000_000  // FIX #837: 30s direct, 90s Tor
+        let perPeerTimeout: UInt64 = torEnabled ? 30_000_000_000 : 15_000_000_000  // FIX #1575: 15s direct, 30s Tor (was 45s)
+        let overallTimeout: UInt64 = torEnabled ? 45_000_000_000 : 30_000_000_000  // FIX #1575: 30s direct, 45s Tor (was 90s)
         print("📡 FIX #211: Using \(torEnabled ? "TOR" : "DIRECT") timeouts: peer=\(perPeerTimeout/1_000_000_000)s, overall=\(overallTimeout/1_000_000_000)s")
 
         // FIX #1184: Block listeners are KEPT RUNNING during broadcast.
@@ -6598,9 +6598,10 @@ public final class NetworkManager: ObservableObject {
             let fallbackTxId = computedTxId
             group.addTask {
                 // FIX #211: Wait for at least one peer to accept
-                // Tor broadcasts take 30-65 seconds per peer, so wait up to 90s
+                // FIX #1575: Reduced Tor polling from 90s to 30s — first peer broadcasts immediately
+                // (no privacy jitter on peerIndex 0), SOCKS5 relay typically responds within 10-20s.
                 // Direct mode: 10 seconds (100 * 100ms)
-                let maxAttempts = useTorTimeouts ? 900 : 100  // 90s for Tor, 10s for direct
+                let maxAttempts = useTorTimeouts ? 300 : 100  // 30s for Tor (was 90s), 10s for direct
                 var waitAttempts = 0
                 while await state.getTxId() == nil && waitAttempts < maxAttempts {
                     try await Task.sleep(nanoseconds: 100_000_000) // 100ms
@@ -6709,14 +6710,29 @@ public final class NetworkManager: ObservableObject {
                     await MainActor.run {
                         self.setMempoolVerified()
                     }
+                } else if currentSuccessCount >= 3 && rejectCount == 0 {
+                    // FIX #1575: 3+ peers accepted with 0 rejections = strong consensus.
+                    // Skip P2P getdata verification — through Tor, getdata times out at 5s/peer
+                    // causing 20-40s of wasted time (verifyTxViaP2P does 5-10 attempts × 5s each).
+                    // 3 independent ZCL nodes accepting is robust Sybil protection (CONSENSUS_THRESHOLD=3).
+                    // This reduces Tor send from 100+s to ~15-20s.
+                    print("✅ FIX #1575: \(currentSuccessCount) peers accepted, 0 rejections — consensus verified (skipping P2P getdata)")
+                    onProgress?("verify", "✅ Verified by \(currentSuccessCount) peers (consensus)", 1.0)
+                    mempoolVerified = true
+                    await state.setVerified()
+                    await MainActor.run {
+                        self.setMempoolVerified()
+                    }
                 } else if currentSuccessCount >= 2 {
-                    // FIX #515: ALL acceptance counts (2+) require actual P2P getdata verification
-                    // High acceptance counts are promising but NOT proof of mempool inclusion
+                    // FIX #515: 2 accepts (or 3+ with rejections) require P2P getdata verification
+                    // 2 peers could include 1 Sybil attacker — verify TX is actually in mempool
                     print("📡 FIX #515: \(currentSuccessCount) peers accepted - verifying TX is ACTUALLY in mempool...")
                     onProgress?("verify", "Verifying in mempool (\(currentSuccessCount) accepts)...", 0.7)
 
-                    // FIX #515: Do actual P2P getdata verification for ALL acceptance counts
-                    let p2pVerified = await self.verifyTxViaP2P(txid: txId, excludePeers: [], maxAttempts: 5)
+                    // FIX #515: Do actual P2P getdata verification
+                    // FIX #1575: Reduce attempts for Tor (each attempt is 5s through SOCKS5)
+                    let p2pAttempts = useTorTimeouts ? 3 : 5
+                    let p2pVerified = await self.verifyTxViaP2P(txid: txId, excludePeers: [], maxAttempts: p2pAttempts)
                     if p2pVerified {
                         print("✅ FIX #515: TX verified via P2P getdata - found in \(currentSuccessCount) peers' mempools")
                         onProgress?("verify", "✅ Verified in network mempool", 1.0)
@@ -6735,7 +6751,8 @@ public final class NetworkManager: ObservableObject {
                         onProgress?("verify", "Waiting for propagation...", 0.8)
                         try? await Task.sleep(nanoseconds: 5_000_000_000)
 
-                        let retryVerified = await self.verifyTxViaP2P(txid: txId, excludePeers: [], maxAttempts: 10)
+                        let retryAttempts = useTorTimeouts ? 5 : 10
+                        let retryVerified = await self.verifyTxViaP2P(txid: txId, excludePeers: [], maxAttempts: retryAttempts)
                         if retryVerified {
                             print("✅ FIX #515: TX verified on retry after propagation delay")
                             onProgress?("verify", "✅ Transaction verified in network", 1.0)
@@ -6770,7 +6787,9 @@ public final class NetworkManager: ObservableObject {
                     onProgress?("verify", "Verifying with additional peers...", 0.7)
 
                     // Try to verify TX exists via P2P getdata from connected peers
-                    let p2pVerified = await self.verifyTxViaP2P(txid: txId, excludePeers: [], maxAttempts: 3)
+                    // FIX #1575: Reduce attempts for Tor (each is 5s through SOCKS5)
+                    let singleAcceptAttempts = useTorTimeouts ? 2 : 3
+                    let p2pVerified = await self.verifyTxViaP2P(txid: txId, excludePeers: [], maxAttempts: singleAcceptAttempts)
                     if p2pVerified {
                         print("✅ FIX #247: TX verified via P2P getdata")
                         onProgress?("verify", "✅ Verified via P2P", 1.0)
@@ -6792,10 +6811,12 @@ public final class NetworkManager: ObservableObject {
                         print("⚠️ FIX #389: 1 peer accepted but TX not found in mempool - retrying verification...")
                         onProgress?("verify", "Waiting for network propagation...", 0.8)
 
-                        // FIX #389: Wait 3 seconds for TX to propagate, then retry P2P verification
-                        try? await Task.sleep(nanoseconds: 3_000_000_000)
+                        // FIX #389: Wait for TX to propagate, then retry P2P verification
+                        // FIX #1575: 2s for Tor (was 3s) — SOCKS5 adds its own latency
+                        try? await Task.sleep(nanoseconds: UInt64(useTorTimeouts ? 2_000_000_000 : 3_000_000_000))
 
-                        let retryP2PVerified = await self.verifyTxViaP2P(txid: txId, excludePeers: [], maxAttempts: 5)
+                        let retryAttempts1 = useTorTimeouts ? 3 : 5
+                        let retryP2PVerified = await self.verifyTxViaP2P(txid: txId, excludePeers: [], maxAttempts: retryAttempts1)
                         if retryP2PVerified {
                             print("✅ FIX #389: TX verified on retry after propagation delay")
                             onProgress?("verify", "✅ Transaction verified in network", 1.0)
