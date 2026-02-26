@@ -2307,6 +2307,15 @@ final class FilterScanner {
                 print("✅ FIX #524: Tree root mismatch repaired - witnesses updated")
             } else {
                 print("⚠️ FIX #524: Could not repair tree root mismatch - may need full rescan")
+                // FIX #1573: Trigger background gap-fill to fix corrupted delta CMUs
+                // Gap-fill with FIX #1572 byte-level replacement will correct corrupted CMU bytes
+                let isGapFilling = await WalletManager.shared.isGapFillingDelta
+                if !isGapFilling {
+                    print("🔄 FIX #1573: Triggering background gap-fill from FIX #524 repair failure")
+                    Task {
+                        await WalletManager.shared.triggerGapFillFromScan()
+                    }
+                }
                 // FIX #1238: Check if repair was exhausted — tree state is CORRUPTED
                 // When TreeRepairExhausted is true, the FFI tree has wrong root because delta
                 // CMUs are incomplete. ANY witnesses created from this tree will have anchors

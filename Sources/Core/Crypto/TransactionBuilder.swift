@@ -2112,6 +2112,11 @@ final class TransactionBuilder {
             print("🚨 FIX #1279: Witness anchor \(rootHex.prefix(16))... NOT FOUND in HeaderStore!")
             print("🚨 FIX #1279: Witnesses were created from incomplete/corrupted tree — REJECTING ALL")
             print("🚨 FIX #1279: This prevents phantom witnesses from being saved to database")
+            // FIX #1574: Set exhausted flag so callers don't immediately retry in a tight loop.
+            // Without this: FIX #1082 → FIX #1027 → rebuildWitnessesForNotes → reject → repeat (41s loop).
+            // Cleared when gap-fill succeeds or Full Rescan completes.
+            UserDefaults.standard.set(true, forKey: "TreeRepairExhausted")
+            print("🛑 FIX #1574: Blocking witness rebuilds until tree root is repaired")
             throw TransactionError.anchorNotOnChain
         }
         print("✅ FIX #1226: Witness anchor verified in HeaderStore")

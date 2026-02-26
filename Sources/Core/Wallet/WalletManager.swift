@@ -1643,7 +1643,16 @@ final class WalletManager: ObservableObject {
                 print("   Blockchain root:  \(blockchainRootHex.prefix(32))...")
                 print("   Delta: \(existingCount) → \(newTotalCount) outputs (gained \(gained))")
 
-                if gained > 0 {
+                // FIX #1573: Track global repair attempts — force-clear after 3 failed gap-fills
+                let attempts = UserDefaults.standard.integer(forKey: "DeltaBundleGlobalRepairAttempts") + 1
+                UserDefaults.standard.set(attempts, forKey: "DeltaBundleGlobalRepairAttempts")
+                print("   FIX #1573: Gap-fill attempt \(attempts)/3")
+
+                if attempts >= 3 {
+                    // FIX #1573: Exhausted all attempts — force-clear delta and rebuild from scratch
+                    print("🚨 FIX #1573: 3 failed gap-fill attempts — force-clearing delta for full rebuild")
+                    await fallbackClearDelta(bundledEndHeight: bundledEndHeight)
+                } else if gained > 0 {
                     // Made progress — save and retry next startup
                     print("   Made progress (+\(gained) CMUs) — saving and will retry next startup")
                     DeltaCMUManager.shared.updateManifestTreeRoot(treeRoot)
@@ -1666,7 +1675,8 @@ final class WalletManager: ObservableObject {
     /// FIX #1220: Fallback to original behavior when gap-fill can't help (truly corrupt delta)
     private func fallbackClearDelta(bundledEndHeight: UInt64) async {
         print("🔄 FIX #1220: Falling back to clear delta + reload boost tree")
-        DeltaCMUManager.shared.clearDeltaBundle()
+        // FIX #1573: Use force:true to guarantee clear even if DeltaBundleVerified is stuck true from a race
+        DeltaCMUManager.shared.clearDeltaBundle(force: true)
 
         // FIX #737: Reset lastScannedHeight to boost file end for full rescan
         let currentLastScanned = (try? WalletDatabase.shared.getLastScannedHeight()) ?? 0
@@ -1695,6 +1705,17 @@ final class WalletManager: ObservableObject {
         } catch {
             print("⚠️ FIX #533: Failed to reload tree: \(error)")
         }
+    }
+
+    /// FIX #1573: Public entry point for gap-fill triggered from FIX #524 scan repair failure.
+    /// Fetches manifest and bundledEndHeight internally so FilterScanner doesn't need private access.
+    func triggerGapFillFromScan() async {
+        guard let manifest = DeltaCMUManager.shared.getManifest() else {
+            print("⚠️ FIX #1573: No delta manifest — cannot gap-fill")
+            return
+        }
+        let bundledEndHeight = UInt64(ZipherXConstants.effectiveTreeHeight)
+        await gapFillDeltaBundle(manifest: manifest, bundledEndHeight: bundledEndHeight)
     }
 
     /// Pre-initialize the Groth16 prover for faster transactions
@@ -6868,6 +6889,14 @@ final class WalletManager: ObservableObject {
                             try? WalletDatabase.shared.clearWitnessesForCorruptedTree()
                             print("🚨 FIX #1279: Cleared ALL witnesses — phantom tree anchor")
                         }
+
+                        // FIX #1574: Set TreeRepairExhausted to break infinite witness rebuild loop.
+                        // Without this: FIX #1082 detects NULL witnesses → triggers preRebuildWitnesses
+                        // → FIX #1027 rebuilds (41s) → FIX #1279 rejects → repeat forever.
+                        // TreeRepairExhausted blocks futile witness rebuilds. Cleared when gap-fill
+                        // succeeds or Full Rescan completes. Balance still visible via getTotalUnspentBalance().
+                        UserDefaults.standard.set(true, forKey: "TreeRepairExhausted")
+                        print("🛑 FIX #1574: Tree root corrupt — blocking witness rebuilds until gap-fill/rescan fixes tree")
                     }
                 }
 

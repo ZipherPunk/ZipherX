@@ -412,7 +412,8 @@ class DeltaCMUManager {
                 var startHeight: UInt64
 
                 // FIX #784: Track existing (height, index) keys to detect duplicates
-                var existingKeys = Set<String>()
+                // FIX #1572: Use dictionary to enable byte-level CMU comparison and replacement
+                var existingKeyIndex: [String: Int] = [:]
 
                 // Load existing data if file exists
                 if FileManager.default.fileExists(atPath: deltaFileURL.path),
@@ -420,14 +421,15 @@ class DeltaCMUManager {
                    let manifest = getManifest() {
                     startHeight = manifest.startHeight
 
-                    // FIX #784: Parse existing outputs and build key set
+                    // FIX #784: Parse existing outputs and build key→index map
                     let outputCount = existingData.count / Self.OUTPUT_SIZE
                     for i in 0..<outputCount {
                         let offset = i * Self.OUTPUT_SIZE
                         if let output = DeltaOutput.parse(from: existingData, at: offset) {
+                            let idx = existingOutputs.count
                             existingOutputs.append(output)
                             let key = "\(output.height)_\(output.index)"
-                            existingKeys.insert(key)
+                            existingKeyIndex[key] = idx
                         }
                     }
                 } else {
@@ -437,20 +439,34 @@ class DeltaCMUManager {
                 }
 
                 // FIX #784: Filter out duplicates from new outputs
+                // FIX #1572: Compare CMU bytes — if same key but different CMU, REPLACE with fresh P2P data
                 var duplicateCount = 0
+                var replacedCount = 0
                 var newUniqueOutputs: [DeltaOutput] = []
                 for output in outputs {
                     let key = "\(output.height)_\(output.index)"
-                    if existingKeys.contains(key) {
-                        duplicateCount += 1
+                    if let existingIdx = existingKeyIndex[key] {
+                        // FIX #1572: Same (height, index) — compare CMU bytes (32 bytes)
+                        let existingCMU = existingOutputs[existingIdx].cmu
+                        if existingCMU != output.cmu {
+                            // CMU bytes differ — existing is corrupted, replace with fresh P2P data
+                            existingOutputs[existingIdx] = output
+                            replacedCount += 1
+                        } else {
+                            duplicateCount += 1
+                        }
                     } else {
+                        let idx = existingOutputs.count + newUniqueOutputs.count
                         newUniqueOutputs.append(output)
-                        existingKeys.insert(key)  // Track so we don't add the same output twice from new batch
+                        existingKeyIndex[key] = idx  // Track so we don't add the same output twice from new batch
                     }
                 }
 
                 if duplicateCount > 0 {
                     print("🔧 FIX #784: Filtered \(duplicateCount) duplicate CMUs (prevented tree root mismatch)")
+                }
+                if replacedCount > 0 {
+                    print("🔧 FIX #1572: Replaced \(replacedCount) corrupted CMUs (byte mismatch at same height_index)")
                 }
 
                 // Rebuild file data with existing + new unique outputs
