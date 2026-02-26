@@ -125,6 +125,8 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.zipherpunk.zipherx.mac
         INFOPLIST_FILE: Info-macOS.plist
         CODE_SIGN_ENTITLEMENTS: ZipherXMac.entitlements
+        # Hardened Runtime required for notarization
+        ENABLE_HARDENED_RUNTIME: true
         # Bridging header for Rust FFI
         SWIFT_OBJC_BRIDGING_HEADER: Sources/ZipherX-Bridging-Header.h
         # Use SQLCipher headers instead of system sqlite3
@@ -148,8 +150,11 @@ targets:
       properties:
         com.apple.security.app-sandbox: false
         com.apple.security.network.client: true
+        com.apple.security.network.server: true
         com.apple.security.device.audio-input: true
         com.apple.security.files.user-selected.read-write: true
+        com.apple.security.cs.allow-unsigned-executable-memory: true
+        com.apple.security.cs.disable-library-validation: true
         keychain-access-groups:
           - $(AppIdentifierPrefix)com.zipherpunk.zipherx.mac
 
