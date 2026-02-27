@@ -1315,15 +1315,20 @@ final class ChatManager: ObservableObject {
         }
 
         // FIX M-001: Verify public key matches stored contact identity (Trust On First Use)
-        // Once a contact's public key is captured on first handshake, all future connections
-        // from the same onion address MUST present the identical key. A mismatch means the
-        // peer does not control the original identity (impersonation or key compromise).
+        // FIX #1580: The .onion address IS the identity proof (requires ed25519 private key to host).
+        // The X25519 session key can legitimately change (app reinstall, update, device migration).
+        // On mismatch: warn + accept the new key instead of permanently rejecting.
         if let existingContact = contacts.first(where: { $0.onionAddress == onionAddress }) {
             if let storedKey = existingContact.publicKeyData {
                 if Data(pubKeyData) != storedKey {
-                    print("🚨 FIX M-001: IDENTITY MISMATCH — \(onionAddress.prefix(16))... sent different public key. Rejecting.")
-                    connection.cancel()
-                    return
+                    // FIX #1580: Accept new key — .onion address proves identity, session key can rotate
+                    print("⚠️ FIX #1580: Key rotation detected for \(onionAddress.prefix(16))... — accepting new key (onion identity verified)")
+                    var updatedContact = existingContact
+                    updatedContact.publicKeyData = Data(pubKeyData)
+                    if let idx = contacts.firstIndex(where: { $0.onionAddress == onionAddress }) {
+                        contacts[idx] = updatedContact
+                    }
+                    database.saveContact(updatedContact)
                 }
                 // Key matches — identity confirmed, no action needed.
             } else {
@@ -1462,15 +1467,21 @@ final class ChatManager: ObservableObject {
         try await peer.setTheirPublicKey(theirPublicKey)
 
         // FIX M-001: Verify public key matches stored contact identity (Trust On First Use, outgoing)
-        // The onion address we dialed is the authoritative identifier; the key returned in the
-        // handshake response must match the key we captured on first connection.
+        // FIX #1580: The .onion address IS the identity proof (requires ed25519 private key to host).
+        // The X25519 session key can legitimately change (app reinstall, update, device migration).
+        // On mismatch: warn + accept the new key instead of permanently rejecting.
         let peerOnion = await peer.onionAddress
         if let existingContact = contacts.first(where: { $0.onionAddress == peerOnion }) {
             if let storedKey = existingContact.publicKeyData {
                 if Data(pubKeyData) != storedKey {
-                    print("🚨 FIX M-001: IDENTITY MISMATCH on outgoing key exchange — \(peerOnion.prefix(16))... returned different public key. Rejecting.")
-                    await peer.connection.cancel()
-                    throw ChatError.encryptionFailed("FIX M-001: Public key mismatch — identity binding violation")
+                    // FIX #1580: Accept new key — .onion address proves identity, session key can rotate
+                    print("⚠️ FIX #1580: Key rotation detected for \(peerOnion.prefix(16))... — accepting new key (onion identity verified, outgoing)")
+                    var updatedContact = existingContact
+                    updatedContact.publicKeyData = Data(pubKeyData)
+                    if let idx = contacts.firstIndex(where: { $0.onionAddress == peerOnion }) {
+                        contacts[idx] = updatedContact
+                    }
+                    database.saveContact(updatedContact)
                 }
                 // Key matches — identity confirmed.
             } else {

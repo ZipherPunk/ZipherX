@@ -605,6 +605,13 @@ public final class NetworkManager: ObservableObject {
                 return
             }
 
+            // FIX #1581: Don't race with reconnectAfterBackground() — it has retry loop + Tor wait
+            if isRecoveringFromBackground {
+                print("⏳ FIX #1581: 0 peers but background recovery in progress — suppressing FIX #1077")
+                blockFeatures([.send, .receive, .chat], reason: "Reconnecting to network...")
+                return
+            }
+
             // FIX #1077: AUTO-HANDLE connection loss - trigger reconnection automatically!
             // User said: "app must handle automatically all errors, inform the user but must handle automatically without users actions"
             print("🔄 FIX #1077: 0 active peers - AUTO-triggering reconnection (no user action needed)")
@@ -3270,9 +3277,18 @@ public final class NetworkManager: ObservableObject {
     /// FIX #258: Force reconnect after iOS background/foreground transition
     /// iOS suspends/kills all network connections when backgrounded - sockets become dead
     /// When returning to foreground, we need to clear stale state and reconnect fresh
+    /// FIX #1581: Flag to suppress concurrent FIX #268 / FIX #1077 during background recovery
+    private var isRecoveringFromBackground = false
+
     func reconnectAfterBackground() async {
         print("🔄 FIX #258: Reconnecting after background - iOS killed all sockets")
         debugLog(.network, "🔄 FIX #258: Reconnecting after iOS background - clearing stale connections")
+
+        // FIX #1581: Suppress concurrent reconnection attempts (FIX #268, FIX #1077, header sync)
+        // They all fire at the same moment on foreground and race for connect(). Only FIX #258
+        // should handle post-background recovery — it waits for Tor and retries on failure.
+        isRecoveringFromBackground = true
+        defer { isRecoveringFromBackground = false }
 
         // 1. Stop keepalive timer temporarily (will restart after connect)
         await MainActor.run {
@@ -3388,15 +3404,39 @@ public final class NetworkManager: ObservableObject {
                 }
             }
 
-            do {
-                try await connect()
-                print("✅ FIX #258: Reconnected after background - \(peers.count) peers")
-            } catch {
-                print("❌ FIX #258: Failed to reconnect: \(error.localizedDescription)")
+            // FIX #1581: Force-clear isConnecting before our attempt.
+            // Race condition: FIX #268 / FIX #1077 / header sync may have already called connect()
+            // and set isConnecting=true. Their connections will timeout (Tor circuits still warming
+            // after iOS background). Without this reset, our connect() hits the guard and returns
+            // immediately with 0 peers — permanently stuck.
+            isConnecting = false
+
+            // FIX #1581: Retry loop — first attempt may fail if Tor circuits are still warming.
+            // iOS kills all sockets in background; Arti reports "connected" (stale cache) but
+            // circuits need 5-15s to rebuild. Retry gives circuits time to establish.
+            for attempt in 1...3 {
+                do {
+                    try await connect()
+                } catch {
+                    print("⚠️ FIX #1581: connect() attempt \(attempt) threw: \(error.localizedDescription)")
+                }
+                let readyCount = peers.filter { $0.isConnectionReady }.count
+                if readyCount >= CONSENSUS_THRESHOLD {
+                    print("✅ FIX #258: Reconnected after background - \(readyCount) peers (attempt \(attempt))")
+                    break
+                }
+                if attempt < 3 {
+                    print("⚠️ FIX #1581: Only \(readyCount) peers after attempt \(attempt)/3 — retrying in 5s...")
+                    try? await Task.sleep(nanoseconds: 5_000_000_000) // 5s for Tor circuits to warm
+                    isConnecting = false  // Reset for next attempt
+                } else {
+                    print("⚠️ FIX #1581: Only \(readyCount) peers after 3 attempts — peer recovery will continue in background")
+                }
             }
         } else {
             // Tor disabled — just wait for iOS networking to stabilize
             try? await Task.sleep(nanoseconds: 500_000_000)
+            isConnecting = false  // FIX #1581: Clear stale lock from concurrent callers
             do {
                 try await connect()
                 print("✅ FIX #258: Reconnected after background - \(peers.count) peers")
@@ -9038,6 +9078,8 @@ public final class NetworkManager: ObservableObject {
 
     /// Check if peers need recovery and trigger reconnection if needed
     private func checkPeerRecovery() {
+        // FIX #1581: Don't race with reconnectAfterBackground() — it owns post-background recovery
+        if isRecoveringFromBackground { return }
         // FIX #1273: Don't attempt peer recovery before authentication
         if !BiometricAuthManager.shared.hasAuthenticatedThisSession {
             return
@@ -9703,6 +9745,12 @@ public final class NetworkManager: ObservableObject {
                 debugLog(.network, "📶 FIX #268: Ignoring path change - within \(PATH_CHANGE_DEBOUNCE)s debounce window")
                 return
             }
+        }
+
+        // FIX #1581: Don't race with reconnectAfterBackground() — it handles post-background recovery
+        if isRecoveringFromBackground {
+            debugLog(.network, "📶 FIX #1581: Suppressing path change — background recovery in progress")
+            return
         }
 
         // Update debounce timestamp

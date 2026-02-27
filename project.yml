@@ -35,7 +35,7 @@ targets:
       path: Info.plist
       properties:
         CFBundleDisplayName: ZipherX
-        CFBundleShortVersionString: "4.2.1"
+        CFBundleShortVersionString: "4.2.2"
         CFBundleVersion: "1"
         UILaunchScreen:
           UIColorName: LaunchScreenColor
@@ -111,7 +111,7 @@ targets:
       path: Info-macOS.plist
       properties:
         CFBundleDisplayName: ZipherX
-        CFBundleShortVersionString: "4.2.1"
+        CFBundleShortVersionString: "4.2.2"
         CFBundleVersion: "1"
         CFBundleName: ZipherX
         LSMinimumSystemVersion: "12.0"
