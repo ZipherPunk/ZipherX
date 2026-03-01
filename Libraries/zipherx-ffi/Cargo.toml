@@ -5,7 +5,7 @@ edition = "2021"
 
 [lib]
 name = "zipherx_ffi"
-crate-type = ["staticlib", "cdylib"]
+crate-type = ["staticlib", "cdylib", "lib"]
 
 [dependencies]
 bip0039 = "0.12"
@@ -83,6 +83,9 @@ path = "src/bin/verify_balance.rs"
 [[bin]]
 name = "build_tree_from_cmus"
 path = "src/bin/build_tree_from_cmus.rs"
+
+[dev-dependencies]
+serial_test = "3.0"
 
 [profile.release]
 lto = true
