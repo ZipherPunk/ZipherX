@@ -8618,3 +8618,231 @@ pub extern "C" fn zipherx_free_buffer(ptr: *mut u8) {
         unsafe { libc::free(ptr as *mut libc::c_void) };
     }
 }
+
+// =============================================================================
+// Test Suite — Internal Helper Tests
+// =============================================================================
+//
+// Tests for pub(crate)/private functions that can't be tested from integration
+// tests in tests/ directory. Run via `cargo test`.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ═══════════════════════════════════════════════════════════
+    // FIX #730: reverse_cmu_display_to_wire is identity
+    // ═══════════════════════════════════════════════════════════
+
+    #[test]
+    fn reverse_cmu_is_identity() {
+        let input = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                     17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32];
+        let output = reverse_cmu_display_to_wire(&input);
+        assert_eq!(input, output, "FIX #730: reverse_cmu must be identity (no reversal)");
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // safe_array
+    // ═══════════════════════════════════════════════════════════
+
+    #[test]
+    fn safe_array_correct_size() {
+        let slice = [1u8, 2, 3, 4];
+        let result: Option<[u8; 4]> = safe_array(&slice);
+        assert_eq!(result, Some([1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn safe_array_wrong_size() {
+        let slice = [1u8, 2, 3];
+        let result: Option<[u8; 4]> = safe_array(&slice);
+        assert!(result.is_none(), "Wrong size must return None");
+    }
+
+    #[test]
+    fn safe_array_empty() {
+        let slice: &[u8] = &[];
+        let result: Option<[u8; 0]> = safe_array(slice);
+        assert_eq!(result, Some([]));
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // safe_slice
+    // ═══════════════════════════════════════════════════════════
+
+    #[test]
+    fn safe_slice_null_pointer() {
+        unsafe {
+            let result = safe_slice::<u8>(std::ptr::null(), 10);
+            assert!(result.is_none(), "Null pointer must return None");
+        }
+    }
+
+    #[test]
+    fn safe_slice_valid() {
+        let data = [1u8, 2, 3, 4];
+        unsafe {
+            let result = safe_slice(data.as_ptr(), 4);
+            assert!(result.is_some());
+            assert_eq!(result.unwrap(), &[1, 2, 3, 4]);
+        }
+    }
+
+    #[test]
+    fn safe_slice_zero_length() {
+        let data = [1u8; 4];
+        unsafe {
+            let result = safe_slice(data.as_ptr(), 0);
+            assert!(result.is_some());
+            assert_eq!(result.unwrap().len(), 0);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // FFI Error Codes
+    // ═══════════════════════════════════════════════════════════
+
+    #[test]
+    fn ffi_error_codes_correct() {
+        assert_eq!(FFI_SUCCESS, 1);
+        assert!(FFI_ERROR_NULL_POINTER < 0);
+        assert!(FFI_ERROR_INVALID_LENGTH < 0);
+        assert!(FFI_ERROR_OVERFLOW < 0);
+        assert!(FFI_ERROR_LOCK_FAILED < 0);
+        assert!(FFI_ERROR_PANIC < 0);
+        assert!(FFI_ERROR_INVALID_DATA < 0);
+        assert!(FFI_ERROR_BUFFER_TOO_SMALL < 0);
+        assert!(FFI_ERROR_CRYPTO_FAILED < 0);
+        assert!(FFI_ERROR_TREE_CORRUPTED < 0);
+        assert!(FFI_ERROR_WITNESS_FAILED < 0);
+    }
+
+    #[test]
+    fn ffi_error_codes_unique() {
+        let codes = [
+            FFI_ERROR_NULL_POINTER, FFI_ERROR_INVALID_LENGTH, FFI_ERROR_OVERFLOW,
+            FFI_ERROR_LOCK_FAILED, FFI_ERROR_PANIC, FFI_ERROR_INVALID_DATA,
+            FFI_ERROR_BUFFER_TOO_SMALL, FFI_ERROR_CRYPTO_FAILED,
+            FFI_ERROR_TREE_CORRUPTED, FFI_ERROR_WITNESS_FAILED,
+        ];
+        for (i, &a) in codes.iter().enumerate() {
+            for (j, &b) in codes.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "Error codes must be unique: index {} and {} both = {}", i, j, a);
+                }
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // ZclassicNetwork Parameters
+    // ═══════════════════════════════════════════════════════════
+
+    #[test]
+    fn zclassic_coin_type() {
+        let net = ZclassicNetwork;
+        assert_eq!(net.coin_type(), 147, "Zclassic coin type must be 147");
+    }
+
+    #[test]
+    fn zclassic_hrp_payment_address() {
+        let net = ZclassicNetwork;
+        assert_eq!(net.hrp_sapling_payment_address(), "zs");
+    }
+
+    #[test]
+    fn zclassic_hrp_spending_key() {
+        let net = ZclassicNetwork;
+        assert_eq!(net.hrp_sapling_extended_spending_key(), "secret-extended-key-main");
+    }
+
+    #[test]
+    fn zclassic_pubkey_prefix() {
+        let net = ZclassicNetwork;
+        assert_eq!(net.b58_pubkey_address_prefix(), [0x1C, 0xB8]);
+    }
+
+    #[test]
+    fn zclassic_sapling_activation() {
+        let net = ZclassicNetwork;
+        assert_eq!(
+            net.activation_height(NetworkUpgrade::Sapling),
+            Some(BlockHeight::from_u32(476969))
+        );
+    }
+
+    #[test]
+    fn zclassic_buttercup_activation() {
+        let net = ZclassicNetwork;
+        assert_eq!(
+            net.activation_height(NetworkUpgrade::ZclassicButtercup),
+            Some(BlockHeight::from_u32(707000))
+        );
+    }
+
+    #[test]
+    fn zclassic_blossom_not_activated() {
+        let net = ZclassicNetwork;
+        assert_eq!(
+            net.activation_height(NetworkUpgrade::Blossom),
+            None,
+            "Blossom is Zcash-only, must be None for Zclassic"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // secure_zero
+    // ═══════════════════════════════════════════════════════════
+
+    #[test]
+    fn secure_zero_clears_data() {
+        let mut data = [1u8, 2, 3, 4, 5];
+        secure_zero(&mut data);
+        assert_eq!(data, [0, 0, 0, 0, 0], "secure_zero must clear all bytes");
+    }
+
+    #[test]
+    fn secure_zero_empty_slice() {
+        let mut data: [u8; 0] = [];
+        secure_zero(&mut data); // Must not panic
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Constants
+    // ═══════════════════════════════════════════════════════════
+
+    #[test]
+    fn max_delta_cmus_constant() {
+        assert_eq!(MAX_DELTA_CMUS, 200_000);
+    }
+
+    #[test]
+    fn sapling_tree_depth_constant() {
+        assert_eq!(SAPLING_COMMITMENT_TREE_DEPTH, 32);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // redact_amount macro
+    // ═══════════════════════════════════════════════════════════
+
+    #[test]
+    fn redact_amount_large() {
+        assert_eq!(redact_amount!(200_000_000u64), "~2 ZCL");
+    }
+
+    #[test]
+    fn redact_amount_medium() {
+        assert_eq!(redact_amount!(15_000_000u64), "~0.X ZCL");
+    }
+
+    #[test]
+    fn redact_amount_small() {
+        assert_eq!(redact_amount!(1_500_000u64), "~0.0X ZCL");
+    }
+
+    #[test]
+    fn redact_amount_dust() {
+        assert_eq!(redact_amount!(50_000u64), "~dust ZCL");
+    }
+}
