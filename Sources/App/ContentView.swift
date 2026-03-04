@@ -2954,7 +2954,10 @@ struct ContentView: View {
         #if os(iOS)
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.userDidTakeScreenshotNotification)) { _ in
             recordUserActivity()
-            if screenshotProtectionEnabled {
+            // FIX #1618b: Skip alert during mnemonic backup — the parent .alert
+            // dismisses the child .sheet (iOS only allows one modal), destroying
+            // the seed phrase display. User NEEDS to screenshot their backup.
+            if screenshotProtectionEnabled && !walletManager.isMnemonicBackupPending {
                 showScreenshotWarning = true
             }
         }
