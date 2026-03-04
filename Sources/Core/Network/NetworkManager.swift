@@ -9619,9 +9619,14 @@ public final class NetworkManager: ObservableObject {
     static func isCellularNetwork() async -> Bool {
         await withCheckedContinuation { continuation in
             let monitor = NWPathMonitor()
+            // NWPathMonitor can fire multiple times before cancel() takes effect.
+            // CheckedContinuation crashes if resumed twice — guard with flag.
+            var resumed = false
             monitor.pathUpdateHandler = { path in
-                continuation.resume(returning: path.isExpensive)
+                guard !resumed else { return }
+                resumed = true
                 monitor.cancel()
+                continuation.resume(returning: path.isExpensive)
             }
             monitor.start(queue: DispatchQueue.global(qos: .userInitiated))
         }
