@@ -2978,7 +2978,9 @@ struct ContentView: View {
         }
         #if os(macOS)
         .onAppear {
-            if screenshotProtectionEnabled {
+            // FIX #1618: Skip screenshot blocking during mnemonic backup — user MUST be able
+            // to screenshot their seed phrase. sharingType = .none blocks ALL screen capture.
+            if screenshotProtectionEnabled && !walletManager.isMnemonicBackupPending {
                 DispatchQueue.main.async {
                     for window in NSApplication.shared.windows {
                         window.sharingType = .none
@@ -2987,9 +2989,21 @@ struct ContentView: View {
             }
         }
         .onChange(of: screenshotProtectionEnabled) { enabled in
+            // FIX #1618: Allow screenshots during mnemonic backup
+            let shouldBlock = enabled && !walletManager.isMnemonicBackupPending
             DispatchQueue.main.async {
                 for window in NSApplication.shared.windows {
-                    window.sharingType = enabled ? .none : .readOnly
+                    window.sharingType = shouldBlock ? .none : .readOnly
+                }
+            }
+        }
+        // FIX #1618: Re-enable screenshot protection after mnemonic backup is confirmed
+        .onChange(of: walletManager.isMnemonicBackupPending) { pending in
+            if !pending && screenshotProtectionEnabled {
+                DispatchQueue.main.async {
+                    for window in NSApplication.shared.windows {
+                        window.sharingType = .none
+                    }
                 }
             }
         }
@@ -2999,7 +3013,8 @@ struct ContentView: View {
         // onAppear loop above. This observer catches any newly-spawned windows so no
         // window escapes screenshot protection.
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
-            if screenshotProtectionEnabled {
+            // FIX #1618: Allow screenshots during mnemonic backup
+            if screenshotProtectionEnabled && !walletManager.isMnemonicBackupPending {
                 DispatchQueue.main.async {
                     for window in NSApplication.shared.windows {
                         window.sharingType = .none
