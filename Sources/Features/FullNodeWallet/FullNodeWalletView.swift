@@ -583,6 +583,9 @@ struct FullNodeWalletView: View {
                     .foregroundColor(theme.textSecondary)
                     .lineLimit(1)
             }
+            Text("ZipherX v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?") (\(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"))")
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundColor(theme.textSecondary)
             Spacer()
             Text(daemonPath)
                 .font(.system(size: 10, design: .monospaced))

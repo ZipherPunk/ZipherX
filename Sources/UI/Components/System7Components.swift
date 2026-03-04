@@ -2644,7 +2644,7 @@ struct CypherpunkMainView: View {
             }
 
             // FIX #1383: ZipherX app version (dynamic from Bundle)
-            Text("ZipherX v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")")
+            Text("ZipherX v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?") (\(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"))")
                 .font(.system(size: 8, design: .monospaced))
                 .foregroundColor(matrixGreenDark.opacity(0.7))
 
