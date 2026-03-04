@@ -1,3 +1,4 @@
+#if ENABLE_VOICE_CALLS
 // VoiceCallManager.swift
 // ZipherX
 //
@@ -977,3 +978,4 @@ final class VoiceCallManager: ObservableObject {
         return String(format: "%02d:%02d", minutes, seconds)
     }
 }
+#endif // ENABLE_VOICE_CALLS

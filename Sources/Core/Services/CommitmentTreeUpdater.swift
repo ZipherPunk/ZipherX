@@ -1792,31 +1792,12 @@ actor CommitmentTreeUpdater {
         // Thread.sleep() on DispatchQueue.main blocks UI updates!
         var progressPollingActive = true
 
-        // FIX #1582: Stall detection — cancel download if no progress for 30 seconds
-        var lastProgressBytes: UInt64 = 0
-        var lastProgressTime = Date()
-        let stallTimeoutSeconds: TimeInterval = 30
-
         // Start polling in background Task (non-blocking)
         Task {
             while progressPollingActive {
                 let (bytes, total, speed) = ZipherXFFI.getDownloadProgress()
                 if total > 0 {
                     let progress = Double(bytes) / Double(total)
-
-                    // FIX #1582: Stall detection — track progress advancement
-                    if bytes > lastProgressBytes {
-                        lastProgressBytes = bytes
-                        lastProgressTime = Date()
-                    } else {
-                        let stallDuration = Date().timeIntervalSince(lastProgressTime)
-                        if stallDuration > stallTimeoutSeconds {
-                            print("⚠️ FIX #1582: Download stalled for \(Int(stallDuration))s at \(bytes)/\(total) bytes — cancelling")
-                            ZipherXFFI.cancelDownload()
-                            progressPollingActive = false
-                            break
-                        }
-                    }
 
                     // Update UI on main thread
                     await MainActor.run {
@@ -1831,14 +1812,6 @@ actor CommitmentTreeUpdater {
                         print("📥 Progress: \(String(format: "%.1f", downloadedMB))/\(String(format: "%.1f", totalMB)) MB @ \(String(format: "%.1f", speedMB)) MB/s")
                     }
                 } else {
-                    // FIX #1582: Also detect stall during initial connection phase
-                    let stallDuration = Date().timeIntervalSince(lastProgressTime)
-                    if stallDuration > stallTimeoutSeconds {
-                        print("⚠️ FIX #1582: Download stalled during connection for \(Int(stallDuration))s — cancelling")
-                        ZipherXFFI.cancelDownload()
-                        progressPollingActive = false
-                        break
-                    }
                     print("🔧 DEBUG: Waiting for download progress... total=\(total)")
                 }
 

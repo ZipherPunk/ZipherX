@@ -879,7 +879,9 @@ struct ConversationView: View {
     @EnvironmentObject private var networkManager: NetworkManager
     @StateObject private var chatManager = ChatManager.shared
     @StateObject private var torManager = TorManager.shared  // FIX #1574: .onion circuit warmup
+    #if ENABLE_VOICE_CALLS
     @StateObject private var voiceCallManager = VoiceCallManager.shared  // FIX #1540: Observe call state changes
+    #endif
 
     let contact: ChatContact
     var onBack: (() -> Void)? = nil  // FIX #1429: Back button callback (macOS)
@@ -1134,6 +1136,7 @@ struct ConversationView: View {
         // FIX #1540: Voice call overlay — shown when call is active, incoming, or outgoing
         // FIX #1567: ALSO added to ContentView for calls arriving outside chat.
         // This one handles calls while the chat sheet is open (separate modal hierarchy).
+        #if ENABLE_VOICE_CALLS
         #if os(iOS)
         .fullScreenCover(isPresented: Binding(
             get: { voiceCallManager.callState != .idle },
@@ -1156,6 +1159,7 @@ struct ConversationView: View {
             .frame(minWidth: 400, minHeight: 500)
         }
         #endif
+        #endif // ENABLE_VOICE_CALLS
         // FIX #1457: Screenshot & recording detection for encrypted chat
         #if os(iOS)
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.userDidTakeScreenshotNotification)) { _ in

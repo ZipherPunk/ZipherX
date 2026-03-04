@@ -1782,6 +1782,7 @@ final class ChatManager: ObservableObject {
             handleFileChunk(message)
 
         // FIX #1540: Voice call signaling — NOT saved to DB, routed to VoiceCallManager
+        #if ENABLE_VOICE_CALLS
         case .callOffer:
             if let data = message.content.data(using: .utf8),
                let offer = try? JSONDecoder().decode(CallOffer.self, from: data) {
@@ -1822,6 +1823,10 @@ final class ChatManager: ObservableObject {
                     VoiceCallManager.shared.handleAudioFrame(frame)
                 }
             }
+        #else
+        case .callOffer, .callAnswer, .callReject, .callEnd, .callAudio:
+            break  // Voice calls disabled
+        #endif
         }
     }
 
@@ -1990,11 +1995,13 @@ final class ChatManager: ObservableObject {
             // NEVER trigger endCall for call_end or call_reject failures — that creates
             // infinite recursion: endCall → sendCallSignal(call_end) → fails → endCall → ...
             // Also skip for call_audio (just drop the frame silently).
+            #if ENABLE_VOICE_CALLS
             if type == .callOffer || type == .callAnswer {
                 Task { @MainActor in
                     await VoiceCallManager.shared.endCall(reason: "network_error")
                 }
             }
+            #endif
         }
     }
 

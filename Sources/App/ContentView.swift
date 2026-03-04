@@ -48,7 +48,13 @@ struct ContentView: View {
         SecItemAdd(query as CFDictionary, nil)
     }
 
+    // FIX #1621: On iOS, Keychain persists across app reinstall — only trust UserDefaults.
+    // On macOS, Keychain is the authoritative source (FIX M-016: prevents bypass via plist deletion).
+    #if os(iOS)
+    @State private var hasAcceptedDisclaimer: Bool = UserDefaults.standard.bool(forKey: "hasAcceptedDisclaimer")
+    #else
     @State private var hasAcceptedDisclaimer: Bool = ContentView.disclaimerAcceptedFromKeychain() || UserDefaults.standard.bool(forKey: "hasAcceptedDisclaimer")
+    #endif
 
     // Screenshot protection setting (enabled by default)
     @AppStorage("screenshotProtectionEnabled") private var screenshotProtectionEnabled: Bool = true
@@ -113,6 +119,10 @@ struct ContentView: View {
 
     // FIX #888: Download failed alert (ask user to retry import)
     @State private var showDownloadFailedAlert = false
+
+    // FIX #1620: Cellular download warning (iOS) — warn before 2+ GB download on cellular
+    @State private var showCellularDownloadWarning = false
+    @State private var cellularDownloadApproved = false
 
     // FIX #409: Critical health alert
     @State private var showCriticalHealthAlert = false
@@ -310,6 +320,21 @@ struct ContentView: View {
                         // Trigger tree loading if not already loaded
                         // This handles the case where wallet was just created/imported
                         if !walletManager.isTreeLoaded {
+                            // FIX #1620: Warn iOS users on cellular before downloading 2+ GB boost file
+                            // Uses direct NWPathMonitor check — NetworkManager.isOnCellular may not be set yet
+                            #if os(iOS)
+                            if isFirstLaunch {
+                                let isCellular = await NetworkManager.isCellularNetwork()
+                                if isCellular {
+                                    showCellularDownloadWarning = true
+                                    // Wait for user to acknowledge the warning
+                                    while showCellularDownloadWarning && !cellularDownloadApproved {
+                                        try? await Task.sleep(nanoseconds: 200_000_000) // 200ms
+                                    }
+                                }
+                            }
+                            #endif
+
                             print("DEBUGZIPHERX: 🚀 Task: Triggering tree load...")
                             await walletManager.ensureTreeLoaded()
                         }
@@ -3761,6 +3786,8 @@ struct ContentView: View {
             showReducedVerificationAlert: $showReducedVerificationAlert,
             showCriticalHealthAlert: $showCriticalHealthAlert,
             showDownloadFailedAlert: $showDownloadFailedAlert,
+            showCellularDownloadWarning: $showCellularDownloadWarning,
+            cellularDownloadApproved: $cellularDownloadApproved,
             selectedTab: $selectedTab,
             showCypherpunkSettings: $showCypherpunkSettings,
             availableDiskSpace: availableDiskSpace,
@@ -4100,6 +4127,8 @@ struct CypherpunkAlertsModifier: ViewModifier {
     @Binding var showReducedVerificationAlert: Bool
     @Binding var showCriticalHealthAlert: Bool
     @Binding var showDownloadFailedAlert: Bool  // FIX #888
+    @Binding var showCellularDownloadWarning: Bool  // FIX #1620
+    @Binding var cellularDownloadApproved: Bool  // FIX #1620
     @Binding var selectedTab: ContentView.Tab
     @Binding var showCypherpunkSettings: Bool
     let availableDiskSpace: String
@@ -4157,6 +4186,12 @@ struct CypherpunkAlertsModifier: ViewModifier {
                     activeAlert = .downloadFailed
                 }
             }
+            // FIX #1620: Show cellular download warning before boost download
+            .onChange(of: showCellularDownloadWarning) { newValue in
+                if newValue {
+                    activeAlert = .cellularDownloadWarning
+                }
+            }
             .sheet(item: Binding(
                 get: { activeAlert },
                 set: { newValue in
@@ -4173,6 +4208,7 @@ struct CypherpunkAlertsModifier: ViewModifier {
                     showReducedVerificationAlert = false
                     showCriticalHealthAlert = false
                     showDownloadFailedAlert = false
+                    showCellularDownloadWarning = false  // FIX #1620
                     // FIX #888: Reset download failed flag when alert dismissed
                     if walletManager.boostDownloadFailed {
                         walletManager.boostDownloadFailed = false
@@ -4186,6 +4222,7 @@ struct CypherpunkAlertsModifier: ViewModifier {
                     healthAlertTitle: healthAlertTitle,
                     selectedTab: $selectedTab,
                     showCypherpunkSettings: $showCypherpunkSettings,
+                    cellularDownloadApproved: $cellularDownloadApproved,
                     walletManager: walletManager,
                     networkManager: networkManager
                 )
@@ -4202,6 +4239,7 @@ enum UnifiedAlert: Identifiable {
     case reducedVerification
     case criticalHealth
     case downloadFailed  // FIX #888
+    case cellularDownloadWarning  // FIX #1620
 
     var id: String {
         switch self {
@@ -4212,6 +4250,7 @@ enum UnifiedAlert: Identifiable {
         case .reducedVerification: return "reducedVerification"
         case .criticalHealth: return "criticalHealth"
         case .downloadFailed: return "downloadFailed"
+        case .cellularDownloadWarning: return "cellularDownloadWarning"
         }
     }
 }
@@ -4224,6 +4263,7 @@ struct UnifiedAlertSheet: View {
     let healthAlertTitle: String
     @Binding var selectedTab: ContentView.Tab
     @Binding var showCypherpunkSettings: Bool
+    @Binding var cellularDownloadApproved: Bool  // FIX #1620
     @ObservedObject var walletManager: WalletManager
     @ObservedObject var networkManager: NetworkManager
 
@@ -4243,6 +4283,8 @@ struct UnifiedAlertSheet: View {
             criticalHealthAlert
         case .downloadFailed:
             downloadFailedAlert
+        case .cellularDownloadWarning:
+            cellularDownloadWarningAlert
         }
     }
 
@@ -4328,6 +4370,20 @@ struct UnifiedAlertSheet: View {
             }),
             secondaryButton: ("Cancel", {
                 // Just dismiss - user can try again from Settings later
+            })
+        )
+    }
+
+    // FIX #1620: Cellular download warning — shown before 2+ GB boost download on cellular
+    private var cellularDownloadWarningAlert: some View {
+        AlertWrapper(
+            title: "Large Download Required",
+            message: "ZipherX needs to download over 2 GB of blockchain data.\n\nThis requires at least 5 minutes on a fast and stable connection.\n\nYou are currently on cellular data. For the best experience, connect to WiFi before continuing.\n\nIf the download fails or gets interrupted, delete and reinstall the app to start fresh.",
+            primaryButton: ("Continue on Cellular", {
+                cellularDownloadApproved = true
+            }),
+            secondaryButton: ("Cancel", {
+                // User can switch to WiFi and relaunch
             })
         )
     }

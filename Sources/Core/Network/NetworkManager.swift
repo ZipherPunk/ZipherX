@@ -9612,6 +9612,21 @@ public final class NetworkManager: ObservableObject {
         debugLog(.network, "🫀 FIX #246: Keepalive timer stopped")
     }
 
+    // MARK: - FIX #1620: Quick cellular check (doesn't require path monitor to be running)
+
+    /// One-shot check: is the device on cellular right now?
+    /// Used by ContentView before boost download to warn the user.
+    static func isCellularNetwork() async -> Bool {
+        await withCheckedContinuation { continuation in
+            let monitor = NWPathMonitor()
+            monitor.pathUpdateHandler = { path in
+                continuation.resume(returning: path.isExpensive)
+                monitor.cancel()
+            }
+            monitor.start(queue: DispatchQueue.global(qos: .userInitiated))
+        }
+    }
+
     // MARK: - FIX #268: NWPathMonitor for Network Transitions
 
     /// Setup NWPathMonitor to detect WiFi ↔ cellular transitions
@@ -9782,19 +9797,6 @@ public final class NetworkManager: ObservableObject {
         // computation only, PHASE 2 manages its own connections. P2P reconnections are HARMFUL
         // (they kill active header sync connections mid-stream).
         if !backgroundProcessesEnabled {
-            // FIX #1582: Exception — when boost download is active and network drops,
-            // cancel the Rust download so stall detection + auto-retry can kick in immediately
-            // instead of waiting 30s for the stall timeout. Still suppress P2P reconnections.
-            let isBoostDownloading = await MainActor.run {
-                WalletManager.shared.treeLoadProgress > 0 && WalletManager.shared.treeLoadProgress < 0.3
-            }
-            if isBoostDownloading && path.status != .satisfied {
-                debugLog(.network, "📶 FIX #1582: Network lost during boost download — cancelling Rust download for fast retry")
-                ZipherXFFI.cancelDownload()
-                // Don't proceed to P2P reconnection — still in initial sync
-                return
-            }
-
             // FIX #1352: Only log first suppression (was 53 messages in iOS import log)
             if !hasLoggedPathChangeSuppression {
                 hasLoggedPathChangeSuppression = true

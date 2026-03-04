@@ -1,3 +1,4 @@
+#if ENABLE_VOICE_CALLS
 // CallView.swift
 // ZipherX
 //
@@ -256,3 +257,4 @@ struct CallView: View {
         }
     }
 }
+#endif // ENABLE_VOICE_CALLS

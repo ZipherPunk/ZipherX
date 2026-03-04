@@ -304,7 +304,7 @@ struct BoostDownloadProgressView: View {
                 Text("You are on cellular data")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundColor(theme.warningColor)
-                Text("This download is ~2 GB. Switch to WiFi for faster speeds and to avoid data charges.")
+                Text("This download is over 2 GB and requires at least 5 minutes on a fast, stable connection. If the download fails, delete and reinstall the app to start fresh.")
                     .font(.system(size: 11))
                     .foregroundColor(theme.textSecondary)
             }
