@@ -327,6 +327,9 @@ public final class NetworkManager: ObservableObject {
     /// Prevents mempool scan, stats refresh, etc. from interfering with critical startup sync
     @Published private(set) var backgroundProcessesEnabled: Bool = false
 
+    /// True when the device is on cellular (expensive) network — used to warn during large downloads
+    @Published private(set) var isOnCellular: Bool = false
+
     /// FIX #519: Flag to indicate header sync is in progress
     /// Health checks should NOT ping peers during header sync as it disrupts the sync
     private(set) var headerSyncInProgress: Bool = false
@@ -9579,6 +9582,9 @@ public final class NetworkManager: ObservableObject {
 
             // Handle path change on main thread
             Task { @MainActor in
+                // Track cellular state for UI warnings (e.g. large boost download on cellular)
+                self.isOnCellular = isExpensive
+
                 // FIX #1352: Only log path changes when background processes are enabled
                 // (suppresses ~53 noisy lines during initial sync — iOS cellular fires every 3-6s)
                 if self.backgroundProcessesEnabled {

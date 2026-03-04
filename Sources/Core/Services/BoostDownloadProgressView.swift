@@ -32,6 +32,13 @@ struct BoostDownloadProgressView: View {
                     // Task list
                     taskList
 
+                    // Cellular warning (iOS)
+                    #if os(iOS)
+                    if NetworkManager.shared.isOnCellular {
+                        cellularWarning
+                    }
+                    #endif
+
                     // Download stats
                     if !walletManager.boostDownloadSpeed.isEmpty || !walletManager.boostETA.isEmpty {
                         downloadStats
@@ -285,6 +292,34 @@ struct BoostDownloadProgressView: View {
         .background(theme.surfaceColor)
         .cornerRadius(theme.cornerRadius)
     }
+
+    #if os(iOS)
+    private var cellularWarning: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "antenna.radiowaves.left.and.right")
+                .font(.system(size: 16))
+                .foregroundColor(theme.warningColor)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("You are on cellular data")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(theme.warningColor)
+                Text("This download is ~2 GB. Switch to WiFi for faster speeds and to avoid data charges.")
+                    .font(.system(size: 11))
+                    .foregroundColor(theme.textSecondary)
+            }
+
+            Spacer()
+        }
+        .padding(12)
+        .background(theme.warningColor.opacity(0.1))
+        .cornerRadius(theme.cornerRadius)
+        .overlay(
+            RoundedRectangle(cornerRadius: theme.cornerRadius)
+                .stroke(theme.warningColor.opacity(0.3), lineWidth: 1)
+        )
+    }
+    #endif
 
     private var footerView: some View {
         HStack {

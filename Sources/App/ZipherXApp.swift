@@ -6,8 +6,58 @@ import UIKit
 import AppKit
 #endif
 
+// MARK: - macOS: Harden against DYLD environment injection
+// Runs before ANY other initialization (before @StateObject, before init()).
+// Blocks a common macOS malware/red-team technique: launching the app with
+// DYLD_INSERT_LIBRARIES set to inject a malicious dylib.
+#if os(macOS)
+private func securityExit(_ variable: String) -> Never {
+    let alert = NSAlert()
+    alert.messageText = "ZipherX Security Policy"
+    alert.informativeText = "ZipherX detected a potentially unsafe environment variable (\(variable)) and cannot start. This is a security precaution to protect your wallet from code injection. Please launch ZipherX normally without modifying its environment."
+    alert.alertStyle = .critical
+    alert.addButton(withTitle: "Quit")
+    alert.runModal()
+    exit(173)
+}
+
+private let _dyldScrubbed: Bool = {
+    // Fail-closed: refuse to run if high-signal injection vars are set
+    let failClosedVars = [
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FRAMEWORK_PATH"
+    ]
+    // Scrub-only: clear lower-signal vars that could influence library resolution
+    let scrubVars = [
+        "DYLD_FALLBACK_LIBRARY_PATH",
+        "DYLD_FALLBACK_FRAMEWORK_PATH",
+        "DYLD_ROOT_PATH",
+        "DYLD_SHARED_REGION"
+    ]
+    #if !DEBUG
+    // Release: fail closed on high-signal vars, scrub the rest
+    for v in failClosedVars {
+        if getenv(v) != nil {
+            securityExit(v)
+        }
+    }
+    for v in scrubVars { unsetenv(v) }
+    #else
+    // Debug: scrub all silently (don't break Xcode workflows)
+    for v in failClosedVars + scrubVars { unsetenv(v) }
+    #endif
+    return true
+}()
+#endif
+
 /// Global app startup time - captured at the very first moment of app launch
-let appStartupTime: Date = Date()
+let appStartupTime: Date = {
+    #if os(macOS)
+    _ = _dyldScrubbed  // Force DYLD scrub before anything else
+    #endif
+    return Date()
+}()
 
 @main
 struct ZipherXApp: App {

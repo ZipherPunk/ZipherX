@@ -1,6 +1,7 @@
 import SwiftUI
 import AVFoundation
 import AudioToolbox
+import CommonCrypto
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -65,6 +66,9 @@ struct SendView: View {
     @State private var memo = ""
     @State private var isSending = false
     @State private var showConfirmation = false
+    @State private var confirmedAddress = ""      // Cleaned address snapshot from confirmation
+    @State private var confirmedAmountZat: UInt64 = 0  // Amount in zatoshis at confirmation time
+    @State private var confirmedTxCheck = ""       // TX preview fingerprint snapshot
     @State private var showSuccess = false
     @State private var showError = false
     @State private var errorMessage = ""
@@ -631,6 +635,13 @@ struct SendView: View {
                         isAddressTransparent = false
                         isAddressSprout = true
                     } else if newValue.hasPrefix("zs1") && newValue.count >= 70 {
+                        // VUL-UI-003: Reject non-ASCII before FFI call (invisible char injection)
+                        guard newValue.allSatisfy({ $0.isASCII }) else {
+                            isAddressValid = false
+                            isAddressTransparent = false
+                            isAddressSprout = false
+                            return
+                        }
                         // Only call FFI for complete-looking addresses
                         isAddressTransparent = false
                         isAddressSprout = false
@@ -809,6 +820,13 @@ struct SendView: View {
             Text("Network fee: 0.0001 ZCL")
                 .font(theme.captionFont)
                 .foregroundColor(theme.textSecondary)
+
+            // Amount validation error (precise feedback)
+            if let error = amountValidationError {
+                Text(error)
+                    .font(theme.captionFont)
+                    .foregroundColor(theme.warningColor)
+            }
         }
     }
 
@@ -894,26 +912,23 @@ struct SendView: View {
                     Divider()
 
                     // To address — FULL address shown (SECURITY: never truncate, never scroll)
+                    // VUL-UI-003: Middle segment highlighted to defeat vanity address attacks.
+                    // Attackers generate addresses matching the first/last chars — the middle
+                    // is the part they CAN'T control, so we draw the user's eye there.
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
                             Text("TO")
                                 .font(theme.captionFont)
                                 .foregroundColor(theme.textSecondary)
                             Spacer()
+                            Text("Verify the highlighted middle section")
+                                .font(.system(size: 10))
+                                .foregroundColor(theme.warningColor)
                             Image(systemName: "shield.fill")
                                 .foregroundColor(theme.primaryColor)
                                 .font(.system(size: 12))
                         }
-                        Text(recipientAddress)
-                            #if os(iOS)
-                            .font(.system(size: 10, weight: .medium, design: .monospaced))
-                            #else
-                            .font(.system(size: 13, weight: .medium, design: .monospaced))
-                            #endif
-                            .foregroundColor(theme.textPrimary)
-                            .textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .lineLimit(nil)
+                        addressVerificationView(recipientAddress)
                             .padding(10)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .background(theme.backgroundColor)
@@ -922,6 +937,28 @@ struct SendView: View {
                                 RoundedRectangle(cornerRadius: 4)
                                     .stroke(theme.primaryColor.opacity(0.3), lineWidth: 1)
                             )
+                    }
+
+                    // Address fingerprint — compact checksum of the full address
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack {
+                            Text("Address fingerprint")
+                                .font(theme.captionFont)
+                                .foregroundColor(theme.textSecondary)
+                            Spacer()
+                            Text(addressFingerprint(recipientAddress))
+                                .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                                .foregroundColor(theme.primaryColor)
+                            Button(action: { ClipboardManager.copyWithAutoExpiry(self.addressFingerprint(self.recipientAddress), seconds: 60) }) {
+                                Image(systemName: "doc.on.doc")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(theme.textSecondary)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        Text("If this code changes, stop \u{2014} the address was modified.")
+                            .font(.system(size: 9))
+                            .foregroundColor(theme.textSecondary.opacity(0.7))
                     }
 
                     Divider()
@@ -935,6 +972,28 @@ struct SendView: View {
                         Text("0.0001 ZCL")
                             .font(.system(size: 12, design: .monospaced))
                             .foregroundColor(theme.textPrimary)
+                    }
+
+                    // VUL-UI-004: TX preview fingerprint — covers address + amount + fee
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack {
+                            Text("TX Check")
+                                .font(theme.captionFont)
+                                .foregroundColor(theme.textSecondary)
+                            Spacer()
+                            Text(txPreviewFingerprint())
+                                .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                                .foregroundColor(theme.primaryColor)
+                            Button(action: { ClipboardManager.copyWithAutoExpiry(self.txPreviewFingerprint(), seconds: 60) }) {
+                                Image(systemName: "doc.on.doc")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(theme.textSecondary)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        Text("If this code changes, stop \u{2014} the transaction was modified.")
+                            .font(.system(size: 9))
+                            .foregroundColor(theme.textSecondary.opacity(0.7))
                     }
 
                     // Warning
@@ -987,6 +1046,139 @@ struct SendView: View {
 
     // MARK: - Validation
 
+    // MARK: - Canonical amount conversion (single source of truth)
+    // Pure string-based integer arithmetic. No Double, no Decimal, no rounding.
+    // "0.12345678" → split "0" + "12345678" → 0*100_000_000 + 12345678 = 12345678 zatoshis.
+    // 1 ZCL = 100,000,000 zatoshis (8 decimal places).
+
+    enum AmountError: Error {
+        case empty
+        case invalidCharacters
+        case tooManyDecimals  // > 8
+        case negative
+        case tooLarge         // > 21M ZCL (max supply)
+    }
+
+    private func parseAmountToZatoshis(_ amountText: String) -> Result<UInt64, AmountError> {
+        let normalized = amountText
+            .replacingOccurrences(of: ",", with: ".")
+            .trimmingCharacters(in: .whitespaces)
+        guard !normalized.isEmpty else { return .failure(.empty) }
+        guard !normalized.contains("-") else { return .failure(.negative) }
+        // Only digits and at most one dot
+        let allowed = CharacterSet(charactersIn: "0123456789.")
+        guard normalized.unicodeScalars.allSatisfy({ allowed.contains($0) }) else {
+            return .failure(.invalidCharacters)
+        }
+        guard normalized.filter({ $0 == "." }).count <= 1 else {
+            return .failure(.invalidCharacters)
+        }
+
+        let parts = normalized.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
+        let intStr = String(parts[0])
+        let fracStr = parts.count > 1 ? String(parts[1]) : ""
+
+        guard fracStr.count <= 8 else { return .failure(.tooManyDecimals) }
+
+        // Right-pad fraction to exactly 8 digits
+        let paddedFrac = fracStr.padding(toLength: 8, withPad: "0", startingAt: 0)
+
+        guard let intPart = UInt64(intStr), let fracPart = UInt64(paddedFrac) else {
+            return .failure(.invalidCharacters)
+        }
+
+        // Max supply ~21M ZCL = 2,100,000,000,000,000 zatoshis
+        let maxZCL: UInt64 = 21_000_000
+        guard intPart <= maxZCL else { return .failure(.tooLarge) }
+
+        let zatoshis = intPart * 100_000_000 + fracPart
+        return zatoshis > 0 ? .success(zatoshis) : .failure(.empty)
+    }
+
+    private func amountToZatoshis(_ amountText: String) -> UInt64 {
+        switch parseAmountToZatoshis(amountText) {
+        case .success(let zat): return zat
+        case .failure: return 0
+        }
+    }
+
+    // Short SHA-256 fingerprint: hash input, return first 4 bytes as XXXX-XXXX.
+    // Used for both address and TX preview fingerprints.
+    private func shortSha256(_ input: String) -> String {
+        guard let data = input.data(using: .utf8), !data.isEmpty else { return "----:----" }
+        var hash = [UInt8](repeating: 0, count: 32)
+        data.withUnsafeBytes { ptr in
+            _ = CC_SHA256(ptr.baseAddress, CC_LONG(data.count), &hash)
+        }
+        let hex = hash.prefix(4).map { String(format: "%02X", $0) }.joined()
+        return "\(hex.prefix(4))-\(hex.suffix(4))"
+    }
+
+    // Address fingerprint: SHA-256 of the normalized address.
+    // If even one character differs, the fingerprint changes completely.
+    private func addressFingerprint(_ address: String) -> String {
+        // Normalize: strip whitespace/newlines and reject non-ASCII (invisible char injection)
+        let cleaned = address.trimmingCharacters(in: .whitespacesAndNewlines)
+            .filter { $0.isASCII }
+        return shortSha256(cleaned)
+    }
+
+    // VUL-UI-004: TX preview fingerprint — covers address + amount + fee.
+    // Protects against amount/fee manipulation between confirmation and broadcast.
+    // Uses integer zatoshis (no floats) to prevent decimal/locale tricks.
+    private func txPreviewFingerprint() -> String {
+        let cleanAddress = recipientAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+            .filter { $0.isASCII }
+        let zatoshis = amountToZatoshis(amount)
+        let fee: UInt64 = 10_000
+        let payload = "to=\(cleanAddress)|amt=\(zatoshis)|fee=\(fee)"
+        return shortSha256(payload)
+    }
+
+    // VUL-UI-003: Segmented address display — highlights the middle section that
+    // vanity address attackers cannot control. z-addresses are 78 chars; attackers
+    // can brute-force matching ~8 prefix + ~8 suffix chars but NOT the middle ~54.
+    @ViewBuilder
+    private func addressVerificationView(_ address: String) -> some View {
+        let prefixLen = 10
+        let suffixLen = 10
+        if address.count > prefixLen + suffixLen {
+            let prefixStr = String(address.prefix(prefixLen))
+            let suffixStr = String(address.suffix(suffixLen))
+            let middleStart = address.index(address.startIndex, offsetBy: prefixLen)
+            let middleEnd = address.index(address.endIndex, offsetBy: -suffixLen)
+            let middleStr = String(address[middleStart..<middleEnd])
+
+            #if os(iOS)
+            let edgeFont = Font.system(size: 10, weight: .medium, design: .monospaced)
+            let middleFont = Font.system(size: 11, weight: .bold, design: .monospaced)
+            #else
+            let edgeFont = Font.system(size: 13, weight: .medium, design: .monospaced)
+            let middleFont = Font.system(size: 14, weight: .bold, design: .monospaced)
+            #endif
+
+            (Text(prefixStr).font(edgeFont).foregroundColor(theme.textSecondary)
+            + Text(middleStr).font(middleFont).foregroundColor(theme.warningColor)
+            + Text(suffixStr).font(edgeFont).foregroundColor(theme.textSecondary))
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .lineLimit(nil)
+        } else {
+            // Fallback for short addresses (shouldn't happen with z-addresses)
+            #if os(iOS)
+            Text(address)
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundColor(theme.textPrimary)
+                .textSelection(.enabled)
+            #else
+            Text(address)
+                .font(.system(size: 13, weight: .medium, design: .monospaced))
+                .foregroundColor(theme.textPrimary)
+                .textSelection(.enabled)
+            #endif
+        }
+    }
+
     private var isValidInput: Bool {
         guard !recipientAddress.isEmpty,
               !amount.isEmpty,
@@ -995,27 +1187,27 @@ struct SendView: View {
             return false
         }
 
-        // Handle both comma and period as decimal separator
-        let normalizedAmount = amount.replacingOccurrences(of: ",", with: ".")
-        // VUL-UI-002: Reject negative amounts before Double conversion
-        guard !normalizedAmount.contains("-"),
-              let amountValue = Double(normalizedAmount),
-              amountValue > 0 else {
+        // Use canonical parser — handles all validation (negative, chars, decimals, overflow)
+        switch parseAmountToZatoshis(amount) {
+        case .success(let zatoshis):
+            let fee: UInt64 = 10_000
+            return zatoshis + fee <= walletManager.shieldedBalance
+        case .failure:
             return false
         }
+    }
 
-        // SECURITY: Prevent integer overflow - max ~184 billion ZCL (UInt64.max / 100_000_000)
-        // In practice, total supply is 21 million, so 100 million is a safe upper bound
-        let maxZCL: Double = 100_000_000.0  // 100 million ZCL
-        guard amountValue <= maxZCL else {
-            return false
+    /// Human-readable amount validation error for UI feedback
+    private var amountValidationError: String? {
+        guard !amount.isEmpty else { return nil }
+        switch parseAmountToZatoshis(amount) {
+        case .success: return nil
+        case .failure(.empty): return nil
+        case .failure(.negative): return "Amount cannot be negative"
+        case .failure(.invalidCharacters): return "Invalid characters in amount"
+        case .failure(.tooManyDecimals): return "Maximum 8 decimal places (1 zatoshi = 0.00000001 ZCL)"
+        case .failure(.tooLarge): return "Amount exceeds maximum supply"
         }
-
-        // Check sufficient funds
-        // Use round() to avoid floating-point precision loss (e.g., 0.0012 becoming 0.00119999...)
-        let zatoshis = UInt64(round(amountValue * 100_000_000))
-        let fee: UInt64 = 10000
-        return zatoshis + fee <= walletManager.shieldedBalance
     }
 
     /// Check if there's a pending outgoing transaction that hasn't confirmed yet
@@ -1108,6 +1300,10 @@ struct SendView: View {
             return
         }
 
+        // Snapshot canonical values at confirmation time (not raw strings)
+        confirmedAddress = recipientAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+        confirmedAmountZat = amountToZatoshis(amount)
+        confirmedTxCheck = txPreviewFingerprint()
         showConfirmation = true
     }
 
@@ -1136,6 +1332,24 @@ struct SendView: View {
 
     /// Actually proceed with the send (after Tor check passed or user chose to bypass)
     private func proceedWithSend() {
+        // VUL-UI-002: Verify address wasn't tampered between confirmation and broadcast
+        let currentCleanAddress = recipientAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard currentCleanAddress == confirmedAddress else {
+            errorMessage = "The recipient address changed after you confirmed. This can indicate clipboard malware. Please paste the address again and verify the highlighted middle section and fingerprint."
+            showError = true
+            print("⚠️ VUL-UI-002: Address changed post-confirmation. confirmed=\(confirmedAddress.prefix(12))... current=\(recipientAddress.prefix(12))...")
+            return
+        }
+
+        // VUL-UI-004: Verify full TX params (address + amount + fee) weren't tampered
+        let currentTxCheck = txPreviewFingerprint()
+        guard currentTxCheck == confirmedTxCheck else {
+            errorMessage = "The amount or fee changed after you confirmed. Transaction cancelled for your safety. Please review the transaction details and try again."
+            showError = true
+            print("⚠️ VUL-UI-004: TX params changed post-confirmation. confirmed=\(confirmedTxCheck) current=\(currentTxCheck)")
+            return
+        }
+
         // VUL-UI-001: Re-validate address immediately before broadcast
         // Prevents sending to an address modified after initial validation (e.g., clipboard replace attack)
         guard walletManager.isValidZAddress(recipientAddress) else {
@@ -1145,9 +1359,7 @@ struct SendView: View {
         }
 
         // Require Face ID / Touch ID authentication before sending
-        let normalizedAmount = amount.replacingOccurrences(of: ",", with: ".")
-        // Use round() to avoid floating-point precision loss
-        let zatoshis = UInt64(round((Double(normalizedAmount) ?? 0) * 100_000_000))
+        let zatoshis = amountToZatoshis(amount)
 
         BiometricAuthManager.shared.authenticateForSend(amount: zatoshis) { [self] success, error in
             if success {
@@ -1477,13 +1689,11 @@ struct SendView: View {
                 }
                 await updateStep("validate", status: .completed)
 
-                // Parse amount
-                let normalizedAmount = amount.replacingOccurrences(of: ",", with: ".")
-                guard let amountValue = Double(normalizedAmount) else {
+                // Parse amount using canonical converter (Decimal, not Double)
+                let zatoshis = amountToZatoshis(amount)
+                guard zatoshis > 0 else {
                     throw WalletError.invalidAddress("Invalid amount")
                 }
-                // Use round() to avoid floating-point precision loss (e.g., 0.0012 -> 119999 instead of 120000)
-                let zatoshis = UInt64(round(amountValue * 100_000_000))
 
                 // Step 2-6: Building transaction (handled by TransactionBuilder with callbacks)
                 await updateStep("prover", status: .inProgress)
@@ -1936,11 +2146,9 @@ struct SendView: View {
         }
     }
 
-    /// Current amount in zatoshis
+    /// Current amount in zatoshis (uses canonical Decimal converter)
     private var currentZatoshis: UInt64 {
-        let normalizedAmount = amount.replacingOccurrences(of: ",", with: ".")
-        guard let amountValue = Double(normalizedAmount) else { return 0 }
-        return UInt64(round(amountValue * 100_000_000))
+        amountToZatoshis(amount)
     }
 
     /// Prepare transaction in background (build zk-SNARK proof)
@@ -2249,8 +2457,9 @@ struct SendView: View {
     // MARK: - Formatting
 
     private func formatBalance(_ zatoshis: UInt64) -> String {
-        let zcl = Double(zatoshis) / 100_000_000.0
-        return String(format: "%.8f", zcl)
+        let whole = zatoshis / 100_000_000
+        let frac = zatoshis % 100_000_000
+        return String(format: "%d.%08d", whole, frac)
     }
 }
 

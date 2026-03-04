@@ -35,18 +35,16 @@ targets:
       path: Info.plist
       properties:
         CFBundleDisplayName: ZipherX
-        CFBundleShortVersionString: "4.2.2"
+        CFBundleShortVersionString: "4.2.3"
         CFBundleVersion: "1"
         UILaunchScreen:
           UIColorName: LaunchScreenColor
         NSFaceIDUsageDescription: ZipherX uses Face ID to protect your wallet and authorize transactions.
         NSLocalNetworkUsageDescription: ZipherX connects to Zclassic network peers to sync your wallet.
         NSCameraUsageDescription: ZipherX uses the camera to scan QR codes for receiving payments.
-        NSMicrophoneUsageDescription: ZipherX uses the microphone for encrypted voice calls over the P2P network.
         NSPhotoLibraryUsageDescription: ZipherX uses the photo library to set your chat profile picture.
         UIBackgroundModes:
           - fetch
-          - audio
         ITSAppUsesNonExemptEncryption: false
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
@@ -111,12 +109,11 @@ targets:
       path: Info-macOS.plist
       properties:
         CFBundleDisplayName: ZipherX
-        CFBundleShortVersionString: "4.2.2"
+        CFBundleShortVersionString: "4.2.3"
         CFBundleVersion: "1"
         CFBundleName: ZipherX
         LSMinimumSystemVersion: "12.0"
         NSLocalNetworkUsageDescription: ZipherX connects to Zclassic network peers to sync your wallet.
-        NSMicrophoneUsageDescription: ZipherX uses the microphone for encrypted voice calls over the P2P network.
         NSCameraUsageDescription: ZipherX uses the camera to scan QR codes for receiving payments.
         NSHumanReadableCopyright: "Copyright © 2025 ZipherX. All rights reserved."
         ITSAppUsesNonExemptEncryption: false
@@ -151,10 +148,7 @@ targets:
         com.apple.security.app-sandbox: false
         com.apple.security.network.client: true
         com.apple.security.network.server: true
-        com.apple.security.device.audio-input: true
         com.apple.security.files.user-selected.read-write: true
-        com.apple.security.cs.allow-unsigned-executable-memory: true
-        com.apple.security.cs.disable-library-validation: true
         keychain-access-groups:
           - $(AppIdentifierPrefix)com.zipherpunk.zipherx.mac
 

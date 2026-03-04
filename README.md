@@ -48,13 +48,13 @@ ZipherX provides full-node-level security through direct P2P networking — with
 - **P2P Networking** — Connects directly to the Zclassic blockchain via peer-to-peer protocol
 - **Tor Integration** — All connections routed through embedded Tor (Arti) for network privacy
 - **Encrypted Chat** — End-to-end encrypted messaging over Tor hidden services
-- **Voice Calls** — Encrypted voice over Tor (WebRTC-style, peer-to-peer)
+- **Voice Calls** — Encrypted voice over Tor (WebRTC-style, peer-to-peer) *(coming soon)*
 - **Biometric Security** — Face ID / Touch ID protection for wallet access and transactions
 - **Cross-Platform** — Native macOS (Apple Silicon + Intel) and iOS (iPhone + iPad)
 - **Full Node Mode** — Optional: connect to your own Zclassic full node via RPC (macOS only)
 - **Fast Sync** — Boost files enable wallet sync in under 30 seconds
 - **SQLCipher** — Database encrypted at rest with 256-bit AES
-- **Hardened Runtime** — macOS app is signed and notarized with Hardened Runtime enabled
+- **Hardened Runtime** — macOS app signed with Hardened Runtime, full library validation, and minimal entitlements (no JIT, no unsigned memory)
 
 ---
 
@@ -66,7 +66,7 @@ Download the latest release from the [Releases](https://github.com/ZipherPunk/Zi
 
 | File | Description |
 |------|-------------|
-| `ZipherX_v4.2.1.dmg` | macOS installer (Apple Silicon + Intel) |
+| `ZipherX_v4.2.3.dmg` | macOS installer (Apple Silicon + Intel) |
 | `SHA256SUMS.txt` | SHA-256 checksums for verification |
 
 ### Verify the Download
@@ -79,7 +79,7 @@ Download the latest release from the [Releases](https://github.com/ZipherPunk/Zi
 # 1. Download both the .dmg and SHA256SUMS.txt from the Releases page
 
 # 2. Verify the checksum
-shasum -a 256 ZipherX_v4.2.1.dmg
+shasum -a 256 ZipherX_v4.2.3.dmg
 
 # 3. Compare the output with the hash in SHA256SUMS.txt
 # The two hashes MUST match exactly. If they don't, do NOT install — re-download or report the issue.
@@ -88,7 +88,7 @@ shasum -a 256 ZipherX_v4.2.1.dmg
 #### Windows (PowerShell)
 
 ```powershell
-Get-FileHash ZipherX_v4.2.1.dmg -Algorithm SHA256
+Get-FileHash ZipherX_v4.2.3.dmg -Algorithm SHA256
 ```
 
 ### Install from DMG
@@ -99,7 +99,7 @@ Get-FileHash ZipherX_v4.2.1.dmg -Algorithm SHA256
 4. If macOS shows "ZipherX can't be opened because Apple cannot check it for malicious software":
    - Go to **System Settings > Privacy & Security**
    - Scroll down and click **Open Anyway**
-5. On first launch, ZipherX will download Sapling parameters (~50 MB) and a boost file (~1 GB) for fast sync
+5. On first launch, ZipherX will download Sapling parameters (~50 MB) and a boost file (~2 GB) for fast sync. **WiFi is recommended** — on iOS, a cellular data warning is shown during the download. The download supports resume: if interrupted, it picks up from where it left off.
 
 ### Uninstall
 
@@ -215,11 +215,11 @@ open ZipherX.xcodeproj
 
 ## Version Details
 
-### ZipherX v4.2.1 (Build 21)
+### ZipherX v4.2.3
 
 | Component | Version | Notes |
 |-----------|---------|-------|
-| **ZipherX** | 4.2.1 (Build 21) | This release |
+| **ZipherX** | 4.2.3 | This release |
 | **zipherx-ffi** | 0.1.0 | Rust FFI — Sapling crypto, commitment tree, Groth16, Tor |
 | **SQLCipher** | 3.46.1 (SQLite 3.45.3) | AES-256 encrypted database |
 | **Arti (Tor)** | 0.37.x | Embedded Tor client (onion services, SOCKS5) |
@@ -448,7 +448,7 @@ The status bar shows:
 
 ## Security
 
-ZipherX has undergone a security audit (v4.2.1). Key security features:
+ZipherX has undergone a security audit (v4.2.3). Key security features:
 
 - **Secure Enclave** — Spending keys stored in hardware-backed secure element
 - **SQLCipher** — All database files encrypted with AES-256
@@ -456,11 +456,14 @@ ZipherX has undergone a security audit (v4.2.1). Key security features:
 - **Groth16 zk-SNARKs** — Zero-knowledge proofs for shielded transactions
 - **Multi-peer consensus** — Requires 3+ peers to agree on chain state (anti-Sybil)
 - **Equihash PoW verification** — Block headers verified using Equihash (192,7)
-- **Hardened Runtime** — macOS binary uses Apple's Hardened Runtime protections
+- **Hardened Runtime** — macOS builds use Hardened Runtime with full library validation and minimal entitlements. No JIT (`allow-unsigned-executable-memory`) or library validation bypass entitlements. All frameworks statically linked and signed.
+- **Send-path integrity firewall** — Address fingerprint and transaction check (address + amount + fee) are snapshotted at confirmation and re-verified before signing. If anything changes between confirmation and broadcast, the wallet blocks the send. Defeats clipboard hijacking, look-alike address attacks, and amount/fee manipulation.
 - **Rate limiting** — P2P message processing rate-limited to prevent DoS
-- **Input validation** — All external inputs (addresses, amounts, P2P messages) validated
+- **Input validation** — All external inputs (addresses, amounts, P2P messages) validated. Non-ASCII characters rejected in addresses to prevent invisible character injection.
+- **Notarized** — macOS builds are code-signed and notarized by Apple
+- **DYLD injection guard** — macOS Release builds refuse to launch if dynamic library injection environment variables are detected (fail-closed)
 
-For the full security audit report, see the [Releases](https://github.com/ZipherPunk/ZipherX/releases) page.
+For the full security audit report and entitlement details, see [`docs/SECURITY.md`](docs/SECURITY.md) or the [Releases](https://github.com/ZipherPunk/ZipherX/releases) page.
 
 ---
 

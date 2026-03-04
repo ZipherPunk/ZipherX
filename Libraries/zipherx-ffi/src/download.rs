@@ -167,10 +167,12 @@ async fn download_file_async(
     resume_from: u64,
     expected_size: u64,
 ) -> Result<(), DownloadError> {
-    // FIX #463: Reduced stall timeout for faster network change detection
-    // 30 seconds is too long when WiFi/network changes - 5 seconds is enough
-    const STALL_TIMEOUT_SECS: u64 = 5;
-    const MAX_RETRIES: u32 = 5;  // More retries for better recovery
+    // FIX #463 → Beta_bugfix_1: Stall timeout for download interruption detection.
+    // Was 5s — too aggressive for iOS WiFi↔cellular handoffs (2-10s stalls).
+    // 30s is generous enough for network transitions without being too long for genuine stalls.
+    const STALL_TIMEOUT_SECS: u64 = 30;
+    // Beta_bugfix_1: Increased retries (was 5) with exponential backoff for iOS resilience.
+    const MAX_RETRIES: u32 = 8;
 
     // FIX #345: Use static client for HTTP/2 connection reuse
     let client = get_client();
@@ -215,8 +217,9 @@ async fn download_file_async(
                 if retry_count > MAX_RETRIES {
                     return Err(DownloadError::Network(format!("Failed after {} retries: {}", MAX_RETRIES, e)));
                 }
-                // FIX #463: Shorter retry delay for faster network change recovery
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                // Beta_bugfix_1: Exponential backoff (2s, 4s, 8s, 16s, 30s, 30s, 30s, 30s)
+                let backoff_secs = std::cmp::min(1u64 << retry_count, 30);
+                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
                 continue;
             }
         };
@@ -228,8 +231,9 @@ async fn download_file_async(
             if retry_count > MAX_RETRIES {
                 return Err(DownloadError::Network(format!("HTTP error: {}", status)));
             }
-            // FIX #463: Shorter retry delay for faster network change recovery
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            // Beta_bugfix_1: Exponential backoff for HTTP errors
+            let backoff_secs = std::cmp::min(1u64 << retry_count, 30);
+            tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
             continue;
         }
 
@@ -340,8 +344,9 @@ async fn download_file_async(
             ));
         }
 
-        // FIX #463: Shorter retry delay for faster network change recovery
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        // Beta_bugfix_1: Exponential backoff for stall/incomplete recovery
+        let backoff_secs = std::cmp::min(1u64 << retry_count, 30);
+        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
     }
 }
 

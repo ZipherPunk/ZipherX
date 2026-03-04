@@ -1381,6 +1381,28 @@ struct CypherpunkSyncView: View {
                 .padding(.horizontal, 20)
             }
 
+            // Cellular data warning (iOS only — during download phase)
+            #if os(iOS)
+            if NetworkManager.shared.isOnCellular && status.lowercased().contains("download") {
+                HStack(spacing: 8) {
+                    Image(systemName: "antenna.radiowaves.left.and.right")
+                        .font(.system(size: 12))
+                        .foregroundColor(.orange)
+
+                    Text("CELLULAR DATA — WiFi recommended for this ~2 GB download")
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .foregroundColor(.orange)
+                }
+                .padding(10)
+                .background(Color.orange.opacity(0.1))
+                .overlay(
+                    Rectangle()
+                        .stroke(Color.orange.opacity(0.3), lineWidth: 1)
+                )
+                .padding(.horizontal, 20)
+            }
+            #endif
+
             // Current task progress (larger, more prominent)
             if let currentTask = tasks.first(where: { if case .inProgress = $0.status { return true } else { return false } }),
                let taskProgress = currentTask.progress {

@@ -3083,9 +3083,15 @@ struct ContentView: View {
             wasInBackground = true
             // Stop inactivity timer when going to background
             stopInactivityTimer()
-            // FIX #1273: Always lock app when going to background
-            biometricManager.lockApp()
-            isShowingLockScreen = true
+            // Beta_bugfix_1: Skip lock during mnemonic backup — wallet has no balance yet,
+            // and locking destroys the mnemonic display state (SwiftUI @State reset on view
+            // recreation). The mnemonic is already visible — locking to "protect" it is pointless.
+            // Privacy overlay still activates to protect app switcher preview.
+            if !walletManager.isMnemonicBackupPending {
+                // FIX #1273: Lock app when going to background
+                biometricManager.lockApp()
+                isShowingLockScreen = true
+            }
             // VUL-U-006: Privacy overlay to protect sensitive data in app switcher
             if screenshotProtectionEnabled {
                 #if os(iOS)
@@ -3110,7 +3116,8 @@ struct ContentView: View {
             // On macOS, the TouchID system dialog causes scene phase transitions
             // (inactive → active). Re-locking during active auth creates a race:
             // lockApp() resets hasAuthenticatedThisSession AFTER auth already succeeded.
-            if hasCompletedInitialSync && !biometricManager.isAuthInProgress {
+            // Beta_bugfix_1: Also skip during mnemonic backup (no lock was set, nothing to check).
+            if hasCompletedInitialSync && !biometricManager.isAuthInProgress && !walletManager.isMnemonicBackupPending {
                 // Check if we need to re-authenticate (inactivity timeout)
                 if biometricManager.isBiometricEnabled && biometricManager.isInactivityTimeoutExceeded {
                     isShowingLockScreen = true
