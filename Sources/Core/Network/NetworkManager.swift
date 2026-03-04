@@ -9626,7 +9626,10 @@ public final class NetworkManager: ObservableObject {
                 guard !resumed else { return }
                 resumed = true
                 monitor.cancel()
-                continuation.resume(returning: path.isExpensive)
+                // FIX #1620c: path.isExpensive returns false on 5G when carrier
+                // marks it as "unlimited". usesInterfaceType(.cellular) is reliable.
+                let isCellular = path.usesInterfaceType(.cellular)
+                continuation.resume(returning: isCellular)
             }
             monitor.start(queue: DispatchQueue.global(qos: .userInitiated))
         }
@@ -9643,18 +9646,20 @@ public final class NetworkManager: ObservableObject {
             guard let self = self else { return }
 
             let pathStatus = path.status
-            let isExpensive = path.isExpensive  // true = cellular
+            // FIX #1620c: path.isExpensive returns false on 5G (carrier "unlimited" plans).
+            // usesInterfaceType(.cellular) is the reliable check.
+            let isCellular = path.usesInterfaceType(.cellular)
             let isConstrained = path.isConstrained
 
             // Handle path change on main thread
             Task { @MainActor in
                 // Track cellular state for UI warnings (e.g. large boost download on cellular)
-                self.isOnCellular = isExpensive
+                self.isOnCellular = isCellular
 
                 // FIX #1352: Only log path changes when background processes are enabled
                 // (suppresses ~53 noisy lines during initial sync — iOS cellular fires every 3-6s)
                 if self.backgroundProcessesEnabled {
-                    debugLog(.network, "📶 FIX #268: Network path changed - status=\(pathStatus), expensive=\(isExpensive), constrained=\(isConstrained)")
+                    debugLog(.network, "📶 FIX #268: Network path changed - status=\(pathStatus), cellular=\(isCellular), constrained=\(isConstrained)")
                 }
                 await self.handleNetworkPathChange(path: path)
             }
