@@ -3283,7 +3283,25 @@ public final class NetworkManager: ObservableObject {
     /// FIX #1581: Flag to suppress concurrent FIX #268 / FIX #1077 during background recovery
     private var isRecoveringFromBackground = false
 
+    /// FIX #1615: Track the active recovery Task so we can cancel stale ones on re-entry.
+    /// Without this: user goes bg→fg→bg→fg rapidly → multiple concurrent recoveries run,
+    /// each calling peers.removeAll() and racing for isConnecting → permanent 0 peers.
+    /// FIX #1615: Stored so ContentView can assign it and reconnectAfterBackground() can cancel stale ones.
+    var backgroundRecoveryTask: Task<Void, Never>?
+
     func reconnectAfterBackground() async {
+        // FIX #1615: Cancel any in-flight recovery before starting a new one.
+        // The previous recovery's stale connect() holds isConnecting=true, blocking new ones.
+        // Also prevents peers.removeAll() from destroying peers the previous recovery connected.
+        if isRecoveringFromBackground {
+            print("🔄 FIX #1615: Cancelling stale background recovery — starting fresh")
+            debugLog(.network, "🔄 FIX #1615: Re-entry detected — cancelling previous recovery")
+            backgroundRecoveryTask?.cancel()
+            // Wait briefly for cancellation to propagate
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            isConnecting = false  // Force-clear stale lock from cancelled connect()
+        }
+
         print("🔄 FIX #258: Reconnecting after background - iOS killed all sockets")
         debugLog(.network, "🔄 FIX #258: Reconnecting after iOS background - clearing stale connections")
 
@@ -3379,6 +3397,23 @@ public final class NetworkManager: ObservableObject {
             if torAlreadyConnected {
                 print("🔒 FIX #1476: Strict privacy — Tor already connected, reusing existing circuits (hidden service preserved)")
                 debugLog(.network, "🔒 FIX #1476: Tor already connected - skipping restart to preserve hidden service")
+
+                // FIX #1615: iOS kills ALL TCP sockets in background. Arti reports
+                // "connected" (process alive, SOCKS port listening) but relay circuits
+                // are dead. ensureRunningOnForeground() called requestNewIdentity()
+                // which triggers circuit rebuild, but this takes 10-20s. Without this
+                // wait, all peer SOCKS5 connections timeout → 0 connected peers.
+                // Poll in 1s increments so Task cancellation propagates quickly.
+                print("🧅 FIX #1615: Waiting for Tor circuit recovery after iOS background (up to 10s)...")
+                debugLog(.network, "🧅 FIX #1615: Circuit recovery wait — iOS killed relay sockets")
+                for _ in 1...10 {
+                    guard !Task.isCancelled else {
+                        print("🔄 FIX #1615: Circuit wait cancelled (newer recovery started)")
+                        return
+                    }
+                    try? await Task.sleep(nanoseconds: 1_000_000_000) // 1s
+                }
+                print("🧅 FIX #1615: Circuit recovery wait complete — attempting peer connections")
             } else {
                 print("🔒 FIX #1445: Strict privacy — Tor not connected, restarting")
                 debugLog(.network, "🔒 FIX #1445: Strict privacy mode - restarting Tor")
@@ -3417,7 +3452,12 @@ public final class NetworkManager: ObservableObject {
             // FIX #1581: Retry loop — first attempt may fail if Tor circuits are still warming.
             // iOS kills all sockets in background; Arti reports "connected" (stale cache) but
             // circuits need 5-15s to rebuild. Retry gives circuits time to establish.
+            // FIX #1615: Check Task.isCancelled — a newer recovery may have cancelled us.
             for attempt in 1...3 {
+                guard !Task.isCancelled else {
+                    print("🔄 FIX #1615: Recovery cancelled (newer recovery started) — exiting attempt \(attempt)")
+                    return
+                }
                 do {
                     try await connect()
                 } catch {
@@ -3429,8 +3469,14 @@ public final class NetworkManager: ObservableObject {
                     break
                 }
                 if attempt < 3 {
-                    print("⚠️ FIX #1581: Only \(readyCount) peers after attempt \(attempt)/3 — retrying in 5s...")
-                    try? await Task.sleep(nanoseconds: 5_000_000_000) // 5s for Tor circuits to warm
+                    guard !Task.isCancelled else {
+                        print("🔄 FIX #1615: Recovery cancelled before retry — exiting")
+                        return
+                    }
+                    // FIX #1615: 15s between retries (was 5s). First attempt triggers Arti
+                    // to discover broken circuits; 15s gives time to rebuild before retry.
+                    print("⚠️ FIX #1581: Only \(readyCount) peers after attempt \(attempt)/3 — retrying in 15s...")
+                    try? await Task.sleep(nanoseconds: 15_000_000_000) // 15s for Tor circuits to rebuild
                     isConnecting = false  // Reset for next attempt
                 } else {
                     print("⚠️ FIX #1581: Only \(readyCount) peers after 3 attempts — peer recovery will continue in background")
@@ -9736,6 +9782,19 @@ public final class NetworkManager: ObservableObject {
         // computation only, PHASE 2 manages its own connections. P2P reconnections are HARMFUL
         // (they kill active header sync connections mid-stream).
         if !backgroundProcessesEnabled {
+            // FIX #1582: Exception — when boost download is active and network drops,
+            // cancel the Rust download so stall detection + auto-retry can kick in immediately
+            // instead of waiting 30s for the stall timeout. Still suppress P2P reconnections.
+            let isBoostDownloading = await MainActor.run {
+                WalletManager.shared.treeLoadProgress > 0 && WalletManager.shared.treeLoadProgress < 0.3
+            }
+            if isBoostDownloading && path.status != .satisfied {
+                debugLog(.network, "📶 FIX #1582: Network lost during boost download — cancelling Rust download for fast retry")
+                ZipherXFFI.cancelDownload()
+                // Don't proceed to P2P reconnection — still in initial sync
+                return
+            }
+
             // FIX #1352: Only log first suppression (was 53 messages in iOS import log)
             if !hasLoggedPathChangeSuppression {
                 hasLoggedPathChangeSuppression = true

@@ -5,7 +5,9 @@ struct ContentView: View {
     @EnvironmentObject var networkManager: NetworkManager
     @EnvironmentObject var themeManager: ThemeManager
     @StateObject private var biometricManager = BiometricAuthManager.shared
+    #if ENABLE_VOICE_CALLS
     @StateObject private var voiceCallManager = VoiceCallManager.shared  // FIX #1567: Global call overlay
+    #endif
     #if os(macOS)
     @StateObject private var modeManager = WalletModeManager.shared  // FIX #448: Observe wallet source changes
     #endif
@@ -20,6 +22,7 @@ struct ContentView: View {
     @State private var lastActivityTime: Date = Date()  // Track user activity
     @State private var inactivityTimer: Timer?  // Timer to check inactivity
     @State private var wasInBackground: Bool = false  // FIX #258: Track if we were in background
+    @State private var backgroundLockTask: Task<Void, Error>? = nil  // FIX #1582: Debounce background lock to avoid screenshot triggering auth reset
     // FIX M-016: Disclaimer state in Keychain (not UserDefaults) to prevent bypass on macOS
     static func disclaimerAcceptedFromKeychain() -> Bool {
         let query: [String: Any] = [
@@ -120,6 +123,7 @@ struct ContentView: View {
         return "\(alert.severity.rawValue) \(alert.title)"
     }
 
+    #if ENABLE_VOICE_CALLS
     // FIX #1567: Look up caller's display name from contacts
     private var callerDisplayName: String {
         guard let onion = voiceCallManager.remotePeerOnionAddress else { return "Unknown" }
@@ -128,6 +132,7 @@ struct ContentView: View {
         }
         return String(onion.prefix(12)) + "..."
     }
+    #endif
 
     enum Tab {
         case balance, send, receive, chat, settings
@@ -2914,11 +2919,8 @@ struct ContentView: View {
                 WalletSetupView()
             }
 
+            #if ENABLE_VOICE_CALLS
             // FIX #1567: Global voice call overlay — shows from ANY screen (balance, settings, etc)
-            // Previously inside ConversationView (chat sheet only), so incoming calls while on
-            // balance/settings showed ringtone but no accept/decline UI.
-            // Note: ConversationView still has its own overlay for calls while chat sheet is open
-            // (sheet is a separate modal hierarchy — ZStack content doesn't show over it).
             if voiceCallManager.callState != .idle && !showCypherpunkChat {
                 CallView(
                     contactName: callerDisplayName,
@@ -2928,6 +2930,7 @@ struct ContentView: View {
                 .transition(.opacity)
                 .zIndex(999)
             }
+            #endif
 
             // Overlays extracted to separate view to reduce type-check complexity
             securityOverlays
@@ -3083,16 +3086,20 @@ struct ContentView: View {
             wasInBackground = true
             // Stop inactivity timer when going to background
             stopInactivityTimer()
-            // Beta_bugfix_1: Skip lock during mnemonic backup — wallet has no balance yet,
-            // and locking destroys the mnemonic display state (SwiftUI @State reset on view
-            // recreation). The mnemonic is already visible — locking to "protect" it is pointless.
-            // Privacy overlay still activates to protect app switcher preview.
-            if !walletManager.isMnemonicBackupPending {
-                // FIX #1273: Lock app when going to background
-                biometricManager.lockApp()
-                isShowingLockScreen = true
+            // FIX #1582: Don't lock immediately — iOS screenshots cause a brief
+            // .active → .inactive → .background → .active transition cycle.
+            // Debounce with 1.5s delay so the lock is cancelled if .active returns quickly.
+            backgroundLockTask?.cancel()
+            backgroundLockTask = Task {
+                try await Task.sleep(nanoseconds: 1_500_000_000)
+                await MainActor.run {
+                    // FIX #1273: Lock app when genuinely going to background
+                    biometricManager.lockApp()
+                    isShowingLockScreen = true
+                }
             }
             // VUL-U-006: Privacy overlay to protect sensitive data in app switcher
+            // (show immediately — this is visual-only and harmless during screenshots)
             if screenshotProtectionEnabled {
                 #if os(iOS)
                 // VUL-UI-003 Fix 3: Use UIKit privacy window (synchronous, no SwiftUI race)
@@ -3103,6 +3110,10 @@ struct ContentView: View {
             }
 
         case .active:
+            // FIX #1582: Cancel pending background lock (screenshot causes brief .background → .active)
+            backgroundLockTask?.cancel()
+            backgroundLockTask = nil
+
             // Security audit TASK 17: Clear privacy overlay when returning to foreground
             #if os(iOS)
             // VUL-UI-003 Fix 3: Hide UIKit privacy window
@@ -3116,8 +3127,7 @@ struct ContentView: View {
             // On macOS, the TouchID system dialog causes scene phase transitions
             // (inactive → active). Re-locking during active auth creates a race:
             // lockApp() resets hasAuthenticatedThisSession AFTER auth already succeeded.
-            // Beta_bugfix_1: Also skip during mnemonic backup (no lock was set, nothing to check).
-            if hasCompletedInitialSync && !biometricManager.isAuthInProgress && !walletManager.isMnemonicBackupPending {
+            if hasCompletedInitialSync && !biometricManager.isAuthInProgress {
                 // Check if we need to re-authenticate (inactivity timeout)
                 if biometricManager.isBiometricEnabled && biometricManager.isInactivityTimeoutExceeded {
                     isShowingLockScreen = true
@@ -3137,9 +3147,12 @@ struct ContentView: View {
             // Only trigger if we actually went to .background (not just .inactive from control center)
             if wasInBackground {
                 wasInBackground = false  // Reset flag
-                Task {
+                // FIX #1615: Store Task reference so reconnectAfterBackground() can cancel
+                // stale recoveries on re-entry (bg→fg→bg→fg rapid cycle)
+                let recoveryTask = Task {
                     await networkManager.reconnectAfterBackground()
                 }
+                networkManager.backgroundRecoveryTask = recoveryTask
             }
 
             // FIX #242: Check if wallet is behind and catch up

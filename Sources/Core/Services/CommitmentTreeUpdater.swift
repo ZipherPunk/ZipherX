@@ -1792,12 +1792,31 @@ actor CommitmentTreeUpdater {
         // Thread.sleep() on DispatchQueue.main blocks UI updates!
         var progressPollingActive = true
 
+        // FIX #1582: Stall detection — cancel download if no progress for 30 seconds
+        var lastProgressBytes: UInt64 = 0
+        var lastProgressTime = Date()
+        let stallTimeoutSeconds: TimeInterval = 30
+
         // Start polling in background Task (non-blocking)
         Task {
             while progressPollingActive {
                 let (bytes, total, speed) = ZipherXFFI.getDownloadProgress()
                 if total > 0 {
                     let progress = Double(bytes) / Double(total)
+
+                    // FIX #1582: Stall detection — track progress advancement
+                    if bytes > lastProgressBytes {
+                        lastProgressBytes = bytes
+                        lastProgressTime = Date()
+                    } else {
+                        let stallDuration = Date().timeIntervalSince(lastProgressTime)
+                        if stallDuration > stallTimeoutSeconds {
+                            print("⚠️ FIX #1582: Download stalled for \(Int(stallDuration))s at \(bytes)/\(total) bytes — cancelling")
+                            ZipherXFFI.cancelDownload()
+                            progressPollingActive = false
+                            break
+                        }
+                    }
 
                     // Update UI on main thread
                     await MainActor.run {
@@ -1812,6 +1831,14 @@ actor CommitmentTreeUpdater {
                         print("📥 Progress: \(String(format: "%.1f", downloadedMB))/\(String(format: "%.1f", totalMB)) MB @ \(String(format: "%.1f", speedMB)) MB/s")
                     }
                 } else {
+                    // FIX #1582: Also detect stall during initial connection phase
+                    let stallDuration = Date().timeIntervalSince(lastProgressTime)
+                    if stallDuration > stallTimeoutSeconds {
+                        print("⚠️ FIX #1582: Download stalled during connection for \(Int(stallDuration))s — cancelling")
+                        ZipherXFFI.cancelDownload()
+                        progressPollingActive = false
+                        break
+                    }
                     print("🔧 DEBUG: Waiting for download progress... total=\(total)")
                 }
 
@@ -1845,14 +1872,20 @@ actor CommitmentTreeUpdater {
         print("🔧 DEBUG: Download complete, result=\(downloadResult)")
 
         guard downloadResult == 0 else {
-            let errorMsg = [
-                "Success",
-                "Network error",
-                "File error",
-                "Cancelled",
-                "Other error"
-            ][Int(min(UInt64(abs(Int32(downloadResult))), 4))] ?? "Unknown error"
-            throw BoostFileError.networkError("Rust download failed: \(errorMsg) (code: \(downloadResult))")
+            // FIX #1582: Descriptive error messages for each Rust download error code
+            let errorCode = Int(abs(downloadResult))
+            let errorMsg: String
+            switch errorCode {
+            case 1:
+                errorMsg = "Network connection lost — check your internet connection"
+            case 2:
+                errorMsg = "Storage error — check available disk space"
+            case 3:
+                errorMsg = "Download cancelled"
+            default:
+                errorMsg = "Unexpected error (code: \(downloadResult))"
+            }
+            throw BoostFileError.networkError(errorMsg)
         }
 
         // Verify file exists and has correct size
@@ -2060,7 +2093,22 @@ actor CommitmentTreeUpdater {
 
     /// FIX #1349: Concatenate split part files into a single output file
     /// Uses 8MB chunked reads to avoid memory pressure on iOS
+    /// FIX #1617: Use write(contentsOf:) instead of write() — the old ObjC method
+    /// throws NSException on disk full/I/O error which bypasses Swift try/catch → SIGABRT crash.
+    /// Also validate part files before concatenating to catch corrupted/truncated downloads.
     private func concatenateFiles(parts: [URL], output: URL) throws {
+        // Validate all parts exist and are non-empty before starting
+        for (index, partURL) in parts.enumerated() {
+            guard FileManager.default.fileExists(atPath: partURL.path) else {
+                throw BoostFileError.networkError("FIX #1617: Part \(index + 1)/\(parts.count) missing: \(partURL.lastPathComponent)")
+            }
+            let attrs = try FileManager.default.attributesOfItem(atPath: partURL.path)
+            let size = attrs[.size] as? UInt64 ?? 0
+            guard size > 0 else {
+                throw BoostFileError.networkError("FIX #1617: Part \(index + 1)/\(parts.count) is empty (0 bytes): \(partURL.lastPathComponent)")
+            }
+        }
+
         // Remove existing output if present
         if FileManager.default.fileExists(atPath: output.path) {
             try FileManager.default.removeItem(at: output)
@@ -2069,18 +2117,20 @@ actor CommitmentTreeUpdater {
         // Create output file
         FileManager.default.createFile(atPath: output.path, contents: nil)
         let outputHandle = try FileHandle(forWritingTo: output)
-        defer { outputHandle.closeFile() }
+        defer { try? outputHandle.close() }
 
         let chunkSize = 8 * 1024 * 1024 // 8MB chunks
 
         for (index, partURL) in parts.enumerated() {
             let inputHandle = try FileHandle(forReadingFrom: partURL)
-            defer { inputHandle.closeFile() }
+            defer { try? inputHandle.close() }
 
-            while autoreleasepool(invoking: {
+            while try autoreleasepool(invoking: {
                 let chunk = inputHandle.readData(ofLength: chunkSize)
                 if chunk.isEmpty { return false }
-                outputHandle.write(chunk)
+                // FIX #1617: write(contentsOf:) throws Swift error on failure
+                // instead of NSException that crashes the app
+                try outputHandle.write(contentsOf: chunk)
                 return true
             }) {}
 

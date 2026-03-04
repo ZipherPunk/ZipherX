@@ -3455,68 +3455,125 @@ final class WalletManager: ObservableObject {
         var downloadedTreeHeight: UInt64 = 0
         var downloadedCMUCount: UInt64 = 0
 
-        do {
-            // Download the unified boost file (contains tree, outputs, spends, etc.)
-            // FIX #278: Enhanced progress callback with speed/ETA calculation
-            let (_, height, cmuCount) = try await CommitmentTreeUpdater.shared.getBestAvailableBoostFile { progress, status in
-                Task { @MainActor in
-                    self.treeLoadProgress = 0.1 + progress * 0.2  // 10-30% for download
-                    self.treeLoadStatus = status
+        // FIX #1582: Auto-retry with linear backoff for network-related download failures
+        let maxRetries = 3
+        let retryDelays: [UInt64] = [5, 10, 15]  // seconds between retries
+        var lastDownloadError: Error?
 
-                    // FIX #278: Calculate download speed and ETA
-                    let now = Date()
-                    let elapsed = now.timeIntervalSince(lastProgressUpdate)
+        for attempt in 0...maxRetries {
+            if attempt > 0 {
+                let delay = retryDelays[attempt - 1]
+                print("⏳ FIX #1582: Retrying boost download in \(delay)s (attempt \(attempt)/\(maxRetries))...")
+                await MainActor.run {
+                    self.treeLoadStatus = "Network issue — retrying in \(delay)s (attempt \(attempt)/\(maxRetries))..."
+                    self.treeLoadProgress = 0.1
+                    self.boostDownloadSpeed = ""
+                    self.boostETA = ""
+                }
+                try? await Task.sleep(nanoseconds: delay * 1_000_000_000)
+                // Reset progress tracking for retry
+                downloadStartTime = Date()
+                lastProgressUpdate = Date()
+                lastProgress = 0
+            }
 
-                    if elapsed >= 0.5 && progress > lastProgress {  // Update every 500ms
-                        let progressDelta = progress - lastProgress
-                        let totalElapsed = now.timeIntervalSince(downloadStartTime)
+            do {
+                // Download the unified boost file (contains tree, outputs, spends, etc.)
+                // FIX #278: Enhanced progress callback with speed/ETA calculation
+                let (_, height, cmuCount) = try await CommitmentTreeUpdater.shared.getBestAvailableBoostFile { progress, status in
+                    Task { @MainActor in
+                        self.treeLoadProgress = 0.1 + progress * 0.2  // 10-30% for download
+                        self.treeLoadStatus = status
 
-                        // Speed based on recent progress (more responsive)
-                        // Assuming ~500MB file size for estimation
-                        let estimatedFileSize: Int64 = 500_000_000
-                        let bytesDownloaded = Int64(Double(estimatedFileSize) * progress)
-                        let recentBytesPerSec = Int64(Double(estimatedFileSize) * progressDelta / elapsed)
+                        // FIX #278: Calculate download speed and ETA
+                        let now = Date()
+                        let elapsed = now.timeIntervalSince(lastProgressUpdate)
 
-                        if recentBytesPerSec > 0 {
-                            self.boostDownloadSpeed = ByteCountFormatter.string(fromByteCount: recentBytesPerSec, countStyle: .file) + "/s"
-                            self.boostFileSize = estimatedFileSize
+                        if elapsed >= 0.5 && progress > lastProgress {  // Update every 500ms
+                            let progressDelta = progress - lastProgress
+                            let totalElapsed = now.timeIntervalSince(downloadStartTime)
 
-                            // ETA based on remaining progress and average speed
-                            let avgBytesPerSec = Double(bytesDownloaded) / totalElapsed
-                            let remainingBytes = Double(estimatedFileSize) * (1.0 - progress)
-                            let etaSeconds = Int(remainingBytes / avgBytesPerSec)
+                            // Speed based on recent progress (more responsive)
+                            // Assuming ~500MB file size for estimation
+                            let estimatedFileSize: Int64 = 500_000_000
+                            let bytesDownloaded = Int64(Double(estimatedFileSize) * progress)
+                            let recentBytesPerSec = Int64(Double(estimatedFileSize) * progressDelta / elapsed)
 
-                            if etaSeconds < 60 {
-                                self.boostETA = "\(etaSeconds)s"
-                            } else if etaSeconds < 3600 {
-                                self.boostETA = "\(etaSeconds / 60)m \(etaSeconds % 60)s"
-                            } else {
-                                self.boostETA = "\(etaSeconds / 3600)h \(etaSeconds % 3600 / 60)m"
+                            if recentBytesPerSec > 0 {
+                                self.boostDownloadSpeed = ByteCountFormatter.string(fromByteCount: recentBytesPerSec, countStyle: .file) + "/s"
+                                self.boostFileSize = estimatedFileSize
+
+                                // ETA based on remaining progress and average speed
+                                let avgBytesPerSec = Double(bytesDownloaded) / totalElapsed
+                                let remainingBytes = Double(estimatedFileSize) * (1.0 - progress)
+                                let etaSeconds = Int(remainingBytes / avgBytesPerSec)
+
+                                if etaSeconds < 60 {
+                                    self.boostETA = "\(etaSeconds)s"
+                                } else if etaSeconds < 3600 {
+                                    self.boostETA = "\(etaSeconds / 60)m \(etaSeconds % 60)s"
+                                } else {
+                                    self.boostETA = "\(etaSeconds / 3600)h \(etaSeconds % 3600 / 60)m"
+                                }
                             }
+
+                            lastProgressUpdate = now
+                            lastProgress = progress
                         }
 
-                        lastProgressUpdate = now
-                        lastProgress = progress
+                        // FIX #124: Update overall progress during download
+                        self.updateOverallProgress(phase: .downloadingTree, phaseProgress: progress)
                     }
-
-                    // FIX #124: Update overall progress during download
-                    self.updateOverallProgress(phase: .downloadingTree, phaseProgress: progress)
                 }
-            }
-            downloadedTreeHeight = height
-            downloadedCMUCount = cmuCount
-            print("🚀 Downloaded boost file from GitHub: height \(height) (\(cmuCount) outputs)")
+                downloadedTreeHeight = height
+                downloadedCMUCount = cmuCount
+                print("🚀 Downloaded boost file from GitHub: height \(height) (\(cmuCount) outputs)")
 
-            // FIX #278: Clear download stats after completion
-            await MainActor.run {
-                self.boostDownloadSpeed = ""
-                self.boostETA = ""
+                // FIX #278: Clear download stats after completion
+                await MainActor.run {
+                    self.boostDownloadSpeed = ""
+                    self.boostETA = ""
+                }
+                lastDownloadError = nil
+                break  // Success — exit retry loop
+            } catch {
+                lastDownloadError = error
+                print("❌ GitHub boost file download failed (attempt \(attempt + 1)/\(maxRetries + 1)): \(error.localizedDescription)")
+
+                // FIX #1582: Only retry on network-related errors (not checksum, format, etc.)
+                let isNetworkError: Bool
+                if let boostError = error as? BoostFileError {
+                    switch boostError {
+                    case .networkError(let msg):
+                        isNetworkError = msg.contains("Network connection lost") ||
+                                         msg.contains("Download cancelled") ||
+                                         msg.contains("Storage error")
+                    default:
+                        isNetworkError = false
+                    }
+                } else {
+                    // URLSession or other transport errors are retryable
+                    isNetworkError = true
+                }
+
+                if !isNetworkError || attempt == maxRetries {
+                    // Non-retryable error or max retries exhausted
+                    await MainActor.run {
+                        self.treeLoadStatus = "Failed to download boost data"
+                        // FIX #888: Set download failed flag to show retry prompt
+                        self.boostDownloadFailed = true
+                        self.boostDownloadError = error.localizedDescription
+                    }
+                    return
+                }
+                // Retryable error — continue loop
             }
-        } catch {
-            print("❌ GitHub boost file download failed: \(error.localizedDescription)")
+        }
+
+        // Safety check: if we somehow exit the loop without success
+        if let error = lastDownloadError {
             await MainActor.run {
                 self.treeLoadStatus = "Failed to download boost data"
-                // FIX #888: Set download failed flag to show retry prompt
                 self.boostDownloadFailed = true
                 self.boostDownloadError = error.localizedDescription
             }
