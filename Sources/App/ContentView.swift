@@ -320,17 +320,13 @@ struct ContentView: View {
                         // Trigger tree loading if not already loaded
                         // This handles the case where wallet was just created/imported
                         if !walletManager.isTreeLoaded {
-                            // FIX #1620: Warn iOS users on cellular before downloading 2+ GB boost file
-                            // Uses direct NWPathMonitor check — NetworkManager.isOnCellular may not be set yet
+                            // FIX #1620: Non-blocking cellular warning — show alert but don't block startup.
+                            // Download proceeds immediately; alert is informational only.
                             #if os(iOS)
                             if isFirstLaunch {
                                 let isCellular = await NetworkManager.isCellularNetwork()
                                 if isCellular {
                                     showCellularDownloadWarning = true
-                                    // Wait for user to acknowledge the warning
-                                    while showCellularDownloadWarning && !cellularDownloadApproved {
-                                        try? await Task.sleep(nanoseconds: 200_000_000) // 200ms
-                                    }
                                 }
                             }
                             #endif
@@ -4374,17 +4370,15 @@ struct UnifiedAlertSheet: View {
         )
     }
 
-    // FIX #1620: Cellular download warning — shown before 2+ GB boost download on cellular
+    // FIX #1620: Non-blocking cellular warning — informational only, download proceeds immediately
     private var cellularDownloadWarningAlert: some View {
         AlertWrapper(
-            title: "Large Download Required",
-            message: "ZipherX needs to download over 2 GB of blockchain data.\n\nThis requires at least 5 minutes on a fast and stable connection.\n\nYou are currently on cellular data. For the best experience, connect to WiFi before continuing.\n\nIf the download fails or gets interrupted, delete and reinstall the app to start fresh.",
-            primaryButton: ("Continue on Cellular", {
-                cellularDownloadApproved = true
+            title: "Cellular Data Notice",
+            message: "ZipherX is downloading over 2 GB of blockchain data on cellular.\n\nFor the best experience, connect to WiFi.\n\nIf the download fails, delete and reinstall the app to start fresh.",
+            primaryButton: ("OK", {
+                // Informational only — download already in progress
             }),
-            secondaryButton: ("Cancel", {
-                // User can switch to WiFi and relaunch
-            })
+            secondaryButton: nil
         )
     }
 }
