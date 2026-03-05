@@ -66,7 +66,7 @@ Download the latest release from the [Releases](https://github.com/ZipherPunk/Zi
 
 | File | Description |
 |------|-------------|
-| `ZipherX_v4.2.3.dmg` | macOS installer (Apple Silicon + Intel) |
+| `ZipherX-macOS-4.2.3.dmg` | macOS installer (Apple Silicon + Intel) |
 | `SHA256SUMS.txt` | SHA-256 checksums for verification |
 
 ### Verify the Download
@@ -79,7 +79,7 @@ Download the latest release from the [Releases](https://github.com/ZipherPunk/Zi
 # 1. Download both the .dmg and SHA256SUMS.txt from the Releases page
 
 # 2. Verify the checksum
-shasum -a 256 ZipherX_v4.2.3.dmg
+shasum -a 256 ZipherX-macOS-4.2.3.dmg
 
 # 3. Compare the output with the hash in SHA256SUMS.txt
 # The two hashes MUST match exactly. If they don't, do NOT install — re-download or report the issue.
@@ -88,18 +88,15 @@ shasum -a 256 ZipherX_v4.2.3.dmg
 #### Windows (PowerShell)
 
 ```powershell
-Get-FileHash ZipherX_v4.2.3.dmg -Algorithm SHA256
+Get-FileHash ZipherX-macOS-4.2.3.dmg -Algorithm SHA256
 ```
 
 ### Install from DMG
 
 1. **Open** the `.dmg` file (double-click)
 2. **Drag** `ZipherX.app` into your `/Applications` folder
-3. **First launch**: Right-click `ZipherX.app` > **Open** (required for unsigned or first-time apps on macOS)
-4. If macOS shows "ZipherX can't be opened because Apple cannot check it for malicious software":
-   - Go to **System Settings > Privacy & Security**
-   - Scroll down and click **Open Anyway**
-5. On first launch, ZipherX will download Sapling parameters (~50 MB) and a boost file (~2 GB) for fast sync. **WiFi is recommended** — on iOS, a cellular data warning is shown during the download. The download supports resume: if interrupted, it picks up from where it left off.
+3. **Launch** — Double-click `ZipherX.app`. The app is code-signed and notarized by Apple, so Gatekeeper accepts it without warnings.
+4. On first launch, ZipherX will download Sapling parameters (~50 MB) and a boost file (~2 GB) for fast sync. **WiFi is recommended** — on iOS, a cellular data warning is shown during the download. The download supports resume: if interrupted, it picks up from where it left off.
 
 ### Uninstall
 
